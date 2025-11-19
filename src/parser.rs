@@ -51,5 +51,6 @@ pub type SelfReference = ast::SelfReferential<ParseInfo, Identifier>;
 pub type Lambda = ast::Lambda<ParseInfo, Identifier>;
 pub type Apply = ast::Apply<ParseInfo, Identifier>;
 pub type Binding = ast::Binding<ParseInfo, Identifier>;
+pub type Record = ast::Record<ParseInfo, Identifier>;
 pub type Tuple = ast::Tuple<ParseInfo, Identifier>;
 pub type Projection = ast::Projection<ParseInfo, Identifier>;

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt, rc::Rc};
+use std::{collections::HashMap, fmt, marker::PhantomData, rc::Rc};
 
 use crate::{
     ast::{self, CompilationUnit, TypeSignature},
@@ -10,6 +10,7 @@ pub type SelfReferential = ast::SelfReferential<ParseInfo, Identifier>;
 pub type Lambda = ast::Lambda<ParseInfo, Identifier>;
 pub type Apply = ast::Apply<ParseInfo, Identifier>;
 pub type Binding = ast::Binding<ParseInfo, Identifier>;
+pub type Record = ast::Record<ParseInfo, Identifier>;
 pub type Tuple = ast::Tuple<ParseInfo, Identifier>;
 pub type Projection = ast::Projection<ParseInfo, Identifier>;
 
@@ -33,23 +34,25 @@ impl fmt::Display for Identifier {
 }
 
 #[derive(Debug, Clone)]
-pub struct Symbols<A, Id> {
-    table: HashMap<parser::Identifier, Symbol<A, Id>>,
+pub struct Symbols<A> {
+    table: HashMap<parser::Identifier, Symbol<A>>,
+    bogus: PhantomData<A>,
 }
 
-impl<A, Id> Default for Symbols<A, Id> {
+impl<A> Default for Symbols<A> {
     fn default() -> Self {
         Self {
             table: HashMap::default(),
+            bogus: PhantomData::default(),
         }
     }
 }
 
-impl<A> Symbols<A, parser::Identifier> {
+impl<A> Symbols<A> {
     // resolve_path
     // resolve_projection
 
-    pub fn lookup(&self, id: &parser::Identifier) -> Option<&Symbol<A, parser::Identifier>> {
+    pub fn lookup(&self, id: &parser::Identifier) -> Option<&Symbol<A>> {
         self.table.get(id)
     }
 
@@ -57,7 +60,7 @@ impl<A> Symbols<A, parser::Identifier> {
         Self::from_module(compilation.root)
     }
 
-    pub fn from_module(module: ast::ModuleDeclaration<A>) -> Symbols<A, parser::Identifier> {
+    pub fn from_module(module: ast::ModuleDeclaration<A>) -> Symbols<A> {
         let mut the = Self::default();
         let Self { table, .. } = &mut the;
 
@@ -66,10 +69,9 @@ impl<A> Symbols<A, parser::Identifier> {
                 ast::Declaration::Value(_, decl) => {
                     let _ = table.insert(
                         decl.name.clone(),
-                        Symbol::Value(ValueSymbol {
+                        Symbol::Value::<A>(ValueSymbol {
                             name: decl.name,
                             type_signature: decl.declarator.type_signature,
-                            body: decl.declarator.body,
                         }),
                     );
                     ()
@@ -77,7 +79,7 @@ impl<A> Symbols<A, parser::Identifier> {
                 ast::Declaration::Module(_, decl) => {
                     let _ = table.insert(
                         decl.name.clone(),
-                        Symbol::Module(ModuleSymbol {
+                        Symbol::Module::<A>(ModuleSymbol {
                             name: decl.name.clone(),
                             contents: Self::from_module(decl),
                         }),
@@ -106,28 +108,28 @@ impl<A> Symbols<A, parser::Identifier> {
 }
 
 #[derive(Debug, Clone)]
-pub enum Symbol<A, Id> {
-    Value(ValueSymbol<A, Id>),
-    Module(ModuleSymbol<A, Id>),
+pub enum Symbol<A> {
+    Value(ValueSymbol),
+    Module(ModuleSymbol<A>),
     // These are both types, they ought to be wrapped as such
     Struct(StructSymbol),
     Coproduct(CoproductSymbol),
 }
 
 #[derive(Debug, Clone)]
-pub struct ValueSymbol<A, Id> {
+pub struct ValueSymbol {
     pub name: parser::Identifier,
     pub type_signature: Option<TypeSignature>,
     // What type?
     // parser::Identifer at this point and
     // resolve_bindings on the whole table?
-    pub body: ast::Expr<A, Id>,
+    //    pub body: ast::Expr<A, Id>,
 }
 
 #[derive(Debug, Clone)]
-pub struct ModuleSymbol<A, Id> {
+pub struct ModuleSymbol<A> {
     pub name: parser::Identifier,
-    pub contents: Symbols<A, Id>,
+    pub contents: Symbols<A>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,11 +158,9 @@ impl DeBruijnIndex {
     where
         F: FnMut(&mut DeBruijnIndex, Identifier) -> A,
     {
-        let de_bruijn = self.0.len();
-        println!("bind: {id} -> {de_bruijn}");
-
+        let de_bruijn_index = self.0.len();
         self.0.push(id);
-        let a = block(self, Identifier::Bound(de_bruijn));
+        let a = block(self, Identifier::Bound(de_bruijn_index));
         self.0.pop();
         a
     }
@@ -179,6 +179,7 @@ impl parser::Expr {
             Self::Lambda(a, info) => Expr::Lambda(*a, info.resolve(names)),
             Self::Apply(a, x) => Expr::Apply(*a, x.resolve(names)),
             Self::Let(a, x) => Expr::Let(*a, x.resolve(names)),
+            Self::Record(a, x) => Expr::Record(*a, x.resolve(names)),
             Self::Tuple(a, x) => Expr::Tuple(*a, x.resolve(names)),
             Self::Project(a, x) => Expr::Project(*a, x.resolve(names)),
         }
@@ -223,6 +224,18 @@ impl parser::Binding {
     }
 }
 
+impl parser::Record {
+    fn resolve(&self, names: &mut DeBruijnIndex) -> Record {
+        Record {
+            fields: self
+                .fields
+                .iter()
+                .map(|(label, e)| (label.clone(), e.resolve(names).into()))
+                .collect(),
+        }
+    }
+}
+
 impl parser::Tuple {
     fn resolve(&self, names: &mut DeBruijnIndex) -> Tuple {
         Tuple {
@@ -239,10 +252,6 @@ impl parser::Projection {
     fn resolve(&self, names: &mut DeBruijnIndex) -> Projection {
         Projection {
             base: self.base.resolve(names).into(),
-
-            // How does this happen?
-            // It needs the decl to know which fields it has
-            // which is to say: it needs the type of base, really.
             select: self.select.clone(),
         }
     }

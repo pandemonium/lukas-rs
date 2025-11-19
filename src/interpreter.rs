@@ -16,7 +16,9 @@ impl Expr<(), namer::Identifier> {
             Self::Variable(_, the) => env
                 .get(the)
                 .ok_or_else(|| RuntimeError::NoSuchSymbol(the.clone())),
+
             Self::Constant(_, the) => Ok(Value::Constant(the.clone().into())),
+
             Self::RecursiveLambda(_, the) => {
                 let closure = Closure::capture(env, &the.underlying.body);
                 closure.borrow_mut().capture.put(Value::SelfReferential {
@@ -25,7 +27,9 @@ impl Expr<(), namer::Identifier> {
                 });
                 Ok(Value::Closure(Rc::clone(&closure)))
             }
+
             Self::Lambda(_, the) => Ok(Value::Closure(Closure::capture(env, &the.body))),
+
             Self::Apply(_, the) => {
                 let argument = the.argument.reduce(env)?;
                 let closure = the.function.reduce(env)?;
@@ -39,15 +43,25 @@ impl Expr<(), namer::Identifier> {
                     Err(RuntimeError::ExpectedClosure(closure))
                 }
             }
+
             Self::Let(_, binding) => {
                 env.with_binding(binding.bound.reduce(env)?, |env| binding.body.reduce(env))
             }
+
+            Self::Record(_, the) => Ok(Value::Product(
+                the.fields
+                    .iter()
+                    .map(|(_, e)| e.reduce(env))
+                    .collect::<Interpretation<_>>()?,
+            )),
+
             Self::Tuple(_, the) => Ok(Value::Product(
                 the.elements
                     .iter()
                     .map(|e| e.reduce(env))
                     .collect::<Interpretation<_>>()?,
             )),
+
             Self::Project(_, the) => match (the.base.reduce(env)?, &the.select) {
                 (Value::Product(values), ProductElement::Ordinal(index)) => {
                     Ok(values[*index].clone())

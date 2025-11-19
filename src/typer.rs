@@ -22,6 +22,7 @@ pub type RecursiveLambda = ast::SelfReferential<TypeInfo, namer::Identifier>;
 pub type Lambda = ast::Lambda<TypeInfo, namer::Identifier>;
 pub type Binding = ast::Binding<TypeInfo, namer::Identifier>;
 pub type Tuple = ast::Tuple<TypeInfo, namer::Identifier>;
+pub type Record = ast::Record<TypeInfo, namer::Identifier>;
 // How does this handle parser::Identifier -> namer::Identifier for fields?
 pub type Projection = ast::Projection<TypeInfo, namer::Identifier>;
 
@@ -95,33 +96,7 @@ pub enum Type {
         codomain: Box<Type>,
     },
     Tuple(Vec<Type>),
-    Struct(Vec<(parser::Identifier, Type)>),
-}
-
-impl fmt::Display for Type {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Variable(TypeParameter(p)) => write!(f, "${p}"),
-            Self::Base(base_type) => write!(f, "{base_type}"),
-            Self::Arrow { domain, codomain } => write!(f, "({domain} -> {codomain})"),
-            Self::Tuple(items) => {
-                let tuple_rendering = items
-                    .iter()
-                    .map(|x| x.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                write!(f, "({tuple_rendering})")
-            }
-            Self::Struct(items) => {
-                let struct_rendering = items
-                    .iter()
-                    .map(|(label, ty)| format!("{label} : {ty}"))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                write!(f, "{{ {struct_rendering} }}")
-            }
-        }
-    }
+    Record(Vec<(parser::Identifier, Type)>),
 }
 
 impl Type {
@@ -139,7 +114,7 @@ impl Type {
                 variables
             }
             Self::Tuple(elements) => elements.iter().flat_map(|el| el.variables()).collect(),
-            Self::Struct(items) => items.iter().flat_map(|(_, e)| e.variables()).collect(),
+            Self::Record(items) => items.iter().flat_map(|(_, e)| e.variables()).collect(),
         }
     }
 
@@ -160,7 +135,7 @@ impl Type {
                     .map(|ty| ty.with_substitutions(subs))
                     .collect(),
             ),
-            Self::Struct(items) => Self::Struct(
+            Self::Record(items) => Self::Record(
                 items
                     .iter()
                     .map(|(field, ty)| (field.clone(), ty.with_substitutions(subs)))
@@ -232,15 +207,6 @@ impl Type {
 pub enum BaseType {
     Int,
     Text,
-}
-
-impl fmt::Display for BaseType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Int => write!(f, "Int"),
-            Self::Text => write!(f, "Text"),
-        }
-    }
 }
 
 // This could contain more information, really. I would love to
@@ -468,12 +434,52 @@ impl TypingContext {
 
             UntypedExpr::Let(parse_info, binding) => self.infer_binding(parse_info, binding),
 
+            UntypedExpr::Record(parse_info, record) => self.infer_record(parse_info, record),
+
             UntypedExpr::Tuple(parse_info, tuple) => self.infer_tuple(parse_info, tuple),
 
             UntypedExpr::Project(parse_info, projection) => {
                 self.infer_projection(parse_info, projection)
             }
         }
+    }
+
+    fn infer_record(&mut self, parse_info: &ParseInfo, record: &namer::Record) -> Typing {
+        let mut substitutions = Substitutions::default();
+        let mut fields = Vec::with_capacity(record.fields.len());
+
+        for (label, initializer) in &record.fields {
+            let (subs, field) = self.infer_type(initializer)?;
+            fields.push((label.clone(), field));
+            substitutions = substitutions.compose(&subs);
+        }
+
+        // it clones the labels twice...
+        let fields = fields
+            .iter()
+            .map(|(label, e)| (label.clone(), e.with_substitutions(&substitutions).into()))
+            .collect::<Vec<_>>();
+
+        let inferred_type = Type::Record(
+            fields
+                .iter()
+                .map(
+                    |(label, e): &(parser::Identifier, Tree<TypeInfo, namer::Identifier>)| {
+                        (label.clone(), e.type_info().inferred_type.clone())
+                    },
+                )
+                .collect(),
+        );
+        Ok((
+            substitutions,
+            Expr::Record(
+                TypeInfo {
+                    parse_info: *parse_info,
+                    inferred_type,
+                },
+                Record { fields },
+            ),
+        ))
     }
 
     fn infer_projection(
@@ -483,7 +489,7 @@ impl TypingContext {
     ) -> Typing {
         let (substitutions, base) = self.infer_type(&projection.base)?;
         match (&base.type_info().inferred_type, &projection.select) {
-            (Type::Struct(items), ProductElement::Name(field)) => {
+            (Type::Record(items), ProductElement::Name(field)) => {
                 if let Some((field_index, (_, field_type))) = items
                     .iter()
                     .enumerate()
@@ -708,5 +714,40 @@ impl TypingContext {
             .flat_map(|ts| ts.free_variables())
             .chain(self.values.bound.iter().flat_map(|ts| ts.free_variables()))
             .collect()
+    }
+}
+
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Variable(TypeParameter(p)) => write!(f, "${p}"),
+            Self::Base(base_type) => write!(f, "{base_type}"),
+            Self::Arrow { domain, codomain } => write!(f, "({domain} -> {codomain})"),
+            Self::Tuple(items) => {
+                let tuple_rendering = items
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "({tuple_rendering})")
+            }
+            Self::Record(items) => {
+                let struct_rendering = items
+                    .iter()
+                    .map(|(label, ty)| format!("{label} : {ty}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                write!(f, "{{ {struct_rendering} }}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for BaseType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Int => write!(f, "Int"),
+            Self::Text => write!(f, "Text"),
+        }
     }
 }

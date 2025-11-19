@@ -32,6 +32,7 @@ where
                 Expr::Lambda(a, node) => Expr::Lambda(f(a), node.map_annotation(&f)),
                 Expr::Apply(a, node) => Expr::Apply(f(a), node.map_annotation(&f)),
                 Expr::Let(a, node) => Expr::Let(f(a), node.map_annotation(&f)),
+                Expr::Record(a, node) => Expr::Record(f(a), node.map_annotation(&f)),
                 Expr::Tuple(a, node) => Expr::Tuple(f(a), node.map_annotation(&f)),
                 Expr::Project(a, node) => Expr::Project(f(a), node.map_annotation(&f)),
             }
@@ -131,6 +132,26 @@ where
             binder: binder.clone(),
             bound: bound.map_annotation(&f),
             body: body.map_annotation(&f),
+        }
+    }
+}
+
+impl<A, B, Id> Annotated<A, B, Id> for Record<A, Id>
+where
+    Id: Clone,
+{
+    type Output = Record<B, Id>;
+
+    fn map_annotation<F>(&self, f: F) -> Self::Output
+    where
+        F: Fn(&A) -> B,
+    {
+        Record {
+            fields: self
+                .fields
+                .iter()
+                .map(|(label, e)| (label.clone(), e.map_annotation(&f)))
+                .collect(),
         }
     }
 }

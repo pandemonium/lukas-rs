@@ -1,7 +1,7 @@
 use lukas::{
     ast::{
         Apply, Binding, CompilationUnit, Declaration, Expr, Lambda, Literal, ModuleDeclaration,
-        ModuleDeclarator, Tuple, ValueDeclaration, ValueDeclarator, namer::Symbols,
+        ModuleDeclarator, Record, Tuple, ValueDeclaration, ValueDeclarator, namer::Symbols,
     },
     interpreter::Environment,
     parser::{Identifier, ParseInfo},
@@ -14,56 +14,66 @@ type Id = Identifier;
 type Tree = Rc<Expr<A, Id>>;
 
 fn var(name: &str) -> Tree {
-    Rc::new(Expr::Variable(
-        ParseInfo::default(),
-        Identifier::from_str(name),
-    ))
+    Expr::Variable(ParseInfo::default(), Identifier::from_str(name)).into()
 }
 
 fn const_int(n: i32) -> Tree {
-    Rc::new(Expr::Constant(ParseInfo::default(), Literal::Int(n)))
+    Expr::Constant(ParseInfo::default(), Literal::Int(n)).into()
 }
 
 fn const_text(s: &str) -> Tree {
-    Rc::new(Expr::Constant(
-        ParseInfo::default(),
-        Literal::Text(s.to_string()),
-    ))
+    Expr::Constant(ParseInfo::default(), Literal::Text(s.to_string())).into()
 }
 
 fn lambda(param: &str, body: Tree) -> Tree {
-    Rc::new(Expr::Lambda(
+    Expr::Lambda(
         ParseInfo::default(),
         Lambda {
             parameter: Identifier::from_str(param),
             body,
         },
-    ))
+    )
+    .into()
 }
 
 fn apply(f: Tree, arg: Tree) -> Tree {
-    Rc::new(Expr::Apply(
+    Expr::Apply(
         ParseInfo::default(),
         Apply {
             function: f,
             argument: arg,
         },
-    ))
+    )
+    .into()
 }
 
 fn let_in(binder: &str, bound: Tree, body: Tree) -> Tree {
-    Rc::new(Expr::Let(
+    Expr::Let(
         ParseInfo::default(),
         Binding {
             binder: Identifier::from_str(binder),
             bound,
             body,
         },
-    ))
+    )
+    .into()
 }
 
 fn tuple(elements: Vec<Tree>) -> Tree {
-    Rc::new(Expr::Tuple(ParseInfo::default(), Tuple { elements }))
+    Expr::Tuple(ParseInfo::default(), Tuple { elements }).into()
+}
+
+fn record(fields: &[(&str, Tree)]) -> Tree {
+    Expr::Record(
+        ParseInfo::default(),
+        Record {
+            fields: fields
+                .iter()
+                .map(|(label, e)| (Identifier::from_str(label), Rc::clone(e)))
+                .collect(),
+        },
+    )
+    .into()
 }
 
 fn main() {
@@ -96,12 +106,19 @@ fn main() {
     println!("main: symbols: {symbols:?}");
 
     let id = lambda("x", var("x"));
-    let id_binding = let_in("id", id.clone(), {
+    let id_binding = let_in("id", id, {
         let_in("z", apply(var("id"), const_int(1)), {
             let_in(
                 "y",
                 apply(var("id"), const_text("hej")),
-                tuple(vec![var("y"), var("z"), var("id")]),
+                let_in(
+                    "q",
+                    record(&[
+                        ("cash", const_int(427)),
+                        ("name", const_text("Patrik Andersson")),
+                    ]),
+                    tuple(vec![var("y"), var("z"), var("q"), var("id")]),
+                ),
             )
         })
     });

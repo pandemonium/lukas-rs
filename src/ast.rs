@@ -69,6 +69,7 @@ pub enum Expr<A, Id> {
     Apply(A, Apply<A, Id>),
     Let(A, Binding<A, Id>),
     Tuple(A, Tuple<A, Id>),
+    Record(A, Record<A, Id>),
     Project(A, Projection<A, Id>),
 }
 
@@ -81,6 +82,7 @@ impl<A, Id> Expr<A, Id> {
             | Expr::Lambda(a, ..)
             | Expr::Apply(a, ..)
             | Expr::Let(a, ..)
+            | Expr::Record(a, ..)
             | Expr::Tuple(a, ..)
             | Expr::Project(a, ..) => a,
         }
@@ -92,6 +94,11 @@ impl<A, Id> Expr<A, Id> {
     {
         self.map_annotation(|_| ())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct Record<A, Id> {
+    pub fields: Vec<(parser::Identifier, Tree<A, Id>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +173,7 @@ where
             Self::Lambda(_, x) => write!(f, "{}", x),
             Self::Apply(_, x) => write!(f, "({} {})", x.function, x.argument),
             Self::Let(_, x) => write!(f, "let {} = {} in {}", x.binder, x.bound, x.body),
+            Self::Record(_, x) => write!(f, "{x}"),
             Self::Tuple(_, x) => write!(f, "{x}"),
             Self::Project(_, x) => write!(f, "{}.{}", x.base, x.select),
         }
@@ -188,6 +196,21 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { parameter, body } = self;
         write!(f, "λ{parameter}. {body}")
+    }
+}
+
+impl<A, Id> fmt::Display for Record<A, Id>
+where
+    Id: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let record_rendering = self
+            .fields
+            .iter()
+            .map(|(label, e)| format!("{label}: {e}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        write!(f, "{{ {record_rendering} }}")
     }
 }
 
