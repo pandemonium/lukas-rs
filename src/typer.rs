@@ -318,14 +318,20 @@ pub enum Term {
 #[derive(Debug, Default)]
 pub struct TermSpace {
     bound: Vec<TypeScheme>,
-    free: HashMap<parser::Identifier, TypeScheme>,
+
+    // SymbolPath is wrong here. Or rather: SymbolPath is an "early"
+    // data structure. Only the first member after the last module
+    // in the module prefix is a valid member path. The rest have to
+    // be handled by project nodes. This can probably be done in the
+    // namer already.
+    free: HashMap<namer::MemberPath, TypeScheme>,
 }
 
 impl TermSpace {
     pub fn lookup(&self, term: &namer::Identifier) -> Option<&TypeScheme> {
         match term {
             namer::Identifier::Bound(index) => Some(&self.bound[*index]),
-            namer::Identifier::Free(identifier) => self.free.get(&identifier),
+            namer::Identifier::Free(..) => todo!(), // self.free.get(&identifier),
         }
     }
 }
@@ -355,9 +361,9 @@ impl TypingContext {
     }
 
     fn substitute_free(
-        terms: &HashMap<parser::Identifier, TypeScheme>,
+        terms: &HashMap<namer::MemberPath, TypeScheme>,
         subs: &Substitutions,
-    ) -> HashMap<parser::Identifier, TypeScheme> {
+    ) -> HashMap<namer::MemberPath, TypeScheme> {
         terms
             .iter()
             .map(|(k, v)| (k.clone(), v.with_substitutions(subs)))
@@ -566,11 +572,11 @@ impl TypingContext {
             TypeScheme::from_constant(own_ty.clone()),
             |ctx| {
                 ctx.bind(
-                    Term::Value(rec_lambda.underlying.parameter.clone()),
+                    Term::Value(rec_lambda.lambda.parameter.clone()),
                     TypeScheme::from_constant(Type::fresh()),
                     |ctx| {
                         let (substitutions, type_info, lambda) =
-                            ctx.infer_lambda(parse_info, &rec_lambda.underlying)?;
+                            ctx.infer_lambda(parse_info, &rec_lambda.lambda)?;
 
                         let own_ty = own_ty.with_substitutions(&substitutions);
                         let substitutions = type_info
@@ -590,7 +596,7 @@ impl TypingContext {
                                 typing_info,
                                 RecursiveLambda {
                                     own_name: rec_lambda.own_name.clone(),
-                                    underlying,
+                                    lambda: underlying,
                                 },
                             ),
                         ))

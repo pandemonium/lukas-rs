@@ -68,11 +68,11 @@ where
     {
         let SelfReferential {
             own_name: name,
-            underlying: lambda,
+            lambda,
         } = self;
         SelfReferential {
             own_name: name.clone(),
-            underlying: lambda.map_annotation(&f),
+            lambda: lambda.map_annotation(&f),
         }
     }
 }

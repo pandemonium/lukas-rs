@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    collections::HashMap,
     fmt,
     rc::{Rc, Weak},
 };
@@ -20,7 +21,7 @@ impl Expr<(), namer::Identifier> {
             Self::Constant(_, the) => Ok(Value::Constant(the.clone().into())),
 
             Self::RecursiveLambda(_, the) => {
-                let closure = Closure::capture(env, &the.underlying.body);
+                let closure = Closure::capture(env, &the.lambda.body);
                 closure.borrow_mut().capture.put(Value::SelfReferential {
                     name: the.own_name.clone(),
                     inner: Rc::downgrade(&closure),
@@ -82,27 +83,8 @@ pub type Interpretation<A = Value> = Result<A, RuntimeError>;
 
 #[derive(Debug, Default, Clone)]
 pub struct Environment {
-    // It should be static_values or somesuch.
+    statics: RefCell<HashMap<namer::MemberPath, Value>>,
     stack: RefCell<Vec<Value>>,
-}
-
-impl fmt::Display for Environment {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { stack } = self;
-        let stack = stack.borrow();
-        let stack_prefix = stack
-            .iter()
-            .take(5)
-            .map(|x| x.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        write!(f, "{stack_prefix}")?;
-        if stack.len() > 5 {
-            write!(f, ", ...")
-        } else {
-            Ok(())
-        }
-    }
 }
 
 impl Environment {
@@ -130,7 +112,7 @@ impl Environment {
     fn get(&self, id: &Identifier) -> Option<Value> {
         match id {
             Identifier::Bound(ix) => self.stack.borrow().get(*ix).cloned(),
-            Identifier::Free(..) => todo!(),
+            Identifier::Free(id) => self.statics.borrow().get(id).cloned(),
         }
     }
 }
@@ -147,30 +129,6 @@ pub enum Value {
         inner: Weak<RefCell<Closure>>,
     },
     Product(Vec<Value>),
-}
-
-impl fmt::Display for Value {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Constant(x) => write!(f, "{x}"),
-            Self::Closure(x) => write!(f, "`{}`", x.borrow()),
-            Self::SelfReferential { name, inner } => {
-                if let Some(inner) = inner.upgrade() {
-                    write!(f, "/{name}/ {}", inner.borrow())
-                } else {
-                    write!(f, "/{name}/ {{ value since dropped }}")
-                }
-            }
-            Self::Product(elements) => {
-                let elements = elements
-                    .iter()
-                    .map(|el| el.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                write!(f, "{elements}")
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -216,5 +174,59 @@ impl Closure {
             capture: capture.clone(),
             body: Rc::clone(body),
         }))
+    }
+}
+
+impl fmt::Display for Environment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { statics, stack } = self;
+
+        let stack_prefix = stack
+            .borrow()
+            .iter()
+            .take(5)
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let static_prefix = statics
+            .borrow()
+            .iter()
+            .take(5)
+            .map(|(path, value)| format!("{path}: {value}"))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        write!(f, "static: {static_prefix}; bound: {stack_prefix}")?;
+
+        if stack.borrow().len() > 5 {
+            write!(f, ", ...")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Constant(x) => write!(f, "{x}"),
+            Self::Closure(x) => write!(f, "`{}`", x.borrow()),
+            Self::SelfReferential { name, inner } => {
+                if let Some(inner) = inner.upgrade() {
+                    write!(f, "/{name}/ {}", inner.borrow())
+                } else {
+                    write!(f, "/{name}/ {{ value since dropped }}")
+                }
+            }
+            Self::Product(elements) => {
+                let elements = elements
+                    .iter()
+                    .map(|el| el.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "{elements}")
+            }
+        }
     }
 }

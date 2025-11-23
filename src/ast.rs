@@ -2,14 +2,27 @@ use std::{fmt, rc::Rc};
 
 use crate::{
     ast::{self, annotation::Annotated},
-    parser,
+    parser::{self, Identifier},
 };
 
 pub mod annotation;
 pub mod namer;
 
+pub const ROOT_MODULE_NAME: &'static str = "__root__";
+
 pub struct CompilationUnit<A> {
     pub root: ModuleDeclaration<A>,
+}
+
+impl<A> CompilationUnit<A> {
+    pub fn from_declarations(decls: Vec<Declaration<A>>) -> Self {
+        Self {
+            root: ModuleDeclaration {
+                name: Identifier::from_str(ROOT_MODULE_NAME),
+                declarator: ModuleDeclarator { members: decls },
+            },
+        }
+    }
 }
 
 pub enum Declaration<A> {
@@ -25,7 +38,7 @@ pub struct ValueDeclaration<A> {
 
 pub struct ValueDeclarator<A> {
     pub type_signature: Option<TypeSignature>,
-    pub body: ast::Expr<A, parser::Identifier>,
+    pub body: ast::Expr<A, parser::IdentifierPath>,
 }
 
 pub struct ModuleDeclaration<A> {
@@ -34,7 +47,7 @@ pub struct ModuleDeclaration<A> {
 }
 
 pub struct ModuleDeclarator<A> {
-    pub contents: Vec<Declaration<A>>,
+    pub members: Vec<Declaration<A>>,
 }
 
 pub struct TypeDeclaration<A> {
@@ -62,6 +75,7 @@ pub type Tree<A, Id> = Rc<Expr<A, Id>>;
 
 #[derive(Debug, Clone)]
 pub enum Expr<A, Id> {
+    // Should this have IdentifierPath<Id>?
     Variable(A, Id),
     Constant(A, Literal),
     RecursiveLambda(A, SelfReferential<A, Id>),
@@ -121,13 +135,14 @@ pub struct Binding<A, Id> {
 
 #[derive(Debug, Clone)]
 pub struct SelfReferential<A, Id> {
+    // Have I done this correctly? Id here?
     pub own_name: Id,
-    pub underlying: Lambda<A, Id>,
+    pub lambda: Lambda<A, Id>,
 }
 
 impl<A, Id> SelfReferential<A, Id> {
     pub fn annotation(&self) -> &A {
-        self.underlying.annotation()
+        self.lambda.annotation()
     }
 }
 
@@ -169,7 +184,7 @@ where
         match self {
             Self::Variable(_, x) => write!(f, "{x}"),
             Self::Constant(_, x) => write!(f, "{x}"),
-            Self::RecursiveLambda(_, x) => write!(f, "{} := {}", x.own_name, x.underlying),
+            Self::RecursiveLambda(_, x) => write!(f, "{} := {}", x.own_name, x.lambda),
             Self::Lambda(_, x) => write!(f, "{}", x),
             Self::Apply(_, x) => write!(f, "({} {})", x.function, x.argument),
             Self::Let(_, x) => write!(f, "let {} = {} in {}", x.binder, x.bound, x.body),

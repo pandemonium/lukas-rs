@@ -1,20 +1,20 @@
 use lukas::{
     ast::{
-        Apply, Binding, CompilationUnit, Declaration, Expr, Lambda, Literal, ModuleDeclaration,
-        ModuleDeclarator, Record, Tuple, ValueDeclaration, ValueDeclarator, namer::Symbols,
+        Apply, Binding, CompilationUnit, Declaration, Expr, Lambda, Literal, Record, Tuple,
+        ValueDeclaration, ValueDeclarator, namer::Symbols,
     },
     interpreter::Environment,
-    parser::{Identifier, ParseInfo},
+    parser::{Identifier, IdentifierPath, ParseInfo},
     typer::TypingContext,
 };
 use std::rc::Rc;
 
 type A = ParseInfo;
-type Id = Identifier;
+type Id = IdentifierPath;
 type Tree = Rc<Expr<A, Id>>;
 
 fn var(name: &str) -> Tree {
-    Expr::Variable(ParseInfo::default(), Identifier::from_str(name)).into()
+    Expr::Variable(ParseInfo::default(), IdentifierPath::new(name)).into()
 }
 
 fn const_int(n: i32) -> Tree {
@@ -29,7 +29,7 @@ fn lambda(param: &str, body: Tree) -> Tree {
     Expr::Lambda(
         ParseInfo::default(),
         Lambda {
-            parameter: Identifier::from_str(param),
+            parameter: IdentifierPath::new(param),
             body,
         },
     )
@@ -51,7 +51,7 @@ fn let_in(binder: &str, bound: Tree, body: Tree) -> Tree {
     Expr::Let(
         ParseInfo::default(),
         Binding {
-            binder: Identifier::from_str(binder),
+            binder: IdentifierPath::new(binder),
             bound,
             body,
         },
@@ -79,29 +79,23 @@ fn record(fields: &[(&str, Tree)]) -> Tree {
 fn main() {
     let mut ctx = TypingContext::default();
 
-    let tree = CompilationUnit {
-        root: ModuleDeclaration {
-            name: Identifier::from_str("_root_"),
-            declarator: ModuleDeclarator {
-                contents: vec![Declaration::Value(
+    let tree = CompilationUnit::from_declarations(vec![Declaration::Value(
+        ParseInfo::default(),
+        ValueDeclaration {
+            name: Identifier::from_str("start"),
+            declarator: ValueDeclarator {
+                type_signature: None,
+                body: Expr::Lambda(
                     ParseInfo::default(),
-                    ValueDeclaration {
-                        name: Identifier::from_str("start"),
-                        declarator: ValueDeclarator {
-                            type_signature: None,
-                            body: Expr::Lambda(
-                                ParseInfo::default(),
-                                Lambda {
-                                    parameter: Identifier::from_str("x"),
-                                    body: const_int(47),
-                                },
-                            ),
-                        },
+                    Lambda {
+                        parameter: IdentifierPath::new("x"),
+                        body: const_int(47),
                     },
-                )],
+                ),
             },
         },
-    };
+    )]);
+
     let symbols = Symbols::from(tree);
     println!("main: symbols: {symbols:?}");
 
@@ -123,7 +117,7 @@ fn main() {
         })
     });
 
-    let (_subs, typed_ast) = ctx.infer_type(&id_binding.resolve_bindings()).unwrap();
+    let (_subs, typed_ast) = ctx.infer_type(&id_binding.resolve_names(&symbols)).unwrap();
     println!("main: type {}", typed_ast.type_info().inferred_type);
 
     let env = Environment::default();
