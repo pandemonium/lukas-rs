@@ -23,12 +23,53 @@ pub type Lambda = ast::Lambda<TypeInfo, namer::Identifier>;
 pub type Binding = ast::Binding<TypeInfo, namer::Identifier>;
 pub type Tuple = ast::Tuple<TypeInfo, namer::Identifier>;
 pub type Record = ast::Record<TypeInfo, namer::Identifier>;
-// How does this handle parser::Identifier -> namer::Identifier for fields?
 pub type Projection = ast::Projection<TypeInfo, namer::Identifier>;
 
 impl Expr {
     pub fn type_info(&self) -> &TypeInfo {
         self.annotation()
+    }
+
+    pub fn free_variables(&self) -> HashSet<&namer::MemberPath> {
+        let mut free = HashSet::default();
+        self.find_free_variables(&mut free);
+        free
+    }
+
+    fn find_free_variables<'a>(&'a self, free: &mut HashSet<&'a namer::MemberPath>) {
+        match self {
+            Self::Variable(_, namer::Identifier::Free(id)) => {
+                let _ = free.insert(id);
+            }
+            Self::RecursiveLambda(_, rec) => {
+                rec.lambda.body.find_free_variables(free);
+            }
+            Self::Lambda(_, lambda) => {
+                let _ = lambda.body.find_free_variables(free);
+            }
+            Self::Apply(_, apply) => {
+                let _ = apply.function.find_free_variables(free);
+                let _ = apply.argument.find_free_variables(free);
+            }
+            Self::Let(_, binding) => {
+                let _ = binding.bound.find_free_variables(free);
+                let _ = binding.body.find_free_variables(free);
+            }
+            Self::Tuple(_, tuple) => {
+                for elt in &tuple.elements {
+                    elt.find_free_variables(free);
+                }
+            }
+            Self::Record(_, record) => {
+                for (_, init) in &record.fields {
+                    let _ = init.find_free_variables(free);
+                }
+            }
+            Self::Project(_, projection) => {
+                let _ = projection.base.find_free_variables(free);
+            }
+            _otherwise => (),
+        }
     }
 }
 
@@ -318,12 +359,6 @@ pub enum Term {
 #[derive(Debug, Default)]
 pub struct TermSpace {
     bound: Vec<TypeScheme>,
-
-    // SymbolPath is wrong here. Or rather: SymbolPath is an "early"
-    // data structure. Only the first member after the last module
-    // in the module prefix is a valid member path. The rest have to
-    // be handled by project nodes. This can probably be done in the
-    // namer already.
     free: HashMap<namer::MemberPath, TypeScheme>,
 }
 
@@ -331,7 +366,7 @@ impl TermSpace {
     pub fn lookup(&self, term: &namer::Identifier) -> Option<&TypeScheme> {
         match term {
             namer::Identifier::Bound(index) => Some(&self.bound[*index]),
-            namer::Identifier::Free(..) => todo!(), // self.free.get(&identifier),
+            namer::Identifier::Free(member) => self.free.get(&member),
         }
     }
 }

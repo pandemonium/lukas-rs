@@ -1,7 +1,7 @@
 use lukas::{
     ast::{
-        Apply, Binding, CompilationUnit, Declaration, Expr, Lambda, Literal, Record, Tuple,
-        ValueDeclaration, ValueDeclarator, namer::Symbols,
+        Apply, Binding, CompilationUnit, Declaration, Expr, Lambda, Literal, ProductElement,
+        Projection, Record, Tuple, ValueDeclaration, ValueDeclarator, namer::Symbols,
     },
     interpreter::Environment,
     parser::{Identifier, IdentifierPath, ParseInfo},
@@ -76,28 +76,19 @@ fn record(fields: &[(&str, Tree)]) -> Tree {
     .into()
 }
 
+fn proj(base: Tree, field: &str) -> Tree {
+    Expr::Project(
+        ParseInfo::default(),
+        Projection {
+            base,
+            select: ProductElement::Name(Identifier::from_str(field)),
+        },
+    )
+    .into()
+}
+
 fn main() {
     let mut ctx = TypingContext::default();
-
-    let tree = CompilationUnit::from_declarations(vec![Declaration::Value(
-        ParseInfo::default(),
-        ValueDeclaration {
-            name: Identifier::from_str("start"),
-            declarator: ValueDeclarator {
-                type_signature: None,
-                body: Expr::Lambda(
-                    ParseInfo::default(),
-                    Lambda {
-                        parameter: IdentifierPath::new("x"),
-                        body: const_int(47),
-                    },
-                ),
-            },
-        },
-    )]);
-
-    let symbols = Symbols::from(tree);
-    println!("main: symbols: {symbols:?}");
 
     let id = lambda("x", var("x"));
     let id_binding = let_in("id", id, {
@@ -111,16 +102,49 @@ fn main() {
                         ("cash", const_int(427)),
                         ("name", const_text("Patrik Andersson")),
                     ]),
-                    tuple(vec![var("y"), var("z"), var("q"), var("id")]),
+                    tuple(vec![var("y"), var("zz"), proj(var("q"), "name"), var("id")]),
                 ),
             )
         })
     });
 
+    let program = CompilationUnit::from_declarations(vec![
+        Declaration::Value(
+            ParseInfo::default(),
+            ValueDeclaration {
+                name: Identifier::from_str("zz"),
+                declarator: ValueDeclarator {
+                    type_signature: None,
+                    body: Expr::Constant(ParseInfo::default(), Literal::Int(1)),
+                },
+            },
+        ),
+        Declaration::Value(
+            ParseInfo::default(),
+            ValueDeclaration {
+                name: Identifier::from_str("start"),
+                declarator: ValueDeclarator {
+                    type_signature: None,
+                    body: Expr::Lambda(
+                        ParseInfo::default(),
+                        Lambda {
+                            parameter: IdentifierPath::new("x"),
+                            body: id_binding.clone(),
+                        },
+                    ),
+                },
+            },
+        ),
+    ]);
+
+    let symbols = Symbols::from(&program);
+    println!("main: symbols: {symbols:?}");
+
     let (_subs, typed_ast) = ctx.infer_type(&id_binding.resolve_names(&symbols)).unwrap();
     println!("main: type {}", typed_ast.type_info().inferred_type);
 
     let env = Environment::default();
+
     let runtime = Rc::new(typed_ast.erase_annotation()).reduce(&env).unwrap();
 
     println!("main: {runtime}");

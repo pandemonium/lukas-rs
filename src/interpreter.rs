@@ -5,9 +5,12 @@ use std::{
     rc::{Rc, Weak},
 };
 
-use crate::ast::{
-    self, Expr, ProductElement, Tree,
-    namer::{self, Identifier},
+use crate::{
+    ast::{
+        self, CompilationUnit, Expr, ProductElement, Tree,
+        namer::{self, Identifier, Symbols},
+    },
+    parser::ParseInfo,
 };
 
 impl Expr<(), namer::Identifier> {
@@ -83,8 +86,15 @@ pub type Interpretation<A = Value> = Result<A, RuntimeError>;
 
 #[derive(Debug, Default, Clone)]
 pub struct Environment {
-    statics: RefCell<HashMap<namer::MemberPath, Value>>,
-    stack: RefCell<Vec<Value>>,
+    // initialize this structure from the compilation unit
+    // namer:: here?
+    inner: RefCell<EnvironmentInner>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct EnvironmentInner {
+    statics: HashMap<namer::MemberPath, Value>,
+    stack: Vec<Value>,
 }
 
 impl Environment {
@@ -93,27 +103,39 @@ impl Environment {
         F: FnMut(&Self) -> A,
     {
         {
-            self.stack.borrow_mut().push(x);
+            self.inner.borrow_mut().stack.push(x);
         }
 
         let v = f(self);
 
         {
-            self.stack.borrow_mut().pop();
+            self.inner.borrow_mut().stack.pop();
         }
 
         v
     }
 
     fn put(&self, v: Value) {
-        self.stack.borrow_mut().push(v);
+        self.inner.borrow_mut().stack.push(v);
     }
 
     fn get(&self, id: &Identifier) -> Option<Value> {
         match id {
-            Identifier::Bound(ix) => self.stack.borrow().get(*ix).cloned(),
-            Identifier::Free(id) => self.statics.borrow().get(id).cloned(),
+            Identifier::Bound(ix) => self.inner.borrow().stack.get(*ix).cloned(),
+            Identifier::Free(id) => self.inner.borrow().statics.get(id).cloned(),
         }
+    }
+
+    // This should be TypeInfo, right?
+    // But where/ when does typing happen?
+    pub fn from_compilation_unit(program: CompilationUnit<ParseInfo>) -> Self {
+        let symbols = Symbols::from(&program);
+
+        if symbols.dependencies_satisfiable() {
+        } else {
+        }
+
+        todo!()
     }
 }
 
@@ -179,18 +201,18 @@ impl Closure {
 
 impl fmt::Display for Environment {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { statics, stack } = self;
+        let env = self.inner.borrow();
 
-        let stack_prefix = stack
-            .borrow()
+        let stack_prefix = env
+            .stack
             .iter()
             .take(5)
             .map(|x| x.to_string())
             .collect::<Vec<_>>()
             .join(", ");
 
-        let static_prefix = statics
-            .borrow()
+        let static_prefix = env
+            .statics
             .iter()
             .take(5)
             .map(|(path, value)| format!("{path}: {value}"))
@@ -199,7 +221,7 @@ impl fmt::Display for Environment {
 
         write!(f, "static: {static_prefix}; bound: {stack_prefix}")?;
 
-        if stack.borrow().len() > 5 {
+        if env.stack.len() > 5 {
             write!(f, ", ...")
         } else {
             Ok(())

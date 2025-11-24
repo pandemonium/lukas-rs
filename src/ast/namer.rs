@@ -1,7 +1,7 @@
-use std::{collections::HashMap, fmt, marker::PhantomData, rc::Rc, vec};
+use std::{collections::HashMap, fmt, hash::Hash, marker::PhantomData, rc::Rc, vec};
 
 use crate::{
-    ast::{self, CompilationUnit, Declaration, ProductElement, TypeSignature},
+    ast::{self, CompilationUnit, Declaration, ProductElement, TypeSignature, namer},
     parser::{self, IdentifierPath, ParseInfo},
 };
 
@@ -63,27 +63,41 @@ impl MemberPath {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Symbols<A> {
-    table: HashMap<String, Symbol<A>>,
-    _bogus: PhantomData<A>,
+#[derive(Debug, Clone, Default)]
+struct DependencyMatrix(HashMap<String, Vec<String>>);
+
+impl DependencyMatrix {
+    fn is_satisfied(&self) -> bool {
+        let Self(map) = self;
+        let unsatisfieds = map
+            .iter()
+            .filter_map(|(_, deps)| deps.iter().find(|&dep| !map.contains_key(dep)))
+            .collect::<Vec<_>>();
+
+        unsatisfieds.is_empty()
+    }
 }
 
-impl<A> Default for Symbols<A> {
+#[derive(Debug, Clone)]
+pub struct Symbols {
+    symbol_table: HashMap<String, Symbol<ParseInfo>>,
+    dependency_matrix: DependencyMatrix,
+}
+
+impl Default for Symbols {
     fn default() -> Self {
         Self {
-            table: HashMap::default(),
-            _bogus: PhantomData::default(),
+            symbol_table: HashMap::default(),
+            dependency_matrix: DependencyMatrix::default(),
         }
     }
 }
 
-impl<A> Symbols<A> {
-    // resolve_path
-    // resolve_projection
+impl Symbols {
+    pub fn dependencies_satisfiable(&self) -> bool {
+        self.dependency_matrix.is_satisfied()
+    }
 
-    // take as many of path.iter() that forms an all module prefix
-    // M0.M1.S.F0.F1
     pub fn resolve_path(&self, path: &parser::IdentifierPath) -> Option<SymbolAccessPath> {
         let mut module_path = vec![];
         let mut member = vec![];
@@ -91,7 +105,7 @@ impl<A> Symbols<A> {
 
         for segment in path.iter() {
             if in_module_prefix {
-                if let Symbol::Module(..) = self.table.get(&module_path.join("/"))? {
+                if let Symbol::Module(..) = self.symbol_table.get(&module_path.join("/"))? {
                     module_path.push(segment);
                 } else {
                     in_module_prefix = false;
@@ -110,31 +124,38 @@ impl<A> Symbols<A> {
         })
     }
 
-    pub fn lookup(&self, id: &parser::Identifier) -> Option<&Symbol<A>> {
-        self.table.get(id.as_str())
-    }
+    pub fn from(compilation: &CompilationUnit<ParseInfo>) -> Self {
+        let mut symbol_table = HashMap::default();
 
-    pub fn from(compilation: CompilationUnit<A>) -> Self {
-        Self::index_module_members(
+        let _ = Self::from_module_contents(
             &mut IdentifierPath::new(compilation.root.name.as_str()),
-            compilation.root.declarator.members,
-        )
+            &compilation.root.declarator.members,
+            &mut symbol_table,
+        );
+
+        Self {
+            symbol_table,
+            dependency_matrix: DependencyMatrix::default(),
+        }
     }
 
-    // This must flatten the module namespace
-    pub fn index_module_members(
+    pub fn from_module_contents(
         prefix: &mut IdentifierPath,
-        declarations: Vec<Declaration<A>>,
-    ) -> Symbols<A> {
-        let mut the = Self::default();
-
+        declarations: &[Declaration<ParseInfo>],
+        symbol_table: &mut HashMap<String, Symbol<ParseInfo>>,
+    ) -> Vec<Symbol<ParseInfo>> {
+        let mut symbols = Vec::with_capacity(declarations.len());
         for decl in declarations {
             let (member_path, symbol) = match decl {
                 ast::Declaration::Value(_, ast::ValueDeclaration { name, declarator }) => (
                     prefix.make_member_path(name.as_str()),
                     Symbol::Value(ValueSymbol {
-                        name: name,
-                        type_signature: declarator.type_signature,
+                        name: name.clone(),
+                        type_signature: declarator.type_signature.clone(),
+
+                        // This is a very expensive clone
+                        // perhaps I _could_ move into here
+                        body: declarator.body.clone(),
                     }),
                 ),
                 ast::Declaration::Module(_, ast::ModuleDeclaration { name, declarator }) => {
@@ -143,14 +164,18 @@ impl<A> Symbols<A> {
                     (
                         prefix.make_member_path(name_str),
                         Symbol::Module(ModuleSymbol {
-                            name,
+                            name: name.clone(),
                             contents: {
                                 prefix.tail.push(owned_str);
-                                let member_symbols =
-                                    Self::index_module_members(prefix, declarator.members);
+                                let member_symbols = Self::from_module_contents(
+                                    prefix,
+                                    &declarator.members,
+                                    symbol_table,
+                                );
                                 prefix.tail.pop();
                                 member_symbols
                             },
+                            _bogus: PhantomData::default(),
                         }),
                     )
                 }
@@ -158,17 +183,17 @@ impl<A> Symbols<A> {
                     prefix.make_member_path(name.as_str()),
                     match declarator {
                         ast::TypeDeclarator::Record(_, record) => Symbol::Struct(StructSymbol {
-                            name: name,
-                            fields: record.fields.into_iter().map(|f| f.name).collect(),
+                            name: name.clone(),
+                            fields: record.fields.iter().map(|f| f.name.clone()).collect(),
                         }),
                     },
                 ),
             };
-
-            the.table.insert(member_path, symbol);
+            symbols.push(symbol.clone());
+            symbol_table.insert(member_path, symbol);
         }
 
-        the
+        symbols
     }
 }
 
@@ -196,16 +221,14 @@ impl<A> Symbol<A> {
 pub struct ValueSymbol {
     pub name: parser::Identifier,
     pub type_signature: Option<TypeSignature>,
-    // What type?
-    // parser::Identifer at this point and
-    // resolve_bindings on the whole table?
-    //    pub body: ast::Expr<A, Id>,
+    pub body: parser::Expr,
 }
 
 #[derive(Debug, Clone)]
 pub struct ModuleSymbol<A> {
     pub name: parser::Identifier,
-    pub contents: Symbols<A>,
+    pub contents: Vec<Symbol<A>>,
+    _bogus: PhantomData<A>,
 }
 
 #[derive(Debug, Clone)]
@@ -219,7 +242,6 @@ pub struct CoproductSymbol {
     pub name: parser::Identifier,
 }
 
-// make part of SymbolTable?
 #[derive(Debug, Default)]
 struct DeBruijnIndex(Vec<parser::Identifier>);
 
@@ -244,12 +266,14 @@ impl DeBruijnIndex {
     }
 }
 
+impl Expr {}
+
 impl parser::Expr {
-    pub fn resolve_names(&self, symbols: &Symbols<ParseInfo>) -> Expr {
+    pub fn resolve_names(&self, symbols: &Symbols) -> Expr {
         self.resolve(&mut DeBruijnIndex::default(), symbols)
     }
 
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols<ParseInfo>) -> Expr {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols) -> Expr {
         match self {
             Self::Variable(a, path) => {
                 // Make sure to insert project here.
@@ -279,7 +303,7 @@ impl parser::Expr {
 }
 
 impl parser::SelfReference {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols<ParseInfo>) -> SelfReferential {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols) -> SelfReferential {
         if let Some(own_name) = self.own_name.try_as_simple() {
             names.bind(own_name, |names, name| SelfReferential {
                 own_name: name,
@@ -292,7 +316,7 @@ impl parser::SelfReference {
 }
 
 impl parser::Lambda {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols<ParseInfo>) -> Lambda {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols) -> Lambda {
         if let Some(parameter) = self.parameter.try_as_simple() {
             names.bind(parameter, |names, parameter| Lambda {
                 parameter,
@@ -305,7 +329,7 @@ impl parser::Lambda {
 }
 
 impl parser::Apply {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols<ParseInfo>) -> Apply {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols) -> Apply {
         Apply {
             function: self.function.resolve(names, symbols).into(),
             argument: self.argument.resolve(names, symbols).into(),
@@ -314,7 +338,7 @@ impl parser::Apply {
 }
 
 impl parser::Binding {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols<ParseInfo>) -> Binding {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols) -> Binding {
         if let Some(binder) = self.binder.try_as_simple() {
             let bound = Rc::new(self.bound.resolve(names, symbols));
             names.bind(binder, |names, binder| Binding {
@@ -329,7 +353,7 @@ impl parser::Binding {
 }
 
 impl parser::Record {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols<ParseInfo>) -> Record {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols) -> Record {
         Record {
             fields: self
                 .fields
@@ -341,7 +365,7 @@ impl parser::Record {
 }
 
 impl parser::Tuple {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols<ParseInfo>) -> Tuple {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols) -> Tuple {
         Tuple {
             elements: self
                 .elements
@@ -353,7 +377,7 @@ impl parser::Tuple {
 }
 
 impl parser::Projection {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols<ParseInfo>) -> Projection {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols) -> Projection {
         Projection {
             base: self.base.resolve(names, symbols).into(),
             select: self.select.clone(),
