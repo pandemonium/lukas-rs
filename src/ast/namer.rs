@@ -1,8 +1,15 @@
-use std::{collections::HashMap, fmt, hash::Hash, marker::PhantomData, rc::Rc, vec};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    fmt,
+    hash::Hash,
+    marker::PhantomData,
+    rc::Rc,
+    vec,
+};
 
 use crate::{
-    ast::{self, CompilationUnit, Declaration, ProductElement, TypeSignature, namer},
-    parser::{self, IdentifierPath, ParseInfo},
+    ast::{self, CompilationUnit, Declaration, ProductElement, TypeSignature},
+    parser::{self, ParseInfo},
 };
 
 pub type Expr = ast::Expr<ParseInfo, Identifier>;
@@ -17,22 +24,23 @@ pub type Projection = ast::Projection<ParseInfo, Identifier>;
 #[derive(Debug, Clone)]
 pub enum Identifier {
     Bound(usize),
-    Free(MemberPath),
+    Free(ModuleMemberPath),
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct SymbolAccessPath {
+pub struct ModulePathExpr {
     module_prefix: parser::IdentifierPath,
     member: String,
     member_suffix: Vec<String>,
 }
 
-impl SymbolAccessPath {
-    fn into_expr(self, parse_info: ParseInfo) -> Expr {
-        let path = MemberPath {
+impl ModulePathExpr {
+    fn into_projection(self, parse_info: ParseInfo) -> Expr {
+        let path = ModuleMemberPath {
             module: self.module_prefix,
             member: parser::Identifier::from_str(&self.member),
         };
+
         self.member_suffix.iter().fold(
             Expr::Variable(parse_info, Identifier::Free(path)),
             |base, field| {
@@ -46,15 +54,22 @@ impl SymbolAccessPath {
             },
         )
     }
+
+    pub fn into_member_path(self) -> ModuleMemberPath {
+        ModuleMemberPath {
+            module: self.module_prefix,
+            member: parser::Identifier::from_str(&self.member),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct MemberPath {
+pub struct ModuleMemberPath {
     module: parser::IdentifierPath,
     member: parser::Identifier,
 }
 
-impl MemberPath {
+impl ModuleMemberPath {
     fn from_root_symbol(member: parser::Identifier) -> Self {
         Self {
             module: parser::IdentifierPath::new(ast::ROOT_MODULE_NAME),
@@ -63,10 +78,19 @@ impl MemberPath {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct DependencyMatrix(HashMap<String, Vec<String>>);
+#[derive(Debug, Clone)]
+pub struct DependencyMatrix<Id>(HashMap<Id, Vec<Id>>);
 
-impl DependencyMatrix {
+impl<Id> Default for DependencyMatrix<Id> {
+    fn default() -> Self {
+        Self(HashMap::default())
+    }
+}
+
+impl<Id> DependencyMatrix<Id>
+where
+    Id: Eq + Hash,
+{
     fn is_satisfied(&self) -> bool {
         let Self(map) = self;
         let unsatisfieds = map
@@ -76,36 +100,95 @@ impl DependencyMatrix {
 
         unsatisfieds.is_empty()
     }
+
+    pub fn initialization_order(&self) -> Vec<&Id> {
+        let mut resolved = Vec::with_capacity(self.0.len());
+
+        let mut graph = self
+            .0
+            .iter()
+            // Filter out recursive definitions
+            .map(|(node, edges)| {
+                (
+                    node,
+                    edges
+                        .iter()
+                        .filter(|&edge| edge != node)
+                        .collect::<HashSet<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut in_degrees = graph
+            .iter()
+            .map(|(node, edges)| (*node, edges.len()))
+            .collect::<HashMap<_, _>>();
+
+        let mut queue = in_degrees
+            .iter()
+            .filter_map(|(node, in_degree)| (*in_degree == 0).then_some(*node))
+            .collect::<VecDeque<_>>();
+
+        while let Some(independent) = queue.pop_front() {
+            resolved.push(independent);
+
+            for (node, edges) in &mut graph {
+                if edges.remove(independent) {
+                    if let Some(count) = in_degrees.get_mut(node) {
+                        *count -= 1;
+                        if *count == 0 {
+                            queue.push_back(node);
+                        }
+                    }
+                }
+            }
+
+            in_degrees.remove(independent);
+        }
+
+        resolved
+    }
 }
 
+// This thing is craving a better name
 #[derive(Debug, Clone)]
-pub struct Symbols {
-    symbol_table: HashMap<String, Symbol<ParseInfo>>,
-    dependency_matrix: DependencyMatrix,
+pub struct SymbolEnvironment<A, Name, Id> {
+    pub symbol_table: HashMap<Name, Symbol<A, Id>>,
+    pub dependency_matrix: DependencyMatrix<Name>,
+    pub phase: PhantomData<A>,
 }
 
-impl Default for Symbols {
+impl<A, Name, Id> Default for SymbolEnvironment<A, Name, Id> {
     fn default() -> Self {
         Self {
             symbol_table: HashMap::default(),
             dependency_matrix: DependencyMatrix::default(),
+            phase: PhantomData::default(),
         }
     }
 }
 
-impl Symbols {
+impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath> {
     pub fn dependencies_satisfiable(&self) -> bool {
         self.dependency_matrix.is_satisfied()
     }
 
-    pub fn resolve_path(&self, path: &parser::IdentifierPath) -> Option<SymbolAccessPath> {
+    pub fn resolution_order(&self) -> Vec<&parser::IdentifierPath> {
+        self.dependency_matrix.initialization_order()
+    }
+
+    pub fn resolve_module_path_expr(
+        &self,
+        path: &parser::IdentifierPath,
+    ) -> Option<ModulePathExpr> {
         let mut module_path = vec![];
         let mut member = vec![];
         let mut in_module_prefix = true;
 
         for segment in path.iter() {
             if in_module_prefix {
-                if let Symbol::Module(..) = self.symbol_table.get(&module_path.join("/"))? {
+                let identifier_path = parser::IdentifierPath::try_from_components(&module_path)?;
+                if let Symbol::Module(..) = self.symbol_table.get(&identifier_path)? {
                     module_path.push(segment);
                 } else {
                     in_module_prefix = false;
@@ -117,7 +200,7 @@ impl Symbols {
         }
 
         let mut members = member.iter().map(|&s| s.to_owned());
-        Some(SymbolAccessPath {
+        Some(ModulePathExpr {
             module_prefix: parser::IdentifierPath::try_from_components(&module_path)?,
             member: members.next()?,
             member_suffix: members.collect(),
@@ -127,8 +210,8 @@ impl Symbols {
     pub fn from(compilation: &CompilationUnit<ParseInfo>) -> Self {
         let mut symbol_table = HashMap::default();
 
-        let _ = Self::from_module_contents(
-            &mut IdentifierPath::new(compilation.root.name.as_str()),
+        let _ = Self::index_module_contents(
+            &mut parser::IdentifierPath::new(compilation.root.name.as_str()),
             &compilation.root.declarator.members,
             &mut symbol_table,
         );
@@ -136,19 +219,23 @@ impl Symbols {
         Self {
             symbol_table,
             dependency_matrix: DependencyMatrix::default(),
+            phase: PhantomData::default(),
         }
     }
 
-    pub fn from_module_contents(
-        prefix: &mut IdentifierPath,
+    pub fn index_module_contents(
+        prefix: &mut parser::IdentifierPath,
         declarations: &[Declaration<ParseInfo>],
-        symbol_table: &mut HashMap<String, Symbol<ParseInfo>>,
-    ) -> Vec<Symbol<ParseInfo>> {
+        symbol_table: &mut HashMap<
+            parser::IdentifierPath,
+            Symbol<ParseInfo, parser::IdentifierPath>,
+        >,
+    ) -> Vec<Symbol<ParseInfo, parser::IdentifierPath>> {
         let mut symbols = Vec::with_capacity(declarations.len());
         for decl in declarations {
             let (member_path, symbol) = match decl {
                 ast::Declaration::Value(_, ast::ValueDeclaration { name, declarator }) => (
-                    prefix.make_member_path(name.as_str()),
+                    prefix.clone().with_suffix(name.as_str()),
                     Symbol::Value(ValueSymbol {
                         name: name.clone(),
                         type_signature: declarator.type_signature.clone(),
@@ -162,12 +249,12 @@ impl Symbols {
                     let name_str = name.as_str();
                     let owned_str = name_str.to_owned();
                     (
-                        prefix.make_member_path(name_str),
+                        prefix.clone().with_suffix(name_str),
                         Symbol::Module(ModuleSymbol {
                             name: name.clone(),
                             contents: {
                                 prefix.tail.push(owned_str);
-                                let member_symbols = Self::from_module_contents(
+                                let member_symbols = Self::index_module_contents(
                                     prefix,
                                     &declarator.members,
                                     symbol_table,
@@ -180,12 +267,14 @@ impl Symbols {
                     )
                 }
                 ast::Declaration::Type(_, ast::TypeDeclaration { name, declarator }) => (
-                    prefix.make_member_path(name.as_str()),
+                    prefix.clone().with_suffix(name.as_str()),
                     match declarator {
-                        ast::TypeDeclarator::Record(_, record) => Symbol::Struct(StructSymbol {
-                            name: name.clone(),
-                            fields: record.fields.iter().map(|f| f.name.clone()).collect(),
-                        }),
+                        ast::TypeDeclarator::Record(_, record) => {
+                            Symbol::Type(TypeSymbol::Record(RecordSymbol {
+                                name: parser::IdentifierPath::new(name.as_str()),
+                                fields: record.fields.iter().map(|f| f.name.clone()).collect(),
+                            }))
+                        }
                     },
                 ),
             };
@@ -197,49 +286,50 @@ impl Symbols {
     }
 }
 
+// It seems to me that this sucker needs 3 type parameters:
+// 1. A for Phase Annotation
+// 2. Name
+// 3. AST identifier type
+//
+// #2 and #3 are not the same because:
+// #2 is always free and #3 is sometimes bound
 #[derive(Debug, Clone)]
-pub enum Symbol<A> {
-    Value(ValueSymbol),
-    Module(ModuleSymbol<A>),
-    // These are both types, they ought to be wrapped as such
-    Struct(StructSymbol),
-    Coproduct(CoproductSymbol),
-}
-
-impl<A> Symbol<A> {
-    pub fn name(&self) -> &parser::Identifier {
-        match self {
-            Symbol::Value(sym) => &sym.name,
-            Symbol::Module(sym) => &sym.name,
-            Symbol::Struct(sym) => &sym.name,
-            Symbol::Coproduct(sym) => &sym.name,
-        }
-    }
+pub enum Symbol<A, Id> {
+    Value(ValueSymbol<A, Id>),
+    Module(ModuleSymbol<A, Id>),
+    Type(TypeSymbol<Id>),
 }
 
 #[derive(Debug, Clone)]
-pub struct ValueSymbol {
+pub enum TypeSymbol<Id> {
+    Record(RecordSymbol<Id>),
+    Coproduct(CoproductSymbol<Id>),
+}
+
+// It has to have Id in here too
+#[derive(Debug, Clone)]
+pub struct ValueSymbol<A, Id> {
     pub name: parser::Identifier,
     pub type_signature: Option<TypeSignature>,
-    pub body: parser::Expr,
+    pub body: ast::Expr<A, Id>,
 }
 
 #[derive(Debug, Clone)]
-pub struct ModuleSymbol<A> {
+pub struct ModuleSymbol<A, Id> {
     pub name: parser::Identifier,
-    pub contents: Vec<Symbol<A>>,
+    pub contents: Vec<Symbol<A, Id>>,
     _bogus: PhantomData<A>,
 }
 
 #[derive(Debug, Clone)]
-pub struct StructSymbol {
-    pub name: parser::Identifier,
+pub struct RecordSymbol<Id> {
+    pub name: Id,
     pub fields: Vec<parser::Identifier>,
 }
 
 #[derive(Debug, Clone)]
-pub struct CoproductSymbol {
-    pub name: parser::Identifier,
+pub struct CoproductSymbol<Id> {
+    pub name: Id,
 }
 
 #[derive(Debug, Default)]
@@ -250,7 +340,7 @@ impl DeBruijnIndex {
         if let Some(index) = self.0.iter().rposition(|n| n == id) {
             Identifier::Bound(index)
         } else {
-            Identifier::Free(MemberPath::from_root_symbol(id.to_owned()))
+            Identifier::Free(ModuleMemberPath::from_root_symbol(id.to_owned()))
         }
     }
 
@@ -269,23 +359,30 @@ impl DeBruijnIndex {
 impl Expr {}
 
 impl parser::Expr {
-    pub fn resolve_names(&self, symbols: &Symbols) -> Expr {
+    pub fn resolve_names(
+        &self,
+        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+    ) -> Expr {
         self.resolve(&mut DeBruijnIndex::default(), symbols)
     }
 
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols) -> Expr {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+    ) -> Expr {
         match self {
-            Self::Variable(a, path) => {
-                // Make sure to insert project here.
-
-                if let Some(name) = path.try_as_simple() {
+            Self::Variable(a, identifier_path) => {
+                if let Some(name) = identifier_path.try_as_simple() {
                     Expr::Variable(*a, names.resolve(&name))
-                } else if let Some(path) = symbols.resolve_path(path) {
-                    path.into_expr(*a)
-                } else if let Some(path) = symbols.resolve_path(&path.as_root_module_member()) {
-                    path.into_expr(*a)
+                } else if let Some(path) = symbols.resolve_module_path_expr(identifier_path) {
+                    path.into_projection(*a)
+                } else if let Some(path) =
+                    symbols.resolve_module_path_expr(&identifier_path.as_root_module_member())
+                {
+                    path.into_projection(*a)
                 } else {
-                    panic!("Unresolved symbol {}", path)
+                    panic!("Unresolved symbol {}", identifier_path)
                 }
             }
             Self::Constant(a, literal) => Expr::Constant(*a, literal.clone()),
@@ -303,7 +400,11 @@ impl parser::Expr {
 }
 
 impl parser::SelfReference {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols) -> SelfReferential {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+    ) -> SelfReferential {
         if let Some(own_name) = self.own_name.try_as_simple() {
             names.bind(own_name, |names, name| SelfReferential {
                 own_name: name,
@@ -316,7 +417,11 @@ impl parser::SelfReference {
 }
 
 impl parser::Lambda {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols) -> Lambda {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+    ) -> Lambda {
         if let Some(parameter) = self.parameter.try_as_simple() {
             names.bind(parameter, |names, parameter| Lambda {
                 parameter,
@@ -329,7 +434,11 @@ impl parser::Lambda {
 }
 
 impl parser::Apply {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols) -> Apply {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+    ) -> Apply {
         Apply {
             function: self.function.resolve(names, symbols).into(),
             argument: self.argument.resolve(names, symbols).into(),
@@ -338,7 +447,11 @@ impl parser::Apply {
 }
 
 impl parser::Binding {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols) -> Binding {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+    ) -> Binding {
         if let Some(binder) = self.binder.try_as_simple() {
             let bound = Rc::new(self.bound.resolve(names, symbols));
             names.bind(binder, |names, binder| Binding {
@@ -353,7 +466,11 @@ impl parser::Binding {
 }
 
 impl parser::Record {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols) -> Record {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+    ) -> Record {
         Record {
             fields: self
                 .fields
@@ -365,7 +482,11 @@ impl parser::Record {
 }
 
 impl parser::Tuple {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols) -> Tuple {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+    ) -> Tuple {
         Tuple {
             elements: self
                 .elements
@@ -377,7 +498,11 @@ impl parser::Tuple {
 }
 
 impl parser::Projection {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &Symbols) -> Projection {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+    ) -> Projection {
         Projection {
             base: self.base.resolve(names, symbols).into(),
             select: self.select.clone(),
@@ -394,7 +519,7 @@ impl fmt::Display for Identifier {
     }
 }
 
-impl fmt::Display for SymbolAccessPath {
+impl fmt::Display for ModulePathExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -406,7 +531,7 @@ impl fmt::Display for SymbolAccessPath {
     }
 }
 
-impl fmt::Display for MemberPath {
+impl fmt::Display for ModuleMemberPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { module, member } = self;
         write!(f, "{module}::{member}")

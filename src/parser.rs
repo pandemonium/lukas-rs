@@ -70,12 +70,9 @@ impl IdentifierPath {
         self.tail.push(component.to_owned());
     }
 
-    pub fn make_member_path(&self, suffix: &str) -> String {
-        self.iter()
-            .chain(iter::once(suffix))
-            .map(|s| s.to_owned())
-            .collect::<Vec<_>>()
-            .join("/")
+    pub fn with_suffix(mut self, suffix: &str) -> Self {
+        self.push(suffix);
+        self
     }
 
     pub fn try_as_simple(&self) -> Option<Identifier> {

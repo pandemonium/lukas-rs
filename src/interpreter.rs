@@ -8,7 +8,7 @@ use std::{
 use crate::{
     ast::{
         self, CompilationUnit, Expr, ProductElement, Tree,
-        namer::{self, Identifier, Symbols},
+        namer::{self, Identifier, SymbolEnvironment},
     },
     parser::ParseInfo,
 };
@@ -93,7 +93,7 @@ pub struct Environment {
 
 #[derive(Debug, Default, Clone)]
 struct EnvironmentInner {
-    statics: HashMap<namer::MemberPath, Value>,
+    statics: HashMap<namer::ModuleMemberPath, Value>,
     stack: Vec<Value>,
 }
 
@@ -126,10 +126,13 @@ impl Environment {
         }
     }
 
-    // This should be TypeInfo, right?
-    // But where/ when does typing happen?
+    // 1. Build symbol table
+    // 2. Check all dependencies
+    // 3. Resolve bindings
+    // 4. Check types
+    // 5. Insert checked values into statics in Environment
     pub fn from_compilation_unit(program: CompilationUnit<ParseInfo>) -> Self {
-        let symbols = Symbols::from(&program);
+        let symbols = SymbolEnvironment::from(&program);
 
         if symbols.dependencies_satisfiable() {
         } else {

@@ -1,7 +1,7 @@
 use lukas::{
     ast::{
         Apply, Binding, CompilationUnit, Declaration, Expr, Lambda, Literal, ProductElement,
-        Projection, Record, Tuple, ValueDeclaration, ValueDeclarator, namer::Symbols,
+        Projection, Record, Tuple, ValueDeclaration, ValueDeclarator, namer::SymbolEnvironment,
     },
     interpreter::Environment,
     parser::{Identifier, IdentifierPath, ParseInfo},
@@ -137,7 +137,7 @@ fn main() {
         ),
     ]);
 
-    let symbols = Symbols::from(&program);
+    let symbols = SymbolEnvironment::from(&program);
     println!("main: symbols: {symbols:?}");
 
     let (_subs, typed_ast) = ctx.infer_type(&id_binding.resolve_names(&symbols)).unwrap();

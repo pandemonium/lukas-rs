@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    marker::PhantomData,
     ops::Deref,
     sync::atomic::{AtomicU32, Ordering},
     vec,
@@ -10,7 +11,7 @@ use crate::{
     ast::{
         self, ProductElement, Tree,
         annotation::Annotated,
-        namer::{self, Identifier},
+        namer::{self, DependencyMatrix, Identifier, SymbolEnvironment, ValueSymbol},
     },
     parser::{self, ParseInfo},
 };
@@ -25,18 +26,69 @@ pub type Tuple = ast::Tuple<TypeInfo, namer::Identifier>;
 pub type Record = ast::Record<TypeInfo, namer::Identifier>;
 pub type Projection = ast::Projection<TypeInfo, namer::Identifier>;
 
+impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath> {
+    pub fn compute_types(
+        self,
+    ) -> Typing<SymbolEnvironment<TypeInfo, namer::ModuleMemberPath, namer::Identifier>> {
+        let mut ctx = TypingContext::default();
+        let mut symbol_table = HashMap::default();
+
+        for (identifier_path, symbol) in
+            self.resolution_order()
+                .iter()
+                .filter_map(|&identifier_path| {
+                    self.symbol_table
+                        .get(identifier_path)
+                        .map(|symbol| (identifier_path, symbol))
+                })
+        {
+            let member_path = self
+                .resolve_module_path_expr(identifier_path)
+                .expect("a valid identifier path")
+                .into_member_path();
+
+            match symbol {
+                // Just enter these into the Typing Context here?
+                namer::Symbol::Type(symbol) => {
+                    todo!()
+                }
+
+                namer::Symbol::Value(symbol) => {
+                    let resolved = symbol.body.resolve_names(&self);
+                    let (_, body) = ctx.infer_type(&resolved)?;
+                    let symbol = namer::Symbol::Value(ValueSymbol {
+                        name: symbol.name.clone(),
+                        type_signature: symbol.type_signature.clone(),
+                        body,
+                    });
+                    symbol_table.insert(member_path, symbol);
+                }
+
+                // How does this work? What does this even mean?
+                namer::Symbol::Module(..) => todo!(),
+            }
+        }
+
+        Ok(SymbolEnvironment {
+            symbol_table,
+            dependency_matrix: DependencyMatrix::default(),
+            phase: PhantomData::default(),
+        })
+    }
+}
+
 impl Expr {
     pub fn type_info(&self) -> &TypeInfo {
         self.annotation()
     }
 
-    pub fn free_variables(&self) -> HashSet<&namer::MemberPath> {
+    pub fn free_variables(&self) -> HashSet<&namer::ModuleMemberPath> {
         let mut free = HashSet::default();
         self.find_free_variables(&mut free);
         free
     }
 
-    fn find_free_variables<'a>(&'a self, free: &mut HashSet<&'a namer::MemberPath>) {
+    fn find_free_variables<'a>(&'a self, free: &mut HashSet<&'a namer::ModuleMemberPath>) {
         match self {
             Self::Variable(_, namer::Identifier::Free(id)) => {
                 let _ = free.insert(id);
@@ -359,7 +411,7 @@ pub enum Term {
 #[derive(Debug, Default)]
 pub struct TermSpace {
     bound: Vec<TypeScheme>,
-    free: HashMap<namer::MemberPath, TypeScheme>,
+    free: HashMap<namer::ModuleMemberPath, TypeScheme>,
 }
 
 impl TermSpace {
@@ -396,9 +448,9 @@ impl TypingContext {
     }
 
     fn substitute_free(
-        terms: &HashMap<namer::MemberPath, TypeScheme>,
+        terms: &HashMap<namer::ModuleMemberPath, TypeScheme>,
         subs: &Substitutions,
-    ) -> HashMap<namer::MemberPath, TypeScheme> {
+    ) -> HashMap<namer::ModuleMemberPath, TypeScheme> {
         terms
             .iter()
             .map(|(k, v)| (k.clone(), v.with_substitutions(subs)))
