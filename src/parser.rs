@@ -10,6 +10,7 @@ pub type Binding = ast::Binding<ParseInfo, IdentifierPath>;
 pub type Record = ast::Record<ParseInfo, IdentifierPath>;
 pub type Tuple = ast::Tuple<ParseInfo, IdentifierPath>;
 pub type Projection = ast::Projection<ParseInfo, IdentifierPath>;
+pub type TypeExpression = ast::TypeExpression<ParseInfo, IdentifierPath>;
 
 impl Expr {
     pub fn parse_info(&self) -> &ParseInfo {

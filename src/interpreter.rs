@@ -7,12 +7,14 @@ use std::{
 
 use crate::{
     ast::{
-        self, CompilationUnit, Expr, ProductElement, Tree,
+        self, Apply, CompilationUnit, Expr, ProductElement, Tree,
         namer::{self, Identifier, SymbolEnvironment},
     },
     parser::ParseInfo,
+    typer,
 };
 
+// Erasing the annotation is not really done for a good reason here
 impl Expr<(), namer::Identifier> {
     pub fn reduce(self: &Tree<(), namer::Identifier>, env: &Environment) -> Interpretation {
         // Plenty of clone calls here.
@@ -35,21 +37,15 @@ impl Expr<(), namer::Identifier> {
             Self::Lambda(_, the) => Ok(Value::Closure(Closure::capture(env, &the.body))),
 
             Self::Apply(_, the) => {
-                let argument = the.argument.reduce(env)?;
-                let closure = the.function.reduce(env)?;
-
-                if let Value::Closure(closure) = closure {
-                    let closure = closure.borrow();
-                    closure
-                        .capture
-                        .with_binding(argument, |env| closure.body.reduce(env))
+                if let Value::Closure(closure) = the.function.reduce(env)? {
+                    apply_closure(closure, the.argument.reduce(env)?)
                 } else {
-                    Err(RuntimeError::ExpectedClosure(closure))
+                    Err(RuntimeError::ExpectedClosure(the.function.reduce(env)?))
                 }
             }
 
             Self::Let(_, binding) => {
-                env.with_binding(binding.bound.reduce(env)?, |env| binding.body.reduce(env))
+                env.bind(binding.bound.reduce(env)?, |env| binding.body.reduce(env))
             }
 
             Self::Record(_, the) => Ok(Value::Product(
@@ -76,6 +72,13 @@ impl Expr<(), namer::Identifier> {
     }
 }
 
+fn apply_closure(closure: Rc<RefCell<Closure>>, argument: Value) -> Interpretation {
+    let closure = closure.borrow();
+    closure
+        .capture
+        .bind(argument, |env| closure.body.reduce(env))
+}
+
 #[derive(Debug)]
 pub enum RuntimeError {
     NoSuchSymbol(Identifier),
@@ -94,36 +97,56 @@ pub struct Environment {
 #[derive(Debug, Default, Clone)]
 struct EnvironmentInner {
     statics: HashMap<namer::ModuleMemberPath, Value>,
-    stack: Vec<Value>,
+    locals: Vec<Value>,
 }
 
 impl Environment {
-    fn with_binding<F, A>(&self, x: Value, mut f: F) -> A
+    pub fn call(&self, symbol: &namer::ModuleMemberPath, argument: ast::Literal) -> Value {
+        if let Some(Value::Closure(closure)) = self.get_static(symbol) {
+            apply_closure(closure, Value::Constant(argument.into())).unwrap()
+        } else {
+            // It did not find __root__/start
+            todo!()
+        }
+    }
+
+    fn bind<F, A>(&self, x: Value, mut f: F) -> A
     where
         F: FnMut(&Self) -> A,
     {
         {
-            self.inner.borrow_mut().stack.push(x);
+            self.inner.borrow_mut().locals.push(x);
         }
 
         let v = f(self);
 
         {
-            self.inner.borrow_mut().stack.pop();
+            self.inner.borrow_mut().locals.pop();
         }
 
         v
     }
 
     fn put(&self, v: Value) {
-        self.inner.borrow_mut().stack.push(v);
+        self.inner.borrow_mut().locals.push(v);
     }
 
     fn get(&self, id: &Identifier) -> Option<Value> {
         match id {
-            Identifier::Bound(ix) => self.inner.borrow().stack.get(*ix).cloned(),
+            Identifier::Bound(ix) => self.inner.borrow().locals.get(*ix).cloned(),
             Identifier::Free(id) => self.inner.borrow().statics.get(id).cloned(),
         }
+    }
+
+    fn get_static(&self, id: &namer::ModuleMemberPath) -> Option<Value> {
+        // Wtf with the cloned here
+        self.inner.borrow().statics.get(id).cloned()
+    }
+
+    fn put_static(&mut self, id: &namer::ModuleMemberPath, value: Value) {
+        // ValueId is wrong here. It must be Name which has to
+        // become resurrected.
+        self.inner.borrow_mut().statics.insert(id.clone(), value);
     }
 
     // 1. Build symbol table
@@ -131,14 +154,27 @@ impl Environment {
     // 3. Resolve bindings
     // 4. Check types
     // 5. Insert checked values into statics in Environment
-    pub fn from_compilation_unit(program: CompilationUnit<ParseInfo>) -> Self {
+    pub fn typecheck_and_initialize(program: CompilationUnit<ParseInfo>) -> typer::Typing<Self> {
         let symbols = SymbolEnvironment::from(&program);
+        let mut environment = Self {
+            inner: EnvironmentInner::default().into(),
+        };
 
         if symbols.dependencies_satisfiable() {
+            for namer::ValueSymbol { name, body, .. } in
+                symbols.with_computed_types()?.value_symbols()
+            {
+                let value = Rc::new(body.erase_annotation())
+                    .reduce(&environment)
+                    .expect("successful static init");
+
+                environment.put_static(name, value);
+            }
         } else {
+            panic!("Bad dependencies")
         }
 
-        todo!()
+        Ok(environment)
     }
 }
 
@@ -149,10 +185,13 @@ pub enum Value {
     // Weird that both Closure and SelfReferential have to
     // have this structure
     Closure(Rc<RefCell<Closure>>),
+
     SelfReferential {
         name: namer::Identifier,
         inner: Weak<RefCell<Closure>>,
     },
+
+    // Is this problem free?
     Product(Vec<Value>),
 }
 
@@ -206,8 +245,8 @@ impl fmt::Display for Environment {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let env = self.inner.borrow();
 
-        let stack_prefix = env
-            .stack
+        let local_prefix = env
+            .locals
             .iter()
             .take(5)
             .map(|x| x.to_string())
@@ -222,9 +261,9 @@ impl fmt::Display for Environment {
             .collect::<Vec<_>>()
             .join(",");
 
-        write!(f, "static: {static_prefix}; bound: {stack_prefix}")?;
+        write!(f, "static: {static_prefix}; bound: {local_prefix}")?;
 
-        if env.stack.len() > 5 {
+        if env.locals.len() > 5 {
             write!(f, ", ...")
         } else {
             Ok(())

@@ -26,42 +26,74 @@ pub type Tuple = ast::Tuple<TypeInfo, namer::Identifier>;
 pub type Record = ast::Record<TypeInfo, namer::Identifier>;
 pub type Projection = ast::Projection<TypeInfo, namer::Identifier>;
 
+// It is weird that Name is parser::IdentifierPath since the name is
+// _always_ going to be a valid reference to a symbol in a (nested)
+// module hierarchy. Name ought to go from:
+//   parser::Identifier to
+//   namer::ModuleMemberPath
+// Why would there ever be something else in between?
 impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath> {
-    pub fn compute_types(
+    pub fn with_computed_types(
         self,
     ) -> Typing<SymbolEnvironment<TypeInfo, namer::ModuleMemberPath, namer::Identifier>> {
         let mut ctx = TypingContext::default();
-        let mut symbol_table = HashMap::default();
+        let mut symbols = HashMap::default();
 
-        for (identifier_path, symbol) in
-            self.resolution_order()
-                .iter()
-                .filter_map(|&identifier_path| {
-                    self.symbol_table
-                        .get(identifier_path)
-                        .map(|symbol| (identifier_path, symbol))
-                })
+        for (term, symbol) in self
+            .initialization_order()
+            .iter()
+            .filter_map(|&identifier_path| {
+                self.symbols
+                    .get(identifier_path)
+                    .map(|symbol| (identifier_path, symbol))
+            })
         {
-            let member_path = self
-                .resolve_module_path_expr(identifier_path)
-                .expect("a valid identifier path")
-                .into_member_path();
+            let term = match term {
+                namer::TermId::Type(id) => namer::TermId::Type(
+                    self.resolve_module_path_expr(id)
+                        .expect("a valid type identifier path")
+                        .into_member_path(),
+                ),
+                namer::TermId::Value(id) => namer::TermId::Value(namer::Identifier::Free(
+                    self.resolve_module_path_expr(id)
+                        .expect("a valid value identifier path")
+                        .into_member_path(),
+                )),
+            };
 
             match symbol {
                 // Just enter these into the Typing Context here?
-                namer::Symbol::Type(symbol) => {
-                    todo!()
-                }
+                namer::Symbol::Type(symbol) => match symbol {
+                    namer::TypeSymbol::Record(..) => {
+                        //                        Type::Record(todo!())
+                        todo!()
+                    }
+                    namer::TypeSymbol::Coproduct(..) => todo!(),
+                },
 
                 namer::Symbol::Value(symbol) => {
                     let resolved = symbol.body.resolve_names(&self);
                     let (_, body) = ctx.infer_type(&resolved)?;
-                    let symbol = namer::Symbol::Value(ValueSymbol {
-                        name: symbol.name.clone(),
-                        type_signature: symbol.type_signature.clone(),
+                    let type_signature = symbol
+                        .type_signature
+                        .clone()
+                        .map(|ts| ts.map(|te| te.resolve_names(&self)));
+                    let symbol_name = match term.clone() {
+                        namer::TermId::Value(Identifier::Free(id)) => id,
+                        otherwise => panic!("Bad term id for a value symbol: {otherwise:?}"),
+                    };
+                    let symbol = namer::Symbol::Value(ValueSymbol::<
+                        TypeInfo,
+                        namer::ModuleMemberPath,
+                        namer::Identifier,
+                    > {
+                        // namer::Identifier is not good here though. It must
+                        // be ModuleMemberPath because it can only be Free.
+                        name: symbol_name,
+                        type_signature,
                         body,
                     });
-                    symbol_table.insert(member_path, symbol);
+                    symbols.insert(term, symbol);
                 }
 
                 // How does this work? What does this even mean?
@@ -70,7 +102,8 @@ impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath
         }
 
         Ok(SymbolEnvironment {
-            symbol_table,
+            modules: self.modules,
+            symbols,
             dependency_matrix: DependencyMatrix::default(),
             phase: PhantomData::default(),
         })
@@ -84,41 +117,41 @@ impl Expr {
 
     pub fn free_variables(&self) -> HashSet<&namer::ModuleMemberPath> {
         let mut free = HashSet::default();
-        self.find_free_variables(&mut free);
+        self.gather_free_variables(&mut free);
         free
     }
 
-    fn find_free_variables<'a>(&'a self, free: &mut HashSet<&'a namer::ModuleMemberPath>) {
+    fn gather_free_variables<'a>(&'a self, free: &mut HashSet<&'a namer::ModuleMemberPath>) {
         match self {
             Self::Variable(_, namer::Identifier::Free(id)) => {
                 let _ = free.insert(id);
             }
             Self::RecursiveLambda(_, rec) => {
-                rec.lambda.body.find_free_variables(free);
+                rec.lambda.body.gather_free_variables(free);
             }
             Self::Lambda(_, lambda) => {
-                let _ = lambda.body.find_free_variables(free);
+                let _ = lambda.body.gather_free_variables(free);
             }
             Self::Apply(_, apply) => {
-                let _ = apply.function.find_free_variables(free);
-                let _ = apply.argument.find_free_variables(free);
+                let _ = apply.function.gather_free_variables(free);
+                let _ = apply.argument.gather_free_variables(free);
             }
             Self::Let(_, binding) => {
-                let _ = binding.bound.find_free_variables(free);
-                let _ = binding.body.find_free_variables(free);
+                let _ = binding.bound.gather_free_variables(free);
+                let _ = binding.body.gather_free_variables(free);
             }
             Self::Tuple(_, tuple) => {
                 for elt in &tuple.elements {
-                    elt.find_free_variables(free);
+                    elt.gather_free_variables(free);
                 }
             }
             Self::Record(_, record) => {
                 for (_, init) in &record.fields {
-                    let _ = init.find_free_variables(free);
+                    let _ = init.gather_free_variables(free);
                 }
             }
             Self::Project(_, projection) => {
-                let _ = projection.base.find_free_variables(free);
+                let _ = projection.base.gather_free_variables(free);
             }
             _otherwise => (),
         }

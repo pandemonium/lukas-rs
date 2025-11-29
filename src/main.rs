@@ -1,7 +1,8 @@
 use lukas::{
     ast::{
-        Apply, Binding, CompilationUnit, Declaration, Expr, Lambda, Literal, ProductElement,
-        Projection, Record, Tuple, ValueDeclaration, ValueDeclarator, namer::SymbolEnvironment,
+        self, Apply, Binding, CompilationUnit, Declaration, Expr, Lambda, Literal, ProductElement,
+        Projection, Record, Tuple, ValueDeclaration, ValueDeclarator,
+        namer::{self, SymbolEnvironment},
     },
     interpreter::Environment,
     parser::{Identifier, IdentifierPath, ParseInfo},
@@ -140,12 +141,12 @@ fn main() {
     let symbols = SymbolEnvironment::from(&program);
     println!("main: symbols: {symbols:?}");
 
-    let (_subs, typed_ast) = ctx.infer_type(&id_binding.resolve_names(&symbols)).unwrap();
-    println!("main: type {}", typed_ast.type_info().inferred_type);
+    let env = Environment::typecheck_and_initialize(program).expect("initialized");
+    println!("main: env: {env:?}");
 
-    let env = Environment::default();
-
-    let runtime = Rc::new(typed_ast.erase_annotation()).reduce(&env).unwrap();
-
-    println!("main: {runtime}");
+    let return_value = env.call(
+        &namer::ModuleMemberPath::from_root_symbol(Identifier::from_str("start")),
+        ast::Literal::Int(1),
+    );
+    println!("main: return value: {return_value}");
 }

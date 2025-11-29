@@ -20,8 +20,18 @@ pub type Binding = ast::Binding<ParseInfo, Identifier>;
 pub type Record = ast::Record<ParseInfo, Identifier>;
 pub type Tuple = ast::Tuple<ParseInfo, Identifier>;
 pub type Projection = ast::Projection<ParseInfo, Identifier>;
+pub type TypeExpression = ast::TypeExpression<ParseInfo, ModuleMemberPath>;
 
-#[derive(Debug, Clone)]
+/*
+ * module A =
+ *   module B =
+ *     type Option a = Some of a | None
+ *     let map f xs : (a -> b) -> Option a -> Option b = ...
+ *
+ *
+ */
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum Identifier {
     Bound(usize),
     Free(ModuleMemberPath),
@@ -35,7 +45,7 @@ pub struct ModulePathExpr {
 }
 
 impl ModulePathExpr {
-    fn into_projection(self, parse_info: ParseInfo) -> Expr {
+    fn into_expression(self, parse_info: ParseInfo) -> Expr {
         let path = ModuleMemberPath {
             module: self.module_prefix,
             member: parser::Identifier::from_str(&self.member),
@@ -70,7 +80,7 @@ pub struct ModuleMemberPath {
 }
 
 impl ModuleMemberPath {
-    fn from_root_symbol(member: parser::Identifier) -> Self {
+    pub fn from_root_symbol(member: parser::Identifier) -> Self {
         Self {
             module: parser::IdentifierPath::new(ast::ROOT_MODULE_NAME),
             member,
@@ -150,31 +160,97 @@ where
     }
 }
 
-// This thing is craving a better name
-#[derive(Debug, Clone)]
-pub struct SymbolEnvironment<A, Name, Id> {
-    pub symbol_table: HashMap<Name, Symbol<A, Id>>,
-    pub dependency_matrix: DependencyMatrix<Name>,
-    pub phase: PhantomData<A>,
+// Why 2 type parameters really? When will they
+// be different types?
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TermId<TypeId, ValueId> {
+    Type(TypeId),
+    Value(ValueId),
 }
 
-impl<A, Name, Id> Default for SymbolEnvironment<A, Name, Id> {
+impl<TypeId, ValueId> TermId<TypeId, ValueId> {
+    pub fn try_into_type(self) -> Option<TypeId> {
+        if let Self::Type(id) = self {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    pub fn try_into_value_term(self) -> Option<ValueId> {
+        if let Self::Value(id) = self {
+            Some(id)
+        } else {
+            None
+        }
+    }
+}
+
+// "Modules do not exist" - they should get their own table.
+#[derive(Debug, Clone)]
+pub struct SymbolEnvironment<A, GlobalName, LocalId> {
+    // does it even need this?
+    pub modules: HashSet<parser::IdentifierPath>,
+    pub symbols: HashMap<TermId<GlobalName, LocalId>, Symbol<A, GlobalName, LocalId>>,
+    pub dependency_matrix: DependencyMatrix<TermId<GlobalName, LocalId>>,
+    pub phase: PhantomData<(A, GlobalName, LocalId)>,
+}
+
+impl<A, TypeId, ValueId> Default for SymbolEnvironment<A, TypeId, ValueId> {
     fn default() -> Self {
         Self {
-            symbol_table: HashMap::default(),
+            modules: HashSet::default(),
+            symbols: HashMap::default(),
             dependency_matrix: DependencyMatrix::default(),
             phase: PhantomData::default(),
         }
     }
 }
 
+impl<A, GlobalName, LocalId> SymbolEnvironment<A, GlobalName, LocalId>
+where
+    GlobalName: Eq + Hash,
+    LocalId: Eq + Hash,
+{
+    pub fn initialization_order(&self) -> Vec<&TermId<GlobalName, LocalId>> {
+        self.dependency_matrix.initialization_order()
+    }
+
+    pub fn value_symbols(&self) -> Vec<&ValueSymbol<A, GlobalName, LocalId>> {
+        self.extract_symbols(|sym| {
+            if let Symbol::Value(sym) = sym {
+                Some(sym)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn type_symbols(&self) -> Vec<&TypeSymbol<A, GlobalName>> {
+        self.extract_symbols(|sym| {
+            if let Symbol::Type(sym) = sym {
+                Some(sym)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn extract_symbols<F, Sym>(&self, p: F) -> Vec<&Sym>
+    where
+        F: Fn(&Symbol<A, GlobalName, LocalId>) -> Option<&Sym>,
+    {
+        self.initialization_order()
+            .iter()
+            .filter_map(|id| self.symbols.get(id))
+            .filter_map(p)
+            .collect()
+    }
+}
+
 impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath> {
     pub fn dependencies_satisfiable(&self) -> bool {
         self.dependency_matrix.is_satisfied()
-    }
-
-    pub fn resolution_order(&self) -> Vec<&parser::IdentifierPath> {
-        self.dependency_matrix.initialization_order()
     }
 
     pub fn resolve_module_path_expr(
@@ -188,7 +264,7 @@ impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath
         for segment in path.iter() {
             if in_module_prefix {
                 let identifier_path = parser::IdentifierPath::try_from_components(&module_path)?;
-                if let Symbol::Module(..) = self.symbol_table.get(&identifier_path)? {
+                if self.modules.contains(&identifier_path) {
                     module_path.push(segment);
                 } else {
                     in_module_prefix = false;
@@ -209,127 +285,142 @@ impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath
 
     pub fn from(compilation: &CompilationUnit<ParseInfo>) -> Self {
         let mut symbol_table = HashMap::default();
+        let mut modules = HashSet::default();
 
         let _ = Self::index_module_contents(
             &mut parser::IdentifierPath::new(compilation.root.name.as_str()),
             &compilation.root.declarator.members,
+            &mut modules,
             &mut symbol_table,
         );
 
         Self {
-            symbol_table,
+            modules,
+            symbols: symbol_table,
             dependency_matrix: DependencyMatrix::default(),
             phase: PhantomData::default(),
         }
     }
 
+    // This could just as well keep a running module_path of varified
+    // modules. Shouldn't I just rewrite this sucker?
     pub fn index_module_contents(
         prefix: &mut parser::IdentifierPath,
         declarations: &[Declaration<ParseInfo>],
+        modules: &mut HashSet<parser::IdentifierPath>,
         symbol_table: &mut HashMap<
-            parser::IdentifierPath,
-            Symbol<ParseInfo, parser::IdentifierPath>,
+            TermId<parser::IdentifierPath, parser::IdentifierPath>,
+            Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
         >,
-    ) -> Vec<Symbol<ParseInfo, parser::IdentifierPath>> {
+    ) -> Vec<Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>> {
         let mut symbols = Vec::with_capacity(declarations.len());
         for decl in declarations {
-            let (member_path, symbol) = match decl {
-                ast::Declaration::Value(_, ast::ValueDeclaration { name, declarator }) => (
-                    prefix.clone().with_suffix(name.as_str()),
-                    Symbol::Value(ValueSymbol {
-                        name: name.clone(),
+            match decl {
+                ast::Declaration::Value(_, ast::ValueDeclaration { name, declarator }) => {
+                    let term = TermId::Value(prefix.clone().with_suffix(name.as_str()));
+                    let symbol = Symbol::Value(ValueSymbol {
+                        name: parser::IdentifierPath::new(name.as_str()),
                         type_signature: declarator.type_signature.clone(),
 
                         // This is a very expensive clone
                         // perhaps I _could_ move into here
                         body: declarator.body.clone(),
-                    }),
-                ),
+                    });
+
+                    symbols.push(symbol.clone());
+                    symbol_table.insert(term, symbol);
+                }
                 ast::Declaration::Module(_, ast::ModuleDeclaration { name, declarator }) => {
                     let name_str = name.as_str();
                     let owned_str = name_str.to_owned();
-                    (
-                        prefix.clone().with_suffix(name_str),
-                        Symbol::Module(ModuleSymbol {
-                            name: name.clone(),
-                            contents: {
-                                prefix.tail.push(owned_str);
-                                let member_symbols = Self::index_module_contents(
-                                    prefix,
-                                    &declarator.members,
-                                    symbol_table,
-                                );
-                                prefix.tail.pop();
-                                member_symbols
-                            },
-                            _bogus: PhantomData::default(),
-                        }),
-                    )
+
+                    let term = prefix.clone().with_suffix(name_str);
+                    let module = ModuleSymbol {
+                        name: parser::IdentifierPath::new(name.as_str()),
+                        contents: {
+                            prefix.tail.push(owned_str);
+                            let member_symbols = Self::index_module_contents(
+                                prefix,
+                                &declarator.members,
+                                modules,
+                                symbol_table,
+                            );
+                            prefix.tail.pop();
+                            member_symbols
+                        },
+                        _bogus: PhantomData::default(),
+                    };
+
+                    symbols.push(Symbol::Module(module.clone()));
+                    modules.insert(term);
                 }
-                ast::Declaration::Type(_, ast::TypeDeclaration { name, declarator }) => (
-                    prefix.clone().with_suffix(name.as_str()),
-                    match declarator {
+                ast::Declaration::Type(_, ast::TypeDeclaration { name, declarator }) => {
+                    let term = TermId::Type(prefix.clone().with_suffix(name.as_str()));
+                    let symbol = match declarator {
                         ast::TypeDeclarator::Record(_, record) => {
                             Symbol::Type(TypeSymbol::Record(RecordSymbol {
                                 name: parser::IdentifierPath::new(name.as_str()),
-                                fields: record.fields.iter().map(|f| f.name.clone()).collect(),
+                                fields: record
+                                    .fields
+                                    .iter()
+                                    .map(|f| (f.name.clone(), f.type_signature.clone()))
+                                    .collect(),
                             }))
                         }
-                    },
-                ),
+                    };
+
+                    symbols.push(symbol.clone());
+                    symbol_table.insert(term, symbol);
+                }
             };
-            symbols.push(symbol.clone());
-            symbol_table.insert(member_path, symbol);
         }
 
         symbols
     }
 }
 
-// It seems to me that this sucker needs 3 type parameters:
-// 1. A for Phase Annotation
-// 2. Name
-// 3. AST identifier type
+#[derive(Debug, Clone)]
+pub enum Symbol<A, GlobalName, LocalId> {
+    Value(ValueSymbol<A, GlobalName, LocalId>),
+    Module(ModuleSymbol<A, GlobalName, LocalId>),
+    Type(TypeSymbol<A, GlobalName>),
+}
+
+#[derive(Debug, Clone)]
+pub enum TypeSymbol<A, GlobalName> {
+    Record(RecordSymbol<A, GlobalName>),
+    Coproduct(CoproductSymbol<GlobalName>),
+}
+
+// This fucker needs a Name parameter anyway because the name
+// field behaves more like TypeId than ValueId. It will never
+// be Bound, always Free.
 //
-// #2 and #3 are not the same because:
-// #2 is always free and #3 is sometimes bound
+// What about substituting TypeId for Name? Is there ever a time
+// when the data type for symbols and types must be different?
 #[derive(Debug, Clone)]
-pub enum Symbol<A, Id> {
-    Value(ValueSymbol<A, Id>),
-    Module(ModuleSymbol<A, Id>),
-    Type(TypeSymbol<Id>),
+pub struct ValueSymbol<A, GlobalName, LocalId> {
+    pub name: GlobalName,
+    pub type_signature: Option<TypeSignature<ParseInfo, GlobalName>>,
+    pub body: ast::Expr<A, LocalId>,
 }
 
 #[derive(Debug, Clone)]
-pub enum TypeSymbol<Id> {
-    Record(RecordSymbol<Id>),
-    Coproduct(CoproductSymbol<Id>),
-}
-
-// It has to have Id in here too
-#[derive(Debug, Clone)]
-pub struct ValueSymbol<A, Id> {
-    pub name: parser::Identifier,
-    pub type_signature: Option<TypeSignature>,
-    pub body: ast::Expr<A, Id>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ModuleSymbol<A, Id> {
-    pub name: parser::Identifier,
-    pub contents: Vec<Symbol<A, Id>>,
+pub struct ModuleSymbol<A, GlobalName, LocalId> {
+    pub name: parser::IdentifierPath,
+    pub contents: Vec<Symbol<A, GlobalName, LocalId>>,
     _bogus: PhantomData<A>,
 }
 
 #[derive(Debug, Clone)]
-pub struct RecordSymbol<Id> {
-    pub name: Id,
-    pub fields: Vec<parser::Identifier>,
+pub struct RecordSymbol<A, GlobalName> {
+    pub name: GlobalName,
+    pub fields: Vec<(parser::Identifier, TypeSignature<A, GlobalName>)>,
 }
 
 #[derive(Debug, Clone)]
-pub struct CoproductSymbol<Id> {
-    pub name: Id,
+pub struct CoproductSymbol<GlobalName> {
+    pub name: GlobalName,
 }
 
 #[derive(Debug, Default)]
@@ -358,6 +449,15 @@ impl DeBruijnIndex {
 
 impl Expr {}
 
+impl parser::TypeExpression {
+    pub fn resolve_names(
+        &self,
+        _symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+    ) -> TypeExpression {
+        todo!()
+    }
+}
+
 impl parser::Expr {
     pub fn resolve_names(
         &self,
@@ -376,11 +476,11 @@ impl parser::Expr {
                 if let Some(name) = identifier_path.try_as_simple() {
                     Expr::Variable(*a, names.resolve(&name))
                 } else if let Some(path) = symbols.resolve_module_path_expr(identifier_path) {
-                    path.into_projection(*a)
+                    path.into_expression(*a)
                 } else if let Some(path) =
                     symbols.resolve_module_path_expr(&identifier_path.as_root_module_member())
                 {
-                    path.into_projection(*a)
+                    path.into_expression(*a)
                 } else {
                     panic!("Unresolved symbol {}", identifier_path)
                 }

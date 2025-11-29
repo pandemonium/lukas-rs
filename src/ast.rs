@@ -1,4 +1,4 @@
-use std::{fmt, rc::Rc};
+use std::{fmt, marker::PhantomData, rc::Rc};
 
 use crate::{
     ast::{self, annotation::Annotated},
@@ -37,7 +37,7 @@ pub struct ValueDeclaration<A> {
 }
 
 pub struct ValueDeclarator<A> {
-    pub type_signature: Option<TypeSignature>,
+    pub type_signature: Option<TypeSignature<A, parser::IdentifierPath>>,
     pub body: ast::Expr<A, parser::IdentifierPath>,
 }
 
@@ -56,26 +56,63 @@ pub struct TypeDeclaration<A> {
 }
 
 pub enum TypeDeclarator<A> {
-    Record(A, RecordDeclarator),
+    Record(A, RecordDeclarator<A>),
 }
 
-pub struct RecordDeclarator {
-    pub fields: Vec<FieldDeclarator>,
+pub struct RecordDeclarator<A> {
+    pub fields: Vec<FieldDeclarator<A>>,
 }
 
-pub struct FieldDeclarator {
+pub struct FieldDeclarator<A> {
     pub name: parser::Identifier,
-    pub type_signature: TypeSignature,
+    pub type_signature: TypeSignature<A, parser::IdentifierPath>,
 }
 
 #[derive(Debug, Clone)]
-pub enum TypeSignature {}
+pub struct TypeSignature<A, TypeId> {
+    pub universal_quantifiers: Vec<parser::Identifier>,
+    pub body: TypeExpression<A, TypeId>,
+    pub phase: PhantomData<A>,
+}
+
+impl<A, TypeId1> TypeSignature<A, TypeId1> {
+    pub fn map<F, B, TypeId2>(self, f: F) -> TypeSignature<B, TypeId2>
+    where
+        F: FnOnce(TypeExpression<A, TypeId1>) -> TypeExpression<B, TypeId2>,
+    {
+        TypeSignature {
+            universal_quantifiers: self.universal_quantifiers,
+            body: f(self.body),
+            phase: PhantomData::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TypeExpression<A, TypeId> {
+    Constructor(A, TypeId),
+    Parameter(A, Identifier),
+    Apply(A, TypeApply<A, TypeId>),
+    Arrow(A, TypeArrow<A, TypeId>),
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeApply<A, TypeId> {
+    pub function: Box<TypeExpression<A, TypeId>>,
+    pub argument: Box<TypeExpression<A, TypeId>>,
+    pub phase: PhantomData<TypeId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeArrow<A, TypeId> {
+    pub domain: Box<TypeExpression<A, TypeId>>,
+    pub codomain: Box<TypeExpression<A, TypeId>>,
+}
 
 pub type Tree<A, Id> = Rc<Expr<A, Id>>;
 
 #[derive(Debug, Clone)]
 pub enum Expr<A, Id> {
-    // Should this have IdentifierPath<Id>?
     Variable(A, Id),
     Constant(A, Literal),
     RecursiveLambda(A, SelfReferential<A, Id>),
@@ -135,7 +172,6 @@ pub struct Binding<A, Id> {
 
 #[derive(Debug, Clone)]
 pub struct SelfReferential<A, Id> {
-    // Have I done this correctly? Id here?
     pub own_name: Id,
     pub lambda: Lambda<A, Id>,
 }
