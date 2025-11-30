@@ -20,7 +20,68 @@ pub type Binding = ast::Binding<ParseInfo, Identifier>;
 pub type Record = ast::Record<ParseInfo, Identifier>;
 pub type Tuple = ast::Tuple<ParseInfo, Identifier>;
 pub type Projection = ast::Projection<ParseInfo, Identifier>;
-pub type TypeExpression = ast::TypeExpression<ParseInfo, ModuleMemberPath>;
+pub type TypeExpression = ast::TypeExpression<ParseInfo, QualifiedName>;
+
+impl<A> ast::Expr<A, Identifier> {
+    pub fn free_variables(&self) -> HashSet<&QualifiedName> {
+        let mut free = HashSet::default();
+        self.gather_free_variables(&mut free);
+        free
+    }
+
+    fn gather_free_variables<'a>(&'a self, free: &mut HashSet<&'a QualifiedName>) {
+        match self {
+            Self::Variable(_, Identifier::Free(id)) => {
+                let _ = free.insert(id);
+            }
+            Self::RecursiveLambda(_, rec) => {
+                rec.lambda.body.gather_free_variables(free);
+            }
+            Self::Lambda(_, lambda) => {
+                let _ = lambda.body.gather_free_variables(free);
+            }
+            Self::Apply(_, apply) => {
+                let _ = apply.function.gather_free_variables(free);
+                let _ = apply.argument.gather_free_variables(free);
+            }
+            Self::Let(_, binding) => {
+                let _ = binding.bound.gather_free_variables(free);
+                let _ = binding.body.gather_free_variables(free);
+            }
+            Self::Tuple(_, tuple) => {
+                for elt in &tuple.elements {
+                    elt.gather_free_variables(free);
+                }
+            }
+            Self::Record(_, record) => {
+                for (_, init) in &record.fields {
+                    let _ = init.gather_free_variables(free);
+                }
+            }
+            Self::Project(_, projection) => {
+                let _ = projection.base.gather_free_variables(free);
+            }
+            _otherwise => (),
+        }
+    }
+}
+
+impl TypeExpression {
+    pub fn free_variables(&self) -> HashSet<&QualifiedName> {
+        let mut free = HashSet::default();
+        self.gather_free_variables(&mut free);
+        free
+    }
+
+    fn gather_free_variables(&self, _free: &mut HashSet<&QualifiedName>) {
+        match self {
+            Self::Constructor(_, _id) => todo!(),
+            Self::Parameter(_, _identifier) => todo!(),
+            Self::Apply(_, _type_apply) => todo!(),
+            Self::Arrow(_, _type_arrow) => todo!(),
+        }
+    }
+}
 
 /*
  * module A =
@@ -34,19 +95,19 @@ pub type TypeExpression = ast::TypeExpression<ParseInfo, ModuleMemberPath>;
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum Identifier {
     Bound(usize),
-    Free(ModuleMemberPath),
+    Free(QualifiedName),
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct ModulePathExpr {
+pub struct QualifiedNameExpr {
     module_prefix: parser::IdentifierPath,
     member: String,
     member_suffix: Vec<String>,
 }
 
-impl ModulePathExpr {
+impl QualifiedNameExpr {
     fn into_expression(self, parse_info: ParseInfo) -> Expr {
-        let path = ModuleMemberPath {
+        let path = QualifiedName {
             module: self.module_prefix,
             member: parser::Identifier::from_str(&self.member),
         };
@@ -65,8 +126,8 @@ impl ModulePathExpr {
         )
     }
 
-    pub fn into_member_path(self) -> ModuleMemberPath {
-        ModuleMemberPath {
+    pub fn into_member_path(self) -> QualifiedName {
+        QualifiedName {
             module: self.module_prefix,
             member: parser::Identifier::from_str(&self.member),
         }
@@ -74,12 +135,12 @@ impl ModulePathExpr {
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct ModuleMemberPath {
+pub struct QualifiedName {
     module: parser::IdentifierPath,
     member: parser::Identifier,
 }
 
-impl ModuleMemberPath {
+impl QualifiedName {
     pub fn from_root_symbol(member: parser::Identifier) -> Self {
         Self {
             module: parser::IdentifierPath::new(ast::ROOT_MODULE_NAME),
@@ -101,6 +162,10 @@ impl<Id> DependencyMatrix<Id>
 where
     Id: Eq + Hash,
 {
+    pub fn add_edge(&mut self, node: Id, vertices: Vec<Id>) {
+        self.0.insert(node, vertices);
+    }
+
     fn is_satisfied(&self) -> bool {
         let Self(map) = self;
         let unsatisfieds = map
@@ -113,6 +178,8 @@ where
 
     pub fn initialization_order(&self) -> Vec<&Id> {
         let mut resolved = Vec::with_capacity(self.0.len());
+
+        println!("initialization_order: {}", self.0.len());
 
         let mut graph = self
             .0
@@ -192,7 +259,6 @@ pub struct SymbolEnvironment<A, GlobalName, LocalId> {
     // does it even need this?
     pub modules: HashSet<parser::IdentifierPath>,
     pub symbols: HashMap<TermId<GlobalName, LocalId>, Symbol<A, GlobalName, LocalId>>,
-    pub dependency_matrix: DependencyMatrix<TermId<GlobalName, LocalId>>,
     pub phase: PhantomData<(A, GlobalName, LocalId)>,
 }
 
@@ -201,62 +267,16 @@ impl<A, TypeId, ValueId> Default for SymbolEnvironment<A, TypeId, ValueId> {
         Self {
             modules: HashSet::default(),
             symbols: HashMap::default(),
-            dependency_matrix: DependencyMatrix::default(),
             phase: PhantomData::default(),
         }
     }
 }
 
-impl<A, GlobalName, LocalId> SymbolEnvironment<A, GlobalName, LocalId>
-where
-    GlobalName: Eq + Hash,
-    LocalId: Eq + Hash,
-{
-    pub fn initialization_order(&self) -> Vec<&TermId<GlobalName, LocalId>> {
-        self.dependency_matrix.initialization_order()
-    }
-
-    pub fn value_symbols(&self) -> Vec<&ValueSymbol<A, GlobalName, LocalId>> {
-        self.extract_symbols(|sym| {
-            if let Symbol::Value(sym) = sym {
-                Some(sym)
-            } else {
-                None
-            }
-        })
-    }
-
-    pub fn type_symbols(&self) -> Vec<&TypeSymbol<A, GlobalName>> {
-        self.extract_symbols(|sym| {
-            if let Symbol::Type(sym) = sym {
-                Some(sym)
-            } else {
-                None
-            }
-        })
-    }
-
-    fn extract_symbols<F, Sym>(&self, p: F) -> Vec<&Sym>
-    where
-        F: Fn(&Symbol<A, GlobalName, LocalId>) -> Option<&Sym>,
-    {
-        self.initialization_order()
-            .iter()
-            .filter_map(|id| self.symbols.get(id))
-            .filter_map(p)
-            .collect()
-    }
-}
-
 impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath> {
-    pub fn dependencies_satisfiable(&self) -> bool {
-        self.dependency_matrix.is_satisfied()
-    }
-
     pub fn resolve_module_path_expr(
         &self,
         path: &parser::IdentifierPath,
-    ) -> Option<ModulePathExpr> {
+    ) -> Option<QualifiedNameExpr> {
         let mut module_path = vec![];
         let mut member = vec![];
         let mut in_module_prefix = true;
@@ -276,7 +296,7 @@ impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath
         }
 
         let mut members = member.iter().map(|&s| s.to_owned());
-        Some(ModulePathExpr {
+        Some(QualifiedNameExpr {
             module_prefix: parser::IdentifierPath::try_from_components(&module_path)?,
             member: members.next()?,
             member_suffix: members.collect(),
@@ -284,21 +304,26 @@ impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath
     }
 
     pub fn from(compilation: &CompilationUnit<ParseInfo>) -> Self {
-        let mut symbol_table = HashMap::default();
+        let mut symbols = HashMap::default();
         let mut modules = HashSet::default();
+        let phase = PhantomData::default();
 
         let _ = Self::index_module_contents(
             &mut parser::IdentifierPath::new(compilation.root.name.as_str()),
             &compilation.root.declarator.members,
             &mut modules,
-            &mut symbol_table,
+            &mut symbols,
         );
+
+        // This cannot be done at this point
+        //        for symbol in symbols.values().into_iter() {
+        //            dependencies.add_edge(symbol.name().clone(), symbol);
+        //        }
 
         Self {
             modules,
-            symbols: symbol_table,
-            dependency_matrix: DependencyMatrix::default(),
-            phase: PhantomData::default(),
+            symbols,
+            phase,
         }
     }
 
@@ -330,6 +355,7 @@ impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath
                     symbols.push(symbol.clone());
                     symbol_table.insert(term, symbol);
                 }
+
                 ast::Declaration::Module(_, ast::ModuleDeclaration { name, declarator }) => {
                     let name_str = name.as_str();
                     let owned_str = name_str.to_owned();
@@ -339,6 +365,8 @@ impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath
                         name: parser::IdentifierPath::new(name.as_str()),
                         contents: {
                             prefix.tail.push(owned_str);
+                            // This isn't good because this structure gets to hold the
+                            // same data repeated 400 times.
                             let member_symbols = Self::index_module_contents(
                                 prefix,
                                 &declarator.members,
@@ -348,12 +376,12 @@ impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath
                             prefix.tail.pop();
                             member_symbols
                         },
-                        _bogus: PhantomData::default(),
                     };
 
                     symbols.push(Symbol::Module(module.clone()));
                     modules.insert(term);
                 }
+
                 ast::Declaration::Type(_, ast::TypeDeclaration { name, declarator }) => {
                     let term = TermId::Type(prefix.clone().with_suffix(name.as_str()));
                     let symbol = match declarator {
@@ -363,7 +391,10 @@ impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath
                                 fields: record
                                     .fields
                                     .iter()
-                                    .map(|f| (f.name.clone(), f.type_signature.clone()))
+                                    .map(|decl| FieldSymbol {
+                                        name: decl.name.clone(),
+                                        type_signature: decl.type_signature.clone(),
+                                    })
                                     .collect(),
                             }))
                         }
@@ -383,21 +414,129 @@ impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath
 pub enum Symbol<A, GlobalName, LocalId> {
     Value(ValueSymbol<A, GlobalName, LocalId>),
     Module(ModuleSymbol<A, GlobalName, LocalId>),
-    Type(TypeSymbol<A, GlobalName>),
+    Type(TypeSymbol<GlobalName>),
+}
+
+impl<A, GlobalName, LocalId> Symbol<A, GlobalName, LocalId> {
+    pub fn name(&self) -> &GlobalName {
+        match self {
+            Self::Value(symbol) => &symbol.name,
+            Self::Module(symbol) => &symbol.name,
+            Self::Type(symbol) => symbol.name(),
+        }
+    }
+}
+
+impl<A> Symbol<A, QualifiedName, Identifier> {
+    pub fn dependencies(&self) -> HashSet<TermId<QualifiedName, Identifier>> {
+        let mut deps = HashSet::default();
+
+        match self {
+            Self::Value(symbol) => {
+                deps.extend(
+                    symbol
+                        .body
+                        .free_variables()
+                        .iter()
+                        .map(|&id| TermId::Value(Identifier::Free(id.clone()))),
+                );
+            }
+
+            Self::Module(symbol) => {
+                deps.extend(symbol.contents.iter().flat_map(|x| x.dependencies()));
+            }
+
+            Self::Type(symbol) => {
+                deps.extend(
+                    symbol
+                        .free_variables()
+                        .iter()
+                        .map(|&id| TermId::Value(Identifier::Free(id.clone()))),
+                );
+            }
+        }
+
+        deps
+    }
 }
 
 #[derive(Debug, Clone)]
-pub enum TypeSymbol<A, GlobalName> {
-    Record(RecordSymbol<A, GlobalName>),
+pub enum TypeSymbol<GlobalName> {
+    Record(RecordSymbol<GlobalName>),
     Coproduct(CoproductSymbol<GlobalName>),
 }
 
-// This fucker needs a Name parameter anyway because the name
-// field behaves more like TypeId than ValueId. It will never
-// be Bound, always Free.
-//
-// What about substituting TypeId for Name? Is there ever a time
-// when the data type for symbols and types must be different?
+impl<GlobalName> TypeSymbol<GlobalName> {
+    pub fn name(&self) -> &GlobalName {
+        match self {
+            Self::Record(symbol) => &symbol.name,
+            Self::Coproduct(symbol) => &symbol.name,
+        }
+    }
+}
+
+impl TypeSymbol<QualifiedName> {
+    pub fn free_variables(&self) -> HashSet<&QualifiedName> {
+        match self {
+            Self::Record(symbol) => symbol.free_variables(),
+            Self::Coproduct(symbol) => symbol.free_variables(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordSymbol<GlobalName> {
+    pub name: GlobalName,
+    pub fields: Vec<FieldSymbol<GlobalName>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldSymbol<GlobalName> {
+    pub name: parser::Identifier,
+    pub type_signature: ast::TypeExpression<ParseInfo, GlobalName>,
+}
+
+impl RecordSymbol<QualifiedName> {
+    pub fn free_variables(&self) -> HashSet<&QualifiedName> {
+        self.fields
+            .iter()
+            .flat_map(|field| field.type_signature.free_variables())
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CoproductSymbol<GlobalName> {
+    pub name: GlobalName,
+    pub constructors: Vec<ConstructorSymbol<GlobalName>>,
+}
+
+impl CoproductSymbol<QualifiedName> {
+    pub fn free_variables(&self) -> HashSet<&QualifiedName> {
+        self.constructors
+            .iter()
+            .flat_map(|ctor| ctor.free_variables())
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConstructorSymbol<GlobalName> {
+    pub name: GlobalName,
+    pub signature: Vec<ast::TypeExpression<ParseInfo, GlobalName>>,
+}
+
+impl ConstructorSymbol<QualifiedName> {
+    pub fn free_variables(&self) -> HashSet<&QualifiedName> {
+        self.signature
+            .iter()
+            .flat_map(|ty_expr| ty_expr.free_variables())
+            .collect()
+    }
+}
+
+impl<GlobalName> TypeSymbol<GlobalName> {}
+
 #[derive(Debug, Clone)]
 pub struct ValueSymbol<A, GlobalName, LocalId> {
     pub name: GlobalName,
@@ -405,22 +544,11 @@ pub struct ValueSymbol<A, GlobalName, LocalId> {
     pub body: ast::Expr<A, LocalId>,
 }
 
+// Is this thing necessary?
 #[derive(Debug, Clone)]
 pub struct ModuleSymbol<A, GlobalName, LocalId> {
-    pub name: parser::IdentifierPath,
+    pub name: GlobalName,
     pub contents: Vec<Symbol<A, GlobalName, LocalId>>,
-    _bogus: PhantomData<A>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RecordSymbol<A, GlobalName> {
-    pub name: GlobalName,
-    pub fields: Vec<(parser::Identifier, TypeSignature<A, GlobalName>)>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CoproductSymbol<GlobalName> {
-    pub name: GlobalName,
 }
 
 #[derive(Debug, Default)]
@@ -431,7 +559,7 @@ impl DeBruijnIndex {
         if let Some(index) = self.0.iter().rposition(|n| n == id) {
             Identifier::Bound(index)
         } else {
-            Identifier::Free(ModuleMemberPath::from_root_symbol(id.to_owned()))
+            Identifier::Free(QualifiedName::from_root_symbol(id.to_owned()))
         }
     }
 
@@ -446,8 +574,6 @@ impl DeBruijnIndex {
         a
     }
 }
-
-impl Expr {}
 
 impl parser::TypeExpression {
     pub fn resolve_names(
@@ -619,7 +745,7 @@ impl fmt::Display for Identifier {
     }
 }
 
-impl fmt::Display for ModulePathExpr {
+impl fmt::Display for QualifiedNameExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -631,7 +757,7 @@ impl fmt::Display for ModulePathExpr {
     }
 }
 
-impl fmt::Display for ModuleMemberPath {
+impl fmt::Display for QualifiedName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { module, member } = self;
         write!(f, "{module}::{member}")

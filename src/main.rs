@@ -1,8 +1,7 @@
 use lukas::{
     ast::{
         self, Apply, Binding, CompilationUnit, Declaration, Expr, Lambda, Literal, ProductElement,
-        Projection, Record, Tuple, ValueDeclaration, ValueDeclarator,
-        namer::{self, SymbolEnvironment},
+        Projection, Record, Tuple, ValueDeclaration, ValueDeclarator, namer,
     },
     interpreter::Environment,
     parser::{Identifier, IdentifierPath, ParseInfo},
@@ -89,7 +88,7 @@ fn proj(base: Tree, field: &str) -> Tree {
 }
 
 fn main() {
-    let mut ctx = TypingContext::default();
+    let _ctx = TypingContext::default();
 
     let id = lambda("x", var("x"));
     let id_binding = let_in("id", id, {
@@ -138,14 +137,14 @@ fn main() {
         ),
     ]);
 
-    let symbols = SymbolEnvironment::from(&program);
-    println!("main: symbols: {symbols:?}");
+    //let symbols = SymbolEnvironment::from(&program);
+    //    println!("main: symbols: {symbols:?}");
 
     let env = Environment::typecheck_and_initialize(program).expect("initialized");
-    println!("main: env: {env:?}");
+    println!("main: env: {env}");
 
     let return_value = env.call(
-        &namer::ModuleMemberPath::from_root_symbol(Identifier::from_str("start")),
+        &namer::QualifiedName::from_root_symbol(Identifier::from_str("start")),
         ast::Literal::Int(1),
     );
     println!("main: return value: {return_value}");

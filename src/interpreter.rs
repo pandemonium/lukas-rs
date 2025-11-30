@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     ast::{
-        self, Apply, CompilationUnit, Expr, ProductElement, Tree,
+        self, CompilationUnit, Expr, ProductElement, Tree,
         namer::{self, Identifier, SymbolEnvironment},
     },
     parser::ParseInfo,
@@ -45,7 +45,7 @@ impl Expr<(), namer::Identifier> {
             }
 
             Self::Let(_, binding) => {
-                env.bind(binding.bound.reduce(env)?, |env| binding.body.reduce(env))
+                env.bind_and_then(binding.bound.reduce(env)?, |env| binding.body.reduce(env))
             }
 
             Self::Record(_, the) => Ok(Value::Product(
@@ -76,7 +76,7 @@ fn apply_closure(closure: Rc<RefCell<Closure>>, argument: Value) -> Interpretati
     let closure = closure.borrow();
     closure
         .capture
-        .bind(argument, |env| closure.body.reduce(env))
+        .bind_and_then(argument, |env| closure.body.reduce(env))
 }
 
 #[derive(Debug)]
@@ -96,12 +96,12 @@ pub struct Environment {
 
 #[derive(Debug, Default, Clone)]
 struct EnvironmentInner {
-    statics: HashMap<namer::ModuleMemberPath, Value>,
+    statics: HashMap<namer::QualifiedName, Value>,
     locals: Vec<Value>,
 }
 
 impl Environment {
-    pub fn call(&self, symbol: &namer::ModuleMemberPath, argument: ast::Literal) -> Value {
+    pub fn call(&self, symbol: &namer::QualifiedName, argument: ast::Literal) -> Value {
         if let Some(Value::Closure(closure)) = self.get_static(symbol) {
             apply_closure(closure, Value::Constant(argument.into())).unwrap()
         } else {
@@ -110,7 +110,7 @@ impl Environment {
         }
     }
 
-    fn bind<F, A>(&self, x: Value, mut f: F) -> A
+    fn bind_and_then<F, A>(&self, x: Value, mut block: F) -> A
     where
         F: FnMut(&Self) -> A,
     {
@@ -118,7 +118,7 @@ impl Environment {
             self.inner.borrow_mut().locals.push(x);
         }
 
-        let v = f(self);
+        let v = block(self);
 
         {
             self.inner.borrow_mut().locals.pop();
@@ -138,14 +138,11 @@ impl Environment {
         }
     }
 
-    fn get_static(&self, id: &namer::ModuleMemberPath) -> Option<Value> {
-        // Wtf with the cloned here
+    fn get_static(&self, id: &namer::QualifiedName) -> Option<Value> {
         self.inner.borrow().statics.get(id).cloned()
     }
 
-    fn put_static(&mut self, id: &namer::ModuleMemberPath, value: Value) {
-        // ValueId is wrong here. It must be Name which has to
-        // become resurrected.
+    fn put_static(&mut self, id: &namer::QualifiedName, value: Value) {
         self.inner.borrow_mut().statics.insert(id.clone(), value);
     }
 
@@ -160,19 +157,36 @@ impl Environment {
             inner: EnvironmentInner::default().into(),
         };
 
-        if symbols.dependencies_satisfiable() {
-            for namer::ValueSymbol { name, body, .. } in
-                symbols.with_computed_types()?.value_symbols()
-            {
-                let value = Rc::new(body.erase_annotation())
-                    .reduce(&environment)
-                    .expect("successful static init");
-
-                environment.put_static(name, value);
-            }
-        } else {
-            panic!("Bad dependencies")
+        for namer::ValueSymbol { name, body, .. } in symbols
+            .rename_symbols()
+            .compute_types()
+            .expect("msg")
+            .value_symbols()
+        {
+            println!("typecheck_and_initialize: {name}");
+            //
+            let value = Rc::new(body.erase_annotation())
+                .reduce(&environment)
+                .expect("successful static init");
+            //
+            environment.put_static(name, value);
         }
+
+        //if symbols.dependencies_satisfiable() {
+        //    for namer::ValueSymbol { name, body, .. } in
+        //        symbols.with_types_computed()?.value_symbols()
+        //    {
+        //        println!("typecheck_and_initialize: {name}");
+        //
+        //        let value = Rc::new(body.erase_annotation())
+        //            .reduce(&environment)
+        //            .expect("successful static init");
+        //
+        //        environment.put_static(name, value);
+        //    }
+        //} else {
+        //    panic!("Bad dependencies")
+        //}
 
         Ok(environment)
     }

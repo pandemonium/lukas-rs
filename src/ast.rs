@@ -65,7 +65,7 @@ pub struct RecordDeclarator<A> {
 
 pub struct FieldDeclarator<A> {
     pub name: parser::Identifier,
-    pub type_signature: TypeSignature<A, parser::IdentifierPath>,
+    pub type_signature: TypeExpression<A, parser::IdentifierPath>,
 }
 
 #[derive(Debug, Clone)]

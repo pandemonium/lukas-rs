@@ -18,12 +18,12 @@ impl Expr {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParseInfo {
     pub location: SourceLocation,
 }
 
-#[derive(Debug, Copy, Clone, Default)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct SourceLocation {
     pub row: usize,
     pub col: usize,

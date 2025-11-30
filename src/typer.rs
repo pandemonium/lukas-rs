@@ -11,7 +11,10 @@ use crate::{
     ast::{
         self, ProductElement, Tree,
         annotation::Annotated,
-        namer::{self, DependencyMatrix, Identifier, SymbolEnvironment, ValueSymbol},
+        namer::{
+            self, CoproductSymbol, DependencyMatrix, Identifier, ModuleSymbol, RecordSymbol,
+            SymbolEnvironment, TermId, ValueSymbol,
+        },
     },
     parser::{self, ParseInfo},
 };
@@ -26,135 +29,212 @@ pub type Tuple = ast::Tuple<TypeInfo, namer::Identifier>;
 pub type Record = ast::Record<TypeInfo, namer::Identifier>;
 pub type Projection = ast::Projection<TypeInfo, namer::Identifier>;
 
-// It is weird that Name is parser::IdentifierPath since the name is
-// _always_ going to be a valid reference to a symbol in a (nested)
-// module hierarchy. Name ought to go from:
-//   parser::Identifier to
-//   namer::ModuleMemberPath
-// Why would there ever be something else in between?
-impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath> {
-    pub fn with_computed_types(
-        self,
-    ) -> Typing<SymbolEnvironment<TypeInfo, namer::ModuleMemberPath, namer::Identifier>> {
-        let mut ctx = TypingContext::default();
-        let mut symbols = HashMap::default();
+type RawTermId = namer::TermId<parser::IdentifierPath, parser::IdentifierPath>;
+type RawSymbols = SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
+type RawSymbol = namer::Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
+type NamedTermId = namer::TermId<namer::QualifiedName, namer::Identifier>;
+type NamedSymbols = SymbolEnvironment<ParseInfo, namer::QualifiedName, namer::Identifier>;
+type NamedSymbol = namer::Symbol<ParseInfo, namer::QualifiedName, namer::Identifier>;
+type TypedSymbols = namer::SymbolEnvironment<TypeInfo, namer::QualifiedName, namer::Identifier>;
 
-        for (term, symbol) in self
-            .initialization_order()
-            .iter()
-            .filter_map(|&identifier_path| {
-                self.symbols
-                    .get(identifier_path)
-                    .map(|symbol| (identifier_path, symbol))
-            })
-        {
-            let term = match term {
-                namer::TermId::Type(id) => namer::TermId::Type(
-                    self.resolve_module_path_expr(id)
-                        .expect("a valid type identifier path")
-                        .into_member_path(),
-                ),
-                namer::TermId::Value(id) => namer::TermId::Value(namer::Identifier::Free(
-                    self.resolve_module_path_expr(id)
-                        .expect("a valid value identifier path")
-                        .into_member_path(),
-                )),
-            };
-
-            match symbol {
-                // Just enter these into the Typing Context here?
-                namer::Symbol::Type(symbol) => match symbol {
-                    namer::TypeSymbol::Record(..) => {
-                        //                        Type::Record(todo!())
-                        todo!()
-                    }
-                    namer::TypeSymbol::Coproduct(..) => todo!(),
-                },
-
-                namer::Symbol::Value(symbol) => {
-                    let resolved = symbol.body.resolve_names(&self);
-                    let (_, body) = ctx.infer_type(&resolved)?;
-                    let type_signature = symbol
-                        .type_signature
-                        .clone()
-                        .map(|ts| ts.map(|te| te.resolve_names(&self)));
-                    let symbol_name = match term.clone() {
-                        namer::TermId::Value(Identifier::Free(id)) => id,
-                        otherwise => panic!("Bad term id for a value symbol: {otherwise:?}"),
-                    };
-                    let symbol = namer::Symbol::Value(ValueSymbol::<
-                        TypeInfo,
-                        namer::ModuleMemberPath,
-                        namer::Identifier,
-                    > {
-                        // namer::Identifier is not good here though. It must
-                        // be ModuleMemberPath because it can only be Free.
-                        name: symbol_name,
-                        type_signature,
-                        body,
-                    });
-                    symbols.insert(term, symbol);
-                }
-
-                // How does this work? What does this even mean?
-                namer::Symbol::Module(..) => todo!(),
+impl<A> SymbolEnvironment<A, namer::QualifiedName, namer::Identifier> {
+    pub fn value_symbols(&self) -> Vec<&ValueSymbol<A, namer::QualifiedName, namer::Identifier>> {
+        self.extract_symbols(|sym| {
+            if let namer::Symbol::Value(sym) = sym {
+                Some(sym)
+            } else {
+                None
             }
+        })
+    }
+
+    pub fn type_symbols(&self) -> Vec<&namer::TypeSymbol<namer::QualifiedName>> {
+        self.extract_symbols(|sym| {
+            if let namer::Symbol::Type(sym) = sym {
+                Some(sym)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn extract_symbols<F, Sym>(&self, p: F) -> Vec<&Sym>
+    where
+        F: Fn(&namer::Symbol<A, namer::QualifiedName, namer::Identifier>) -> Option<&Sym>,
+    {
+        self.initialization_order()
+            .iter()
+            .filter_map(|id| self.symbols.get(id))
+            .filter_map(p)
+            .collect()
+    }
+
+    fn initialization_order(&self) -> Vec<NamedTermId> {
+        let mut matrix = DependencyMatrix::default();
+
+        // This function is incredibly inefficient.
+        for (id, symbol) in &self.symbols {
+            matrix.add_edge(id.clone(), symbol.dependencies().into_iter().collect());
         }
 
-        Ok(SymbolEnvironment {
-            modules: self.modules,
-            symbols,
-            dependency_matrix: DependencyMatrix::default(),
+        matrix.initialization_order().into_iter().cloned().collect()
+    }
+}
+
+impl NamedSymbols {
+    pub fn compute_types(self) -> Typing<TypedSymbols> {
+        let mut ctx = TypingContext::default();
+
+        for symbol in self
+            .initialization_order()
+            .into_iter()
+            .map(|id| {
+                self.symbols
+                    .get(&id)
+                    .ok_or_else(|| TypeError::UndefinedTerm(id.clone()))
+            })
+            .collect::<Typing<Vec<_>>>()?
+        {
+            let symbol = match symbol {
+                namer::Symbol::Value(symbol) => {
+                    let (_, body) = ctx.infer_type(&symbol.body)?;
+
+                    ctx.bind(
+                        // Is this really right?
+                        Term::Value(namer::Identifier::Free(symbol.name.clone())),
+                        TypeScheme::from_constant(body.type_info().inferred_type.clone()),
+                    );
+
+                    // This thing has to also be in the TypingContext
+                    namer::Symbol::Value(ValueSymbol {
+                        name: symbol.name.clone(),
+                        type_signature: symbol.type_signature.clone(),
+                        body,
+                    })
+                }
+
+                namer::Symbol::Module(_symbol) => continue,
+
+                namer::Symbol::Type(symbol) => namer::Symbol::Type(match symbol {
+                    namer::TypeSymbol::Record(symbol) => {
+                        let record = Type::Record(
+                            symbol
+                                .fields
+                                .iter()
+                                // symbol.type_signature.synthesize_type(ctx)
+                                .map(|symbol| (symbol.name.clone(), Type::fresh()))
+                                .collect(),
+                        );
+
+                        ctx.bind(
+                            Term::Type(symbol.name.clone()),
+                            TypeScheme::from_constant(record),
+                        );
+
+                        namer::TypeSymbol::Record(symbol.clone())
+                    }
+
+                    namer::TypeSymbol::Coproduct(symbol) => {
+                        namer::TypeSymbol::Coproduct(symbol.clone())
+                    }
+                }),
+            };
+        }
+
+        todo!()
+    }
+}
+
+// Why not namer::ModuleMemberPath and namer::Identifier here?
+// This calls the namer. Is this necessary?
+impl RawSymbols {
+    // Move to namer.rs
+    // This does not need the symbols in any particular order, so long as all
+    // modules are known
+    pub fn rename_symbols(self) -> NamedSymbols {
+        SymbolEnvironment {
+            modules: self.modules.clone(),
+            symbols: self
+                .symbols
+                .iter()
+                .map(|(id, symbol)| (self.rename_term_id(id), self.rename_symbol(symbol)))
+                .collect(),
             phase: PhantomData::default(),
-        })
+        }
+    }
+
+    fn rename_term_id(&self, id: &RawTermId) -> NamedTermId {
+        match id {
+            namer::TermId::Type(id) => namer::TermId::Type(self.resolve_member_path(id)),
+            namer::TermId::Value(id) => {
+                namer::TermId::Value(namer::Identifier::Free(self.resolve_member_path(id)))
+            }
+        }
+    }
+
+    fn resolve_member_path(&self, id: &parser::IdentifierPath) -> namer::QualifiedName {
+        self.resolve_module_path_expr(&id)
+            .expect("a valid type identifier path")
+            .into_member_path()
+    }
+
+    fn rename_symbol(&self, symbol: &RawSymbol) -> NamedSymbol {
+        match symbol {
+            namer::Symbol::Value(symbol) => namer::Symbol::Value(ValueSymbol {
+                name: self.resolve_member_path(&symbol.name),
+                type_signature: symbol
+                    .type_signature
+                    .clone()
+                    .map(|ts| ts.map(|te| te.resolve_names(self))),
+                body: symbol.body.resolve_names(self),
+            }),
+
+            namer::Symbol::Module(symbol) => namer::Symbol::Module(ModuleSymbol {
+                name: self.resolve_member_path(&symbol.name),
+                contents: symbol
+                    .contents
+                    .iter()
+                    .map(|symbol| self.rename_symbol(symbol))
+                    .collect(),
+            }),
+
+            namer::Symbol::Type(symbol) => namer::Symbol::Type(match symbol {
+                namer::TypeSymbol::Record(symbol) => namer::TypeSymbol::Record(RecordSymbol {
+                    name: self.resolve_member_path(&symbol.name),
+                    fields: symbol
+                        .fields
+                        .iter()
+                        .map(|symbol| namer::FieldSymbol {
+                            name: symbol.name.clone(),
+                            type_signature: symbol.type_signature.resolve_names(self),
+                        })
+                        .collect(),
+                }),
+                namer::TypeSymbol::Coproduct(symbol) => {
+                    namer::TypeSymbol::Coproduct(CoproductSymbol {
+                        name: self.resolve_member_path(&symbol.name),
+                        constructors: symbol
+                            .constructors
+                            .iter()
+                            .map(|symbol| namer::ConstructorSymbol {
+                                name: self.resolve_member_path(&symbol.name),
+                                signature: symbol
+                                    .signature
+                                    .iter()
+                                    .map(|te| te.resolve_names(self))
+                                    .collect(),
+                            })
+                            .collect(),
+                    })
+                }
+            }),
+        }
     }
 }
 
 impl Expr {
     pub fn type_info(&self) -> &TypeInfo {
         self.annotation()
-    }
-
-    pub fn free_variables(&self) -> HashSet<&namer::ModuleMemberPath> {
-        let mut free = HashSet::default();
-        self.gather_free_variables(&mut free);
-        free
-    }
-
-    fn gather_free_variables<'a>(&'a self, free: &mut HashSet<&'a namer::ModuleMemberPath>) {
-        match self {
-            Self::Variable(_, namer::Identifier::Free(id)) => {
-                let _ = free.insert(id);
-            }
-            Self::RecursiveLambda(_, rec) => {
-                rec.lambda.body.gather_free_variables(free);
-            }
-            Self::Lambda(_, lambda) => {
-                let _ = lambda.body.gather_free_variables(free);
-            }
-            Self::Apply(_, apply) => {
-                let _ = apply.function.gather_free_variables(free);
-                let _ = apply.argument.gather_free_variables(free);
-            }
-            Self::Let(_, binding) => {
-                let _ = binding.bound.gather_free_variables(free);
-                let _ = binding.body.gather_free_variables(free);
-            }
-            Self::Tuple(_, tuple) => {
-                for elt in &tuple.elements {
-                    elt.gather_free_variables(free);
-                }
-            }
-            Self::Record(_, record) => {
-                for (_, init) in &record.fields {
-                    let _ = init.gather_free_variables(free);
-                }
-            }
-            Self::Project(_, projection) => {
-                let _ = projection.base.gather_free_variables(free);
-            }
-            _otherwise => (),
-        }
     }
 }
 
@@ -188,6 +268,7 @@ pub enum TypeError {
         inferred_type: Type,
     },
     UndefinedName(Identifier),
+    UndefinedTerm(TermId<namer::QualifiedName, namer::Identifier>),
 }
 
 pub type Typing<A = (Substitutions, Expr)> = Result<A, TypeError>;
@@ -435,19 +516,19 @@ impl Deref for Substitutions {
     }
 }
 
-#[derive(Debug)]
-pub enum Term {
-    Type(namer::Identifier),
-    Value(namer::Identifier),
-}
+pub type Term = namer::TermId<namer::QualifiedName, namer::Identifier>;
 
 #[derive(Debug, Default)]
 pub struct TermSpace {
     bound: Vec<TypeScheme>,
-    free: HashMap<namer::ModuleMemberPath, TypeScheme>,
+    free: HashMap<namer::QualifiedName, TypeScheme>,
 }
 
 impl TermSpace {
+    pub fn lookup_free(&self, term: &namer::QualifiedName) -> Option<&TypeScheme> {
+        self.free.get(term)
+    }
+
     pub fn lookup(&self, term: &namer::Identifier) -> Option<&TypeScheme> {
         match term {
             namer::Identifier::Bound(index) => Some(&self.bound[*index]),
@@ -481,9 +562,9 @@ impl TypingContext {
     }
 
     fn substitute_free(
-        terms: &HashMap<namer::ModuleMemberPath, TypeScheme>,
+        terms: &HashMap<namer::QualifiedName, TypeScheme>,
         subs: &Substitutions,
-    ) -> HashMap<namer::ModuleMemberPath, TypeScheme> {
+    ) -> HashMap<namer::QualifiedName, TypeScheme> {
         terms
             .iter()
             .map(|(k, v)| (k.clone(), v.with_substitutions(subs)))
@@ -492,12 +573,16 @@ impl TypingContext {
 
     pub fn lookup(&self, term: &Term) -> Option<&TypeScheme> {
         match term {
-            Term::Type(name) => self.types.lookup(name),
+            Term::Type(name) => self.types.lookup_free(name),
             Term::Value(name) => self.values.lookup(name),
         }
     }
 
-    pub fn bind<F, A>(&mut self, term: Term, scheme: TypeScheme, block: F) -> A
+    pub fn bind(&mut self, term: Term, scheme: TypeScheme) {
+        self.bindings(&term).push(scheme);
+    }
+
+    pub fn bind_and_then<F, A>(&mut self, term: Term, scheme: TypeScheme, block: F) -> A
     where
         F: FnOnce(&mut TypingContext) -> A,
     {
@@ -687,11 +772,11 @@ impl TypingContext {
         rec_lambda: &namer::SelfReferential,
     ) -> Typing {
         let own_ty = Type::fresh();
-        self.bind(
+        self.bind_and_then(
             Term::Value(rec_lambda.own_name.clone()),
             TypeScheme::from_constant(own_ty.clone()),
             |ctx| {
-                ctx.bind(
+                ctx.bind_and_then(
                     Term::Value(rec_lambda.lambda.parameter.clone()),
                     TypeScheme::from_constant(Type::fresh()),
                     |ctx| {
@@ -775,7 +860,7 @@ impl TypingContext {
         lambda: &namer::Lambda,
     ) -> Typing<(Substitutions, TypeInfo, Lambda)> {
         let domain = Type::fresh();
-        self.bind(
+        self.bind_and_then(
             Term::Value(lambda.parameter.clone()),
             TypeScheme::from_constant(domain.clone()),
             |ctx| {
@@ -809,7 +894,7 @@ impl TypingContext {
         let bound_type = bound.type_info().inferred_type.generalize(self);
 
         // Term::Xxx is... not good.
-        self.bind(Term::Value(binding.binder.clone()), bound_type, |ctx| {
+        self.bind_and_then(Term::Value(binding.binder.clone()), bound_type, |ctx| {
             let (body_subs, body) = ctx.infer_type(&binding.body)?;
             let substitutions = bound_subs.compose(&body_subs);
 
