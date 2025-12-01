@@ -166,7 +166,7 @@ where
         self.0.insert(node, vertices);
     }
 
-    fn is_satisfied(&self) -> bool {
+    pub fn are_sound(&self) -> bool {
         let Self(map) = self;
         let unsatisfieds = map
             .iter()
@@ -176,10 +176,8 @@ where
         unsatisfieds.is_empty()
     }
 
-    pub fn initialization_order(&self) -> Vec<&Id> {
+    pub fn in_resolvable_order(&self) -> Vec<&Id> {
         let mut resolved = Vec::with_capacity(self.0.len());
-
-        println!("initialization_order: {}", self.0.len());
 
         let mut graph = self
             .0
@@ -255,14 +253,14 @@ impl<TypeId, ValueId> TermId<TypeId, ValueId> {
 
 // "Modules do not exist" - they should get their own table.
 #[derive(Debug, Clone)]
-pub struct SymbolEnvironment<A, GlobalName, LocalId> {
+pub struct CompilationContext<A, GlobalName, LocalId> {
     // does it even need this?
     pub modules: HashSet<parser::IdentifierPath>,
     pub symbols: HashMap<TermId<GlobalName, LocalId>, Symbol<A, GlobalName, LocalId>>,
     pub phase: PhantomData<(A, GlobalName, LocalId)>,
 }
 
-impl<A, TypeId, ValueId> Default for SymbolEnvironment<A, TypeId, ValueId> {
+impl<A, TypeId, ValueId> Default for CompilationContext<A, TypeId, ValueId> {
     fn default() -> Self {
         Self {
             modules: HashSet::default(),
@@ -272,7 +270,7 @@ impl<A, TypeId, ValueId> Default for SymbolEnvironment<A, TypeId, ValueId> {
     }
 }
 
-impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath> {
+impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath> {
     pub fn resolve_module_path_expr(
         &self,
         path: &parser::IdentifierPath,
@@ -283,10 +281,11 @@ impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath
 
         for segment in path.iter() {
             if in_module_prefix {
+                module_path.push(segment);
                 let identifier_path = parser::IdentifierPath::try_from_components(&module_path)?;
-                if self.modules.contains(&identifier_path) {
-                    module_path.push(segment);
-                } else {
+
+                if !self.modules.contains(&identifier_path) {
+                    module_path.pop();
                     in_module_prefix = false;
                     member.push(segment);
                 }
@@ -303,22 +302,19 @@ impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath
         })
     }
 
-    pub fn from(compilation: &CompilationUnit<ParseInfo>) -> Self {
+    pub fn from(program: &CompilationUnit<ParseInfo>) -> Self {
         let mut symbols = HashMap::default();
         let mut modules = HashSet::default();
         let phase = PhantomData::default();
 
+        modules.insert(parser::IdentifierPath::new(ast::ROOT_MODULE_NAME));
+
         let _ = Self::index_module_contents(
-            &mut parser::IdentifierPath::new(compilation.root.name.as_str()),
-            &compilation.root.declarator.members,
+            &mut parser::IdentifierPath::new(program.root.name.as_str()),
+            &program.root.declarator.members,
             &mut modules,
             &mut symbols,
         );
-
-        // This cannot be done at this point
-        //        for symbol in symbols.values().into_iter() {
-        //            dependencies.add_edge(symbol.name().clone(), symbol);
-        //        }
 
         Self {
             modules,
@@ -342,9 +338,10 @@ impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath
         for decl in declarations {
             match decl {
                 ast::Declaration::Value(_, ast::ValueDeclaration { name, declarator }) => {
-                    let term = TermId::Value(prefix.clone().with_suffix(name.as_str()));
+                    let symbol_name = prefix.clone().with_suffix(name.as_str());
+                    let term = TermId::Value(symbol_name.clone());
                     let symbol = Symbol::Value(ValueSymbol {
-                        name: parser::IdentifierPath::new(name.as_str()),
+                        name: symbol_name,
                         type_signature: declarator.type_signature.clone(),
 
                         // This is a very expensive clone
@@ -356,38 +353,17 @@ impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath
                     symbol_table.insert(term, symbol);
                 }
 
-                ast::Declaration::Module(_, ast::ModuleDeclaration { name, declarator }) => {
-                    let name_str = name.as_str();
-                    let owned_str = name_str.to_owned();
-
-                    let term = prefix.clone().with_suffix(name_str);
-                    let module = ModuleSymbol {
-                        name: parser::IdentifierPath::new(name.as_str()),
-                        contents: {
-                            prefix.tail.push(owned_str);
-                            // This isn't good because this structure gets to hold the
-                            // same data repeated 400 times.
-                            let member_symbols = Self::index_module_contents(
-                                prefix,
-                                &declarator.members,
-                                modules,
-                                symbol_table,
-                            );
-                            prefix.tail.pop();
-                            member_symbols
-                        },
-                    };
-
-                    symbols.push(Symbol::Module(module.clone()));
-                    modules.insert(term);
+                ast::Declaration::Module(_, decl) => {
+                    modules.insert(prefix.clone().with_suffix(decl.name.as_str()));
                 }
 
                 ast::Declaration::Type(_, ast::TypeDeclaration { name, declarator }) => {
-                    let term = TermId::Type(prefix.clone().with_suffix(name.as_str()));
+                    let symbol_name = prefix.clone().with_suffix(name.as_str());
+                    let term = TermId::Type(symbol_name.clone());
                     let symbol = match declarator {
                         ast::TypeDeclarator::Record(_, record) => {
                             Symbol::Type(TypeSymbol::Record(RecordSymbol {
-                                name: parser::IdentifierPath::new(name.as_str()),
+                                name: symbol_name,
                                 fields: record
                                     .fields
                                     .iter()
@@ -413,7 +389,6 @@ impl SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath
 #[derive(Debug, Clone)]
 pub enum Symbol<A, GlobalName, LocalId> {
     Value(ValueSymbol<A, GlobalName, LocalId>),
-    Module(ModuleSymbol<A, GlobalName, LocalId>),
     Type(TypeSymbol<GlobalName>),
 }
 
@@ -421,7 +396,6 @@ impl<A, GlobalName, LocalId> Symbol<A, GlobalName, LocalId> {
     pub fn name(&self) -> &GlobalName {
         match self {
             Self::Value(symbol) => &symbol.name,
-            Self::Module(symbol) => &symbol.name,
             Self::Type(symbol) => symbol.name(),
         }
     }
@@ -440,10 +414,6 @@ impl<A> Symbol<A, QualifiedName, Identifier> {
                         .iter()
                         .map(|&id| TermId::Value(Identifier::Free(id.clone()))),
                 );
-            }
-
-            Self::Module(symbol) => {
-                deps.extend(symbol.contents.iter().flat_map(|x| x.dependencies()));
             }
 
             Self::Type(symbol) => {
@@ -578,7 +548,7 @@ impl DeBruijnIndex {
 impl parser::TypeExpression {
     pub fn resolve_names(
         &self,
-        _symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+        _symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
     ) -> TypeExpression {
         todo!()
     }
@@ -587,7 +557,7 @@ impl parser::TypeExpression {
 impl parser::Expr {
     pub fn resolve_names(
         &self,
-        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
     ) -> Expr {
         self.resolve(&mut DeBruijnIndex::default(), symbols)
     }
@@ -595,7 +565,7 @@ impl parser::Expr {
     fn resolve(
         &self,
         names: &mut DeBruijnIndex,
-        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
     ) -> Expr {
         match self {
             Self::Variable(a, identifier_path) => {
@@ -629,7 +599,7 @@ impl parser::SelfReference {
     fn resolve(
         &self,
         names: &mut DeBruijnIndex,
-        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
     ) -> SelfReferential {
         if let Some(own_name) = self.own_name.try_as_simple() {
             names.bind(own_name, |names, name| SelfReferential {
@@ -646,7 +616,7 @@ impl parser::Lambda {
     fn resolve(
         &self,
         names: &mut DeBruijnIndex,
-        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
     ) -> Lambda {
         if let Some(parameter) = self.parameter.try_as_simple() {
             names.bind(parameter, |names, parameter| Lambda {
@@ -663,7 +633,7 @@ impl parser::Apply {
     fn resolve(
         &self,
         names: &mut DeBruijnIndex,
-        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
     ) -> Apply {
         Apply {
             function: self.function.resolve(names, symbols).into(),
@@ -676,7 +646,7 @@ impl parser::Binding {
     fn resolve(
         &self,
         names: &mut DeBruijnIndex,
-        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
     ) -> Binding {
         if let Some(binder) = self.binder.try_as_simple() {
             let bound = Rc::new(self.bound.resolve(names, symbols));
@@ -695,7 +665,7 @@ impl parser::Record {
     fn resolve(
         &self,
         names: &mut DeBruijnIndex,
-        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
     ) -> Record {
         Record {
             fields: self
@@ -711,7 +681,7 @@ impl parser::Tuple {
     fn resolve(
         &self,
         names: &mut DeBruijnIndex,
-        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
     ) -> Tuple {
         Tuple {
             elements: self
@@ -727,7 +697,7 @@ impl parser::Projection {
     fn resolve(
         &self,
         names: &mut DeBruijnIndex,
-        symbols: &SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
     ) -> Projection {
         Projection {
             base: self.base.resolve(names, symbols).into(),
@@ -761,5 +731,18 @@ impl fmt::Display for QualifiedName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { module, member } = self;
         write!(f, "{module}::{member}")
+    }
+}
+
+impl<TypeId, ValueId> fmt::Display for TermId<TypeId, ValueId>
+where
+    TypeId: fmt::Display,
+    ValueId: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Type(id) => write!(f, "{id}"),
+            Self::Value(id) => write!(f, "{id}"),
+        }
     }
 }

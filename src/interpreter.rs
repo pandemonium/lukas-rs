@@ -8,7 +8,7 @@ use std::{
 use crate::{
     ast::{
         self, CompilationUnit, Expr, ProductElement, Tree,
-        namer::{self, Identifier, SymbolEnvironment},
+        namer::{self, CompilationContext, Identifier},
     },
     parser::ParseInfo,
     typer,
@@ -146,47 +146,29 @@ impl Environment {
         self.inner.borrow_mut().statics.insert(id.clone(), value);
     }
 
-    // 1. Build symbol table
-    // 2. Check all dependencies
-    // 3. Resolve bindings
-    // 4. Check types
-    // 5. Insert checked values into statics in Environment
+    // Ought to be Interpretation
     pub fn typecheck_and_initialize(program: CompilationUnit<ParseInfo>) -> typer::Typing<Self> {
-        let symbols = SymbolEnvironment::from(&program);
-        let mut environment = Self {
-            inner: EnvironmentInner::default().into(),
-        };
+        let compilation = CompilationContext::from(&program);
+        let mut environment = Self::default();
 
-        for namer::ValueSymbol { name, body, .. } in symbols
-            .rename_symbols()
-            .compute_types()
-            .expect("msg")
-            .value_symbols()
-        {
-            println!("typecheck_and_initialize: {name}");
-            //
-            let value = Rc::new(body.erase_annotation())
-                .reduce(&environment)
-                .expect("successful static init");
-            //
-            environment.put_static(name, value);
+        let compilation = compilation.rename_symbols();
+
+        let dependencies = compilation.dependency_matrix();
+        let order = dependencies.in_resolvable_order();
+
+        if dependencies.are_sound() {
+            for symbol in compilation
+                .check_types(order.iter())?
+                .toplevel_value_symbols(order.iter())
+            {
+                let value = Rc::new(symbol.body.erase_annotation())
+                    .reduce(&environment)
+                    .expect("successful static init");
+                environment.put_static(&symbol.name, value);
+            }
+        } else {
+            panic!("Bad dependencies")
         }
-
-        //if symbols.dependencies_satisfiable() {
-        //    for namer::ValueSymbol { name, body, .. } in
-        //        symbols.with_types_computed()?.value_symbols()
-        //    {
-        //        println!("typecheck_and_initialize: {name}");
-        //
-        //        let value = Rc::new(body.erase_annotation())
-        //            .reduce(&environment)
-        //            .expect("successful static init");
-        //
-        //        environment.put_static(name, value);
-        //    }
-        //} else {
-        //    panic!("Bad dependencies")
-        //}
 
         Ok(environment)
     }
@@ -215,15 +197,6 @@ pub enum Literal {
     Text(String),
 }
 
-impl fmt::Display for Literal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Int(x) => write!(f, "{x}"),
-            Self::Text(x) => write!(f, "{x}"),
-        }
-    }
-}
-
 impl From<ast::Literal> for Literal {
     fn from(value: ast::Literal) -> Self {
         match value {
@@ -239,19 +212,28 @@ pub struct Closure {
     body: Tree<(), namer::Identifier>,
 }
 
-impl fmt::Display for Closure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { capture, body } = self;
-        write!(f, "[ {capture} ]: {body}")
-    }
-}
-
 impl Closure {
     fn capture(capture: &Environment, body: &Tree<(), namer::Identifier>) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
             capture: capture.clone(),
             body: Rc::clone(body),
         }))
+    }
+}
+
+impl fmt::Display for Literal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Int(x) => write!(f, "{x}"),
+            Self::Text(x) => write!(f, "{x}"),
+        }
+    }
+}
+
+impl fmt::Display for Closure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { capture, body } = self;
+        write!(f, "[ {capture} ]: {body}")
     }
 }
 

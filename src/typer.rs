@@ -3,6 +3,7 @@ use std::{
     fmt,
     marker::PhantomData,
     ops::Deref,
+    slice::Iter,
     sync::atomic::{AtomicU32, Ordering},
     vec,
 };
@@ -12,8 +13,8 @@ use crate::{
         self, ProductElement, Tree,
         annotation::Annotated,
         namer::{
-            self, CoproductSymbol, DependencyMatrix, Identifier, ModuleSymbol, RecordSymbol,
-            SymbolEnvironment, TermId, ValueSymbol,
+            self, CompilationContext, CoproductSymbol, DependencyMatrix, Identifier, RecordSymbol,
+            TermId, ValueSymbol,
         },
     },
     parser::{self, ParseInfo},
@@ -30,16 +31,20 @@ pub type Record = ast::Record<TypeInfo, namer::Identifier>;
 pub type Projection = ast::Projection<TypeInfo, namer::Identifier>;
 
 type RawTermId = namer::TermId<parser::IdentifierPath, parser::IdentifierPath>;
-type RawSymbols = SymbolEnvironment<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
+type RawSymbols = CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
 type RawSymbol = namer::Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
 type NamedTermId = namer::TermId<namer::QualifiedName, namer::Identifier>;
-type NamedSymbols = SymbolEnvironment<ParseInfo, namer::QualifiedName, namer::Identifier>;
+type NamedSymbols = CompilationContext<ParseInfo, namer::QualifiedName, namer::Identifier>;
 type NamedSymbol = namer::Symbol<ParseInfo, namer::QualifiedName, namer::Identifier>;
-type TypedSymbols = namer::SymbolEnvironment<TypeInfo, namer::QualifiedName, namer::Identifier>;
+type TypedSymbol = namer::Symbol<TypeInfo, namer::QualifiedName, namer::Identifier>;
+type TypedSymbols = namer::CompilationContext<TypeInfo, namer::QualifiedName, namer::Identifier>;
 
-impl<A> SymbolEnvironment<A, namer::QualifiedName, namer::Identifier> {
-    pub fn value_symbols(&self) -> Vec<&ValueSymbol<A, namer::QualifiedName, namer::Identifier>> {
-        self.extract_symbols(|sym| {
+impl<A> CompilationContext<A, namer::QualifiedName, namer::Identifier> {
+    pub fn toplevel_value_symbols(
+        &self,
+        order: Iter<&NamedTermId>,
+    ) -> Vec<&ValueSymbol<A, namer::QualifiedName, namer::Identifier>> {
+        self.extract_symbols(order, |sym| {
             if let namer::Symbol::Value(sym) = sym {
                 Some(sym)
             } else {
@@ -48,8 +53,11 @@ impl<A> SymbolEnvironment<A, namer::QualifiedName, namer::Identifier> {
         })
     }
 
-    pub fn type_symbols(&self) -> Vec<&namer::TypeSymbol<namer::QualifiedName>> {
-        self.extract_symbols(|sym| {
+    pub fn type_symbols(
+        &self,
+        order: Iter<&NamedTermId>,
+    ) -> Vec<&namer::TypeSymbol<namer::QualifiedName>> {
+        self.extract_symbols(order, |sym| {
             if let namer::Symbol::Type(sym) = sym {
                 Some(sym)
             } else {
@@ -58,18 +66,19 @@ impl<A> SymbolEnvironment<A, namer::QualifiedName, namer::Identifier> {
         })
     }
 
-    fn extract_symbols<F, Sym>(&self, p: F) -> Vec<&Sym>
+    fn extract_symbols<F, Sym>(&self, order: Iter<&NamedTermId>, select: F) -> Vec<&Sym>
     where
         F: Fn(&namer::Symbol<A, namer::QualifiedName, namer::Identifier>) -> Option<&Sym>,
     {
-        self.initialization_order()
-            .iter()
-            .filter_map(|id| self.symbols.get(id))
-            .filter_map(p)
+        order
+            .filter_map(|&id| self.symbols.get(id))
+            .filter_map(select)
             .collect()
     }
 
-    fn initialization_order(&self) -> Vec<NamedTermId> {
+    pub fn dependency_matrix(
+        &self,
+    ) -> DependencyMatrix<TermId<namer::QualifiedName, namer::Identifier>> {
         let mut matrix = DependencyMatrix::default();
 
         // This function is incredibly inefficient.
@@ -77,71 +86,84 @@ impl<A> SymbolEnvironment<A, namer::QualifiedName, namer::Identifier> {
             matrix.add_edge(id.clone(), symbol.dependencies().into_iter().collect());
         }
 
-        matrix.initialization_order().into_iter().cloned().collect()
+        matrix
     }
 }
 
 impl NamedSymbols {
-    pub fn compute_types(self) -> Typing<TypedSymbols> {
+    pub fn check_types(self, initialization_order: Iter<&NamedTermId>) -> Typing<TypedSymbols> {
         let mut ctx = TypingContext::default();
+        let mut symbols = HashMap::with_capacity(self.symbols.len());
 
-        for symbol in self
-            .initialization_order()
-            .into_iter()
-            .map(|id| {
+        for (id, symbol) in initialization_order
+            .map(|&id| {
                 self.symbols
                     .get(&id)
+                    .map(|symbol| (id, symbol))
                     .ok_or_else(|| TypeError::UndefinedTerm(id.clone()))
             })
             .collect::<Typing<Vec<_>>>()?
         {
             let symbol = match symbol {
-                namer::Symbol::Value(symbol) => {
-                    let (_, body) = ctx.infer_type(&symbol.body)?;
-
-                    ctx.bind(
-                        // Is this really right?
-                        Term::Value(namer::Identifier::Free(symbol.name.clone())),
-                        TypeScheme::from_constant(body.type_info().inferred_type.clone()),
-                    );
-
-                    // This thing has to also be in the TypingContext
-                    namer::Symbol::Value(ValueSymbol {
-                        name: symbol.name.clone(),
-                        type_signature: symbol.type_signature.clone(),
-                        body,
-                    })
-                }
-
-                namer::Symbol::Module(_symbol) => continue,
-
-                namer::Symbol::Type(symbol) => namer::Symbol::Type(match symbol {
-                    namer::TypeSymbol::Record(symbol) => {
-                        let record = Type::Record(
-                            symbol
-                                .fields
-                                .iter()
-                                // symbol.type_signature.synthesize_type(ctx)
-                                .map(|symbol| (symbol.name.clone(), Type::fresh()))
-                                .collect(),
-                        );
-
-                        ctx.bind(
-                            Term::Type(symbol.name.clone()),
-                            TypeScheme::from_constant(record),
-                        );
-
-                        namer::TypeSymbol::Record(symbol.clone())
-                    }
-
-                    namer::TypeSymbol::Coproduct(symbol) => {
-                        namer::TypeSymbol::Coproduct(symbol.clone())
-                    }
-                }),
+                namer::Symbol::Value(symbol) => Self::compute_for_value_symbol(symbol, &mut ctx)?,
+                namer::Symbol::Type(symbol) => Self::compute_for_type_symbol(symbol, &mut ctx)?,
             };
+
+            symbols.insert(id.clone(), symbol);
         }
 
-        todo!()
+        Ok(CompilationContext {
+            modules: self.modules,
+            symbols,
+            phase: PhantomData::default(),
+        })
+    }
+
+    fn compute_for_value_symbol(
+        symbol: &ValueSymbol<ParseInfo, namer::QualifiedName, Identifier>,
+        ctx: &mut TypingContext,
+    ) -> Typing<TypedSymbol> {
+        let (_, body) = ctx.infer_type(&symbol.body)?;
+
+        ctx.bind(
+            Term::Value(namer::Identifier::Free(symbol.name.clone())),
+            TypeScheme::from_constant(body.type_info().inferred_type.clone()),
+        );
+
+        Ok(namer::Symbol::Value(ValueSymbol {
+            name: symbol.name.clone(),
+            type_signature: symbol.type_signature.clone(),
+            body,
+        }))
+    }
+
+    fn compute_for_type_symbol(
+        symbol: &namer::TypeSymbol<namer::QualifiedName>,
+        ctx: &mut TypingContext,
+    ) -> Typing<TypedSymbol> {
+        let symbol = namer::Symbol::Type(match symbol {
+            namer::TypeSymbol::Record(symbol) => {
+                let record = Type::Record(
+                    symbol
+                        .fields
+                        .iter()
+                        // symbol.type_signature.synthesize_type(ctx)
+                        .map(|symbol| (symbol.name.clone(), Type::fresh()))
+                        .collect(),
+                );
+
+                ctx.bind(
+                    Term::Type(symbol.name.clone()),
+                    TypeScheme::from_constant(record),
+                );
+
+                namer::TypeSymbol::Record(symbol.clone())
+            }
+
+            namer::TypeSymbol::Coproduct(symbol) => namer::TypeSymbol::Coproduct(symbol.clone()),
+        });
+
+        Ok(symbol)
     }
 }
 
@@ -152,7 +174,7 @@ impl RawSymbols {
     // This does not need the symbols in any particular order, so long as all
     // modules are known
     pub fn rename_symbols(self) -> NamedSymbols {
-        SymbolEnvironment {
+        CompilationContext {
             modules: self.modules.clone(),
             symbols: self
                 .symbols
@@ -179,6 +201,8 @@ impl RawSymbols {
     }
 
     fn rename_symbol(&self, symbol: &RawSymbol) -> NamedSymbol {
+        //        println!("rename_symbols: {symbol:?}");
+
         match symbol {
             namer::Symbol::Value(symbol) => namer::Symbol::Value(ValueSymbol {
                 name: self.resolve_member_path(&symbol.name),
@@ -187,15 +211,6 @@ impl RawSymbols {
                     .clone()
                     .map(|ts| ts.map(|te| te.resolve_names(self))),
                 body: symbol.body.resolve_names(self),
-            }),
-
-            namer::Symbol::Module(symbol) => namer::Symbol::Module(ModuleSymbol {
-                name: self.resolve_member_path(&symbol.name),
-                contents: symbol
-                    .contents
-                    .iter()
-                    .map(|symbol| self.rename_symbol(symbol))
-                    .collect(),
             }),
 
             namer::Symbol::Type(symbol) => namer::Symbol::Type(match symbol {
@@ -539,6 +554,8 @@ impl TermSpace {
 
 #[derive(Debug, Default)]
 pub struct TypingContext {
+    // This should not be a TermSpace like this. There is no point, at
+    // least not at this point.
     types: TermSpace,
     values: TermSpace,
 }
@@ -579,20 +596,58 @@ impl TypingContext {
     }
 
     pub fn bind(&mut self, term: Term, scheme: TypeScheme) {
-        self.bindings(&term).push(scheme);
+        match term {
+            Term::Type(id) => self.types.free.insert(id, scheme),
+            Term::Value(namer::Identifier::Bound(..)) => panic!("What is this?"),
+            Term::Value(namer::Identifier::Free(id)) => self.values.free.insert(id, scheme),
+        };
     }
 
     pub fn bind_and_then<F, A>(&mut self, term: Term, scheme: TypeScheme, block: F) -> A
     where
         F: FnOnce(&mut TypingContext) -> A,
     {
-        self.bindings(&term).push(scheme);
-        let v = block(self);
-        self.bindings(&term).pop();
-        v
+        // This is not correct.
+        //   Term can be Value(Identifier::Free)
+        match term {
+            Term::Type(id) => {
+                let previous = self.types.free.insert(id.clone(), scheme);
+                let v = block(self);
+                if let Some(previous) = previous {
+                    self.types.free.insert(id, previous);
+                } else {
+                    self.types.free.remove(&id);
+                }
+                v
+            }
+            Term::Value(namer::Identifier::Bound(ix)) => {
+                if self.values.bound.len() != ix {
+                    panic!("Bad medicine")
+                }
+                self.values.bound.push(scheme);
+                let v = block(self);
+                self.values.bound.pop();
+                v
+            }
+            Term::Value(namer::Identifier::Free(id)) => {
+                let previous = self.values.free.insert(id.clone(), scheme);
+                let v = block(self);
+                if let Some(previous) = previous {
+                    self.values.free.insert(id, previous);
+                } else {
+                    self.values.free.remove(&id);
+                }
+                v
+            }
+        }
+
+        //        self.term_space(&term).push(scheme);
+        //        let v = block(self);
+        //        self.term_space(&term).pop();
+        //        v
     }
 
-    fn bindings(&mut self, term: &Term) -> &mut Vec<TypeScheme> {
+    fn term_space(&mut self, term: &Term) -> &mut Vec<TypeScheme> {
         match *term {
             Term::Type(..) => &mut self.types.bound,
             Term::Value(..) => &mut self.values.bound,
@@ -960,5 +1015,25 @@ impl fmt::Display for BaseType {
             Self::Int => write!(f, "Int"),
             Self::Text => write!(f, "Text"),
         }
+    }
+}
+
+impl fmt::Display for TypeScheme {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.quantified.is_empty() {
+            write!(f, "forall {}", self.quantified[0])?;
+            for param in &self.quantified[1..] {
+                write!(f, ", {param}")?;
+            }
+            write!(f, ". ",)?;
+        }
+
+        write!(f, "{}", self.underlying)
+    }
+}
+
+impl fmt::Display for TypeParameter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "${}", self.0)
     }
 }

@@ -137,9 +137,6 @@ fn main() {
         ),
     ]);
 
-    //let symbols = SymbolEnvironment::from(&program);
-    //    println!("main: symbols: {symbols:?}");
-
     let env = Environment::typecheck_and_initialize(program).expect("initialized");
     println!("main: env: {env}");
 
