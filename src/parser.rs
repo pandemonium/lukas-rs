@@ -85,7 +85,7 @@ impl IdentifierPath {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &str> {
-        iter::once(self.head.as_str()).chain(self.tail.iter().map(|s| s.as_str()))
+        iter::once(&self.head).chain(&self.tail).map(|s| s.as_str())
     }
 }
 

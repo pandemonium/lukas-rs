@@ -640,18 +640,6 @@ impl TypingContext {
                 v
             }
         }
-
-        //        self.term_space(&term).push(scheme);
-        //        let v = block(self);
-        //        self.term_space(&term).pop();
-        //        v
-    }
-
-    fn term_space(&mut self, term: &Term) -> &mut Vec<TypeScheme> {
-        match *term {
-            Term::Type(..) => &mut self.types.bound,
-            Term::Value(..) => &mut self.values.bound,
-        }
     }
 
     pub fn infer_type(&mut self, expr: &UntypedExpr) -> Typing {
