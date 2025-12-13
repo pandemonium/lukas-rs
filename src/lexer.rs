@@ -4,6 +4,7 @@ use std::fmt;
 pub struct LexicalAnalyzer {
     location: SourceLocation,
     indentation_level: u32,
+    indentation: Vec<u32>,
     output: Vec<Token>,
 }
 
@@ -76,7 +77,7 @@ impl LexicalAnalyzer {
     }
 
     fn compute_location(&mut self, remains: &[char], pos: usize) {
-        let new_location = self.compute_new_location(&remains[..=pos + 1]);
+        let new_location = self.compute_next_location(&remains[..=pos + 1]);
         self.update_location(new_location);
     }
 
@@ -158,7 +159,10 @@ impl LexicalAnalyzer {
     }
 
     fn emit<'a>(&mut self, length: u32, token_type: TokenType, remains: &'a [char]) -> &'a [char] {
-        self.output.push(Token(token_type, self.location));
+        self.output.push(Token {
+            kind: token_type,
+            position: self.location,
+        });
         self.location.move_right(length);
         remains
     }
@@ -166,19 +170,15 @@ impl LexicalAnalyzer {
     // This ought to merge itself with comments
     fn scan_whitespace<'a>(&mut self, input: &'a [char]) -> &'a [char] {
         let (whitespace_prefix, remains) =
-            if let Some(end) = input.iter().position(|c| !c.is_whitespace()) {
-                input.split_at(end)
-            } else {
-                (input, &input[..0])
-            };
+            input.split_at(input.iter().take_while(|c| c.is_whitespace()).count());
 
-        let next_location = self.compute_new_location(whitespace_prefix);
+        let next_location = self.compute_next_location(whitespace_prefix);
         self.update_location(next_location);
 
         remains
     }
 
-    fn compute_new_location(&self, whitespace: &[char]) -> SourceLocation {
+    fn compute_next_location(&self, whitespace: &[char]) -> SourceLocation {
         let mut next_location = self.location;
 
         for c in whitespace {
@@ -194,8 +194,12 @@ impl LexicalAnalyzer {
     fn update_location(&mut self, next: SourceLocation) {
         if next.is_below(&self.location) {
             if next.is_left_of(self.indentation_level) {
+                while let Some(i) = self.indentation.pop_if(|i| next.is_left_of(*i)) {
+                    self.emit_layout(next.at_column(i), Layout::Dedent);
+                }
                 self.emit_layout(next, Layout::Dedent);
             } else if next.is_right_of(self.indentation_level) {
+                self.indentation.push(self.indentation_level);
                 self.emit_layout(next, Layout::Indent);
             } else {
                 self.emit_layout(next, Layout::Newline);
@@ -210,20 +214,22 @@ impl LexicalAnalyzer {
     fn emit_layout(&mut self, location: SourceLocation, indentation: Layout) {
         if let Some(last) = self.output.last_mut() {
             if last.token_type() == &TokenType::Layout(Layout::Newline) {
-                *last = Token(TokenType::Layout(indentation), location);
+                *last = Token {
+                    kind: TokenType::Layout(indentation),
+                    position: location,
+                };
             } else {
-                self.output
-                    .push(Token(TokenType::Layout(indentation), location));
+                self.output.push(Token {
+                    kind: TokenType::Layout(indentation),
+                    position: location,
+                });
             }
         }
     }
 
     fn scan_number<'a>(&mut self, prefix: &'a [char]) -> &'a [char] {
-        let (prefix, remains) = if let Some(end) = prefix.iter().position(|c| !c.is_ascii_digit()) {
-            prefix.split_at(end)
-        } else {
-            (prefix, &prefix[..0])
-        };
+        let (prefix, remains) =
+            prefix.split_at(prefix.iter().take_while(|c| c.is_ascii_digit()).count());
 
         // This has to be able to fail the tokenization here
         let num = prefix.iter().collect::<String>().parse().unwrap();
@@ -260,6 +266,7 @@ impl Default for LexicalAnalyzer {
         Self {
             location,
             indentation_level: location.column,
+            indentation: Vec::default(),
             output: Vec::default(), // This could actually be something a lot bigger.
         }
     }
@@ -278,6 +285,13 @@ impl SourceLocation {
 
     const fn move_right(&mut self, delta: u32) {
         self.column += delta;
+    }
+
+    const fn at_column(self, column: u32) -> Self {
+        Self {
+            row: self.row,
+            column,
+        }
     }
 
     const fn new_line(&mut self) {
@@ -479,16 +493,6 @@ pub enum Layout {
     Newline,
 }
 
-impl fmt::Display for Layout {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Indent => write!(f, "<Indent>"),
-            Self::Dedent => write!(f, "<Dedent>"),
-            Self::Newline => write!(f, "<Newline>"),
-        }
-    }
-}
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Keyword {
     Let,
@@ -547,19 +551,44 @@ pub enum Literal {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Token(pub TokenType, pub SourceLocation);
+pub struct Token {
+    pub kind: TokenType,
+    pub position: SourceLocation,
+}
 
 impl Token {
     pub const fn token_type(&self) -> &TokenType {
-        &self.0
+        &self.kind
+    }
+
+    pub const fn is_indent(&self) -> bool {
+        matches!(self.token_type(), TokenType::Layout(Layout::Indent))
+    }
+
+    pub const fn is_newline(&self) -> bool {
+        matches!(self.token_type(), TokenType::Layout(Layout::Newline))
+    }
+
+    pub const fn is_dedent(&self) -> bool {
+        matches!(self.token_type(), TokenType::Layout(Layout::Dedent))
     }
 
     pub const fn location(&self) -> &SourceLocation {
-        &self.1
+        &self.position
     }
 
     pub const fn is_layout(&self) -> bool {
-        matches!(self, Self(TokenType::Layout(..), ..))
+        matches!(self.kind, TokenType::Layout(..))
+    }
+}
+
+impl fmt::Display for Layout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Indent => write!(f, "<Indent>"),
+            Self::Dedent => write!(f, "<Dedent>"),
+            Self::Newline => write!(f, "<Newline>"),
+        }
     }
 }
 
@@ -684,6 +713,22 @@ impl fmt::Display for Keyword {
             Self::Deconstruct => write!(f, "Deconstruct"),
             Self::Into => write!(f, "Into"),
             Self::Where => write!(f, "Where"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::lexer::LexicalAnalyzer;
+
+    #[test]
+    fn lexington() {
+        let mut lexer = LexicalAnalyzer::default();
+        let input = include_str!("3.txt");
+
+        let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
+        for crate::lexer::Token { kind, position } in tokens {
+            println!("[{position}] {kind:?}");
         }
     }
 }

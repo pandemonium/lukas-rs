@@ -154,12 +154,12 @@ impl Environment {
         let compilation = compilation.rename_symbols();
 
         let dependencies = compilation.dependency_matrix();
-        let order = dependencies.in_resolvable_order();
+        let initialization_order = dependencies.in_resolvable_order();
 
         if dependencies.are_sound() {
             for symbol in compilation
-                .check_types(order.iter())?
-                .toplevel_value_symbols(order.iter())
+                .check_types(initialization_order.iter())?
+                .static_value_symbols(initialization_order.iter())
             {
                 let value = Rc::new(symbol.body.erase_annotation())
                     .reduce(&environment)
@@ -193,7 +193,7 @@ pub enum Value {
 
 #[derive(Debug, Clone)]
 pub enum Literal {
-    Int(i32),
+    Int(i64),
     Text(String),
 }
 

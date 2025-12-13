@@ -183,7 +183,7 @@ where
         F: Fn(&A) -> B,
     {
         Projection {
-            base: self.base.map_annotation(f).into(),
+            base: self.base.map_annotation(f),
             select: self.select.clone(),
         }
     }

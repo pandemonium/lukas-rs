@@ -8,7 +8,7 @@ use crate::{
 pub mod annotation;
 pub mod namer;
 
-pub const ROOT_MODULE_NAME: &'static str = "__root__";
+pub const ROOT_MODULE_NAME: &str = "__root__";
 
 pub struct CompilationUnit<A> {
     pub root: ModuleDeclaration<A>,
@@ -83,7 +83,7 @@ impl<A, TypeId1> TypeSignature<A, TypeId1> {
         TypeSignature {
             universal_quantifiers: self.universal_quantifiers,
             body: f(self.body),
-            phase: PhantomData::default(),
+            phase: PhantomData,
         }
     }
 }
@@ -159,7 +159,7 @@ pub struct Tuple<A, Id> {
 
 #[derive(Debug, Clone)]
 pub enum Literal {
-    Int(i32),
+    Int(i64),
     Text(String),
 }
 

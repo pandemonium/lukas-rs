@@ -32,35 +32,29 @@ impl<A> ast::Expr<A, Identifier> {
     fn gather_free_variables<'a>(&'a self, free: &mut HashSet<&'a QualifiedName>) {
         match self {
             Self::Variable(_, Identifier::Free(id)) => {
-                let _ = free.insert(id);
+                free.insert(id);
             }
-            Self::RecursiveLambda(_, rec) => {
-                rec.lambda.body.gather_free_variables(free);
-            }
-            Self::Lambda(_, lambda) => {
-                let _ = lambda.body.gather_free_variables(free);
-            }
+            Self::RecursiveLambda(_, rec) => rec.lambda.body.gather_free_variables(free),
+            Self::Lambda(_, lambda) => lambda.body.gather_free_variables(free),
             Self::Apply(_, apply) => {
-                let _ = apply.function.gather_free_variables(free);
-                let _ = apply.argument.gather_free_variables(free);
+                apply.function.gather_free_variables(free);
+                apply.argument.gather_free_variables(free)
             }
             Self::Let(_, binding) => {
-                let _ = binding.bound.gather_free_variables(free);
-                let _ = binding.body.gather_free_variables(free);
+                binding.bound.gather_free_variables(free);
+                binding.body.gather_free_variables(free)
             }
             Self::Tuple(_, tuple) => {
                 for elt in &tuple.elements {
-                    elt.gather_free_variables(free);
+                    elt.gather_free_variables(free)
                 }
             }
             Self::Record(_, record) => {
                 for (_, init) in &record.fields {
-                    let _ = init.gather_free_variables(free);
+                    init.gather_free_variables(free)
                 }
             }
-            Self::Project(_, projection) => {
-                let _ = projection.base.gather_free_variables(free);
-            }
+            Self::Project(_, projection) => projection.base.gather_free_variables(free),
             _otherwise => (),
         }
     }
@@ -208,12 +202,12 @@ where
             resolved.push(independent);
 
             for (node, edges) in &mut graph {
-                if edges.remove(independent) {
-                    if let Some(count) = in_degrees.get_mut(node) {
-                        *count -= 1;
-                        if *count == 0 {
-                            queue.push_back(node);
-                        }
+                if edges.remove(independent)
+                    && let Some(count) = in_degrees.get_mut(node)
+                {
+                    *count -= 1;
+                    if *count == 0 {
+                        queue.push_back(node);
                     }
                 }
             }
@@ -265,7 +259,7 @@ impl<A, TypeId, ValueId> Default for CompilationContext<A, TypeId, ValueId> {
         Self {
             modules: HashSet::default(),
             symbols: HashMap::default(),
-            phase: PhantomData::default(),
+            phase: PhantomData,
         }
     }
 }
@@ -305,7 +299,7 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
     pub fn from(program: &CompilationUnit<ParseInfo>) -> Self {
         let mut symbols = HashMap::default();
         let mut modules = HashSet::default();
-        let phase = PhantomData::default();
+        let phase = PhantomData;
 
         modules.insert(parser::IdentifierPath::new(ast::ROOT_MODULE_NAME));
 

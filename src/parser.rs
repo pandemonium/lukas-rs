@@ -1,6 +1,9 @@
-use std::{fmt, iter};
+use std::{fmt, iter, result};
 
-use crate::ast;
+use crate::{
+    ast,
+    lexer::{Keyword, Layout, Literal, SourceLocation, Token, TokenType},
+};
 
 pub type Expr = ast::Expr<ParseInfo, IdentifierPath>;
 pub type SelfReference = ast::SelfReferential<ParseInfo, IdentifierPath>;
@@ -21,12 +24,6 @@ impl Expr {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParseInfo {
     pub location: SourceLocation,
-}
-
-#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
-pub struct SourceLocation {
-    pub row: usize,
-    pub col: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Hash, Eq)]
@@ -103,6 +100,125 @@ impl Identifier {
     }
 }
 
+#[derive(Debug)]
+enum Fault {
+    UnexpectedEof,
+    Expected(TokenType),
+    ExpectedIdentifier,
+}
+
+type Result<A> = result::Result<A, Fault>;
+
+#[derive(Debug, Default)]
+struct Parser<'a> {
+    remains: &'a [Token],
+}
+
+impl<'a> Parser<'a> {
+    fn peek(&self) -> Result<&Token> {
+        if !self.remains.is_empty() {
+            Ok(&self.remains[0])
+        } else {
+            Err(Fault::UnexpectedEof)
+        }
+    }
+
+    fn expect(&mut self, expected: TokenType) -> Result<()> {
+        match self.remains {
+            [token, remains @ ..] if token.kind == expected => Ok(self.remains = remains),
+            _ => Err(Fault::Expected(expected)),
+        }
+    }
+
+    fn identifier(&mut self) -> Result<(SourceLocation, String)> {
+        if let Token {
+            kind: TokenType::Identifier(id),
+            position,
+        } = self.peek()?
+        {
+            let retval = (*position, id.to_owned());
+            self.consume()?;
+            Ok(retval)
+        } else {
+            Err(Fault::ExpectedIdentifier)
+        }
+    }
+
+    fn consume(&mut self) -> Result<&Token> {
+        if let Some(the) = self.remains.first() {
+            self.remains = &self.remains[1..];
+            Ok(the)
+        } else {
+            Err(Fault::UnexpectedEof)
+        }
+    }
+
+    fn parse_block<Parse, A>(&mut self, body: Parse, terminals: &[TokenType]) -> Result<A>
+    where
+        Parse: FnOnce(&mut Parser<'a>, &[TokenType]) -> Result<A>,
+    {
+        if self.peek()?.is_indent() {
+            self.consume()?;
+            let body = body(self, terminals)?;
+            self.expect(TokenType::Layout(Layout::Dedent))?;
+            Ok(body)
+        } else {
+            body(self, terminals)
+        }
+    }
+
+    fn parse_let(&mut self) -> Result<Expr> {
+        self.expect(TokenType::Keyword(Keyword::Let))?;
+        let (pos, binder) = self.identifier()?;
+        self.expect(TokenType::Equals)?;
+        let bound = self.parse_block(
+            |parser, terminals| parser.parse_expr(terminals),
+            &[TokenType::Keyword(Keyword::In)],
+        )?;
+        self.expect(TokenType::Keyword(Keyword::In))?;
+        let body = self.parse_block(|parser, terminals| parser.parse_expr(terminals), &[])?;
+        Ok(Expr::Let(
+            ParseInfo { location: pos },
+            Binding {
+                binder: IdentifierPath::new(&binder),
+                bound: bound.into(),
+                body: body.into(),
+            },
+        ))
+    }
+
+    fn parse_expr(&mut self, _terminals: &[TokenType]) -> Result<Expr> {
+        match &self.remains {
+            [
+                Token {
+                    kind: TokenType::Literal(literal),
+                    position,
+                },
+                remains @ ..,
+            ] => {
+                self.remains = remains;
+                Ok(Expr::Constant(
+                    ParseInfo {
+                        location: *position,
+                    },
+                    literal.clone().into(),
+                ))
+            }
+            otherwise => panic!("{otherwise:?}"),
+        }
+    }
+}
+
+impl From<Literal> for ast::Literal {
+    fn from(value: Literal) -> Self {
+        match value {
+            Literal::Integer(x) => ast::Literal::Int(x),
+            Literal::Text(x) => ast::Literal::Text(x),
+            Literal::Bool(..) => todo!(),
+        }
+    }
+}
+
 impl fmt::Display for Identifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self(id) = self;
@@ -118,5 +234,24 @@ impl fmt::Display for IdentifierPath {
             write!(f, ".{part}")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        lexer::{Keyword, LexicalAnalyzer, TokenType},
+        parser::{Expr, ParseInfo, Parser},
+    };
+
+    #[test]
+    fn parsington() {
+        let mut lexer = LexicalAnalyzer::default();
+        let input = include_str!("3.txt");
+
+        let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
+
+        let mut p = Parser { remains: tokens };
+        let x = p.parse_let().unwrap();
     }
 }

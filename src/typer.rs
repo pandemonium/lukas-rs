@@ -31,16 +31,19 @@ pub type Record = ast::Record<TypeInfo, namer::Identifier>;
 pub type Projection = ast::Projection<TypeInfo, namer::Identifier>;
 
 type RawTermId = namer::TermId<parser::IdentifierPath, parser::IdentifierPath>;
-type RawSymbols = CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
+type RawCompilationContext =
+    CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
 type RawSymbol = namer::Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
 type NamedTermId = namer::TermId<namer::QualifiedName, namer::Identifier>;
-type NamedSymbols = CompilationContext<ParseInfo, namer::QualifiedName, namer::Identifier>;
+type NamedCompilationContext =
+    CompilationContext<ParseInfo, namer::QualifiedName, namer::Identifier>;
 type NamedSymbol = namer::Symbol<ParseInfo, namer::QualifiedName, namer::Identifier>;
 type TypedSymbol = namer::Symbol<TypeInfo, namer::QualifiedName, namer::Identifier>;
-type TypedSymbols = namer::CompilationContext<TypeInfo, namer::QualifiedName, namer::Identifier>;
+type TypedCompilationContext =
+    namer::CompilationContext<TypeInfo, namer::QualifiedName, namer::Identifier>;
 
 impl<A> CompilationContext<A, namer::QualifiedName, namer::Identifier> {
-    pub fn toplevel_value_symbols(
+    pub fn static_value_symbols(
         &self,
         order: Iter<&NamedTermId>,
     ) -> Vec<&ValueSymbol<A, namer::QualifiedName, namer::Identifier>> {
@@ -90,15 +93,18 @@ impl<A> CompilationContext<A, namer::QualifiedName, namer::Identifier> {
     }
 }
 
-impl NamedSymbols {
-    pub fn check_types(self, initialization_order: Iter<&NamedTermId>) -> Typing<TypedSymbols> {
+impl NamedCompilationContext {
+    pub fn check_types(
+        self,
+        initialization_order: Iter<&NamedTermId>,
+    ) -> Typing<TypedCompilationContext> {
         let mut ctx = TypingContext::default();
         let mut symbols = HashMap::with_capacity(self.symbols.len());
 
         for (id, symbol) in initialization_order
             .map(|&id| {
                 self.symbols
-                    .get(&id)
+                    .get(id)
                     .map(|symbol| (id, symbol))
                     .ok_or_else(|| TypeError::UndefinedTerm(id.clone()))
             })
@@ -115,7 +121,7 @@ impl NamedSymbols {
         Ok(CompilationContext {
             modules: self.modules,
             symbols,
-            phase: PhantomData::default(),
+            phase: PhantomData,
         })
     }
 
@@ -169,11 +175,11 @@ impl NamedSymbols {
 
 // Why not namer::ModuleMemberPath and namer::Identifier here?
 // This calls the namer. Is this necessary?
-impl RawSymbols {
+impl RawCompilationContext {
     // Move to namer.rs
     // This does not need the symbols in any particular order, so long as all
     // modules are known
-    pub fn rename_symbols(self) -> NamedSymbols {
+    pub fn rename_symbols(self) -> NamedCompilationContext {
         CompilationContext {
             modules: self.modules.clone(),
             symbols: self
@@ -181,7 +187,7 @@ impl RawSymbols {
                 .iter()
                 .map(|(id, symbol)| (self.rename_term_id(id), self.rename_symbol(symbol)))
                 .collect(),
-            phase: PhantomData::default(),
+            phase: PhantomData,
         }
     }
 
@@ -195,7 +201,7 @@ impl RawSymbols {
     }
 
     fn resolve_member_path(&self, id: &parser::IdentifierPath) -> namer::QualifiedName {
-        self.resolve_module_path_expr(&id)
+        self.resolve_module_path_expr(id)
             .expect("a valid type identifier path")
             .into_member_path()
     }
@@ -547,7 +553,7 @@ impl TermSpace {
     pub fn lookup(&self, term: &namer::Identifier) -> Option<&TypeScheme> {
         match term {
             namer::Identifier::Bound(index) => Some(&self.bound[*index]),
-            namer::Identifier::Free(member) => self.free.get(&member),
+            namer::Identifier::Free(member) => self.free.get(member),
         }
     }
 }

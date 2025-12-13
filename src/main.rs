@@ -17,7 +17,7 @@ fn var(name: &str) -> Tree {
     Expr::Variable(ParseInfo::default(), IdentifierPath::new(name)).into()
 }
 
-fn const_int(n: i32) -> Tree {
+fn const_int(n: i64) -> Tree {
     Expr::Constant(ParseInfo::default(), Literal::Int(n)).into()
 }
 
