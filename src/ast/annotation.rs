@@ -35,6 +35,7 @@ where
                 Expr::Record(a, node) => Expr::Record(f(a), node.map_annotation(&f)),
                 Expr::Tuple(a, node) => Expr::Tuple(f(a), node.map_annotation(&f)),
                 Expr::Project(a, node) => Expr::Project(f(a), node.map_annotation(&f)),
+                Expr::Sequence(a, node) => Expr::Sequence(f(a), node.map_annotation(&f)),
             }
         }
 
@@ -185,6 +186,23 @@ where
         Projection {
             base: self.base.map_annotation(f),
             select: self.select.clone(),
+        }
+    }
+}
+
+impl<A, B, Id> Annotated<A, B, Id> for Sequence<A, Id>
+where
+    Id: Clone,
+{
+    type Output = Sequence<B, Id>;
+
+    fn map_annotation<F>(&self, f: F) -> Self::Output
+    where
+        F: Fn(&A) -> B,
+    {
+        Sequence {
+            this: self.this.map_annotation(&f),
+            and_then: self.and_then.map_annotation(&f),
         }
     }
 }

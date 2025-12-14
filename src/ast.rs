@@ -122,6 +122,7 @@ pub enum Expr<A, Id> {
     Tuple(A, Tuple<A, Id>),
     Record(A, Record<A, Id>),
     Project(A, Projection<A, Id>),
+    Sequence(A, Sequence<A, Id>),
 }
 
 impl<A, Id> Expr<A, Id> {
@@ -135,7 +136,8 @@ impl<A, Id> Expr<A, Id> {
             | Expr::Let(a, ..)
             | Expr::Record(a, ..)
             | Expr::Tuple(a, ..)
-            | Expr::Project(a, ..) => a,
+            | Expr::Project(a, ..)
+            | Expr::Sequence(a, ..) => a,
         }
     }
 
@@ -212,6 +214,12 @@ pub enum ProductElement {
     Name(parser::Identifier),
 }
 
+#[derive(Debug, Clone)]
+pub struct Sequence<A, Id> {
+    pub this: Tree<A, Id>,
+    pub and_then: Tree<A, Id>,
+}
+
 impl<A, Id> fmt::Display for Expr<A, Id>
 where
     Id: fmt::Display,
@@ -227,6 +235,7 @@ where
             Self::Record(_, x) => write!(f, "{x}"),
             Self::Tuple(_, x) => write!(f, "{x}"),
             Self::Project(_, x) => write!(f, "{}.{}", x.base, x.select),
+            Self::Sequence(_, x) => write!(f, "{}; {}", x.this, x.and_then),
         }
     }
 }

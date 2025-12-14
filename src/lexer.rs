@@ -19,43 +19,43 @@ impl LexicalAnalyzer {
                 [c, ..] if c.is_whitespace() => self.scan_whitespace(input),
                 ['(', '*', ..] => self.scan_block_comment(input),
                 [c, remains @ ..] if is_special_symbol(*c) => {
-                    self.emit(1, TokenType::decode_reserved_words(c.to_string()), remains)
+                    self.emit(1, TokenKind::decode_reserved_words(c.to_string()), remains)
                 }
                 prefix @ [c, ..] if is_identifier_prefix(*c) => self.scan_identifier(prefix),
                 prefix @ [c, ..] if is_number_prefix(*c) => self.scan_number(prefix),
                 ['"', remains @ ..] => self.scan_text_literal(remains),
 
-                [':', ':', '=', remains @ ..] => self.emit(3, TokenType::TypeAssign, remains),
-                [':', ':', remains @ ..] => self.emit(2, TokenType::TypeAscribe, remains),
-                ['-', '>', remains @ ..] => self.emit(2, TokenType::Arrow, remains),
+                [':', ':', '=', remains @ ..] => self.emit(3, TokenKind::TypeAssign, remains),
+                [':', ':', remains @ ..] => self.emit(2, TokenKind::TypeAscribe, remains),
+                ['-', '>', remains @ ..] => self.emit(2, TokenKind::Arrow, remains),
 
-                ['>', '=', remains @ ..] => self.emit(2, TokenType::Gte, remains),
-                ['<', '=', remains @ ..] => self.emit(2, TokenType::Lte, remains),
-                ['>', remains @ ..] => self.emit(1, TokenType::Gt, remains),
-                ['<', remains @ ..] => self.emit(1, TokenType::Lt, remains),
+                ['>', '=', remains @ ..] => self.emit(2, TokenKind::Gte, remains),
+                ['<', '=', remains @ ..] => self.emit(2, TokenKind::Lte, remains),
+                ['>', remains @ ..] => self.emit(1, TokenKind::Gt, remains),
+                ['<', remains @ ..] => self.emit(1, TokenKind::Lt, remains),
 
-                ['=', remains @ ..] => self.emit(1, TokenType::Equals, remains),
-                [',', remains @ ..] => self.emit(1, TokenType::Comma, remains),
-                ['(', remains @ ..] => self.emit(1, TokenType::LeftParen, remains),
-                [')', remains @ ..] => self.emit(1, TokenType::RightParen, remains),
-                ['{', remains @ ..] => self.emit(1, TokenType::LeftBrace, remains),
-                ['}', remains @ ..] => self.emit(1, TokenType::RightBrace, remains),
-                ['_', remains @ ..] => self.emit(1, TokenType::Underscore, remains),
-                ['|', remains @ ..] => self.emit(1, TokenType::Pipe, remains),
-                [';', remains @ ..] => self.emit(1, TokenType::Semicolon, remains),
-                [':', remains @ ..] => self.emit(1, TokenType::Colon, remains),
-                ['.', remains @ ..] => self.emit(1, TokenType::Period, remains),
+                ['=', remains @ ..] => self.emit(1, TokenKind::Equals, remains),
+                [',', remains @ ..] => self.emit(1, TokenKind::Comma, remains),
+                ['(', remains @ ..] => self.emit(1, TokenKind::LeftParen, remains),
+                [')', remains @ ..] => self.emit(1, TokenKind::RightParen, remains),
+                ['{', remains @ ..] => self.emit(1, TokenKind::LeftBrace, remains),
+                ['}', remains @ ..] => self.emit(1, TokenKind::RightBrace, remains),
+                ['_', remains @ ..] => self.emit(1, TokenKind::Underscore, remains),
+                ['|', remains @ ..] => self.emit(1, TokenKind::Pipe, remains),
+                [';', remains @ ..] => self.emit(1, TokenKind::Semicolon, remains),
+                [':', remains @ ..] => self.emit(1, TokenKind::Colon, remains),
+                ['.', remains @ ..] => self.emit(1, TokenKind::Period, remains),
 
-                ['+', remains @ ..] => self.emit(1, TokenType::Plus, remains),
-                ['-', remains @ ..] => self.emit(1, TokenType::Minus, remains),
-                ['*', remains @ ..] => self.emit(1, TokenType::Star, remains),
-                ['/', remains @ ..] => self.emit(1, TokenType::Slash, remains),
-                ['%', remains @ ..] => self.emit(1, TokenType::Percent, remains),
+                ['+', remains @ ..] => self.emit(1, TokenKind::Plus, remains),
+                ['-', remains @ ..] => self.emit(1, TokenKind::Minus, remains),
+                ['*', remains @ ..] => self.emit(1, TokenKind::Star, remains),
+                ['/', remains @ ..] => self.emit(1, TokenKind::Slash, remains),
+                ['%', remains @ ..] => self.emit(1, TokenKind::Percent, remains),
 
                 [c, ..] => panic!("{c}"),
 
                 [] => {
-                    self.emit(0, TokenType::End, &[]);
+                    self.emit(0, TokenKind::End, &[]);
                     break &self.output;
                 }
             };
@@ -94,7 +94,7 @@ impl LexicalAnalyzer {
         let identifier = prefix.iter().collect::<String>();
         self.emit(
             identifier.len() as u32,
-            TokenType::decode_reserved_words(identifier),
+            TokenKind::decode_reserved_words(identifier),
             remains,
         )
     }
@@ -115,14 +115,14 @@ impl LexicalAnalyzer {
         if matches!(remains, ['"', ..]) {
             self.emit(
                 length,
-                TokenType::Literal(Literal::Text(image)),
+                TokenKind::Literal(Literal::Text(image)),
                 &remains[1..],
             )
         } else {
             loop {
                 remains = self.emit(
                     length,
-                    TokenType::Interpolate(Interpolation::Interlude(Literal::Text(image))),
+                    TokenKind::Interpolate(Interpolation::Interlude(Literal::Text(image))),
                     &remains[1..],
                 );
 
@@ -148,7 +148,7 @@ impl LexicalAnalyzer {
                 if matches!(remains1, ['"', ..]) {
                     break self.emit(
                         image.len() as u32,
-                        TokenType::Interpolate(Interpolation::Epilogue(Literal::Text(image))),
+                        TokenKind::Interpolate(Interpolation::Epilogue(Literal::Text(image))),
                         &remains1[1..],
                     );
                 }
@@ -158,7 +158,7 @@ impl LexicalAnalyzer {
         }
     }
 
-    fn emit<'a>(&mut self, length: u32, token_type: TokenType, remains: &'a [char]) -> &'a [char] {
+    fn emit<'a>(&mut self, length: u32, token_type: TokenKind, remains: &'a [char]) -> &'a [char] {
         self.output.push(Token {
             kind: token_type,
             position: self.location,
@@ -213,14 +213,14 @@ impl LexicalAnalyzer {
     // Which location is the location of an Indent or Dedent?
     fn emit_layout(&mut self, location: SourceLocation, indentation: Layout) {
         if let Some(last) = self.output.last_mut() {
-            if last.token_type() == &TokenType::Layout(Layout::Newline) {
+            if last.kind == TokenKind::Layout(Layout::Newline) {
                 *last = Token {
-                    kind: TokenType::Layout(indentation),
+                    kind: TokenKind::Layout(indentation),
                     position: location,
                 };
             } else {
                 self.output.push(Token {
-                    kind: TokenType::Layout(indentation),
+                    kind: TokenKind::Layout(indentation),
                     position: location,
                 });
             }
@@ -236,7 +236,7 @@ impl LexicalAnalyzer {
 
         self.emit(
             prefix.len() as u32,
-            TokenType::Literal(Literal::Integer(num)),
+            TokenKind::Literal(Literal::Integer(num)),
             remains,
         );
 
@@ -325,7 +325,7 @@ impl Default for SourceLocation {
 // Flatten this?
 // What does this hierarchy buy me?
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TokenType {
+pub enum TokenKind {
     Equals,      // =
     TypeAssign,  // ::=
     TypeAscribe, // ::
@@ -363,7 +363,7 @@ pub enum TokenType {
     End,
 }
 
-impl TokenType {
+impl TokenKind {
     fn decode_reserved_words(id: String) -> Self {
         Keyword::try_from_identifier(&id).map_or_else(
             || {
@@ -410,28 +410,28 @@ pub enum Operator {
 }
 
 impl Operator {
-    pub const fn is_defined(token: &TokenType) -> bool {
+    pub const fn is_defined(token: &TokenKind) -> bool {
         Self::try_from(token).is_some()
     }
 
-    pub const fn try_from(token: &TokenType) -> Option<Self> {
+    pub const fn try_from(token: &TokenKind) -> Option<Self> {
         match token {
-            TokenType::Equals => Some(Self::Equals),
-            TokenType::Plus => Some(Self::Plus),
-            TokenType::Minus => Some(Self::Minus),
-            TokenType::Star => Some(Self::Times),
-            TokenType::Slash => Some(Self::Division),
-            TokenType::Percent => Some(Self::Modulo),
-            TokenType::Gte => Some(Self::Gte),
-            TokenType::Lte => Some(Self::Lte),
-            TokenType::Gt => Some(Self::Gt),
-            TokenType::Lt => Some(Self::Lt),
-            TokenType::Comma => Some(Self::Tuple),
-            TokenType::Period => Some(Self::Select),
-            TokenType::Keyword(Keyword::And) => Some(Self::And),
-            TokenType::Keyword(Keyword::Or) => Some(Self::Or),
-            TokenType::Keyword(Keyword::Xor) => Some(Self::Xor),
-            TokenType::Keyword(Keyword::Not) => Some(Self::Not),
+            TokenKind::Equals => Some(Self::Equals),
+            TokenKind::Plus => Some(Self::Plus),
+            TokenKind::Minus => Some(Self::Minus),
+            TokenKind::Star => Some(Self::Times),
+            TokenKind::Slash => Some(Self::Division),
+            TokenKind::Percent => Some(Self::Modulo),
+            TokenKind::Gte => Some(Self::Gte),
+            TokenKind::Lte => Some(Self::Lte),
+            TokenKind::Gt => Some(Self::Gt),
+            TokenKind::Lt => Some(Self::Lt),
+            TokenKind::Comma => Some(Self::Tuple),
+            TokenKind::Period => Some(Self::Select),
+            TokenKind::Keyword(Keyword::And) => Some(Self::And),
+            TokenKind::Keyword(Keyword::Or) => Some(Self::Or),
+            TokenKind::Keyword(Keyword::Xor) => Some(Self::Xor),
+            TokenKind::Keyword(Keyword::Not) => Some(Self::Not),
             _otherwise => None,
         }
     }
@@ -552,25 +552,32 @@ pub enum Literal {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Token {
-    pub kind: TokenType,
+    pub kind: TokenKind,
     pub position: SourceLocation,
 }
 
 impl Token {
-    pub const fn token_type(&self) -> &TokenType {
-        &self.kind
-    }
-
     pub const fn is_indent(&self) -> bool {
-        matches!(self.token_type(), TokenType::Layout(Layout::Indent))
+        matches!(self.kind, TokenKind::Layout(Layout::Indent))
     }
 
     pub const fn is_newline(&self) -> bool {
-        matches!(self.token_type(), TokenType::Layout(Layout::Newline))
+        matches!(self.kind, TokenKind::Layout(Layout::Newline))
+    }
+
+    pub const fn is_sequence_separator(&self) -> bool {
+        matches!(
+            self.kind,
+            TokenKind::Layout(Layout::Newline) | TokenKind::Semicolon
+        )
     }
 
     pub const fn is_dedent(&self) -> bool {
-        matches!(self.token_type(), TokenType::Layout(Layout::Dedent))
+        matches!(self.kind, TokenKind::Layout(Layout::Dedent))
+    }
+
+    pub fn is_keyword(&self, keyword: Keyword) -> bool {
+        self.kind == TokenKind::Keyword(keyword)
     }
 
     pub const fn location(&self) -> &SourceLocation {
@@ -578,7 +585,11 @@ impl Token {
     }
 
     pub const fn is_layout(&self) -> bool {
-        matches!(self.kind, TokenType::Layout(..))
+        matches!(self.kind, TokenKind::Layout(..))
+    }
+
+    pub const fn is_literal(&self) -> bool {
+        matches!(self.kind, TokenKind::Literal(..))
     }
 }
 
@@ -594,11 +605,11 @@ impl fmt::Display for Layout {
 
 impl fmt::Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}] {}", self.location(), self.token_type())
+        write!(f, "[{}] {}", self.position, self.kind)
     }
 }
 
-impl fmt::Display for TokenType {
+impl fmt::Display for TokenKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Equals => write!(f, "="),

@@ -701,6 +701,8 @@ impl TypingContext {
             UntypedExpr::Project(parse_info, projection) => {
                 self.infer_projection(parse_info, projection)
             }
+
+            UntypedExpr::Sequence(_parse_info, sequence) => self.infer_sequence(sequence),
         }
     }
 
@@ -965,6 +967,12 @@ impl TypingContext {
                 ),
             ))
         })
+    }
+
+    fn infer_sequence(&mut self, sequence: &namer::Sequence) -> Typing {
+        // Is it this simple?
+        self.infer_type(&sequence.this)?;
+        self.infer_type(&sequence.and_then)
     }
 
     fn free_variables(&self) -> HashSet<TypeParameter> {

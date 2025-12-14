@@ -2,7 +2,7 @@ use std::{fmt, iter, result};
 
 use crate::{
     ast,
-    lexer::{Keyword, Layout, Literal, SourceLocation, Token, TokenType},
+    lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
 };
 
 pub type Expr = ast::Expr<ParseInfo, IdentifierPath>;
@@ -13,6 +13,7 @@ pub type Binding = ast::Binding<ParseInfo, IdentifierPath>;
 pub type Record = ast::Record<ParseInfo, IdentifierPath>;
 pub type Tuple = ast::Tuple<ParseInfo, IdentifierPath>;
 pub type Projection = ast::Projection<ParseInfo, IdentifierPath>;
+pub type Sequence = ast::Sequence<ParseInfo, IdentifierPath>;
 pub type TypeExpression = ast::TypeExpression<ParseInfo, IdentifierPath>;
 
 impl Expr {
@@ -103,7 +104,10 @@ impl Identifier {
 #[derive(Debug)]
 enum Fault {
     UnexpectedEof,
-    Expected(TokenType),
+    Expected {
+        expected: TokenKind,
+        found: TokenKind,
+    },
     ExpectedIdentifier,
 }
 
@@ -123,16 +127,20 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn expect(&mut self, expected: TokenType) -> Result<()> {
+    fn expect(&mut self, expected: TokenKind) -> Result<()> {
         match self.remains {
             [token, remains @ ..] if token.kind == expected => Ok(self.remains = remains),
-            _ => Err(Fault::Expected(expected)),
+            [token, ..] => Err(Fault::Expected {
+                expected,
+                found: token.kind.clone(),
+            }),
+            _ => panic!(),
         }
     }
 
     fn identifier(&mut self) -> Result<(SourceLocation, String)> {
         if let Token {
-            kind: TokenType::Identifier(id),
+            kind: TokenKind::Identifier(id),
             position,
         } = self.peek()?
         {
@@ -153,32 +161,35 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_block<Parse, A>(&mut self, body: Parse, terminals: &[TokenType]) -> Result<A>
+    fn parse_block<F, A>(&mut self, parse_body: F) -> Result<A>
     where
-        Parse: FnOnce(&mut Parser<'a>, &[TokenType]) -> Result<A>,
+        F: FnOnce(&mut Parser<'a>) -> Result<A>,
     {
         if self.peek()?.is_indent() {
             self.consume()?;
-            let body = body(self, terminals)?;
-            self.expect(TokenType::Layout(Layout::Dedent))?;
+            let body = parse_body(self)?;
+            self.expect(TokenKind::Layout(Layout::Dedent))?;
             Ok(body)
         } else {
-            body(self, terminals)
+            parse_body(self)
         }
     }
 
     fn parse_let(&mut self) -> Result<Expr> {
-        self.expect(TokenType::Keyword(Keyword::Let))?;
-        let (pos, binder) = self.identifier()?;
-        self.expect(TokenType::Equals)?;
-        let bound = self.parse_block(
-            |parser, terminals| parser.parse_expr(terminals),
-            &[TokenType::Keyword(Keyword::In)],
-        )?;
-        self.expect(TokenType::Keyword(Keyword::In))?;
-        let body = self.parse_block(|parser, terminals| parser.parse_expr(terminals), &[])?;
+        self.expect(TokenKind::Keyword(Keyword::Let))?;
+        let (location, binder) = self.identifier()?;
+        self.expect(TokenKind::Equals)?;
+        let bound = self.parse_block(|parser| parser.parse_expression(0))?;
+        if self.peek()?.is_newline() {
+            self.consume()?;
+        }
+        self.expect(TokenKind::Keyword(Keyword::In))?;
+        if self.peek()?.is_newline() {
+            self.consume()?;
+        }
+        let body = self.parse_block(|parser| parser.parse_expression(0))?;
         Ok(Expr::Let(
-            ParseInfo { location: pos },
+            ParseInfo { location },
             Binding {
                 binder: IdentifierPath::new(&binder),
                 bound: bound.into(),
@@ -187,25 +198,120 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn parse_expr(&mut self, _terminals: &[TokenType]) -> Result<Expr> {
-        match &self.remains {
+    fn parse_expression(&mut self, precedence: usize) -> Result<Expr> {
+        let prefix = self.parse_expr_prefix()?;
+        self.parse_expr_infix(prefix, precedence)
+    }
+
+    fn parse_expr_prefix(&mut self) -> Result<Expr> {
+        match self.remains {
             [
                 Token {
-                    kind: TokenType::Literal(literal),
+                    kind: TokenKind::Literal(lit),
                     position,
                 },
                 remains @ ..,
             ] => {
                 self.remains = remains;
-                Ok(Expr::Constant(
-                    ParseInfo {
-                        location: *position,
-                    },
-                    literal.clone().into(),
-                ))
+                self.parse_literal(lit, position)
+            }
+            [
+                Token {
+                    kind: TokenKind::Identifier(id),
+                    position,
+                },
+                remains @ ..,
+            ] => {
+                self.remains = remains;
+                self.parse_identifier(id, position)
+            }
+            [t, ..] if t.is_keyword(Keyword::Let) => self.parse_let(),
+            otherwise => panic!("{otherwise:?}"),
+        }
+    }
+
+    fn parse_expr_infix(&mut self, lhs: Expr, context_precedence: usize) -> Result<Expr> {
+        let terminals = [
+            TokenKind::Layout(Layout::Dedent),
+            TokenKind::Keyword(Keyword::In),
+            TokenKind::End,
+        ];
+        let is_terminal = |t| terminals.contains(t);
+        let is_expr_prefix = |t: &TokenKind| {
+            !matches!(
+                t,
+                TokenKind::Layout(Layout::Dedent)
+                    | TokenKind::End
+                    | TokenKind::Keyword(
+                        Keyword::And
+                            | Keyword::Or
+                            | Keyword::Xor
+                            | Keyword::Else
+                            | Keyword::Into
+                            | Keyword::In
+                    )
+                    | TokenKind::Interpolate(Interpolation::Epilogue(..))
+            )
+        };
+
+        match self.remains {
+            [t, ..] if is_terminal(&t.kind) => Ok(lhs),
+            [t, u, ..] if t.is_layout() && is_terminal(&u.kind) => Ok(lhs),
+            [t, u, ..] if t.is_sequence_separator() && is_expr_prefix(&u.kind) => {
+                self.parse_sequence(lhs)
+            }
+            [t, ..]
+                if is_expr_prefix(&t.kind)
+                    && Operator::Juxtaposition.precedence() > context_precedence =>
+            {
+                self.parse_juxtaposed(lhs, context_precedence)
             }
             otherwise => panic!("{otherwise:?}"),
         }
+    }
+
+    fn parse_juxtaposed(&mut self, lhs: Expr, context_precedence: usize) -> Result<Expr> {
+        let rhs = self.parse_expr_prefix()?;
+        self.parse_expr_infix(
+            Expr::Apply(
+                *lhs.parse_info(),
+                ast::Apply {
+                    function: lhs.into(),
+                    argument: rhs.into(),
+                },
+            ),
+            context_precedence,
+        )
+    }
+
+    fn parse_literal(&mut self, literal: &Literal, position: &SourceLocation) -> Result<Expr> {
+        Ok(Expr::Constant(
+            ParseInfo {
+                location: *position,
+            },
+            literal.clone().into(),
+        ))
+    }
+
+    fn parse_identifier(&mut self, id: &str, position: &SourceLocation) -> Result<Expr> {
+        Ok(Expr::Variable(
+            ParseInfo {
+                location: *position,
+            },
+            IdentifierPath::new(id),
+        ))
+    }
+
+    fn parse_sequence(&mut self, this: Expr) -> Result<Expr> {
+        self.consume()?; //the separator
+        let and_then = self.parse_expression(0)?;
+        Ok(Expr::Sequence(
+            *and_then.parse_info(),
+            Sequence {
+                this: this.into(),
+                and_then: and_then.into(),
+            },
+        ))
     }
 }
 
@@ -239,10 +345,7 @@ impl fmt::Display for IdentifierPath {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        lexer::{Keyword, LexicalAnalyzer, TokenType},
-        parser::{Expr, ParseInfo, Parser},
-    };
+    use crate::{lexer::LexicalAnalyzer, parser::Parser};
 
     #[test]
     fn parsington() {
@@ -252,6 +355,7 @@ mod tests {
         let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
 
         let mut p = Parser { remains: tokens };
-        let x = p.parse_let().unwrap();
+        let x = p.parse_expression(0).unwrap();
+        panic!("{x}")
     }
 }

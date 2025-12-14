@@ -20,6 +20,7 @@ pub type Binding = ast::Binding<ParseInfo, Identifier>;
 pub type Record = ast::Record<ParseInfo, Identifier>;
 pub type Tuple = ast::Tuple<ParseInfo, Identifier>;
 pub type Projection = ast::Projection<ParseInfo, Identifier>;
+pub type Sequence = ast::Sequence<ParseInfo, Identifier>;
 pub type TypeExpression = ast::TypeExpression<ParseInfo, QualifiedName>;
 
 impl<A> ast::Expr<A, Identifier> {
@@ -585,6 +586,7 @@ impl parser::Expr {
             Self::Record(a, node) => Expr::Record(*a, node.resolve(names, symbols)),
             Self::Tuple(a, node) => Expr::Tuple(*a, node.resolve(names, symbols)),
             Self::Project(a, node) => Expr::Project(*a, node.resolve(names, symbols)),
+            Self::Sequence(a, node) => Expr::Sequence(*a, node.resolve(names, symbols)),
         }
     }
 }
@@ -696,6 +698,19 @@ impl parser::Projection {
         Projection {
             base: self.base.resolve(names, symbols).into(),
             select: self.select.clone(),
+        }
+    }
+}
+
+impl parser::Sequence {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+    ) -> Sequence {
+        Sequence {
+            this: self.this.resolve(names, symbols).into(),
+            and_then: self.and_then.resolve(names, symbols).into(),
         }
     }
 }

@@ -44,8 +44,8 @@ impl Expr<(), namer::Identifier> {
                 }
             }
 
-            Self::Let(_, binding) => {
-                env.bind_and_then(binding.bound.reduce(env)?, |env| binding.body.reduce(env))
+            Self::Let(_, the) => {
+                env.bind_and_then(the.bound.reduce(env)?, |env| the.body.reduce(env))
             }
 
             Self::Record(_, the) => Ok(Value::Product(
@@ -68,6 +68,10 @@ impl Expr<(), namer::Identifier> {
                 }
                 (base, select) => panic!("projection off of {base:?} with {select:?}"),
             },
+
+            Self::Sequence(_, the) => {
+                env.bind_and_then(the.this.reduce(env)?, |env| the.and_then.reduce(env))
+            }
         }
     }
 }
