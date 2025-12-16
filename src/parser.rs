@@ -20,11 +20,21 @@ impl Expr {
     pub fn parse_info(&self) -> &ParseInfo {
         self.annotation()
     }
+
+    pub fn position(&self) -> &SourceLocation {
+        &self.parse_info().location
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParseInfo {
     pub location: SourceLocation,
+}
+
+impl ParseInfo {
+    pub fn from_position(location: SourceLocation) -> Self {
+        Self { location }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Hash, Eq)]
@@ -107,6 +117,7 @@ enum Fault {
     Expected {
         expected: TokenKind,
         found: TokenKind,
+        position: SourceLocation,
     },
     ExpectedIdentifier,
 }
@@ -127,12 +138,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn expect(&mut self, expected: TokenKind) -> Result<()> {
+    fn expect(&mut self, expected: TokenKind) -> Result<&Token> {
         match self.remains {
-            [token, remains @ ..] if token.kind == expected => Ok(self.remains = remains),
+            [token, remains @ ..] if token.kind == expected => {
+                self.remains = remains;
+                Ok(token)
+            }
             [token, ..] => Err(Fault::Expected {
                 expected,
                 found: token.kind.clone(),
+                position: token.position,
             }),
             _ => panic!(),
         }
@@ -161,6 +176,20 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn consume_if<P>(&mut self, mut p: P) -> Result<&Token>
+    where
+        P: FnMut(&Token) -> bool,
+    {
+        if let Some(the) = self.remains.first()
+            && p(the)
+        {
+            self.remains = &self.remains[1..];
+            Ok(the)
+        } else {
+            Err(Fault::UnexpectedEof)
+        }
+    }
+
     fn parse_block<F, A>(&mut self, parse_body: F) -> Result<A>
     where
         F: FnOnce(&mut Parser<'a>) -> Result<A>,
@@ -176,10 +205,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_let(&mut self) -> Result<Expr> {
-        self.expect(TokenKind::Keyword(Keyword::Let))?;
-        let (location, binder) = self.identifier()?;
+        let location = *self.expect(TokenKind::Keyword(Keyword::Let))?.location();
+        let (.., binder) = self.identifier()?;
         self.expect(TokenKind::Equals)?;
-        let bound = self.parse_block(|parser| parser.parse_expression(0))?;
+        let bound = self.parse_block(|parser| parser.parse_sequence())?;
         if self.peek()?.is_newline() {
             self.consume()?;
         }
@@ -187,13 +216,65 @@ impl<'a> Parser<'a> {
         if self.peek()?.is_newline() {
             self.consume()?;
         }
-        let body = self.parse_block(|parser| parser.parse_expression(0))?;
+        let body = self.parse_block(|parser| parser.parse_sequence())?;
         Ok(Expr::Let(
             ParseInfo { location },
             Binding {
                 binder: IdentifierPath::new(&binder),
                 bound: bound.into(),
                 body: body.into(),
+            },
+        ))
+    }
+
+    // This probably needs to be a parse_seq_prefix/infix pair too
+    // because this style super bort the grand parent
+    fn parse_sequence(&mut self) -> Result<Expr> {
+        let prefix = self.parse_expression(0)?;
+
+        match self.remains {
+            [t, u, ..] if t.is_sequence_separator() && Self::is_expr_prefix(&u.kind) => {
+                self.consume()?;
+                self.parse_subsequent(prefix)
+            }
+
+            // If the previous expression ends in a Dedent "back to" sequence level
+            [t, u, ..]
+                if t.is_dedent()
+                    && Self::is_expr_prefix(&u.kind)
+                    && u.location().is_same_block(&prefix.parse_info().location) =>
+            {
+                //
+                self.consume()?;
+                self.parse_subsequent(prefix)
+            }
+
+            [t, u, ..] => {
+                //                if self.peek()?.is_dedent() {
+                //                    self.consume()?;
+                //                }
+                println!("------");
+                println!(
+                    "parse_sequence: prefix{} t{} u{}",
+                    prefix.parse_info().location,
+                    t.location(),
+                    u.location()
+                );
+                Ok(prefix)
+            }
+
+            _ => Ok(prefix),
+        }
+    }
+
+    fn parse_subsequent(&mut self, this: Expr) -> Result<Expr> {
+        let and_then = self.parse_sequence()?;
+
+        Ok(Expr::Sequence(
+            *and_then.parse_info(),
+            Sequence {
+                this: this.into(),
+                and_then: and_then.into(),
             },
         ))
     }
@@ -215,6 +296,7 @@ impl<'a> Parser<'a> {
                 self.remains = remains;
                 self.parse_literal(lit, position)
             }
+
             [
                 Token {
                     kind: TokenKind::Identifier(id),
@@ -225,11 +307,31 @@ impl<'a> Parser<'a> {
                 self.remains = remains;
                 self.parse_identifier(id, position)
             }
+
             [t, ..] if t.is_keyword(Keyword::Let) => self.parse_let(),
+
             otherwise => panic!("{otherwise:?}"),
         }
     }
 
+    fn is_expr_prefix(kind: &TokenKind) -> bool {
+        !matches!(
+            kind,
+            TokenKind::Layout(Layout::Dedent)
+                | TokenKind::End
+                | TokenKind::Keyword(
+                    Keyword::And
+                        | Keyword::Or
+                        | Keyword::Xor
+                        | Keyword::Else
+                        | Keyword::Into
+                        | Keyword::In
+                )
+                | TokenKind::Interpolate(Interpolation::Epilogue(..))
+        )
+    }
+
+    // All infices must be right of lhs.
     fn parse_expr_infix(&mut self, lhs: Expr, context_precedence: usize) -> Result<Expr> {
         let terminals = [
             TokenKind::Layout(Layout::Dedent),
@@ -237,35 +339,36 @@ impl<'a> Parser<'a> {
             TokenKind::End,
         ];
         let is_terminal = |t| terminals.contains(t);
-        let is_expr_prefix = |t: &TokenKind| {
-            !matches!(
-                t,
-                TokenKind::Layout(Layout::Dedent)
-                    | TokenKind::End
-                    | TokenKind::Keyword(
-                        Keyword::And
-                            | Keyword::Or
-                            | Keyword::Xor
-                            | Keyword::Else
-                            | Keyword::Into
-                            | Keyword::In
-                    )
-                    | TokenKind::Interpolate(Interpolation::Epilogue(..))
-            )
-        };
 
         match self.remains {
             [t, ..] if is_terminal(&t.kind) => Ok(lhs),
+
             [t, u, ..] if t.is_layout() && is_terminal(&u.kind) => Ok(lhs),
-            [t, u, ..] if t.is_sequence_separator() && is_expr_prefix(&u.kind) => {
-                self.parse_sequence(lhs)
+
+            // f
+            //   x <- this
+            // or:
+            // f
+            //   x
+            //   y <- this
+            [t, u, ..]
+                if (t.is_indent() || t.is_newline())
+                    && Self::is_expr_prefix(&u.kind)
+                    && Operator::Juxtaposition.precedence() > context_precedence
+                    && (u.location().is_descendant_of(&lhs.position())) =>
+            {
+                self.consume()?; //the indent
+                self.parse_juxtaposed(lhs, context_precedence)
             }
-            [t, ..]
-                if is_expr_prefix(&t.kind)
+
+            // f x
+            [t, u, ..]
+                if Self::is_expr_prefix(&t.kind)
                     && Operator::Juxtaposition.precedence() > context_precedence =>
             {
                 self.parse_juxtaposed(lhs, context_precedence)
             }
+
             otherwise => panic!("{otherwise:?}"),
         }
     }
@@ -295,22 +398,8 @@ impl<'a> Parser<'a> {
 
     fn parse_identifier(&mut self, id: &str, position: &SourceLocation) -> Result<Expr> {
         Ok(Expr::Variable(
-            ParseInfo {
-                location: *position,
-            },
+            ParseInfo::from_position(*position),
             IdentifierPath::new(id),
-        ))
-    }
-
-    fn parse_sequence(&mut self, this: Expr) -> Result<Expr> {
-        self.consume()?; //the separator
-        let and_then = self.parse_expression(0)?;
-        Ok(Expr::Sequence(
-            *and_then.parse_info(),
-            Sequence {
-                this: this.into(),
-                and_then: and_then.into(),
-            },
         ))
     }
 }
@@ -354,8 +443,12 @@ mod tests {
 
         let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
 
+        for t in tokens {
+            println!("{t}")
+        }
+
         let mut p = Parser { remains: tokens };
-        let x = p.parse_expression(0).unwrap();
-        panic!("{x}")
+        let x = p.parse_sequence().unwrap();
+        println!("{x}")
     }
 }

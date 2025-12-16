@@ -194,20 +194,29 @@ impl LexicalAnalyzer {
     fn update_location(&mut self, next: SourceLocation) {
         if next.is_below(&self.location) {
             if next.is_left_of(self.indentation_level) {
-                while let Some(i) = self.indentation.pop_if(|i| next.is_left_of(*i)) {
-                    self.emit_layout(next.at_column(i), Layout::Dedent);
-                }
-                self.emit_layout(next, Layout::Dedent);
+                self.dedent_and_emit(next);
             } else if next.is_right_of(self.indentation_level) {
-                self.indentation.push(self.indentation_level);
-                self.emit_layout(next, Layout::Indent);
+                self.indent_and_emit(next);
             } else {
                 self.emit_layout(next, Layout::Newline);
             }
-            self.indentation_level = next.column;
         }
 
         self.location = next;
+    }
+
+    fn dedent_and_emit(&mut self, next: SourceLocation) {
+        if next.is_left_of(self.indentation_level) {
+            self.indentation_level = self.indentation.pop().unwrap();
+            self.emit_layout(next.at_column(self.indentation_level), Layout::Dedent);
+            self.dedent_and_emit(next);
+        }
+    }
+
+    fn indent_and_emit(&mut self, next: SourceLocation) {
+        self.indentation.push(self.indentation_level);
+        self.indentation_level = next.column;
+        self.emit_layout(next, Layout::Indent);
     }
 
     // Which location is the location of an Indent or Dedent?
@@ -312,7 +321,11 @@ impl SourceLocation {
     }
 
     pub const fn is_same_block(&self, rhs: &Self) -> bool {
-        (self.column == rhs.column && self.is_below(rhs)) || self.row == rhs.row
+        self.column == rhs.column
+    }
+
+    pub const fn is_descendant_of(&self, rhs: &Self) -> bool {
+        self.column >= rhs.column && self.row >= rhs.row
     }
 }
 
