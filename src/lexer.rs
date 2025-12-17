@@ -327,7 +327,7 @@ impl SourceLocation {
     }
 
     pub const fn is_descendant_of(&self, rhs: &Self) -> bool {
-        self.column >= rhs.column && self.row >= rhs.row
+        self.column > rhs.column && self.row >= rhs.row
     }
 }
 

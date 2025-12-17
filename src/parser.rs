@@ -282,8 +282,6 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    // This probably needs to be a parse_seq_prefix/infix pair too
-    // because this style super bort the grand parent
     fn parse_sequence(&mut self) -> Result<Expr> {
         self.trace();
 
@@ -399,6 +397,7 @@ impl<'a> Parser<'a> {
     // All infices must be right of lhs.
     fn parse_expr_infix(&mut self, lhs: Expr, context_precedence: usize) -> Result<Expr> {
         let terminals = [
+            TokenKind::Semicolon,
             TokenKind::Layout(Layout::Dedent),
             TokenKind::Keyword(Keyword::Let),
             TokenKind::Keyword(Keyword::In),
@@ -413,6 +412,13 @@ impl<'a> Parser<'a> {
 
             [t, u, ..] if t.is_layout() && is_terminal(&u.kind) => Ok(lhs),
 
+            [t, ..] if Operator::is_defined(&t.kind) => {
+                let operator = Operator::try_from(&t.kind).expect("msg");
+                // the operator
+                self.consume()?;
+                self.parse_operator(lhs, operator, *t.location(), context_precedence)
+            }
+
             // f
             //   x <- this
             // or:
@@ -423,9 +429,12 @@ impl<'a> Parser<'a> {
                 if (t.is_indent() || t.is_newline())
                     && Self::is_expr_prefix(&u.kind)
                     && Operator::Juxtaposition.precedence() > context_precedence
-                    && (u.location().is_descendant_of(&lhs.position())) =>
+                    && u.location().is_descendant_of(&lhs.position()) =>
             {
-                println!("Calling parse_juxtaposed(1)");
+                println!(
+                    "Calling parse_juxtaposed(1); lhs pos {}",
+                    lhs.parse_info().location
+                );
                 self.consume()?; //the indent
                 self.parse_juxtaposed(lhs, context_precedence)
             }
@@ -474,6 +483,58 @@ impl<'a> Parser<'a> {
             IdentifierPath::new(id),
         ))
     }
+
+    fn parse_operator(
+        &mut self,
+        lhs: Expr,
+        operator: Operator,
+        operator_position: SourceLocation,
+        context_precedence: usize,
+    ) -> Result<Expr> {
+        self.trace();
+
+        let operator_precedence = operator.precedence();
+        if operator_precedence > context_precedence {
+            println!("parse_operator(1)");
+            let operator_precedence = if operator.is_right_associative() {
+                operator_precedence - 1
+            } else {
+                operator_precedence
+            };
+            let apply_lhs = Expr::Apply(
+                ParseInfo {
+                    location: *lhs.position(),
+                },
+                Apply {
+                    function: Expr::Variable(
+                        ParseInfo {
+                            location: operator_position,
+                        },
+                        IdentifierPath::new(operator.name()),
+                    )
+                    .into(),
+                    argument: lhs.into(),
+                },
+            );
+            let rhs = self.parse_expression(operator_precedence)?;
+            let rhs = Expr::Apply(
+                ParseInfo {
+                    location: *rhs.position(),
+                },
+                Apply {
+                    function: apply_lhs.into(),
+                    argument: rhs.into(),
+                },
+            );
+            self.parse_expr_infix(rhs, context_precedence)
+        } else {
+            // this needs to unconsume what was consumed.
+            // Since it is not, there is no operator to trigger parse_operator
+            // which triggers parse_juxtaposed instead.
+            println!("parse_operator(2)");
+            Ok(lhs)
+        }
+    }
 }
 
 impl From<Literal> for ast::Literal {
@@ -511,7 +572,7 @@ mod tests {
     #[test]
     fn parsington() {
         let mut lexer = LexicalAnalyzer::default();
-        let input = include_str!("3.txt");
+        let input = include_str!("4.txt");
 
         let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
 
