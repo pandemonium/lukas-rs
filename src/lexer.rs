@@ -195,6 +195,8 @@ impl LexicalAnalyzer {
         if next.is_below(&self.location) {
             if next.is_left_of(self.indentation_level) {
                 self.dedent_and_emit(next);
+                // Yes?
+                //                self.emit_layout(next, Layout::Newline);
             } else if next.is_right_of(self.indentation_level) {
                 self.indent_and_emit(next);
             } else {
@@ -663,7 +665,7 @@ impl fmt::Display for TokenKind {
 impl fmt::Display for SourceLocation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { row, column } = self;
-        write!(f, "({row},{column})")
+        write!(f, "{row}, {column}")
     }
 }
 

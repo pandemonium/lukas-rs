@@ -1,5 +1,7 @@
 use std::{fmt, iter, result};
 
+use backtrace::{Backtrace, BacktraceSymbol};
+
 use crate::{
     ast,
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
@@ -124,12 +126,57 @@ enum Fault {
 
 type Result<A> = result::Result<A, Fault>;
 
+#[derive(Debug)]
+struct TraceLogEntry<'a> {
+    step: String,
+    remains: &'a [Token],
+}
+
+impl<'a> fmt::Display for TraceLogEntry<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { step, remains } = self;
+        write!(
+            f,
+            "{step:<20}: {}",
+            remains
+                .iter()
+                .map(|t| t.to_string())
+                .take(10)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
 #[derive(Debug, Default)]
 struct Parser<'a> {
     remains: &'a [Token],
 }
 
 impl<'a> Parser<'a> {
+    fn trace(&mut self) {
+        let backtrace = Backtrace::new();
+        let calling_symbol = backtrace.frames().iter().find_map(|frame| {
+            frame
+                .symbols()
+                .iter()
+                .find_map(|sym| sym.name().filter(|n| !n.to_string().contains("trace")))
+        });
+
+        if let Some(caller) = calling_symbol {
+            let caller_name = caller.to_string();
+            let caller = caller_name.split("::").collect::<Vec<_>>();
+            let caller = caller.get(caller.len() - 2);
+            let e = TraceLogEntry {
+                step: caller.unwrap_or(&caller_name.as_str()).to_string(),
+                remains: self.remains,
+            };
+            println!("{e}");
+        } else {
+            println!("Unknown caller.")
+        }
+    }
+
     fn peek(&self) -> Result<&Token> {
         if !self.remains.is_empty() {
             Ok(&self.remains[0])
@@ -194,9 +241,14 @@ impl<'a> Parser<'a> {
     where
         F: FnOnce(&mut Parser<'a>) -> Result<A>,
     {
+        self.trace();
+
         if self.peek()?.is_indent() {
             self.consume()?;
             let body = parse_body(self)?;
+            // This does not interact well with sequences because parse_sequence
+            // does not see a sequence separator anymore after this
+            println!("parse_block: delete dedent");
             self.expect(TokenKind::Layout(Layout::Dedent))?;
             Ok(body)
         } else {
@@ -205,6 +257,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_let(&mut self) -> Result<Expr> {
+        self.trace();
+
         let location = *self.expect(TokenKind::Keyword(Keyword::Let))?.location();
         let (.., binder) = self.identifier()?;
         self.expect(TokenKind::Equals)?;
@@ -217,6 +271,7 @@ impl<'a> Parser<'a> {
             self.consume()?;
         }
         let body = self.parse_block(|parser| parser.parse_sequence())?;
+        println!("parse_let: body `{body}`");
         Ok(Expr::Let(
             ParseInfo { location },
             Binding {
@@ -230,7 +285,14 @@ impl<'a> Parser<'a> {
     // This probably needs to be a parse_seq_prefix/infix pair too
     // because this style super bort the grand parent
     fn parse_sequence(&mut self) -> Result<Expr> {
+        self.trace();
+
         let prefix = self.parse_expression(0)?;
+
+        println!(
+            "parse_sequence: prefix `{prefix}` at {}",
+            prefix.parse_info().location
+        );
 
         match self.remains {
             [t, u, ..] if t.is_sequence_separator() && Self::is_expr_prefix(&u.kind) => {
@@ -244,30 +306,28 @@ impl<'a> Parser<'a> {
                     && Self::is_expr_prefix(&u.kind)
                     && u.location().is_same_block(&prefix.parse_info().location) =>
             {
-                //
                 self.consume()?;
                 self.parse_subsequent(prefix)
             }
 
-            [t, u, ..] => {
-                //                if self.peek()?.is_dedent() {
-                //                    self.consume()?;
-                //                }
-                println!("------");
-                println!(
-                    "parse_sequence: prefix{} t{} u{}",
-                    prefix.parse_info().location,
-                    t.location(),
-                    u.location()
-                );
-                Ok(prefix)
+            [t, u, ..]
+                if Self::is_expr_prefix(&t.kind)
+                    && t.location().is_same_block(&prefix.parse_info().location)
+                    && u.kind != TokenKind::End =>
+            {
+                self.parse_subsequent(prefix)
             }
 
-            _ => Ok(prefix),
+            _ => {
+                println!("parse_sequence: sequence concluded with prefix `{prefix}`");
+                Ok(prefix)
+            }
         }
     }
 
     fn parse_subsequent(&mut self, this: Expr) -> Result<Expr> {
+        self.trace();
+
         let and_then = self.parse_sequence()?;
 
         Ok(Expr::Sequence(
@@ -280,11 +340,15 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expression(&mut self, precedence: usize) -> Result<Expr> {
+        self.trace();
+
         let prefix = self.parse_expr_prefix()?;
         self.parse_expr_infix(prefix, precedence)
     }
 
     fn parse_expr_prefix(&mut self) -> Result<Expr> {
+        self.trace();
+
         match self.remains {
             [
                 Token {
@@ -318,6 +382,7 @@ impl<'a> Parser<'a> {
         !matches!(
             kind,
             TokenKind::Layout(Layout::Dedent)
+                | TokenKind::Layout(Layout::Newline)
                 | TokenKind::End
                 | TokenKind::Keyword(
                     Keyword::And
@@ -335,10 +400,13 @@ impl<'a> Parser<'a> {
     fn parse_expr_infix(&mut self, lhs: Expr, context_precedence: usize) -> Result<Expr> {
         let terminals = [
             TokenKind::Layout(Layout::Dedent),
+            TokenKind::Keyword(Keyword::Let),
             TokenKind::Keyword(Keyword::In),
             TokenKind::End,
         ];
         let is_terminal = |t| terminals.contains(t);
+
+        self.trace();
 
         match self.remains {
             [t, ..] if is_terminal(&t.kind) => Ok(lhs),
@@ -357,6 +425,7 @@ impl<'a> Parser<'a> {
                     && Operator::Juxtaposition.precedence() > context_precedence
                     && (u.location().is_descendant_of(&lhs.position())) =>
             {
+                println!("Calling parse_juxtaposed(1)");
                 self.consume()?; //the indent
                 self.parse_juxtaposed(lhs, context_precedence)
             }
@@ -366,14 +435,17 @@ impl<'a> Parser<'a> {
                 if Self::is_expr_prefix(&t.kind)
                     && Operator::Juxtaposition.precedence() > context_precedence =>
             {
+                println!("Calling parse_juxtaposed(2)");
                 self.parse_juxtaposed(lhs, context_precedence)
             }
 
-            otherwise => panic!("{otherwise:?}"),
+            _ => Ok(lhs),
         }
     }
 
     fn parse_juxtaposed(&mut self, lhs: Expr, context_precedence: usize) -> Result<Expr> {
+        self.trace();
+
         let rhs = self.parse_expr_prefix()?;
         self.parse_expr_infix(
             Expr::Apply(
