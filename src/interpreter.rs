@@ -106,11 +106,12 @@ struct EnvironmentInner {
 
 impl Environment {
     pub fn call(&self, symbol: &namer::QualifiedName, argument: ast::Literal) -> Value {
-        if let Some(Value::Closure(closure)) = self.get_static(symbol) {
+        let symbol = self.get_static(symbol);
+        if let Some(Value::Closure(closure)) = symbol {
             apply_closure(closure, Value::Constant(argument.into())).unwrap()
         } else {
             // It did not find __root__/start
-            todo!()
+            panic!("{symbol:?}")
         }
     }
 

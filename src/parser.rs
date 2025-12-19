@@ -114,7 +114,7 @@ impl Identifier {
 }
 
 #[derive(Debug)]
-enum Fault {
+pub enum Fault {
     UnexpectedOverflow,
     UnexpectedUnderflow,
     Expected {
@@ -151,7 +151,7 @@ impl<'a> fmt::Display for TraceLogEntry<'a> {
 }
 
 #[derive(Debug, Default)]
-struct Parser<'a> {
+pub struct Parser<'a> {
     remains: &'a [Token],
     offset: usize,
 }
@@ -261,11 +261,15 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_compilation_unit(&mut self) -> Result<CompilationUnit<ParseInfo>> {
+    pub fn parse_compilation_unit(&mut self) -> Result<CompilationUnit<ParseInfo>> {
+        self.trace();
+
         let mut decls = vec![self.parse_declaration()?];
 
-        while self.peek()?.is_newline() {
-            self.consume()?;
+        while self.has_declaration_prefix() {
+            if self.peek()?.is_newline() {
+                self.consume()?;
+            }
 
             if !self.peek()?.is_end() {
                 let decl = self.parse_declaration()?;
@@ -278,7 +282,32 @@ impl<'a> Parser<'a> {
         Ok(CompilationUnit::from_declarations(decls))
     }
 
+    fn has_declaration_prefix(&self) -> bool {
+        matches!(
+            self.remains(),
+            [
+                Token {
+                    kind: TokenKind::Identifier(..),
+                    ..
+                },
+                Token {
+                    kind: TokenKind::Assign | TokenKind::TypeAssign,
+                    ..
+                },
+                ..
+            ] | [
+                Token {
+                    kind: TokenKind::Layout(Layout::Newline),
+                    ..
+                },
+                ..
+            ]
+        )
+    }
+
     fn parse_declaration(&mut self) -> Result<Declaration<ParseInfo>> {
+        self.trace();
+
         match self.remains() {
             [
                 Token {
@@ -306,6 +335,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_value_declarator(&mut self) -> Result<ValueDeclarator<ParseInfo>> {
+        self.trace();
+
         Ok(ValueDeclarator {
             type_signature: None,
             body: self.parse_block(|parser| parser.parse_expression(0))?,

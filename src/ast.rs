@@ -307,3 +307,125 @@ impl fmt::Display for Literal {
         }
     }
 }
+
+impl<A> fmt::Display for CompilationUnit<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.root)
+    }
+}
+
+impl<A> fmt::Display for Declaration<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Value(_, decl) => write!(f, "value {decl}"),
+            Self::Module(_, decl) => write!(f, "module {decl}"),
+            Self::Type(_, decl) => write!(f, "type {decl}"),
+        }
+    }
+}
+
+impl<A> fmt::Display for ValueDeclaration<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { name, declarator } = self;
+        write!(f, "{name} is {declarator}")
+    }
+}
+
+impl<A> fmt::Display for ValueDeclarator<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            type_signature,
+            body,
+        } = self;
+        write!(f, "{body}")?;
+        if let Some(ts) = type_signature {
+            write!(f, ":: {ts}")?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<A> fmt::Display for ModuleDeclaration<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { name, declarator } = self;
+        write!(f, "module {name}:")?;
+        write!(f, "{declarator}")
+    }
+}
+
+impl<A> fmt::Display for ModuleDeclarator<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for m in &self.members {
+            writeln!(f, "{m}")?;
+        }
+        Ok(())
+    }
+}
+
+impl<A> fmt::Display for TypeDeclaration<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { name, declarator } = self;
+        write!(f, "{name} ::= {declarator}")
+    }
+}
+
+
+impl<A> fmt::Display for TypeDeclarator<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Record(_, decl) => write!(f, "{decl}"),
+        }
+    }
+}
+
+impl<A> fmt::Display for RecordDeclarator<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for field in &self.fields {
+            writeln!(f, "{field}")?;
+        }
+        Ok(())
+    }
+}
+
+impl<A> fmt::Display for FieldDeclarator<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            name,
+            type_signature,
+        } = self;
+        write!(f, "{name} :: {type_signature}")
+    }
+}
+
+impl<A, TypeId> fmt::Display for TypeSignature<A, TypeId> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            universal_quantifiers,
+            body,
+            ..
+        } = self;
+        if !universal_quantifiers.is_empty() {
+            write!(f, "forall ")?;
+            for q in universal_quantifiers {
+                write!(f, "{q}")?;
+            }
+            write!(f, ". ")?;
+        }
+
+        write!(f, "{body}")?;
+
+        Ok(())
+    }
+}
+
+impl<A, TypeId> fmt::Display for TypeExpression<A, TypeId> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Constructor(_, _) => todo!(),
+            Self::Parameter(_, identifier) => todo!(),
+            Self::Apply(_, type_apply) => todo!(),
+            Self::Arrow(_, type_arrow) => todo!(),
+        }
+    }
+}

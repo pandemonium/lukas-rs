@@ -4,7 +4,8 @@ use lukas::{
         Projection, Record, Tuple, ValueDeclaration, ValueDeclarator, namer,
     },
     interpreter::Environment,
-    parser::{Identifier, IdentifierPath, ParseInfo},
+    lexer::LexicalAnalyzer,
+    parser::{Identifier, IdentifierPath, ParseInfo, Parser},
     typer::TypingContext,
 };
 use std::rc::Rc;
@@ -90,59 +91,73 @@ fn proj(base: Tree, field: &str) -> Tree {
 fn main() {
     let _ctx = TypingContext::default();
 
-    let id = lambda("x", var("x"));
-    let id_binding = let_in("id", id, {
-        let_in("z", apply(var("id"), const_int(1)), {
-            let_in(
-                "y",
-                apply(var("id"), const_text("hej")),
-                let_in(
-                    "q",
-                    record(&[
-                        ("cash", const_int(427)),
-                        ("name", const_text("Patrik Andersson")),
-                    ]),
-                    tuple(vec![var("y"), var("zz"), proj(var("q"), "name"), var("id")]),
-                ),
-            )
-        })
-    });
+    //    let id = lambda("x", var("x"));
+    //    let id_binding = let_in("id", id, {
+    //        let_in("z", apply(var("id"), const_int(1)), {
+    //            let_in(
+    //                "y",
+    //                apply(var("id"), const_text("hej")),
+    //                let_in(
+    //                    "q",
+    //                    record(&[
+    //                        ("cash", const_int(427)),
+    //                        ("name", const_text("Patrik Andersson")),
+    //                    ]),
+    //                    tuple(vec![var("y"), var("zz"), proj(var("q"), "name"), var("id")]),
+    //                ),
+    //            )
+    //        })
+    //    });
 
-    let program = CompilationUnit::from_declarations(vec![
-        Declaration::Value(
-            ParseInfo::default(),
-            ValueDeclaration {
-                name: Identifier::from_str("zz"),
-                declarator: ValueDeclarator {
-                    type_signature: None,
-                    body: Expr::Constant(ParseInfo::default(), Literal::Int(1)),
-                },
-            },
-        ),
-        Declaration::Value(
-            ParseInfo::default(),
-            ValueDeclaration {
-                name: Identifier::from_str("start"),
-                declarator: ValueDeclarator {
-                    type_signature: None,
-                    body: Expr::Lambda(
-                        ParseInfo::default(),
-                        Lambda {
-                            parameter: IdentifierPath::new("x"),
-                            body: id_binding.clone(),
-                        },
-                    ),
-                },
-            },
-        ),
-    ]);
+    //    let program = CompilationUnit::from_declarations(vec![
+    //        Declaration::Value(
+    //            ParseInfo::default(),
+    //            ValueDeclaration {
+    //                name: Identifier::from_str("zz"),
+    //                declarator: ValueDeclarator {
+    //                    type_signature: None,
+    //                    body: Expr::Constant(ParseInfo::default(), Literal::Int(1)),
+    //                },
+    //            },
+    //        ),
+    //        Declaration::Value(
+    //            ParseInfo::default(),
+    //            ValueDeclaration {
+    //                name: Identifier::from_str("start"),
+    //                declarator: ValueDeclarator {
+    //                    type_signature: None,
+    //                    body: Expr::Lambda(
+    //                        ParseInfo::default(),
+    //                        Lambda {
+    //                            parameter: IdentifierPath::new("x"),
+    //                            body: id_binding.clone(),
+    //                        },
+    //                    ),
+    //                },
+    //            },
+    //        ),
+    //    ]);
+
+    let mut lexer = LexicalAnalyzer::default();
+    let input = include_str!("4.txt");
+
+    let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
+
+    for t in tokens {
+        println!("{t}")
+    }
+
+    let mut parser = Parser::from_tokens(tokens);
+    let program = parser.parse_compilation_unit().unwrap();
+
+    println!("Program: {program}");
 
     let env = Environment::typecheck_and_initialize(program).expect("initialized");
     println!("main: env: {env}");
 
     let return_value = env.call(
         &namer::QualifiedName::from_root_symbol(Identifier::from_str("start")),
-        ast::Literal::Int(1),
+        ast::Literal::Int(27),
     );
     println!("main: return value: {return_value}");
 }
