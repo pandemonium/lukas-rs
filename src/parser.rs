@@ -115,7 +115,8 @@ impl Identifier {
 
 #[derive(Debug)]
 enum Fault {
-    UnexpectedEof,
+    UnexpectedOverflow,
+    UnexpectedUnderflow,
     Expected {
         expected: TokenKind,
         found: TokenKind,
@@ -151,9 +152,22 @@ impl<'a> fmt::Display for TraceLogEntry<'a> {
 #[derive(Debug, Default)]
 struct Parser<'a> {
     remains: &'a [Token],
+    offset: usize,
 }
 
 impl<'a> Parser<'a> {
+    pub fn from_tokens(remains: &'a [Token]) -> Self {
+        Self { remains, offset: 0 }
+    }
+
+    fn remains(&self) -> &'a [Token] {
+        &self.remains[self.offset..]
+    }
+
+    fn advance(&mut self, by: usize) {
+        self.offset += by;
+    }
+
     fn trace(&mut self) {
         let backtrace = Backtrace::new();
         let calling_symbol = backtrace.frames().iter().find_map(|frame| {
@@ -169,7 +183,7 @@ impl<'a> Parser<'a> {
             let caller = caller.get(caller.len() - 2);
             let e = TraceLogEntry {
                 step: caller.unwrap_or(&caller_name.as_str()).to_string(),
-                remains: self.remains,
+                remains: self.remains(),
             };
             println!("{e}");
         } else {
@@ -178,17 +192,17 @@ impl<'a> Parser<'a> {
     }
 
     fn peek(&self) -> Result<&Token> {
-        if !self.remains.is_empty() {
-            Ok(&self.remains[0])
+        if !self.remains().is_empty() {
+            Ok(&self.remains()[0])
         } else {
-            Err(Fault::UnexpectedEof)
+            Err(Fault::UnexpectedOverflow)
         }
     }
 
     fn expect(&mut self, expected: TokenKind) -> Result<&Token> {
-        match self.remains {
+        match self.remains() {
             [token, remains @ ..] if token.kind == expected => {
-                self.remains = remains;
+                self.advance(1);
                 Ok(token)
             }
             [token, ..] => Err(Fault::Expected {
@@ -215,11 +229,19 @@ impl<'a> Parser<'a> {
     }
 
     fn consume(&mut self) -> Result<&Token> {
-        if let Some(the) = self.remains.first() {
-            self.remains = &self.remains[1..];
+        if let Some(the) = self.remains().first() {
+            self.advance(1);
             Ok(the)
         } else {
-            Err(Fault::UnexpectedEof)
+            Err(Fault::UnexpectedOverflow)
+        }
+    }
+
+    fn unconsume(&mut self) -> Result<()> {
+        if self.offset > 0 {
+            Ok(self.offset -= 1)
+        } else {
+            Err(Fault::UnexpectedUnderflow)
         }
     }
 
@@ -227,13 +249,13 @@ impl<'a> Parser<'a> {
     where
         P: FnMut(&Token) -> bool,
     {
-        if let Some(the) = self.remains.first()
+        if let Some(the) = self.remains().first()
             && p(the)
         {
-            self.remains = &self.remains[1..];
+            self.advance(1);
             Ok(the)
         } else {
-            Err(Fault::UnexpectedEof)
+            Err(Fault::UnexpectedOverflow)
         }
     }
 
@@ -292,7 +314,7 @@ impl<'a> Parser<'a> {
             prefix.parse_info().location
         );
 
-        match self.remains {
+        match self.remains() {
             [t, u, ..] if t.is_sequence_separator() && Self::is_expr_prefix(&u.kind) => {
                 self.consume()?;
                 self.parse_subsequent(prefix)
@@ -347,15 +369,15 @@ impl<'a> Parser<'a> {
     fn parse_expr_prefix(&mut self) -> Result<Expr> {
         self.trace();
 
-        match self.remains {
+        match self.remains() {
             [
                 Token {
                     kind: TokenKind::Literal(lit),
                     position,
                 },
-                remains @ ..,
+                ..,
             ] => {
-                self.remains = remains;
+                self.advance(1);
                 self.parse_literal(lit, position)
             }
 
@@ -364,9 +386,9 @@ impl<'a> Parser<'a> {
                     kind: TokenKind::Identifier(id),
                     position,
                 },
-                remains @ ..,
+                ..,
             ] => {
-                self.remains = remains;
+                self.advance(1);
                 self.parse_identifier(id, position)
             }
 
@@ -407,7 +429,7 @@ impl<'a> Parser<'a> {
 
         self.trace();
 
-        match self.remains {
+        match self.remains() {
             [t, ..] if is_terminal(&t.kind) => Ok(lhs),
 
             [t, u, ..] if t.is_layout() && is_terminal(&u.kind) => Ok(lhs),
@@ -532,6 +554,10 @@ impl<'a> Parser<'a> {
             // Since it is not, there is no operator to trigger parse_operator
             // which triggers parse_juxtaposed instead.
             println!("parse_operator(2)");
+
+            // Symmetrical with the consume call befor entering parse_operator.
+            // I would like these two to be in the same spot
+            self.unconsume()?;
             Ok(lhs)
         }
     }
@@ -580,7 +606,7 @@ mod tests {
             println!("{t}")
         }
 
-        let mut p = Parser { remains: tokens };
+        let mut p = Parser::from_tokens(tokens);
         let x = p.parse_sequence().unwrap();
         println!("{x}")
     }
