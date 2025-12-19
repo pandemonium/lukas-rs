@@ -26,6 +26,7 @@ impl LexicalAnalyzer {
                 ['"', remains @ ..] => self.scan_text_literal(remains),
 
                 [':', ':', '=', remains @ ..] => self.emit(3, TokenKind::TypeAssign, remains),
+                [':', '=', remains @ ..] => self.emit(2, TokenKind::Assign, remains),
                 [':', ':', remains @ ..] => self.emit(2, TokenKind::TypeAscribe, remains),
                 ['-', '>', remains @ ..] => self.emit(2, TokenKind::Arrow, remains),
 
@@ -344,6 +345,7 @@ pub enum TokenKind {
     Equals,      // =
     TypeAssign,  // ::=
     TypeAscribe, // ::
+    Assign,      // :=
     Arrow,       // ->
     Comma,       // ,
     LeftParen,   // (
@@ -572,6 +574,10 @@ pub struct Token {
 }
 
 impl Token {
+    pub const fn is_identifier(&self) -> bool {
+        matches!(self.kind, TokenKind::Identifier(..))
+    }
+
     pub const fn is_indent(&self) -> bool {
         matches!(self.kind, TokenKind::Layout(Layout::Indent))
     }
@@ -606,6 +612,10 @@ impl Token {
     pub const fn is_literal(&self) -> bool {
         matches!(self.kind, TokenKind::Literal(..))
     }
+
+    pub const fn is_end(&self) -> bool {
+        matches!(self.kind, TokenKind::End)
+    }
 }
 
 impl fmt::Display for Layout {
@@ -630,6 +640,7 @@ impl fmt::Display for TokenKind {
             Self::Equals => write!(f, "="),
             Self::TypeAssign => write!(f, "::="),
             Self::TypeAscribe => write!(f, "::"),
+            Self::Assign => write!(f, ":="),
             Self::Arrow => write!(f, "->"),
             Self::Comma => write!(f, ","),
             Self::LeftParen => write!(f, "("),

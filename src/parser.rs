@@ -1,9 +1,9 @@
 use std::{fmt, iter, result};
 
-use backtrace::{Backtrace, BacktraceSymbol};
+use backtrace::Backtrace;
 
 use crate::{
-    ast,
+    ast::{self, CompilationUnit, Declaration, ValueDeclaration, ValueDeclarator, namer},
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
 };
 
@@ -122,7 +122,8 @@ enum Fault {
         found: TokenKind,
         position: SourceLocation,
     },
-    ExpectedIdentifier,
+    ExpectedParameterList,
+    ExpectedIdentifier(Token),
 }
 
 type Result<A> = result::Result<A, Fault>;
@@ -215,16 +216,17 @@ impl<'a> Parser<'a> {
     }
 
     fn identifier(&mut self) -> Result<(SourceLocation, String)> {
+        let token = self.peek()?;
         if let Token {
             kind: TokenKind::Identifier(id),
             position,
-        } = self.peek()?
+        } = token
         {
             let retval = (*position, id.to_owned());
             self.consume()?;
             Ok(retval)
         } else {
-            Err(Fault::ExpectedIdentifier)
+            Err(Fault::ExpectedIdentifier(token.clone()))
         }
     }
 
@@ -257,6 +259,57 @@ impl<'a> Parser<'a> {
         } else {
             Err(Fault::UnexpectedOverflow)
         }
+    }
+
+    fn parse_compilation_unit(&mut self) -> Result<CompilationUnit<ParseInfo>> {
+        let mut decls = vec![self.parse_declaration()?];
+
+        while self.peek()?.is_newline() {
+            self.consume()?;
+
+            if !self.peek()?.is_end() {
+                let decl = self.parse_declaration()?;
+                decls.push(decl);
+            } else {
+                break;
+            }
+        }
+
+        Ok(CompilationUnit::from_declarations(decls))
+    }
+
+    fn parse_declaration(&mut self) -> Result<Declaration<ParseInfo>> {
+        match self.remains() {
+            [
+                Token {
+                    kind: TokenKind::Identifier(name),
+                    position,
+                },
+                Token {
+                    kind: TokenKind::Assign,
+                    ..
+                },
+                ..,
+            ] => {
+                self.advance(2);
+                Ok(Declaration::Value(
+                    ParseInfo::from_position(*position),
+                    ValueDeclaration {
+                        name: Identifier::from_str(name),
+                        declarator: self.parse_value_declarator()?,
+                    },
+                ))
+            }
+
+            otherwise => panic!("{otherwise:?}"),
+        }
+    }
+
+    fn parse_value_declarator(&mut self) -> Result<ValueDeclarator<ParseInfo>> {
+        Ok(ValueDeclarator {
+            type_signature: None,
+            body: self.parse_block(|parser| parser.parse_expression(0))?,
+        })
     }
 
     fn parse_block<F, A>(&mut self, parse_body: F) -> Result<A>
@@ -302,6 +355,37 @@ impl<'a> Parser<'a> {
                 body: body.into(),
             },
         ))
+    }
+
+    fn parse_lambda(&mut self) -> Result<Expr> {
+        self.trace();
+
+        self.expect(TokenKind::Keyword(Keyword::Lambda))?;
+
+        let mut params = vec![];
+        while self.peek()?.is_identifier() {
+            params.push(self.identifier()?);
+        }
+
+        if params.is_empty() {
+            Err(Fault::ExpectedIdentifier(self.peek()?.clone()))?;
+        }
+
+        self.expect(TokenKind::Period)?;
+
+        let body = self.parse_block(|parser| parser.parse_expression(0))?;
+
+        let lambda = params.into_iter().rfold(body, |body, (pos, param)| {
+            Expr::Lambda(
+                ParseInfo::from_position(pos),
+                Lambda {
+                    parameter: IdentifierPath::new(&param),
+                    body: body.into(),
+                },
+            )
+        });
+
+        Ok(lambda)
     }
 
     fn parse_sequence(&mut self) -> Result<Expr> {
@@ -389,8 +473,10 @@ impl<'a> Parser<'a> {
                 ..,
             ] => {
                 self.advance(1);
-                self.parse_identifier(id, position)
+                self.parse_variable(id, position)
             }
+
+            [t, ..] if t.is_keyword(Keyword::Lambda) => self.parse_lambda(),
 
             [t, ..] if t.is_keyword(Keyword::Let) => self.parse_let(),
 
@@ -492,14 +578,12 @@ impl<'a> Parser<'a> {
 
     fn parse_literal(&mut self, literal: &Literal, position: &SourceLocation) -> Result<Expr> {
         Ok(Expr::Constant(
-            ParseInfo {
-                location: *position,
-            },
+            ParseInfo::from_position(*position),
             literal.clone().into(),
         ))
     }
 
-    fn parse_identifier(&mut self, id: &str, position: &SourceLocation) -> Result<Expr> {
+    fn parse_variable(&mut self, id: &str, position: &SourceLocation) -> Result<Expr> {
         Ok(Expr::Variable(
             ParseInfo::from_position(*position),
             IdentifierPath::new(id),
@@ -524,14 +608,10 @@ impl<'a> Parser<'a> {
                 operator_precedence
             };
             let apply_lhs = Expr::Apply(
-                ParseInfo {
-                    location: *lhs.position(),
-                },
+                ParseInfo::from_position(*lhs.position()),
                 Apply {
                     function: Expr::Variable(
-                        ParseInfo {
-                            location: operator_position,
-                        },
+                        ParseInfo::from_position(operator_position),
                         IdentifierPath::new(operator.name()),
                     )
                     .into(),
@@ -540,9 +620,7 @@ impl<'a> Parser<'a> {
             );
             let rhs = self.parse_expression(operator_precedence)?;
             let rhs = Expr::Apply(
-                ParseInfo {
-                    location: *rhs.position(),
-                },
+                ParseInfo::from_position(*rhs.position()),
                 Apply {
                     function: apply_lhs.into(),
                     argument: rhs.into(),
@@ -550,11 +628,6 @@ impl<'a> Parser<'a> {
             );
             self.parse_expr_infix(rhs, context_precedence)
         } else {
-            // this needs to unconsume what was consumed.
-            // Since it is not, there is no operator to trigger parse_operator
-            // which triggers parse_juxtaposed instead.
-            println!("parse_operator(2)");
-
             // Symmetrical with the consume call befor entering parse_operator.
             // I would like these two to be in the same spot
             self.unconsume()?;
@@ -607,7 +680,7 @@ mod tests {
         }
 
         let mut p = Parser::from_tokens(tokens);
-        let x = p.parse_sequence().unwrap();
-        println!("{x}")
+        let x = p.parse_compilation_unit().unwrap();
+        println!("{x:?}")
     }
 }

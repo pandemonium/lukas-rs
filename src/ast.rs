@@ -10,6 +10,7 @@ pub mod namer;
 
 pub const ROOT_MODULE_NAME: &str = "__root__";
 
+#[derive(Debug)]
 pub struct CompilationUnit<A> {
     pub root: ModuleDeclaration<A>,
 }
@@ -25,44 +26,53 @@ impl<A> CompilationUnit<A> {
     }
 }
 
+#[derive(Debug)]
 pub enum Declaration<A> {
     Value(A, ValueDeclaration<A>),
     Module(A, ModuleDeclaration<A>),
     Type(A, TypeDeclaration<A>),
 }
 
+#[derive(Debug)]
 pub struct ValueDeclaration<A> {
     pub name: parser::Identifier,
     pub declarator: ValueDeclarator<A>,
 }
 
+#[derive(Debug)]
 pub struct ValueDeclarator<A> {
     pub type_signature: Option<TypeSignature<A, parser::IdentifierPath>>,
     pub body: ast::Expr<A, parser::IdentifierPath>,
 }
 
+#[derive(Debug)]
 pub struct ModuleDeclaration<A> {
     pub name: parser::Identifier,
     pub declarator: ModuleDeclarator<A>,
 }
 
+#[derive(Debug)]
 pub struct ModuleDeclarator<A> {
     pub members: Vec<Declaration<A>>,
 }
 
+#[derive(Debug)]
 pub struct TypeDeclaration<A> {
     pub name: parser::Identifier,
     pub declarator: TypeDeclarator<A>,
 }
 
+#[derive(Debug)]
 pub enum TypeDeclarator<A> {
     Record(A, RecordDeclarator<A>),
 }
 
+#[derive(Debug)]
 pub struct RecordDeclarator<A> {
     pub fields: Vec<FieldDeclarator<A>>,
 }
 
+#[derive(Debug)]
 pub struct FieldDeclarator<A> {
     pub name: parser::Identifier,
     pub type_signature: TypeExpression<A, parser::IdentifierPath>,
