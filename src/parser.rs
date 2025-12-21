@@ -3,7 +3,7 @@ use std::{fmt, iter, result};
 use backtrace::Backtrace;
 
 use crate::{
-    ast::{self, CompilationUnit, Declaration, ValueDeclaration, ValueDeclarator, namer},
+    ast::{self, CompilationUnit, Declaration, ValueDeclaration, ValueDeclarator},
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
 };
 

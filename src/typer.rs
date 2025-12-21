@@ -113,8 +113,8 @@ impl NamedCompilationContext {
             .collect::<Typing<Vec<_>>>()?
         {
             let symbol = match symbol {
-                namer::Symbol::Value(symbol) => Self::compute_for_value_symbol(symbol, &mut ctx)?,
-                namer::Symbol::Type(symbol) => Self::compute_for_type_symbol(symbol, &mut ctx)?,
+                namer::Symbol::Value(symbol) => Self::compute_term_symbol(symbol, &mut ctx)?,
+                namer::Symbol::Type(symbol) => Self::compute_type_symbol(symbol, &mut ctx)?,
             };
 
             symbols.insert(id.clone(), symbol);
@@ -127,7 +127,7 @@ impl NamedCompilationContext {
         })
     }
 
-    fn compute_for_value_symbol(
+    fn compute_term_symbol(
         symbol: &ValueSymbol<ParseInfo, namer::QualifiedName, Identifier>,
         ctx: &mut TypingContext,
     ) -> Typing<TypedSymbol> {
@@ -138,8 +138,8 @@ impl NamedCompilationContext {
 
         println!("{qualified_name}::{inferred_type}");
 
-        ctx.bind(
-            Term::Value(namer::Identifier::Free(qualified_name.clone())),
+        ctx.bind_term(
+            qualified_name.clone(),
             TypeScheme::from_constant(inferred_type.clone()),
         );
 
@@ -150,37 +150,12 @@ impl NamedCompilationContext {
         }))
     }
 
-    fn compute_for_type_symbol(
+    fn compute_type_symbol(
         symbol: &namer::TypeSymbol<namer::QualifiedName>,
         ctx: &mut TypingContext,
     ) -> Typing<TypedSymbol> {
-        let tc = TypeConstructor::from_symbol(symbol);
-
-        let symbol = namer::Symbol::Type(match symbol {
-            namer::TypeSymbol::Record(symbol) => {
-                let record = Type::Record(
-                    symbol
-                        .fields
-                        .iter()
-                        // symbol.type_signature.synthesize_type(ctx)
-                        .map(|symbol| (symbol.name.clone(), Type::fresh()))
-                        .collect(),
-                );
-
-                // ctx.bind_type_constructor or something?
-                // and bind_term as the corollary
-                ctx.bind(
-                    Term::Type(symbol.name.clone()),
-                    TypeScheme::from_constant(record),
-                );
-
-                namer::TypeSymbol::Record(symbol.clone())
-            }
-
-            namer::TypeSymbol::Coproduct(symbol) => namer::TypeSymbol::Coproduct(symbol.clone()),
-        });
-
-        Ok(symbol)
+        ctx.bind_type(symbol.name().clone(), TypeConstructor::from_symbol(symbol));
+        Ok(namer::Symbol::Type(symbol.clone()))
     }
 }
 
@@ -553,6 +528,13 @@ impl TypeConstructor {
             underlying,
         }
     }
+
+    fn with_substitutions(&self, subs: &Substitutions) -> Self {
+        Self {
+            parameters: self.parameters.clone(),
+            underlying: self.underlying.with_substitutions(subs),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -671,26 +653,51 @@ impl TermSpace {
             namer::Identifier::Free(member) => self.free.get(member),
         }
     }
+
+    pub fn free_variables(&self) -> HashSet<TypeParameter> {
+        self.bound
+            .iter()
+            .flat_map(|ts| ts.free_variables())
+            .chain(self.free.values().flat_map(|ts| ts.free_variables()))
+            .collect()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TypeSpace(HashMap<namer::QualifiedName, TypeConstructor>);
+
+impl TypeSpace {
+    fn bind(&mut self, name: namer::QualifiedName, tc: TypeConstructor) {
+        self.0.insert(name, tc);
+    }
+
+    fn lookup(&self, name: &namer::QualifiedName) -> Option<&TypeConstructor> {
+        self.0.get(name)
+    }
+
+    fn with_substitutions(&self, subs: &Substitutions) -> Self {
+        Self(
+            self.0
+                .iter()
+                .map(|(id, tc)| (id.clone(), tc.with_substitutions(subs)))
+                .collect(),
+        )
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct TypingContext {
-    // This should not be a TermSpace like this. There is no point, at
-    // least not at this point.
-    types: TermSpace,
-    values: TermSpace,
+    types: TypeSpace,
+    terms: TermSpace,
 }
 
 impl TypingContext {
     pub fn with_substitutions(&self, subs: &Substitutions) -> Self {
         Self {
-            types: TermSpace {
-                bound: Self::substitute_bound(&self.types.bound, subs),
-                free: Self::substitute_free(&self.types.free, subs),
-            },
-            values: TermSpace {
-                bound: Self::substitute_bound(&self.values.bound, subs),
-                free: Self::substitute_free(&self.values.free, subs),
+            types: self.types.with_substitutions(subs),
+            terms: TermSpace {
+                bound: Self::substitute_bound(&self.terms.bound, subs),
+                free: Self::substitute_free(&self.terms.free, subs),
             },
         }
     }
@@ -709,55 +716,41 @@ impl TypingContext {
             .collect()
     }
 
-    pub fn lookup(&self, term: &Term) -> Option<&TypeScheme> {
-        match term {
-            Term::Type(name) => self.types.lookup_free(name),
-            Term::Value(name) => self.values.lookup(name),
-        }
+    pub fn bind_type(&mut self, name: namer::QualifiedName, constructor: TypeConstructor) {
+        self.types.bind(name, constructor);
     }
 
-    // This must not take TypeScheme
-    pub fn bind(&mut self, term: Term, scheme: TypeScheme) {
-        match term {
-            Term::Type(id) => self.types.free.insert(id, scheme),
-            Term::Value(namer::Identifier::Bound(..)) => panic!("What is this?"),
-            Term::Value(namer::Identifier::Free(id)) => self.values.free.insert(id, scheme),
-        };
+    pub fn bind_term(&mut self, name: namer::QualifiedName, scheme: TypeScheme) {
+        self.terms.free.insert(name, scheme);
     }
 
-    pub fn bind_and_then<F, A>(&mut self, term: Term, scheme: TypeScheme, block: F) -> A
+    pub fn bind_term_and_then<F, A>(
+        &mut self,
+        name: namer::Identifier,
+        scheme: TypeScheme,
+        block: F,
+    ) -> A
     where
         F: FnOnce(&mut TypingContext) -> A,
     {
-        // This is not correct.
-        //   Term can be Value(Identifier::Free)
-        match term {
-            Term::Type(id) => {
-                let previous = self.types.free.insert(id.clone(), scheme);
-                let v = block(self);
-                if let Some(previous) = previous {
-                    self.types.free.insert(id, previous);
-                } else {
-                    self.types.free.remove(&id);
-                }
-                v
-            }
-            Term::Value(namer::Identifier::Bound(ix)) => {
-                if self.values.bound.len() != ix {
+        match name {
+            namer::Identifier::Bound(ix) => {
+                if self.terms.bound.len() != ix {
                     panic!("Bad medicine")
                 }
-                self.values.bound.push(scheme);
+                self.terms.bound.push(scheme);
                 let v = block(self);
-                self.values.bound.pop();
+                self.terms.bound.pop();
                 v
             }
-            Term::Value(namer::Identifier::Free(id)) => {
-                let previous = self.values.free.insert(id.clone(), scheme);
+
+            namer::Identifier::Free(id) => {
+                let previous = self.terms.free.insert(id.clone(), scheme);
                 let v = block(self);
                 if let Some(previous) = previous {
-                    self.values.free.insert(id, previous);
+                    self.terms.free.insert(id, previous);
                 } else {
-                    self.values.free.remove(&id);
+                    self.terms.free.remove(&id);
                 }
                 v
             }
@@ -772,7 +765,7 @@ impl TypingContext {
                     TypeInfo {
                         parse_info: *parse_info,
                         inferred_type: self
-                            .values
+                            .terms
                             .lookup(name)
                             .ok_or_else(|| TypeError::UndefinedName(name.clone()))?
                             .instantiate(),
@@ -939,12 +932,12 @@ impl TypingContext {
         rec_lambda: &namer::SelfReferential,
     ) -> Typing {
         let own_ty = Type::fresh();
-        self.bind_and_then(
-            Term::Value(rec_lambda.own_name.clone()),
+        self.bind_term_and_then(
+            rec_lambda.own_name.clone(),
             TypeScheme::from_constant(own_ty.clone()),
             |ctx| {
-                ctx.bind_and_then(
-                    Term::Value(rec_lambda.lambda.parameter.clone()),
+                ctx.bind_term_and_then(
+                    rec_lambda.lambda.parameter.clone(),
                     TypeScheme::from_constant(Type::fresh()),
                     |ctx| {
                         let (substitutions, type_info, lambda) =
@@ -1027,8 +1020,8 @@ impl TypingContext {
         lambda: &namer::Lambda,
     ) -> Typing<(Substitutions, TypeInfo, Lambda)> {
         let domain = Type::fresh();
-        self.bind_and_then(
-            Term::Value(lambda.parameter.clone()),
+        self.bind_term_and_then(
+            lambda.parameter.clone(),
             TypeScheme::from_constant(domain.clone()),
             |ctx| {
                 let (substitutions, body) = ctx.infer_type(&lambda.body)?;
@@ -1060,8 +1053,7 @@ impl TypingContext {
         let (bound_subs, bound) = self.infer_type(&binding.bound)?;
         let bound_type = bound.type_info().inferred_type.generalize(self);
 
-        // Term::Xxx is... not good.
-        self.bind_and_then(Term::Value(binding.binder.clone()), bound_type, |ctx| {
+        self.bind_term_and_then(binding.binder.clone(), bound_type, |ctx| {
             let (body_subs, body) = ctx.infer_type(&binding.body)?;
             let substitutions = bound_subs.compose(&body_subs);
 
@@ -1092,12 +1084,7 @@ impl TypingContext {
     }
 
     fn free_variables(&self) -> HashSet<TypeParameter> {
-        self.types
-            .bound
-            .iter()
-            .flat_map(|ts| ts.free_variables())
-            .chain(self.values.bound.iter().flat_map(|ts| ts.free_variables()))
-            .collect()
+        self.terms.free_variables()
     }
 }
 

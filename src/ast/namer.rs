@@ -305,7 +305,7 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
         modules.insert(parser::IdentifierPath::new(ast::ROOT_MODULE_NAME));
 
         let _ = Self::index_module_contents(
-            &mut parser::IdentifierPath::new(program.root.name.as_str()),
+            parser::IdentifierPath::new(program.root.name.as_str()),
             &program.root.declarator.members,
             &mut modules,
             &mut symbols,
@@ -321,7 +321,7 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
     // This could just as well keep a running module_path of varified
     // modules. Shouldn't I just rewrite this sucker?
     pub fn index_module_contents(
-        prefix: &mut parser::IdentifierPath,
+        prefix: parser::IdentifierPath,
         declarations: &[Declaration<ParseInfo>],
         modules: &mut HashSet<parser::IdentifierPath>,
         symbol_table: &mut HashMap<
