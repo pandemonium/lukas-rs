@@ -352,13 +352,21 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
                     modules.insert(prefix.clone().with_suffix(decl.name.as_str()));
                 }
 
-                ast::Declaration::Type(_, ast::TypeDeclaration { name, declarator }) => {
+                ast::Declaration::Type(
+                    _,
+                    ast::TypeDeclaration {
+                        name,
+                        type_parameters,
+                        declarator,
+                    },
+                ) => {
                     let symbol_name = prefix.clone().with_suffix(name.as_str());
                     let term = TermId::Type(symbol_name.clone());
                     let symbol = match declarator {
                         ast::TypeDeclarator::Record(_, record) => {
                             Symbol::Type(TypeSymbol::Record(RecordSymbol {
                                 name: symbol_name,
+                                type_parameters: type_parameters.clone(),
                                 fields: record
                                     .fields
                                     .iter()
@@ -441,6 +449,13 @@ impl<GlobalName> TypeSymbol<GlobalName> {
 }
 
 impl TypeSymbol<QualifiedName> {
+    pub fn type_parameters(&self) -> &[parser::Identifier] {
+        match self {
+            Self::Record(sym) => &sym.type_parameters,
+            Self::Coproduct(sym) => &sym.type_parameters,
+        }
+    }
+
     pub fn free_variables(&self) -> HashSet<&QualifiedName> {
         match self {
             Self::Record(symbol) => symbol.free_variables(),
@@ -452,6 +467,7 @@ impl TypeSymbol<QualifiedName> {
 #[derive(Debug, Clone)]
 pub struct RecordSymbol<GlobalName> {
     pub name: GlobalName,
+    pub type_parameters: Vec<parser::Identifier>,
     pub fields: Vec<FieldSymbol<GlobalName>>,
 }
 
@@ -473,6 +489,7 @@ impl RecordSymbol<QualifiedName> {
 #[derive(Debug, Clone)]
 pub struct CoproductSymbol<GlobalName> {
     pub name: GlobalName,
+    pub type_parameters: Vec<parser::Identifier>,
     pub constructors: Vec<ConstructorSymbol<GlobalName>>,
 }
 

@@ -1,0 +1,6 @@
+Option ::=
+  forall a. This a | None
+
+module Parser =
+  apply :: Input -> Option Int =
+    lambda input. This 1

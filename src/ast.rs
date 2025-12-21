@@ -59,6 +59,7 @@ pub struct ModuleDeclarator<A> {
 #[derive(Debug)]
 pub struct TypeDeclaration<A> {
     pub name: parser::Identifier,
+    pub type_parameters: Vec<parser::Identifier>,
     pub declarator: TypeDeclarator<A>,
 }
 
@@ -365,11 +366,22 @@ impl<A> fmt::Display for ModuleDeclarator<A> {
 
 impl<A> fmt::Display for TypeDeclaration<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { name, declarator } = self;
-        write!(f, "{name} ::= {declarator}")
+        let Self {
+            name,
+            type_parameters,
+            declarator,
+        } = self;
+        write!(f, "{name} ::= ")?;
+        if !type_parameters.is_empty() {
+            write!(f, "forall")?;
+            for p in type_parameters {
+                write!(f, " {p}")?;
+            }
+            write!(f, ".")?;
+        }
+        write!(f, "{declarator}")
     }
 }
-
 
 impl<A> fmt::Display for TypeDeclarator<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

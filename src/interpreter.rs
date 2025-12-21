@@ -164,7 +164,7 @@ impl Environment {
         if dependencies.are_sound() {
             for symbol in compilation
                 .check_types(initialization_order.iter())?
-                .static_value_symbols(initialization_order.iter())
+                .statically_initialized_values(initialization_order.iter())
             {
                 let value = Rc::new(symbol.body.erase_annotation())
                     .reduce(&environment)
