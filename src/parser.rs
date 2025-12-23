@@ -4,7 +4,7 @@ use backtrace::Backtrace;
 
 use crate::{
     ast::{
-        self, CompilationUnit, Declaration, FieldDeclarator, RecordDeclarator, TypeApply,
+        self, CompilationUnit, Declaration, FieldDeclarator, RecordDeclarator, Tree, TypeApply,
         TypeArrow, TypeDeclaration, TypeDeclarator, ValueDeclaration, ValueDeclarator,
     },
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
@@ -379,15 +379,9 @@ impl<'a> Parser<'a> {
         self.strip_layout()?;
 
         let column = *self.peek()?.location();
-        println!("parse_record_type_decl: {column}");
-
         let mut fields = vec![self.parse_field_decl()?];
 
-        while {
-            let t = self.peek()?;
-            ((t.is_newline() || t.is_indent()) && t.location().is_same_block(&column))
-                || t.kind == TokenKind::Semicolon
-        } {
+        while self.is_record_field_separator(column)? {
             self.consume()?;
             fields.push(self.parse_field_decl()?);
         }
@@ -397,6 +391,14 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::RightBrace)?;
 
         Ok(RecordDeclarator { fields })
+    }
+
+    fn is_record_field_separator(&mut self, block: SourceLocation) -> Result<bool> {
+        let t = self.peek()?;
+        Ok(
+            ((t.is_newline() || t.is_indent()) && t.location().is_same_block(&block))
+                || t.kind == TokenKind::Semicolon,
+        )
     }
 
     fn strip_layout(&mut self) -> Result<()> {
@@ -576,6 +578,42 @@ impl<'a> Parser<'a> {
         ))
     }
 
+    fn parse_record(&mut self) -> Result<Expr> {
+        self.trace();
+
+        // the `{`
+        self.advance(1);
+        self.strip_layout()?;
+        let column = *self.peek()?.location();
+
+        let mut fields = vec![self.parse_field_init()?];
+
+        while self.is_record_field_separator(column)? {
+            self.consume()?;
+            fields.push(self.parse_field_init()?);
+        }
+
+        self.strip_layout()?;
+
+        self.expect(TokenKind::RightBrace)?;
+
+        Ok(Expr::Record(
+            ParseInfo::from_position(column),
+            Record { fields },
+        ))
+    }
+
+    fn parse_field_init(&mut self) -> Result<(Identifier, Tree<ParseInfo, IdentifierPath>)> {
+        self.trace();
+
+        let (_, label) = self.identifier()?;
+        self.expect(TokenKind::Colon)?;
+
+        let expr = self.parse_expression(0)?;
+
+        Ok((Identifier::from_str(&label), expr.into()))
+    }
+
     fn parse_lambda(&mut self) -> Result<Expr> {
         self.trace();
 
@@ -695,6 +733,14 @@ impl<'a> Parser<'a> {
                 self.parse_variable(id, position)
             }
 
+            [
+                Token {
+                    kind: TokenKind::LeftBrace,
+                    ..
+                },
+                ..,
+            ] => self.parse_record(),
+
             [t, ..] if t.is_keyword(Keyword::Lambda) => self.parse_lambda(),
 
             [t, ..] if t.is_keyword(Keyword::Let) => self.parse_local_binding(),
@@ -706,8 +752,9 @@ impl<'a> Parser<'a> {
     fn is_expr_prefix(kind: &TokenKind) -> bool {
         !matches!(
             kind,
-            TokenKind::Layout(Layout::Dedent)
+            TokenKind::Layout(Layout::Dedent | Layout::Indent)
                 | TokenKind::Layout(Layout::Newline)
+                | TokenKind::RightBrace
                 | TokenKind::End
                 | TokenKind::Keyword(
                     Keyword::And

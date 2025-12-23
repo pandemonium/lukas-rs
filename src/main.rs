@@ -1,7 +1,7 @@
 use lukas::{
     ast::{
-        self, Apply, Binding, CompilationUnit, Declaration, Expr, Lambda, Literal, ProductElement,
-        Projection, Record, Tuple, ValueDeclaration, ValueDeclarator, namer,
+        self, Apply, Binding, Expr, Lambda, Literal, ProductElement, Projection, Record, Tuple,
+        namer,
     },
     interpreter::Environment,
     lexer::LexicalAnalyzer,
@@ -139,7 +139,7 @@ fn main() {
     //    ]);
 
     let mut lexer = LexicalAnalyzer::default();
-    let input = include_str!("4.txt");
+    let input = include_str!("../examples/4.txt");
 
     let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
 
