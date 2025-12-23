@@ -761,7 +761,7 @@ mod tests {
     #[test]
     fn lexington() {
         let mut lexer = LexicalAnalyzer::default();
-        let input = include_str!("3.txt");
+        let input = include_str!("../examples/3.txt");
 
         let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
         for crate::lexer::Token { kind, position } in tokens {

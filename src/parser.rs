@@ -1,9 +1,12 @@
-use std::{fmt, iter, result};
+use std::{fmt, iter, marker::PhantomData, result};
 
 use backtrace::Backtrace;
 
 use crate::{
-    ast::{self, CompilationUnit, Declaration, ValueDeclaration, ValueDeclarator},
+    ast::{
+        self, CompilationUnit, Declaration, FieldDeclarator, RecordDeclarator, TypeApply,
+        TypeArrow, TypeDeclaration, TypeDeclarator, ValueDeclaration, ValueDeclarator,
+    },
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
 };
 
@@ -124,6 +127,7 @@ pub enum Fault {
     },
     ExpectedParameterList,
     ExpectedIdentifier(Token),
+    ExpectedTypeConstructor,
 }
 
 type Result<A> = result::Result<A, Fault>;
@@ -132,22 +136,6 @@ type Result<A> = result::Result<A, Fault>;
 struct TraceLogEntry<'a> {
     step: String,
     remains: &'a [Token],
-}
-
-impl<'a> fmt::Display for TraceLogEntry<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { step, remains } = self;
-        write!(
-            f,
-            "{step:<20}: {}",
-            remains
-                .iter()
-                .map(|t| t.to_string())
-                .take(10)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
 }
 
 #[derive(Debug, Default)]
@@ -193,24 +181,24 @@ impl<'a> Parser<'a> {
     }
 
     fn peek(&self) -> Result<&Token> {
-        if !self.remains().is_empty() {
-            Ok(&self.remains()[0])
-        } else {
-            Err(Fault::UnexpectedOverflow)
-        }
+        self.remains()
+            .first()
+            .ok_or_else(|| Fault::UnexpectedOverflow)
     }
 
     fn expect(&mut self, expected: TokenKind) -> Result<&Token> {
         match self.remains() {
-            [token, remains @ ..] if token.kind == expected => {
+            [token, ..] if token.kind == expected => {
                 self.advance(1);
                 Ok(token)
             }
+
             [token, ..] => Err(Fault::Expected {
                 expected,
                 found: token.kind.clone(),
                 position: token.position,
             }),
+
             _ => panic!(),
         }
     }
@@ -247,13 +235,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn consume_if<P>(&mut self, mut p: P) -> Result<&Token>
+    fn consume_if<P>(&mut self, p: P) -> Result<&Token>
     where
-        P: FnMut(&Token) -> bool,
+        P: FnMut(&&Token) -> bool,
     {
-        if let Some(the) = self.remains().first()
-            && p(the)
-        {
+        if let Some(the) = self.remains().first().filter(p) {
             self.advance(1);
             Ok(the)
         } else {
@@ -330,6 +316,32 @@ impl<'a> Parser<'a> {
                 ))
             }
 
+            [
+                Token {
+                    kind: TokenKind::Identifier(name),
+                    position,
+                },
+                Token {
+                    kind: TokenKind::TypeAssign,
+                    ..
+                },
+                ..,
+            ] => {
+                self.advance(2);
+
+                //                let type_parameters = self.parse_type_parameters()?;
+
+                Ok(Declaration::Type(
+                    ParseInfo::from_position(*position),
+                    TypeDeclaration {
+                        name: Identifier::from_str(name),
+                        // Move this to TypeDeclarator
+                        type_parameters: vec![],
+                        declarator: self.parse_block(|parser| parser.parse_type_declarator())?,
+                    },
+                ))
+            }
+
             otherwise => panic!("{otherwise:?}"),
         }
     }
@@ -341,6 +353,182 @@ impl<'a> Parser<'a> {
             type_signature: None,
             body: self.parse_block(|parser| parser.parse_expression(0))?,
         })
+    }
+
+    fn parse_type_declarator(&mut self) -> Result<TypeDeclarator<ParseInfo>> {
+        self.trace();
+
+        if self.peek()?.kind == TokenKind::LeftBrace {
+            self.parse_block(|parser| {
+                // The `{`
+                let info = ParseInfo::from_position(*parser.consume()?.location());
+                parser
+                    .parse_record_type_decl()
+                    .map(|decl| TypeDeclarator::Record(info, decl))
+            })
+        } else {
+            //            self.parse_coproduct_type()
+            todo!()
+        }
+    }
+
+    // This is incredibly noisy for something very simple
+    fn parse_record_type_decl(&mut self) -> Result<RecordDeclarator<ParseInfo>> {
+        self.trace();
+
+        self.strip_layout()?;
+
+        let column = *self.peek()?.location();
+        println!("parse_record_type_decl: {column}");
+
+        let mut fields = vec![self.parse_field_decl()?];
+
+        while {
+            let t = self.peek()?;
+            ((t.is_newline() || t.is_indent()) && t.location().is_same_block(&column))
+                || t.kind == TokenKind::Semicolon
+        } {
+            self.consume()?;
+            fields.push(self.parse_field_decl()?);
+        }
+
+        self.strip_layout()?;
+
+        self.expect(TokenKind::RightBrace)?;
+
+        Ok(RecordDeclarator { fields })
+    }
+
+    fn strip_layout(&mut self) -> Result<()> {
+        while self.peek()?.is_layout() {
+            self.consume()?;
+        }
+
+        Ok(())
+    }
+
+    fn parse_field_decl(&mut self) -> Result<FieldDeclarator<ParseInfo>> {
+        self.trace();
+
+        let (_, label) = self.identifier()?;
+        self.expect(TokenKind::Colon)?;
+        let type_signature = self.parse_type_expression()?;
+        Ok(FieldDeclarator {
+            // It could really keep this Identifier instead of cloning it
+            name: Identifier::from_str(&label),
+            type_signature,
+        })
+    }
+
+    fn parse_type_expression(&mut self) -> Result<TypeExpression> {
+        self.trace();
+
+        let prefix = self.parse_type_expr_prefix()?;
+        self.parse_type_expr_infix(prefix)
+    }
+
+    fn parse_type_expr_prefix(&mut self) -> Result<TypeExpression> {
+        self.trace();
+
+        match self.remains() {
+            [
+                Token {
+                    kind: TokenKind::Identifier(id),
+                    position,
+                },
+                ..,
+            ] => {
+                self.advance(1);
+                Ok(self.parse_simple_type_expr_term(id, position))
+            }
+
+            [
+                Token {
+                    kind: TokenKind::LeftParen,
+                    ..
+                },
+                ..,
+            ] => {
+                self.advance(1);
+                self.parse_type_expression()
+            }
+
+            // parens
+            otherwise => panic!("{otherwise:?}"),
+        }
+    }
+
+    fn parse_simple_type_expr_term(
+        &self,
+        id: &String,
+        position: &SourceLocation,
+    ) -> ast::TypeExpression<ParseInfo, IdentifierPath> {
+        let parse_info = ParseInfo::from_position(*position);
+        if is_lowercase(id) {
+            TypeExpression::Parameter(parse_info, Identifier::from_str(&id))
+        } else {
+            TypeExpression::Constructor(parse_info, IdentifierPath::new(&id))
+        }
+    }
+
+    fn parse_type_expr_infix(&mut self, lhs: TypeExpression) -> Result<TypeExpression> {
+        self.trace();
+
+        match self.remains() {
+            [
+                Token {
+                    kind: TokenKind::Identifier(id),
+                    position,
+                },
+                ..,
+            ] => {
+                if lhs.is_applicable() {
+                    self.advance(1);
+                    let rhs = self.parse_simple_type_expr_term(&id, position);
+                    self.parse_type_expr_infix(TypeExpression::Apply(
+                        ParseInfo::from_position(*position),
+                        TypeApply {
+                            function: lhs.into(),
+                            argument: rhs.into(),
+                            phase: PhantomData,
+                        },
+                    ))
+                } else {
+                    Err(Fault::ExpectedTypeConstructor)
+                }
+            }
+
+            [
+                Token {
+                    kind: TokenKind::Arrow,
+                    position,
+                },
+                ..,
+            ] => {
+                self.advance(1);
+                let rhs = self.parse_type_expression()?;
+                self.parse_type_expr_infix(TypeExpression::Arrow(
+                    ParseInfo::from_position(*position),
+                    TypeArrow {
+                        domain: lhs.into(),
+                        codomain: rhs.into(),
+                    },
+                ))
+            }
+
+            [
+                Token {
+                    kind: TokenKind::RightParen,
+                    ..
+                },
+                ..,
+            ] => {
+                self.advance(1);
+                Ok(lhs)
+            }
+
+            _otherwise => Ok(lhs),
+        }
     }
 
     fn parse_block<F, A>(&mut self, parse_body: F) -> Result<A>
@@ -362,7 +550,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_let(&mut self) -> Result<Expr> {
+    fn parse_local_binding(&mut self) -> Result<Expr> {
         self.trace();
 
         let location = *self.expect(TokenKind::Keyword(Keyword::Let))?.location();
@@ -509,7 +697,7 @@ impl<'a> Parser<'a> {
 
             [t, ..] if t.is_keyword(Keyword::Lambda) => self.parse_lambda(),
 
-            [t, ..] if t.is_keyword(Keyword::Let) => self.parse_let(),
+            [t, ..] if t.is_keyword(Keyword::Let) => self.parse_local_binding(),
 
             otherwise => panic!("{otherwise:?}"),
         }
@@ -667,6 +855,16 @@ impl<'a> Parser<'a> {
     }
 }
 
+fn is_lowercase(id: &str) -> bool {
+    id.chars().all(char::is_lowercase)
+}
+
+impl TypeExpression {
+    fn is_applicable(&self) -> bool {
+        matches!(self, Self::Constructor(..) | Self::Apply(..))
+    }
+}
+
 impl From<Literal> for ast::Literal {
     fn from(value: Literal) -> Self {
         match value {
@@ -695,14 +893,46 @@ impl fmt::Display for IdentifierPath {
     }
 }
 
+impl<'a> fmt::Display for TraceLogEntry<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { step, remains } = self;
+        write!(
+            f,
+            "{step:<20}: {}",
+            remains
+                .iter()
+                .map(|t| t.to_string())
+                .take(10)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{lexer::LexicalAnalyzer, parser::Parser};
 
     #[test]
+    fn type_expressions() {
+        let mut lexer = LexicalAnalyzer::default();
+        let input = include_str!("../examples/type-expression.txt");
+
+        let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
+
+        for t in tokens {
+            println!("{t}")
+        }
+
+        let mut p = Parser::from_tokens(tokens);
+        let x = p.parse_type_expression().unwrap();
+        println!("{x}")
+    }
+
+    #[test]
     fn parsington() {
         let mut lexer = LexicalAnalyzer::default();
-        let input = include_str!("4.txt");
+        let input = include_str!("../examples/4.txt");
 
         let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
 
@@ -712,6 +942,6 @@ mod tests {
 
         let mut p = Parser::from_tokens(tokens);
         let x = p.parse_compilation_unit().unwrap();
-        println!("{x:?}")
+        println!("{x}")
     }
 }

@@ -410,7 +410,10 @@ impl<A> fmt::Display for FieldDeclarator<A> {
     }
 }
 
-impl<A, TypeId> fmt::Display for TypeSignature<A, TypeId> {
+impl<A, TypeId> fmt::Display for TypeSignature<A, TypeId>
+where
+    TypeId: fmt::Display,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             universal_quantifiers,
@@ -431,13 +434,21 @@ impl<A, TypeId> fmt::Display for TypeSignature<A, TypeId> {
     }
 }
 
-impl<A, TypeId> fmt::Display for TypeExpression<A, TypeId> {
+impl<A, TypeId> fmt::Display for TypeExpression<A, TypeId>
+where
+    TypeId: fmt::Display,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Constructor(_, _) => todo!(),
-            Self::Parameter(_, identifier) => todo!(),
-            Self::Apply(_, type_apply) => todo!(),
-            Self::Arrow(_, type_arrow) => todo!(),
+            Self::Constructor(_, name) => write!(f, "{name}"),
+            Self::Parameter(_, name) => write!(f, "{name}"),
+            Self::Apply(
+                _,
+                TypeApply {
+                    function, argument, ..
+                },
+            ) => write!(f, "({function} {argument})"),
+            Self::Arrow(_, TypeArrow { domain, codomain }) => write!(f, "({domain} -> {codomain})"),
         }
     }
 }
