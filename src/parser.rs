@@ -69,8 +69,19 @@ impl IdentifierPath {
 
     pub fn as_root_module_member(&self) -> Self {
         let Self { head, tail } = self;
+        self.clone()
+            .prefigure(head, tail, ast::ROOT_MODULE_NAME.to_owned())
+    }
+
+    pub fn as_builtin_module_member(&self) -> Self {
+        let Self { head, tail } = self;
+        self.clone()
+            .prefigure(head, tail, ast::BUILTIN_MODULE_NAME.to_owned())
+    }
+
+    fn prefigure(self, head: &String, tail: &Vec<String>, head1: String) -> IdentifierPath {
         Self {
-            head: ast::ROOT_MODULE_NAME.to_owned(),
+            head: head1,
             tail: {
                 let mut new_tail = Vec::with_capacity(1 + tail.capacity());
                 new_tail.push(head.clone());
@@ -103,7 +114,7 @@ impl IdentifierPath {
 }
 
 // What about ParseInfo?
-#[derive(Debug, Clone, PartialEq, Hash, Eq)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, PartialOrd, Ord)]
 pub struct Identifier(String);
 
 impl Identifier {

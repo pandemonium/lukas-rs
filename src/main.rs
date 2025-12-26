@@ -143,12 +143,17 @@ fn main() {
 
     let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
 
-    for t in tokens {
-        println!("{t}")
-    }
+    //    for t in tokens {
+    //        println!("{t}")
+    //    }
 
     let mut parser = Parser::from_tokens(tokens);
     let program = parser.parse_compilation_unit().unwrap();
+
+    //    Type inferencing ought to not infer a naked anonymous record type,
+    //    it must instead resolve its type constructor. How does it do this?
+    //
+    //    Lookup the type symbol, get it from there
 
     println!("Program: {program}");
 

@@ -156,7 +156,14 @@ impl Environment {
         let compilation = CompilationContext::from(&program);
         let mut environment = Self::default();
 
+        for (name, symbol) in &compilation.symbols {
+            println!("-----> {} -> {:?}", name, symbol);
+        }
+
+        println!("typecheck_and_initialize: rename symbols");
         let compilation = compilation.rename_symbols();
+
+        println!("typecheck_and_initialize: Hmm?");
 
         let dependencies = compilation.dependency_matrix();
         let initialization_order = dependencies.in_resolvable_order();

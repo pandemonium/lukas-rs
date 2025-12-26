@@ -8,8 +8,11 @@ use std::{
 };
 
 use crate::{
-    ast::{self, CompilationUnit, Declaration, ProductElement, TypeSignature},
+    ast::{
+        self, CompilationUnit, Declaration, ProductElement, TypeApply, TypeArrow, TypeSignature,
+    },
     parser::{self, ParseInfo},
+    typer::BaseType,
 };
 
 pub type Expr = ast::Expr<ParseInfo, Identifier>;
@@ -136,6 +139,13 @@ pub struct QualifiedName {
 }
 
 impl QualifiedName {
+    pub fn builtin(member: &str) -> Self {
+        Self {
+            module: parser::IdentifierPath::new(ast::BUILTIN_MODULE_NAME),
+            member: parser::Identifier::from_str(member),
+        }
+    }
+
     pub fn from_root_symbol(member: parser::Identifier) -> Self {
         Self {
             module: parser::IdentifierPath::new(ast::ROOT_MODULE_NAME),
@@ -223,27 +233,9 @@ where
 // Why 2 type parameters really? When will they
 // be different types?
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum TermId<TypeId, ValueId> {
+pub enum SymbolName<TypeId, ValueId> {
     Type(TypeId),
     Value(ValueId),
-}
-
-impl<TypeId, ValueId> TermId<TypeId, ValueId> {
-    pub fn try_into_type(self) -> Option<TypeId> {
-        if let Self::Type(id) = self {
-            Some(id)
-        } else {
-            None
-        }
-    }
-
-    pub fn try_into_value_term(self) -> Option<ValueId> {
-        if let Self::Value(id) = self {
-            Some(id)
-        } else {
-            None
-        }
-    }
 }
 
 // "Modules do not exist" - they should get their own table.
@@ -251,7 +243,7 @@ impl<TypeId, ValueId> TermId<TypeId, ValueId> {
 pub struct CompilationContext<A, GlobalName, LocalId> {
     // does it even need this?
     pub modules: HashSet<parser::IdentifierPath>,
-    pub symbols: HashMap<TermId<GlobalName, LocalId>, Symbol<A, GlobalName, LocalId>>,
+    pub symbols: HashMap<SymbolName<GlobalName, LocalId>, Symbol<A, GlobalName, LocalId>>,
     pub phase: PhantomData<(A, GlobalName, LocalId)>,
 }
 
@@ -300,9 +292,29 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
     pub fn from(program: &CompilationUnit<ParseInfo>) -> Self {
         let mut symbols = HashMap::default();
         let mut modules = HashSet::default();
-        let phase = PhantomData;
+
+        let builtins = parser::IdentifierPath::new(ast::BUILTIN_MODULE_NAME);
 
         modules.insert(parser::IdentifierPath::new(ast::ROOT_MODULE_NAME));
+        modules.insert(builtins.clone());
+
+        symbols.insert(
+            SymbolName::Type(parser::IdentifierPath::new("Int")),
+            Symbol::Type(TypeSymbol {
+                definition: TypeDefinition::Builtin(BaseType::Int),
+                origin: TypeOrigin::Builtin,
+                arity: 0,
+            }),
+        );
+
+        symbols.insert(
+            SymbolName::Type(parser::IdentifierPath::new("Text")),
+            Symbol::Type(TypeSymbol {
+                definition: TypeDefinition::Builtin(BaseType::Text),
+                origin: TypeOrigin::Builtin,
+                arity: 0,
+            }),
+        );
 
         let _ = Self::index_module_contents(
             parser::IdentifierPath::new(program.root.name.as_str()),
@@ -314,7 +326,7 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
         Self {
             modules,
             symbols,
-            phase,
+            phase: PhantomData,
         }
     }
 
@@ -325,7 +337,7 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
         declarations: &[Declaration<ParseInfo>],
         modules: &mut HashSet<parser::IdentifierPath>,
         symbol_table: &mut HashMap<
-            TermId<parser::IdentifierPath, parser::IdentifierPath>,
+            SymbolName<parser::IdentifierPath, parser::IdentifierPath>,
             Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
         >,
     ) -> Vec<Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>> {
@@ -334,7 +346,7 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
             match decl {
                 ast::Declaration::Value(_, ast::ValueDeclaration { name, declarator }) => {
                     let symbol_name = prefix.clone().with_suffix(name.as_str());
-                    let term = TermId::Value(symbol_name.clone());
+                    let term = SymbolName::Value(symbol_name.clone());
                     let symbol = Symbol::Value(ValueSymbol {
                         name: symbol_name,
                         type_signature: declarator.type_signature.clone(),
@@ -361,10 +373,10 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
                     },
                 ) => {
                     let symbol_name = prefix.clone().with_suffix(name.as_str());
-                    let term = TermId::Type(symbol_name.clone());
+                    let term = SymbolName::Type(symbol_name.clone());
                     let symbol = match declarator {
-                        ast::TypeDeclarator::Record(_, record) => {
-                            Symbol::Type(TypeSymbol::Record(RecordSymbol {
+                        ast::TypeDeclarator::Record(_, record) => Symbol::Type(TypeSymbol {
+                            definition: TypeDefinition::Record(RecordSymbol {
                                 name: symbol_name,
                                 type_parameters: type_parameters.clone(),
                                 fields: record
@@ -375,8 +387,10 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
                                         type_signature: decl.type_signature.clone(),
                                     })
                                     .collect(),
-                            }))
-                        }
+                            }),
+                            origin: TypeOrigin::UserDefined,
+                            arity: type_parameters.len(),
+                        }),
                     };
 
                     symbols.push(symbol.clone());
@@ -395,17 +409,8 @@ pub enum Symbol<A, GlobalName, LocalId> {
     Type(TypeSymbol<GlobalName>),
 }
 
-impl<A, GlobalName, LocalId> Symbol<A, GlobalName, LocalId> {
-    pub fn name(&self) -> &GlobalName {
-        match self {
-            Self::Value(symbol) => &symbol.name,
-            Self::Type(symbol) => symbol.name(),
-        }
-    }
-}
-
 impl<A> Symbol<A, QualifiedName, Identifier> {
-    pub fn dependencies(&self) -> HashSet<TermId<QualifiedName, Identifier>> {
+    pub fn dependencies(&self) -> HashSet<SymbolName<QualifiedName, Identifier>> {
         let mut deps = HashSet::default();
 
         match self {
@@ -415,17 +420,18 @@ impl<A> Symbol<A, QualifiedName, Identifier> {
                         .body
                         .free_variables()
                         .iter()
-                        .map(|&id| TermId::Value(Identifier::Free(id.clone()))),
+                        .map(|&id| SymbolName::Value(Identifier::Free(id.clone()))),
                 );
             }
 
-            Self::Type(symbol) => {
-                deps.extend(
-                    symbol
-                        .free_variables()
-                        .iter()
-                        .map(|&id| TermId::Value(Identifier::Free(id.clone()))),
-                );
+            Self::Type(..) => {
+                // Does this work?
+                //                deps.extend(
+                //                    symbol
+                //                        .free_variables()
+                //                        .iter()
+                //                        .map(|&id| SymbolName::Value(Identifier::Free(id.clone()))),
+                //                );
             }
         }
 
@@ -434,32 +440,49 @@ impl<A> Symbol<A, QualifiedName, Identifier> {
 }
 
 #[derive(Debug, Clone)]
-pub enum TypeSymbol<GlobalName> {
-    Record(RecordSymbol<GlobalName>),
-    Coproduct(CoproductSymbol<GlobalName>),
+pub struct TypeSymbol<GlobalName> {
+    pub definition: TypeDefinition<GlobalName>,
+    pub origin: TypeOrigin,
+    pub arity: usize,
 }
 
-impl<GlobalName> TypeSymbol<GlobalName> {
-    pub fn name(&self) -> &GlobalName {
-        match self {
-            Self::Record(symbol) => &symbol.name,
-            Self::Coproduct(symbol) => &symbol.name,
+#[derive(Debug, Clone)]
+pub enum TypeOrigin {
+    UserDefined,
+    Builtin,
+}
+
+#[derive(Debug, Clone)]
+pub enum TypeDefinition<GlobalName> {
+    Record(RecordSymbol<GlobalName>),
+    Coproduct(CoproductSymbol<GlobalName>),
+    Builtin(BaseType),
+}
+
+impl TypeSymbol<QualifiedName> {
+    pub fn name(&self) -> QualifiedName {
+        match &self.definition {
+            TypeDefinition::Record(symbol) => symbol.name.clone(),
+            TypeDefinition::Coproduct(symbol) => symbol.name.clone(),
+            TypeDefinition::Builtin(base_type) => base_type.name(),
         }
     }
 }
 
 impl TypeSymbol<QualifiedName> {
     pub fn type_parameters(&self) -> &[parser::Identifier] {
-        match self {
-            Self::Record(sym) => &sym.type_parameters,
-            Self::Coproduct(sym) => &sym.type_parameters,
+        match &self.definition {
+            TypeDefinition::Record(sym) => &sym.type_parameters,
+            TypeDefinition::Coproduct(sym) => &sym.type_parameters,
+            TypeDefinition::Builtin(..) => &[],
         }
     }
 
     pub fn free_variables(&self) -> HashSet<&QualifiedName> {
-        match self {
-            Self::Record(symbol) => symbol.free_variables(),
-            Self::Coproduct(symbol) => symbol.free_variables(),
+        match &self.definition {
+            TypeDefinition::Record(symbol) => symbol.free_variables(),
+            TypeDefinition::Coproduct(symbol) => symbol.free_variables(),
+            TypeDefinition::Builtin(..) => HashSet::default(),
         }
     }
 }
@@ -560,9 +583,36 @@ impl DeBruijnIndex {
 impl parser::TypeExpression {
     pub fn resolve_names(
         &self,
-        _symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
     ) -> TypeExpression {
-        todo!()
+        match self {
+            Self::Constructor(a, name) => {
+                // TODO: Is this where this happens? What exactly is _this_?
+                // Resolve local name against _import prefixes_?
+                let new_name = if name.tail.is_empty() {
+                    name.as_builtin_module_member()
+                } else {
+                    name.clone()
+                };
+                TypeExpression::Constructor(*a, symbols.resolve_member_path(&new_name))
+            }
+            Self::Parameter(a, name) => TypeExpression::Parameter(*a, name.clone()),
+            Self::Apply(a, apply) => TypeExpression::Apply(
+                *a,
+                TypeApply {
+                    function: apply.function.resolve_names(symbols).into(),
+                    argument: apply.argument.resolve_names(symbols).into(),
+                    phase: PhantomData,
+                },
+            ),
+            Self::Arrow(a, arrow) => TypeExpression::Arrow(
+                *a,
+                TypeArrow {
+                    domain: arrow.domain.resolve_names(symbols).into(),
+                    codomain: arrow.codomain.resolve_names(symbols).into(),
+                },
+            ),
+        }
     }
 }
 
@@ -760,7 +810,7 @@ impl fmt::Display for QualifiedName {
     }
 }
 
-impl<TypeId, ValueId> fmt::Display for TermId<TypeId, ValueId>
+impl<TypeId, ValueId> fmt::Display for SymbolName<TypeId, ValueId>
 where
     TypeId: fmt::Display,
     ValueId: fmt::Display,
