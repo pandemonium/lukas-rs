@@ -45,8 +45,11 @@ type TypedSymbol = namer::Symbol<TypeInfo, namer::QualifiedName, namer::Identifi
 type TypedCompilationContext =
     namer::CompilationContext<TypeInfo, namer::QualifiedName, namer::Identifier>;
 
-impl<A> CompilationContext<A, namer::QualifiedName, namer::Identifier> {
-    pub fn statically_initialized_values(
+impl<A> CompilationContext<A, namer::QualifiedName, namer::Identifier>
+where
+    A: fmt::Debug,
+{
+    pub fn static_values(
         &self,
         order: Iter<&NamedTermId>,
     ) -> Vec<&ValueSymbol<A, namer::QualifiedName, namer::Identifier>> {
@@ -109,10 +112,12 @@ impl NamedCompilationContext {
             _ => None,
         }) {
             ctx.bind_type(
-                symbol.name().clone(),
-                TypeConstructor::elaborate(symbol, &ctx)?,
+                symbol.qualified_name().clone(),
+                TypeConstructor::from_symbol(symbol),
             );
         }
+
+        ctx.elaborate_types()?;
 
         for (id, symbol) in initialization_order
             .map(|&id| {
@@ -187,18 +192,18 @@ impl RawCompilationContext {
             namer::SymbolName::Type(id) => {
                 // What is it really doing here?
                 //   `id` either represents a user type or a builtin
+
                 let new_name = if id.tail.is_empty() {
-                    id.as_builtin_module_member()
+                    if BaseType::is_name(&id.head) {
+                        id.as_builtin_module_member()
+                    } else {
+                        id.as_root_module_member()
+                    }
                 } else {
                     id.clone()
                 };
-                //                println!("rename_term_id: x {new_name}");
 
-                let term_id = namer::SymbolName::Type(self.resolve_member_path(&new_name));
-
-                //                println!("rename_term_id: did {term_id}");
-
-                term_id
+                namer::SymbolName::Type(self.resolve_member_path(&new_name))
             }
             namer::SymbolName::Value(id) => {
                 namer::SymbolName::Value(namer::Identifier::Free(self.resolve_member_path(id)))
@@ -214,8 +219,6 @@ impl RawCompilationContext {
 
     // Own and move instead?
     fn rename_symbol(&self, symbol: &RawSymbol) -> NamedSymbol {
-        //        println!("rename_symbols: {symbol:?}");
-
         match symbol {
             Symbol::Value(symbol) => Symbol::Value(ValueSymbol {
                 name: self.resolve_member_path(&symbol.name),
@@ -364,10 +367,16 @@ impl fmt::Display for RecordType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self(fields) = self;
         write!(f, "{{ ")?;
-        write!(f, "{} : {}", fields[0].0, fields[1].1)?;
-        for (label, ty) in &fields[1..] {
+        let mut fields = fields.iter();
+
+        if let Some((label, ty)) = fields.next() {
+            write!(f, "{label} : {ty}")?;
+        }
+
+        for (label, ty) in fields {
             write!(f, "; {label} : {ty}")?;
         }
+
         write!(f, " }}")
     }
 }
@@ -524,14 +533,28 @@ impl Type {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+const BUILTIN_BASE_TYPE_NAMES: [&str; 2] =
+    [BaseType::Int.local_name(), BaseType::Text.local_name()];
+
+#[derive(Copy, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BaseType {
     Int,
     Text,
 }
 
 impl BaseType {
-    pub fn name(&self) -> namer::QualifiedName {
+    pub fn is_name(id: &str) -> bool {
+        BUILTIN_BASE_TYPE_NAMES.iter().any(|&n| n == id)
+    }
+
+    const fn local_name(&self) -> &str {
+        match self {
+            Self::Int => "Int",
+            Self::Text => "Text",
+        }
+    }
+
+    pub fn qualified_name(&self) -> namer::QualifiedName {
         match self {
             Self::Int => namer::QualifiedName::builtin("Int"),
             Self::Text => namer::QualifiedName::builtin("Text"),
@@ -542,7 +565,7 @@ impl BaseType {
 impl RecordSymbol {
     fn synthesize_type(
         &self,
-        type_params: &HashMap<&parser::Identifier, TypeParameter>,
+        type_params: &HashMap<parser::Identifier, TypeParameter>,
         ctx: &TypingContext,
     ) -> Typing<Type> {
         Ok(Type::Record(RecordType::from_fields(
@@ -563,7 +586,7 @@ impl RecordSymbol {
 impl TypeExpression {
     fn synthesize_type(
         &self,
-        type_params: &HashMap<&parser::Identifier, TypeParameter>,
+        type_params: &HashMap<parser::Identifier, TypeParameter>,
         ctx: &TypingContext,
     ) -> Typing<Type> {
         match self {
@@ -573,7 +596,10 @@ impl TypeExpression {
                     .lookup(name)
                     .ok_or_else(|| TypeError::UndefinedType(name.clone()))?;
 
-                Ok(constructor.make_type())
+                Ok(constructor
+                    .header()
+                    .as_base_type()
+                    .unwrap_or_else(|| constructor.header().apply()))
             }
 
             Self::Parameter(_, p) => type_params
@@ -596,75 +622,131 @@ impl TypeExpression {
 }
 
 #[derive(Debug, Clone)]
-pub struct TypeConstructor {
+pub struct ElaboratedConstructor {
+    pub header: ConstructorHeader,
+    pub structure: Type,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConstructorHeader {
     pub name: namer::QualifiedName,
-    pub parameters: Vec<TypeParameter>,
-    pub underlying: Type,
+    pub type_parameters: HashMap<parser::Identifier, TypeParameter>,
+    pub symbol: TypeSymbol<namer::QualifiedName>,
+}
+
+impl ConstructorHeader {
+    fn apply(&self) -> Type {
+        self.type_parameters.iter().fold(
+            Type::Constructor(self.name.clone()),
+            |constructor, (_, at)| Type::Apply {
+                constructor: constructor.into(),
+                argument: Type::Variable(*at).into(),
+            },
+        )
+    }
+
+    fn as_base_type(&self) -> Option<Type> {
+        if let TypeDefinition::Builtin(base_type) = self.symbol.definition {
+            Some(Type::Base(base_type))
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TypeConstructor {
+    Unelaborated(ConstructorHeader),
+    Elaborated(ElaboratedConstructor),
 }
 
 impl TypeConstructor {
-    fn elaborate(symbol: &TypeSymbol<namer::QualifiedName>, ctx: &TypingContext) -> Typing<Self> {
-        let type_params = symbol
-            .type_parameters()
-            .iter()
-            .map(|tp| (tp, TypeParameter::fresh()))
-            .collect();
+    fn from_symbol(symbol: &TypeSymbol<namer::QualifiedName>) -> Self {
+        if let TypeDefinition::Builtin(base_type) = &symbol.definition {
+            Self::Elaborated(ElaboratedConstructor {
+                header: ConstructorHeader {
+                    name: symbol.qualified_name(),
+                    type_parameters: HashMap::default(),
+                    symbol: symbol.clone(),
+                },
+                structure: Type::Base(*base_type),
+            })
+        } else {
+            Self::Unelaborated(ConstructorHeader {
+                name: symbol.qualified_name(),
+                type_parameters: symbol
+                    .type_parameters()
+                    .iter()
+                    .map(|tp| (tp.clone(), TypeParameter::fresh()))
+                    .collect(),
+                symbol: symbol.clone(),
+            })
+        }
+    }
 
-        let underlying = match &symbol.definition {
-            TypeDefinition::Record(record) => record.synthesize_type(&type_params, ctx)?,
-            TypeDefinition::Coproduct(..) => todo!(),
-            TypeDefinition::Builtin(base_type) => Type::Base(base_type.clone()),
-        };
+    fn elaborate(&mut self, ctx: &TypingContext) -> Typing<()> {
+        if let Self::Unelaborated(constructor) = self {
+            let structure = match &constructor.symbol.definition {
+                TypeDefinition::Record(record) => {
+                    record.synthesize_type(&constructor.type_parameters, ctx)?
+                }
+                TypeDefinition::Coproduct(..) => todo!(),
+                TypeDefinition::Builtin(base_type) => Type::Base(base_type.clone()),
+            };
 
-        Ok(Self {
-            name: symbol.name(),
-            parameters: type_params.into_values().collect(),
-            underlying,
-        })
+            *self = Self::Elaborated(ElaboratedConstructor {
+                header: constructor.clone(),
+                structure,
+            });
+        }
+
+        Ok(())
     }
 
     fn with_substitutions(&self, subs: &Substitutions) -> Self {
-        Self {
-            name: self.name.clone(),
-            parameters: self.parameters.clone(),
-            underlying: self.underlying.with_substitutions(subs),
-        }
-    }
-
-    fn make_type(&self) -> Type {
-        // Terribly inefficient.
-        if self.underlying.is_base() {
-            self.underlying.clone()
-        } else {
-            self.clone().applied()
-        }
-    }
-
-    fn applied(self) -> Type {
-        self.parameters
-            .into_iter()
-            .fold(Type::Constructor(self.name), |constructor, at| {
-                Type::Apply {
-                    constructor: constructor.into(),
-                    argument: Type::Variable(at).into(),
-                }
+        if let Self::Elaborated(constructor) = self {
+            Self::Elaborated(ElaboratedConstructor {
+                header: constructor.header.clone(),
+                structure: constructor.structure.with_substitutions(subs),
             })
+        } else {
+            todo!()
+        }
+    }
+
+    fn apply(&self) -> Type {
+        match self {
+            Self::Unelaborated(header) => header.apply(),
+            Self::Elaborated(constructor) => constructor.header.apply(),
+        }
+    }
+
+    fn header(&self) -> &ConstructorHeader {
+        match self {
+            Self::Unelaborated(header) => header,
+            Self::Elaborated(constructor) => &constructor.header,
+        }
     }
 }
 
 impl fmt::Display for TypeConstructor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.name)?;
+        match self {
+            Self::Unelaborated(header) => write!(f, "Suspended {}", header.symbol.qualified_name()),
+            Self::Elaborated(constructor) => {
+                write!(f, "{}", constructor.header.name)?;
 
-        for p in &self.parameters {
-            write!(f, " {p}")?;
+                for (_, p) in &constructor.header.type_parameters {
+                    write!(f, " {p}")?;
+                }
+
+                write!(f, " ::= {}", constructor.structure)
+            }
         }
-
-        write!(f, " ::= {}", self.underlying)
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TypeScheme {
     pub quantifiers: Vec<TypeParameter>,
     pub underlying: Type,
@@ -763,7 +845,7 @@ impl Deref for Substitutions {
 
 pub type Term = namer::SymbolName<namer::QualifiedName, namer::Identifier>;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct TermSpace {
     bound: Vec<TypeScheme>,
     free: HashMap<namer::QualifiedName, TypeScheme>,
@@ -790,7 +872,7 @@ impl TermSpace {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct TypeSpace {
     bindings: HashMap<namer::QualifiedName, TypeConstructor>,
     record_type_index: HashMap<RecordType, namer::QualifiedName>,
@@ -798,7 +880,6 @@ pub struct TypeSpace {
 
 impl TypeSpace {
     fn bind(&mut self, name: namer::QualifiedName, tc: TypeConstructor) {
-        println!("bind: {name} -> {tc}");
         self.bindings.insert(name, tc);
     }
 
@@ -807,16 +888,6 @@ impl TypeSpace {
     }
 
     fn infer_record_type_constructor(&self, image: &RecordType) -> Option<&TypeConstructor> {
-        println!("infer_record_type_constructor: find {image}");
-
-        for (qn, tc) in &self.bindings {
-            println!("infer_record_type_constructor: binding {qn} -> {tc} -> ");
-        }
-
-        for (rt, qn) in &self.record_type_index {
-            println!("infer_record_type_constructor: index {rt} -> {qn}");
-        }
-
         self.record_type_index
             .get(image)
             .and_then(|name| self.bindings.get(name))
@@ -838,7 +909,7 @@ impl TypeSpace {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct TypingContext {
     types: TypeSpace,
     terms: TermSpace,
@@ -869,14 +940,29 @@ impl TypingContext {
             .collect()
     }
 
-    pub fn bind_type(&mut self, name: namer::QualifiedName, constructor: TypeConstructor) {
-        if let Type::Record(image) = &constructor.underlying {
-            println!("bind_type: {} -> {}", constructor.name, image);
-            self.types
-                .record_type_index
-                .insert(image.clone(), constructor.name.clone());
+    fn elaborate_types(&mut self) -> Typing<()> {
+        let alt_ctx = self.clone();
+
+        for constructor in self.types.bindings.values_mut() {
+            // This means that the elaboration phase does not
+            // see its own results
+            constructor.elaborate(&alt_ctx)?;
         }
 
+        for constructor in self.types.bindings.values() {
+            if let TypeConstructor::Elaborated(constructor) = constructor {
+                if let Type::Record(image) = &constructor.structure {
+                    self.types
+                        .record_type_index
+                        .insert(image.clone(), constructor.header.name.clone());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn bind_type(&mut self, name: namer::QualifiedName, constructor: TypeConstructor) {
         self.types.bind(name, constructor);
     }
 
@@ -1017,7 +1103,7 @@ impl TypingContext {
             Expr::Record(
                 TypeInfo {
                     parse_info: *parse_info,
-                    inferred_type: type_constructor.applied(),
+                    inferred_type: type_constructor.apply(),
                 },
                 Record { fields },
             ),

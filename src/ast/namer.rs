@@ -71,12 +71,20 @@ impl TypeExpression {
         free
     }
 
-    fn gather_free_variables(&self, _free: &mut HashSet<&QualifiedName>) {
+    fn gather_free_variables<'a>(&'a self, free: &mut HashSet<&'a QualifiedName>) {
         match self {
-            Self::Constructor(_, _id) => todo!(),
-            Self::Parameter(_, _identifier) => todo!(),
-            Self::Apply(_, _type_apply) => todo!(),
-            Self::Arrow(_, _type_arrow) => todo!(),
+            Self::Constructor(_, id) => {
+                free.insert(id);
+            }
+            Self::Parameter(..) => (),
+            Self::Apply(_, apply) => {
+                apply.function.gather_free_variables(free);
+                apply.argument.gather_free_variables(free);
+            }
+            Self::Arrow(_, arrow) => {
+                arrow.domain.gather_free_variables(free);
+                arrow.codomain.gather_free_variables(free);
+            }
         }
     }
 }
@@ -165,7 +173,7 @@ impl<Id> Default for DependencyMatrix<Id> {
 
 impl<Id> DependencyMatrix<Id>
 where
-    Id: Eq + Hash,
+    Id: Eq + Hash + fmt::Display + fmt::Debug,
 {
     pub fn add_edge(&mut self, node: Id, vertices: Vec<Id>) {
         self.0.insert(node, vertices);
@@ -241,7 +249,6 @@ pub enum SymbolName<TypeId, ValueId> {
 // "Modules do not exist" - they should get their own table.
 #[derive(Debug, Clone)]
 pub struct CompilationContext<A, GlobalName, LocalId> {
-    // does it even need this?
     pub modules: HashSet<parser::IdentifierPath>,
     pub symbols: HashMap<SymbolName<GlobalName, LocalId>, Symbol<A, GlobalName, LocalId>>,
     pub phase: PhantomData<(A, GlobalName, LocalId)>,
@@ -299,7 +306,7 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
         modules.insert(builtins.clone());
 
         symbols.insert(
-            SymbolName::Type(parser::IdentifierPath::new("Int")),
+            SymbolName::Type(builtins.clone().with_suffix("Int")),
             Symbol::Type(TypeSymbol {
                 definition: TypeDefinition::Builtin(BaseType::Int),
                 origin: TypeOrigin::Builtin,
@@ -308,7 +315,7 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
         );
 
         symbols.insert(
-            SymbolName::Type(parser::IdentifierPath::new("Text")),
+            SymbolName::Type(builtins.with_suffix("Text")),
             Symbol::Type(TypeSymbol {
                 definition: TypeDefinition::Builtin(BaseType::Text),
                 origin: TypeOrigin::Builtin,
@@ -425,17 +432,22 @@ impl<A> Symbol<A, QualifiedName, Identifier> {
             }
 
             Self::Type(..) => {
-                // Does this work?
-                //                deps.extend(
-                //                    symbol
-                //                        .free_variables()
-                //                        .iter()
-                //                        .map(|&id| SymbolName::Value(Identifier::Free(id.clone()))),
-                //                );
+                //deps.extend(
+                //    symbol
+                //        .free_variables()
+                //        .iter()
+                //        .map(|&id| SymbolName::Value(Identifier::Free(id.clone()))),
+                //);
             }
         }
 
         deps
+    }
+}
+
+impl<A, GlobalName, LocalId> fmt::Display for Symbol<A, GlobalName, LocalId> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        todo!()
     }
 }
 
@@ -459,12 +471,18 @@ pub enum TypeDefinition<GlobalName> {
     Builtin(BaseType),
 }
 
+impl<GlobalName> TypeDefinition<GlobalName> {
+    pub fn is_base_type(&self) -> bool {
+        matches!(self, Self::Builtin(..))
+    }
+}
+
 impl TypeSymbol<QualifiedName> {
-    pub fn name(&self) -> QualifiedName {
+    pub fn qualified_name(&self) -> QualifiedName {
         match &self.definition {
             TypeDefinition::Record(symbol) => symbol.name.clone(),
             TypeDefinition::Coproduct(symbol) => symbol.name.clone(),
-            TypeDefinition::Builtin(base_type) => base_type.name(),
+            TypeDefinition::Builtin(base_type) => base_type.qualified_name(),
         }
     }
 }
@@ -590,10 +608,15 @@ impl parser::TypeExpression {
                 // TODO: Is this where this happens? What exactly is _this_?
                 // Resolve local name against _import prefixes_?
                 let new_name = if name.tail.is_empty() {
-                    name.as_builtin_module_member()
+                    if BaseType::is_name(&name.head) {
+                        name.as_builtin_module_member()
+                    } else {
+                        name.as_root_module_member()
+                    }
                 } else {
                     name.clone()
                 };
+
                 TypeExpression::Constructor(*a, symbols.resolve_member_path(&new_name))
             }
             Self::Parameter(a, name) => TypeExpression::Parameter(*a, name.clone()),

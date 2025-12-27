@@ -8,7 +8,7 @@ use crate::{
 pub mod annotation;
 pub mod namer;
 
-pub const ROOT_MODULE_NAME: &str = "__root__"; // This should be the main source file name
+pub const ROOT_MODULE_NAME: &str = "Root"; // This should be the main source file name
 pub const BUILTIN_MODULE_NAME: &str = "__builtin__";
 
 #[derive(Debug)]
