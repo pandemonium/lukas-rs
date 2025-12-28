@@ -246,7 +246,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn consume_if<P>(&mut self, p: P) -> Result<&Token>
+    fn _consume_if<P>(&mut self, p: P) -> Result<&Token>
     where
         P: FnMut(&&Token) -> bool,
     {
@@ -340,20 +340,42 @@ impl<'a> Parser<'a> {
             ] => {
                 self.advance(2);
 
-                //                let type_parameters = self.parse_type_parameters()?;
-
                 Ok(Declaration::Type(
                     ParseInfo::from_position(*position),
                     TypeDeclaration {
                         name: Identifier::from_str(name),
                         // Move this to TypeDeclarator
-                        type_parameters: vec![],
+                        type_parameters: self.parse_type_parameters()?,
                         declarator: self.parse_block(|parser| parser.parse_type_declarator())?,
                     },
                 ))
             }
 
             otherwise => panic!("{otherwise:?}"),
+        }
+    }
+
+    // preceed with parse_block, but it has to lookahead to see
+    // that there is a forall in there, or it will erroneously
+    // consume the type body block tokens.
+    fn parse_type_parameters(&mut self) -> Result<Vec<Identifier>> {
+        if self.peek()?.is_keyword(Keyword::Forall) {
+            self.advance(1);
+
+            let mut params = vec![];
+            while self.peek()?.is_identifier() {
+                params.push(self.identifier().map(|(_, id)| Identifier(id))?);
+            }
+
+            if params.is_empty() {
+                Err(Fault::ExpectedIdentifier(self.peek()?.clone()))?;
+            }
+
+            self.expect(TokenKind::Period)?;
+
+            Ok(params)
+        } else {
+            Ok(vec![])
         }
     }
 

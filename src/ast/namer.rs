@@ -26,6 +26,14 @@ pub type Projection = ast::Projection<ParseInfo, Identifier>;
 pub type Sequence = ast::Sequence<ParseInfo, Identifier>;
 pub type TypeExpression = ast::TypeExpression<ParseInfo, QualifiedName>;
 
+type RawTermId = SymbolName<parser::IdentifierPath, parser::IdentifierPath>;
+type RawCompilationContext =
+    CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
+type RawSymbol = Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
+pub type TermId = SymbolName<QualifiedName, Identifier>;
+pub type NamedCompilationContext = CompilationContext<ParseInfo, QualifiedName, Identifier>;
+pub type NamedSymbol = Symbol<ParseInfo, QualifiedName, Identifier>;
+
 impl<A> ast::Expr<A, Identifier> {
     pub fn free_variables(&self) -> HashSet<&QualifiedName> {
         let mut free = HashSet::default();
@@ -354,7 +362,7 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
                 ast::Declaration::Value(_, ast::ValueDeclaration { name, declarator }) => {
                     let symbol_name = prefix.clone().with_suffix(name.as_str());
                     let term = SymbolName::Value(symbol_name.clone());
-                    let symbol = Symbol::Value(ValueSymbol {
+                    let symbol = Symbol::Term(TermSymbol {
                         name: symbol_name,
                         type_signature: declarator.type_signature.clone(),
 
@@ -412,7 +420,7 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
 
 #[derive(Debug, Clone)]
 pub enum Symbol<A, GlobalName, LocalId> {
-    Value(ValueSymbol<A, GlobalName, LocalId>),
+    Term(TermSymbol<A, GlobalName, LocalId>),
     Type(TypeSymbol<GlobalName>),
 }
 
@@ -421,7 +429,7 @@ impl<A> Symbol<A, QualifiedName, Identifier> {
         let mut deps = HashSet::default();
 
         match self {
-            Self::Value(symbol) => {
+            Self::Term(symbol) => {
                 deps.extend(
                     symbol
                         .body
@@ -446,7 +454,7 @@ impl<A> Symbol<A, QualifiedName, Identifier> {
 }
 
 impl<A, GlobalName, LocalId> fmt::Display for Symbol<A, GlobalName, LocalId> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
         todo!()
     }
 }
@@ -561,7 +569,7 @@ impl ConstructorSymbol<QualifiedName> {
 impl<GlobalName> TypeSymbol<GlobalName> {}
 
 #[derive(Debug, Clone)]
-pub struct ValueSymbol<A, GlobalName, LocalId> {
+pub struct TermSymbol<A, GlobalName, LocalId> {
     pub name: GlobalName,
     pub type_signature: Option<TypeSignature<ParseInfo, GlobalName>>,
     pub body: ast::Expr<A, LocalId>,
@@ -801,6 +809,115 @@ impl parser::Sequence {
         Sequence {
             this: self.this.resolve(names, symbols).into(),
             and_then: self.and_then.resolve(names, symbols).into(),
+        }
+    }
+}
+
+impl RawCompilationContext {
+    // Move to namer.rs
+    // This does not need the symbols in any particular order, so long as all
+    // modules are known
+    pub fn rename_symbols(self) -> NamedCompilationContext {
+        CompilationContext {
+            modules: self.modules.clone(),
+            symbols: self
+                .symbols
+                .iter()
+                //                   The builtins must receive a name prefigured with __builtin__ here
+                //                   or they cannot be resolved
+                .map(|(id, symbol)| (self.rename_term_id(id), self.rename_symbol(symbol)))
+                .collect(),
+            phase: PhantomData,
+        }
+    }
+
+    fn rename_term_id(&self, id: &RawTermId) -> TermId {
+        match id {
+            SymbolName::Type(id) => {
+                // What is it really doing here?
+                //   `id` either represents a user type or a builtin
+
+                let new_name = if id.tail.is_empty() {
+                    if BaseType::is_name(&id.head) {
+                        id.as_builtin_module_member()
+                    } else {
+                        id.as_root_module_member()
+                    }
+                } else {
+                    id.clone()
+                };
+
+                SymbolName::Type(self.resolve_member_path(&new_name))
+            }
+            SymbolName::Value(id) => {
+                SymbolName::Value(Identifier::Free(self.resolve_member_path(id)))
+            }
+        }
+    }
+
+    pub fn resolve_member_path(&self, id: &parser::IdentifierPath) -> QualifiedName {
+        self.resolve_module_path_expr(id)
+            .expect(&format!("a valid type identifier path: {id}"))
+            .into_member_path()
+    }
+
+    // Own and move instead?
+    fn rename_symbol(&self, symbol: &RawSymbol) -> NamedSymbol {
+        match symbol {
+            Symbol::Term(symbol) => Symbol::Term(TermSymbol {
+                name: self.resolve_member_path(&symbol.name),
+                type_signature: symbol
+                    .type_signature
+                    .clone()
+                    .map(|ts| ts.map(|te| te.resolve_names(self))),
+                body: symbol.body.resolve_names(self),
+            }),
+
+            Symbol::Type(symbol) => Symbol::Type(match &symbol.definition {
+                TypeDefinition::Record(record) => TypeSymbol {
+                    definition: TypeDefinition::Record(RecordSymbol {
+                        name: self.resolve_member_path(&record.name),
+                        type_parameters: record.type_parameters.clone(),
+                        fields: record
+                            .fields
+                            .iter()
+                            .map(|symbol| FieldSymbol {
+                                name: symbol.name.clone(),
+                                type_signature: symbol.type_signature.resolve_names(self),
+                            })
+                            .collect(),
+                    }),
+                    origin: symbol.origin.clone(),
+                    arity: symbol.arity.clone(),
+                },
+
+                TypeDefinition::Coproduct(coproduct) => TypeSymbol {
+                    definition: TypeDefinition::Coproduct(CoproductSymbol {
+                        name: self.resolve_member_path(&coproduct.name),
+                        type_parameters: coproduct.type_parameters.clone(),
+                        constructors: coproduct
+                            .constructors
+                            .iter()
+                            .map(|symbol| ConstructorSymbol {
+                                name: self.resolve_member_path(&symbol.name),
+                                signature: symbol
+                                    .signature
+                                    .iter()
+                                    .map(|te| te.resolve_names(self))
+                                    .collect(),
+                            })
+                            .collect(),
+                    }),
+                    origin: symbol.origin.clone(),
+                    arity: symbol.arity.clone(),
+                },
+
+                TypeDefinition::Builtin(base_type) => TypeSymbol {
+                    definition: TypeDefinition::Builtin(base_type.clone()),
+                    origin: symbol.origin.clone(),
+                    arity: symbol.arity,
+                },
+            }),
         }
     }
 }

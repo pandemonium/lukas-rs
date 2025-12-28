@@ -163,7 +163,7 @@ impl Environment {
 
         if dependencies.are_sound() {
             for symbol in compilation
-                .check_types(evaluation_order.iter())?
+                .compute_types(evaluation_order.iter())?
                 .static_values(evaluation_order.iter())
             {
                 let value = Rc::new(symbol.body.erase_annotation())
