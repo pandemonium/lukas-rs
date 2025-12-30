@@ -1,11 +1,12 @@
-use std::{fmt, iter, marker::PhantomData, result};
+use std::{cell::Cell, fmt, iter, marker::PhantomData, result};
 
 use backtrace::Backtrace;
 
 use crate::{
     ast::{
-        self, CompilationUnit, Declaration, FieldDeclarator, RecordDeclarator, Tree, TypeApply,
-        TypeArrow, TypeDeclaration, TypeDeclarator, ValueDeclaration, ValueDeclarator,
+        self, CompilationUnit, CoproductConstructor, CoproductDeclarator, Declaration,
+        FieldDeclarator, RecordDeclarator, Tree, TypeApply, TypeArrow, TypeDeclaration,
+        TypeDeclarator, TypeSignature, ValueDeclaration, ValueDeclarator,
     },
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
 };
@@ -149,6 +150,29 @@ struct TraceLogEntry<'a> {
     remains: &'a [Token],
 }
 
+thread_local! {
+    static STACK_DEPTH: Cell<usize> = Cell::new(0);
+}
+
+pub struct TraceGuard;
+
+impl TraceGuard {
+    fn enter() -> Self {
+        STACK_DEPTH.with(|d| d.set(d.get() + 1));
+        TraceGuard
+    }
+}
+
+impl Drop for TraceGuard {
+    fn drop(&mut self) {
+        STACK_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
+fn stack_depth() -> usize {
+    STACK_DEPTH.with(|d| d.get())
+}
+
 #[derive(Debug, Default)]
 pub struct Parser<'a> {
     remains: &'a [Token],
@@ -168,7 +192,9 @@ impl<'a> Parser<'a> {
         self.offset += by;
     }
 
-    fn trace(&mut self) {
+    fn trace(&mut self) -> TraceGuard {
+        let depth = stack_depth();
+
         let backtrace = Backtrace::new();
         let calling_symbol = backtrace.frames().iter().find_map(|frame| {
             frame
@@ -185,10 +211,25 @@ impl<'a> Parser<'a> {
                 step: caller.unwrap_or(&caller_name.as_str()).to_string(),
                 remains: self.remains(),
             };
-            println!("{e}");
+            println!(
+                "{:indent$}{}{:<pad$}{}",
+                "",
+                e.step,
+                "",
+                self.remains()
+                    .iter()
+                    .map(|t| t.to_string())
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                indent = depth * 2,
+                pad = 50 - (depth * 2 + e.step.len())
+            );
         } else {
             println!("Unknown caller.")
         }
+
+        TraceGuard::enter()
     }
 
     fn peek(&self) -> Result<&Token> {
@@ -210,7 +251,7 @@ impl<'a> Parser<'a> {
                 position: token.position,
             }),
 
-            _ => panic!(),
+            _ => Err(Fault::UnexpectedUnderflow),
         }
     }
 
@@ -259,13 +300,13 @@ impl<'a> Parser<'a> {
     }
 
     pub fn parse_compilation_unit(&mut self) -> Result<CompilationUnit<ParseInfo>> {
-        self.trace();
+        let _t = self.trace();
 
         let mut decls = vec![self.parse_declaration()?];
 
         while self.has_declaration_prefix() {
             if self.peek()?.is_newline() {
-                self.consume()?;
+                self.advance(1);
             }
 
             if !self.peek()?.is_end() {
@@ -288,7 +329,7 @@ impl<'a> Parser<'a> {
                     ..
                 },
                 Token {
-                    kind: TokenKind::Assign | TokenKind::TypeAssign,
+                    kind: TokenKind::Assign | TokenKind::TypeAssign | TokenKind::TypeAscribe,
                     ..
                 },
                 ..
@@ -303,7 +344,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_declaration(&mut self) -> Result<Declaration<ParseInfo>> {
-        self.trace();
+        let _t = self.trace();
 
         match self.remains() {
             [
@@ -317,12 +358,44 @@ impl<'a> Parser<'a> {
                 },
                 ..,
             ] => {
+                // <id> <:=>
                 self.advance(2);
+
                 Ok(Declaration::Value(
                     ParseInfo::from_position(*position),
                     ValueDeclaration {
                         name: Identifier::from_str(name),
-                        declarator: self.parse_value_declarator()?,
+                        declarator: self.parse_value_declarator(None)?,
+                    },
+                ))
+            }
+
+            [
+                Token {
+                    kind: TokenKind::Identifier(name),
+                    position,
+                },
+                Token {
+                    kind: TokenKind::TypeAscribe,
+                    ..
+                },
+                ..,
+            ] => {
+                // <id> <::>
+                self.advance(2);
+
+                let type_signature = self.parse_type_signature().map(Some)?;
+
+                //                println!("parse_declaration: {}", self.peek()?.kind);
+
+                // <:=>
+                self.advance(1);
+
+                Ok(Declaration::Value(
+                    ParseInfo::from_position(*position),
+                    ValueDeclaration {
+                        name: Identifier::from_str(name),
+                        declarator: self.parse_value_declarator(type_signature)?,
                     },
                 ))
             }
@@ -338,6 +411,7 @@ impl<'a> Parser<'a> {
                 },
                 ..,
             ] => {
+                // <id> <::=>
                 self.advance(2);
 
                 Ok(Declaration::Type(
@@ -345,7 +419,7 @@ impl<'a> Parser<'a> {
                     TypeDeclaration {
                         name: Identifier::from_str(name),
                         // Move this to TypeDeclarator
-                        type_parameters: self.parse_type_parameters()?,
+                        type_parameters: self.parse_forall_clause()?,
                         declarator: self.parse_block(|parser| parser.parse_type_declarator())?,
                     },
                 ))
@@ -358,8 +432,11 @@ impl<'a> Parser<'a> {
     // preceed with parse_block, but it has to lookahead to see
     // that there is a forall in there, or it will erroneously
     // consume the type body block tokens.
-    fn parse_type_parameters(&mut self) -> Result<Vec<Identifier>> {
+    fn parse_forall_clause(&mut self) -> Result<Vec<Identifier>> {
+        let _t = self.trace();
+
         if self.peek()?.is_keyword(Keyword::Forall) {
+            // forall
             self.advance(1);
 
             let mut params = vec![];
@@ -379,35 +456,46 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_value_declarator(&mut self) -> Result<ValueDeclarator<ParseInfo>> {
-        self.trace();
+    fn parse_value_declarator(
+        &mut self,
+        type_signature: Option<TypeSignature<ParseInfo, IdentifierPath>>,
+    ) -> Result<ValueDeclarator<ParseInfo>> {
+        let _t = self.trace();
 
         Ok(ValueDeclarator {
-            type_signature: None,
+            type_signature,
             body: self.parse_block(|parser| parser.parse_expression(0))?,
         })
     }
 
     fn parse_type_declarator(&mut self) -> Result<TypeDeclarator<ParseInfo>> {
-        self.trace();
+        let _t = self.trace();
 
-        if self.peek()?.kind == TokenKind::LeftBrace {
-            self.parse_block(|parser| {
-                // The `{`
-                let info = ParseInfo::from_position(*parser.consume()?.location());
+        match self.remains() {
+            [t, ..] if t.kind == TokenKind::LeftBrace => {
+                self.parse_block(|parser| {
+                    // The `{`
+                    let info = ParseInfo::from_position(*parser.consume()?.location());
+                    parser
+                        .parse_record_type_decl()
+                        .map(|decl| TypeDeclarator::Record(info, decl))
+                })
+            }
+
+            [t, ..] if t.is_identifier() => self.parse_block(|parser| {
+                let info = ParseInfo::from_position(*parser.peek()?.location());
                 parser
-                    .parse_record_type_decl()
-                    .map(|decl| TypeDeclarator::Record(info, decl))
-            })
-        } else {
-            //            self.parse_coproduct_type()
-            todo!()
+                    .parse_coproduct()
+                    .map(|decl| TypeDeclarator::Coproduct(info, decl))
+            }),
+
+            otherwise => panic!("{otherwise:?}"),
         }
     }
 
     // This is incredibly noisy for something very simple
     fn parse_record_type_decl(&mut self) -> Result<RecordDeclarator<ParseInfo>> {
-        self.trace();
+        let _t = self.trace();
 
         self.strip_layout()?;
 
@@ -435,6 +523,8 @@ impl<'a> Parser<'a> {
     }
 
     fn strip_layout(&mut self) -> Result<()> {
+        let _t = self.trace();
+
         while self.peek()?.is_layout() {
             self.consume()?;
         }
@@ -443,10 +533,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_field_decl(&mut self) -> Result<FieldDeclarator<ParseInfo>> {
-        self.trace();
+        let _t = self.trace();
 
         let (_, label) = self.identifier()?;
-        self.expect(TokenKind::Colon)?;
+        self.expect(TokenKind::TypeAscribe)?;
         let type_signature = self.parse_type_expression()?;
         Ok(FieldDeclarator {
             // It could really keep this Identifier instead of cloning it
@@ -456,14 +546,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type_expression(&mut self) -> Result<TypeExpression> {
-        self.trace();
+        let _t = self.trace();
 
         let prefix = self.parse_type_expr_prefix()?;
         self.parse_type_expr_infix(prefix)
     }
 
     fn parse_type_expr_prefix(&mut self) -> Result<TypeExpression> {
-        self.trace();
+        let _t = self.trace();
 
         match self.remains() {
             [
@@ -507,7 +597,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type_expr_infix(&mut self, lhs: TypeExpression) -> Result<TypeExpression> {
-        self.trace();
+        let _t = self.trace();
 
         match self.remains() {
             [
@@ -558,7 +648,7 @@ impl<'a> Parser<'a> {
                 },
                 ..,
             ] => {
-                self.advance(1);
+                //                self.advance(1);
                 Ok(lhs)
             }
 
@@ -570,14 +660,14 @@ impl<'a> Parser<'a> {
     where
         F: FnOnce(&mut Parser<'a>) -> Result<A>,
     {
-        self.trace();
+        let _t = self.trace();
 
         if self.peek()?.is_indent() {
             self.consume()?;
             let body = parse_body(self)?;
             // This does not interact well with sequences because parse_sequence
             // does not see a sequence separator anymore after this
-            println!("parse_block: delete dedent");
+            //            println!("parse_block: delete dedent");
             self.expect(TokenKind::Layout(Layout::Dedent))?;
             Ok(body)
         } else {
@@ -586,7 +676,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_local_binding(&mut self) -> Result<Expr> {
-        self.trace();
+        let _t = self.trace();
 
         let location = *self.expect(TokenKind::Keyword(Keyword::Let))?.location();
         let (.., binder) = self.identifier()?;
@@ -612,7 +702,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_record(&mut self) -> Result<Expr> {
-        self.trace();
+        let _t = self.trace();
 
         // the `{`
         self.advance(1);
@@ -637,7 +727,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_field_init(&mut self) -> Result<(Identifier, Tree<ParseInfo, IdentifierPath>)> {
-        self.trace();
+        let _t = self.trace();
 
         let (_, label) = self.identifier()?;
         self.expect(TokenKind::Colon)?;
@@ -648,7 +738,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_lambda(&mut self) -> Result<Expr> {
-        self.trace();
+        let _t = self.trace();
 
         self.expect(TokenKind::Keyword(Keyword::Lambda))?;
 
@@ -679,7 +769,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_sequence(&mut self) -> Result<Expr> {
-        self.trace();
+        let _t = self.trace();
 
         let prefix = self.parse_expression(0)?;
 
@@ -720,7 +810,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_subsequent(&mut self, this: Expr) -> Result<Expr> {
-        self.trace();
+        let _t = self.trace();
 
         let and_then = self.parse_sequence()?;
 
@@ -734,14 +824,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expression(&mut self, precedence: usize) -> Result<Expr> {
-        self.trace();
+        let _t = self.trace();
 
         let prefix = self.parse_expr_prefix()?;
         self.parse_expr_infix(prefix, precedence)
     }
 
     fn parse_expr_prefix(&mut self) -> Result<Expr> {
-        self.trace();
+        let _t = self.trace();
 
         match self.remains() {
             [
@@ -785,8 +875,7 @@ impl<'a> Parser<'a> {
     fn is_expr_prefix(kind: &TokenKind) -> bool {
         !matches!(
             kind,
-            TokenKind::Layout(Layout::Dedent | Layout::Indent)
-                | TokenKind::Layout(Layout::Newline)
+            TokenKind::Layout(Layout::Dedent | Layout::Indent | Layout::Newline)
                 | TokenKind::RightBrace
                 | TokenKind::End
                 | TokenKind::Keyword(
@@ -812,7 +901,7 @@ impl<'a> Parser<'a> {
         ];
         let is_terminal = |t| terminals.contains(t);
 
-        self.trace();
+        let _t = self.trace();
 
         match self.remains() {
             [t, ..] if is_terminal(&t.kind) => Ok(lhs),
@@ -838,10 +927,10 @@ impl<'a> Parser<'a> {
                     && Operator::Juxtaposition.precedence() > context_precedence
                     && u.location().is_descendant_of(&lhs.position()) =>
             {
-                println!(
-                    "Calling parse_juxtaposed(1); lhs pos {}",
-                    lhs.parse_info().location
-                );
+                //                println!(
+                //                    "Calling parse_juxtaposed(1); lhs pos {}",
+                //                    lhs.parse_info().location
+                //                );
                 self.consume()?; //the indent
                 self.parse_juxtaposed(lhs, context_precedence)
             }
@@ -851,7 +940,7 @@ impl<'a> Parser<'a> {
                 if Self::is_expr_prefix(&t.kind)
                     && Operator::Juxtaposition.precedence() > context_precedence =>
             {
-                println!("Calling parse_juxtaposed(2)");
+                //                println!("Calling parse_juxtaposed(2)");
                 self.parse_juxtaposed(lhs, context_precedence)
             }
 
@@ -860,7 +949,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_juxtaposed(&mut self, lhs: Expr, context_precedence: usize) -> Result<Expr> {
-        self.trace();
+        let _t = self.trace();
 
         let rhs = self.parse_expr_prefix()?;
         self.parse_expr_infix(
@@ -896,7 +985,7 @@ impl<'a> Parser<'a> {
         operator_position: SourceLocation,
         context_precedence: usize,
     ) -> Result<Expr> {
-        self.trace();
+        let _t = self.trace();
 
         let operator_precedence = operator.precedence();
         if operator_precedence > context_precedence {
@@ -932,6 +1021,62 @@ impl<'a> Parser<'a> {
             self.unconsume()?;
             Ok(lhs)
         }
+    }
+
+    fn parse_type_signature(&mut self) -> Result<TypeSignature<ParseInfo, IdentifierPath>> {
+        let _t = self.trace();
+
+        let quantifiers = self.parse_forall_clause()?;
+        let body = self.parse_type_expression()?;
+
+        Ok(TypeSignature {
+            universal_quantifiers: quantifiers,
+            body,
+            phase: PhantomData,
+        })
+    }
+
+    fn parse_coproduct(&mut self) -> Result<CoproductDeclarator<ParseInfo>> {
+        let _t = self.trace();
+
+        let mut constructors = vec![self.parse_coproduct_constructor()?];
+
+        while self.peek()?.kind == TokenKind::Pipe {
+            // |
+            self.advance(1);
+            constructors.push(self.parse_coproduct_constructor()?);
+        }
+
+        Ok(CoproductDeclarator { constructors })
+    }
+
+    fn parse_coproduct_constructor(&mut self) -> Result<CoproductConstructor<ParseInfo>> {
+        let _t = self.trace();
+
+        let (_, id) = self.identifier()?;
+
+        let mut signature = vec![];
+
+        while matches!(
+            self.peek()?.kind,
+            TokenKind::Identifier(..) | TokenKind::LeftParen
+        ) {
+            if self.peek()?.is_identifier() {
+                let (pos, id) = self.identifier()?;
+                signature.push(TypeExpression::Constructor(
+                    ParseInfo::from_position(pos),
+                    IdentifierPath::new(&id),
+                ));
+            } else {
+                signature.push(self.parse_type_expression()?);
+                self.expect(TokenKind::RightParen)?;
+            }
+        }
+
+        Ok(CoproductConstructor {
+            name: Identifier::from_str(&id),
+            signature,
+        })
     }
 }
 
@@ -973,21 +1118,23 @@ impl fmt::Display for IdentifierPath {
     }
 }
 
-impl<'a> fmt::Display for TraceLogEntry<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { step, remains } = self;
-        write!(
-            f,
-            "{step:<20}: {}",
-            remains
-                .iter()
-                .map(|t| t.to_string())
-                .take(10)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
+//impl<'a> fmt::Display for TraceLogEntry<'a> {
+//    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//        let Self { step, remains } = self;
+//        write!(
+//            f,
+//            "{} -->{:<pad$}",
+//            step,
+//            remains
+//                .iter()
+//                .map(|t| t.to_string())
+//                .take(10)
+//                .collect::<Vec<_>>()
+//                .join(", ")
+//            pad = 40
+//        )
+//    }
+//}
 
 #[cfg(test)]
 mod tests {

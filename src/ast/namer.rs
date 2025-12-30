@@ -11,7 +11,7 @@ use crate::{
     ast::{
         self, CompilationUnit, Declaration, ProductElement, TypeApply, TypeArrow, TypeSignature,
     },
-    parser::{self, ParseInfo},
+    parser::{self, IdentifierPath, ParseInfo},
     typer::BaseType,
 };
 
@@ -400,6 +400,23 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
                                     .map(|decl| FieldSymbol {
                                         name: decl.name.clone(),
                                         type_signature: decl.type_signature.clone(),
+                                    })
+                                    .collect(),
+                            }),
+                            origin: TypeOrigin::UserDefined,
+                            arity: type_parameters.len(),
+                        }),
+
+                        ast::TypeDeclarator::Coproduct(_, coproduct) => Symbol::Type(TypeSymbol {
+                            definition: TypeDefinition::Coproduct(CoproductSymbol {
+                                name: symbol_name,
+                                type_parameters: type_parameters.clone(),
+                                constructors: coproduct
+                                    .constructors
+                                    .iter()
+                                    .map(|decl| ConstructorSymbol::<IdentifierPath> {
+                                        name: IdentifierPath::new(decl.name.as_str()),
+                                        signature: decl.signature.clone(),
                                     })
                                     .collect(),
                             }),

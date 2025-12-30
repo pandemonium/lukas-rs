@@ -158,6 +158,10 @@ impl Environment {
 
         let compilation = compilation.rename_symbols();
 
+        for (name, sym) in &compilation.symbols {
+            println!("typecheck_and_initialize: {name} -> {sym:?}");
+        }
+
         let dependencies = compilation.dependency_matrix();
         let evaluation_order = dependencies.in_resolvable_order();
 

@@ -67,11 +67,23 @@ pub struct TypeDeclaration<A> {
 #[derive(Debug)]
 pub enum TypeDeclarator<A> {
     Record(A, RecordDeclarator<A>),
+    Coproduct(A, CoproductDeclarator<A>),
 }
 
 #[derive(Debug)]
 pub struct RecordDeclarator<A> {
     pub fields: Vec<FieldDeclarator<A>>,
+}
+
+#[derive(Debug)]
+pub struct CoproductDeclarator<A> {
+    pub constructors: Vec<CoproductConstructor<A>>,
+}
+
+#[derive(Debug)]
+pub struct CoproductConstructor<A> {
+    pub name: parser::Identifier,
+    pub signature: Vec<TypeExpression<A, parser::IdentifierPath>>,
 }
 
 #[derive(Debug)]
@@ -388,6 +400,7 @@ impl<A> fmt::Display for TypeDeclarator<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Record(_, decl) => write!(f, "{decl}"),
+            Self::Coproduct(_, decl) => write!(f, "{decl}"),
         }
     }
 }
@@ -397,6 +410,39 @@ impl<A> fmt::Display for RecordDeclarator<A> {
         for field in &self.fields {
             writeln!(f, "{field}")?;
         }
+        Ok(())
+    }
+}
+
+impl<A> fmt::Display for CoproductDeclarator<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut constructors = self.constructors.iter();
+
+        if let Some(constructor) = constructors.next() {
+            write!(f, "{}", constructor)?;
+
+            for c in constructors {
+                write!(f, " | {c}")?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl<A> fmt::Display for CoproductConstructor<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)?;
+        let mut signature = self.signature.iter();
+
+        if let Some(ty_expr) = signature.next() {
+            write!(f, "({ty_expr})")?;
+
+            for ty_expr in signature {
+                write!(f, " ({ty_expr})")?;
+            }
+        }
+
         Ok(())
     }
 }

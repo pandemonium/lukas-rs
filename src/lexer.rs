@@ -621,16 +621,16 @@ impl Token {
 impl fmt::Display for Layout {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Indent => write!(f, "<Indent>"),
-            Self::Dedent => write!(f, "<Dedent>"),
-            Self::Newline => write!(f, "<Newline>"),
+            Self::Indent => write!(f, "<Ind>"),
+            Self::Dedent => write!(f, "<Ded>"),
+            Self::Newline => write!(f, "<NL>"),
         }
     }
 }
 
 impl fmt::Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}] {}", self.position, self.kind)
+        write!(f, "<{} {}>", self.position, self.kind)
     }
 }
 
@@ -676,7 +676,7 @@ impl fmt::Display for TokenKind {
 impl fmt::Display for SourceLocation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { row, column } = self;
-        write!(f, "{row}, {column}")
+        write!(f, "{row},{column}")
     }
 }
 
