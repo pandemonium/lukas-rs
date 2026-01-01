@@ -48,12 +48,20 @@ impl Expr<(), namer::Identifier> {
                 env.bind_and_then(the.bound.reduce(env)?, |env| the.body.reduce(env))
             }
 
-            Self::Record(_, the) => Ok(Value::Product(
-                the.fields
-                    .iter()
-                    .map(|(_, e)| e.reduce(env))
-                    .collect::<Interpretation<_>>()?,
-            )),
+            Self::Record(_, the) => {
+                print!("reduce: record {{");
+                for field in &the.fields {
+                    print!(" {}", field.0);
+                }
+                println!(" }}.");
+
+                Ok(Value::Product(
+                    the.fields
+                        .iter()
+                        .map(|(_, e)| e.reduce(env))
+                        .collect::<Interpretation<_>>()?,
+                ))
+            }
 
             Self::Tuple(_, the) => Ok(Value::Product(
                 the.elements
@@ -72,12 +80,15 @@ impl Expr<(), namer::Identifier> {
                     .collect::<Interpretation<Vec<_>>>()?,
             }),
 
-            Self::Project(_, the) => match (the.base.reduce(env)?, &the.select) {
-                (Value::Product(values), ProductElement::Ordinal(index)) => {
-                    Ok(values[*index].clone())
+            Self::Project(_, the) => {
+                println!("recuce: `{the:?}`");
+                match (the.base.reduce(env)?, &the.select) {
+                    (Value::Product(values), ProductElement::Ordinal(index)) => {
+                        Ok(values[*index].clone())
+                    }
+                    (base, select) => panic!("projection off of {base:?} with {select:?}"),
                 }
-                (base, select) => panic!("projection off of {base:?} with {select:?}"),
-            },
+            }
 
             Self::Sequence(_, the) => {
                 env.bind_and_then(the.this.reduce(env)?, |env| the.and_then.reduce(env))

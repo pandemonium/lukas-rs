@@ -48,27 +48,39 @@ impl<A> ast::Expr<A, Identifier> {
             Self::Variable(_, Identifier::Free(id)) => {
                 free.insert(id);
             }
+
             Self::RecursiveLambda(_, rec) => rec.lambda.body.gather_free_variables(free),
-            Self::Lambda(_, lambda) => lambda.body.gather_free_variables(free),
+
+            Self::Lambda(_, lambda) => {
+                // not quite right?
+                // surely remove lambda.param?
+                lambda.body.gather_free_variables(free)
+            }
+
             Self::Apply(_, apply) => {
                 apply.function.gather_free_variables(free);
                 apply.argument.gather_free_variables(free)
             }
+
             Self::Let(_, binding) => {
                 binding.bound.gather_free_variables(free);
                 binding.body.gather_free_variables(free)
             }
+
             Self::Tuple(_, tuple) => {
                 for elt in &tuple.elements {
                     elt.gather_free_variables(free)
                 }
             }
+
             Self::Record(_, record) => {
                 for (_, init) in &record.fields {
                     init.gather_free_variables(free)
                 }
             }
+
             Self::Project(_, projection) => projection.base.gather_free_variables(free),
+
             _otherwise => (),
         }
     }
@@ -214,6 +226,8 @@ where
             .iter()
             .filter_map(|(_, deps)| deps.iter().find(|&dep| !map.contains_key(dep)))
             .collect::<Vec<_>>();
+
+        println!("dependencies: unsatisfied {:?}", unsatisfieds);
 
         unsatisfieds.is_empty()
     }
@@ -689,6 +703,14 @@ pub struct ModuleSymbol<A, GlobalName, LocalId> {
 struct DeBruijnIndex(Vec<parser::Identifier>);
 
 impl DeBruijnIndex {
+    fn try_resolve_bound(&self, id: &parser::Identifier) -> Option<Identifier> {
+        if let bound @ Identifier::Bound(..) = self.resolve(id) {
+            Some(bound)
+        } else {
+            None
+        }
+    }
+
     fn resolve(&self, id: &parser::Identifier) -> Identifier {
         if let Some(index) = self.0.iter().rposition(|n| n == id) {
             Identifier::Bound(index)
@@ -710,10 +732,7 @@ impl DeBruijnIndex {
 }
 
 impl parser::TypeExpression {
-    pub fn resolve_names(
-        &self,
-        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
-    ) -> TypeExpression {
+    pub fn resolve_names(&self, symbols: &ParserCompilationContext) -> TypeExpression {
         match self {
             Self::Constructor(a, name) => {
                 // TODO: Is this where this happens? What exactly is _this_?
@@ -759,23 +778,23 @@ impl parser::TypeExpression {
 }
 
 impl parser::Expr {
-    pub fn resolve_names(
-        &self,
-        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
-    ) -> Expr {
+    pub fn resolve_names(&self, symbols: &ParserCompilationContext) -> Expr {
         self.resolve(&mut DeBruijnIndex::default(), symbols)
     }
 
-    fn resolve(
-        &self,
-        names: &mut DeBruijnIndex,
-        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
-    ) -> Expr {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Expr {
         match self {
             Self::Variable(a, identifier_path) => {
-                if let Some(name) = identifier_path.try_as_simple() {
+                println!("resolve: {identifier_path}");
+
+                if let Some(bound) =
+                    names.try_resolve_bound(&parser::Identifier::from_str(&identifier_path.head))
+                {
+                    into_projection(a, bound, identifier_path)
+                } else if let Some(name) = identifier_path.try_as_simple() {
                     Expr::Variable(*a, names.resolve(&name))
                 } else if let Some(path) = symbols.resolve_module_path_expr(identifier_path) {
+                    panic!("What causes this?(1) `{identifier_path}`");
                     path.into_expression(*a)
                 } else if let Some(path) =
                     symbols.resolve_module_path_expr(&identifier_path.as_root_module_member())
@@ -801,11 +820,25 @@ impl parser::Expr {
     }
 }
 
+fn into_projection(pi: &ParseInfo, base: Identifier, path: &parser::IdentifierPath) -> Expr {
+    path.tail
+        .iter()
+        .fold(Expr::Variable(*pi, base), |base, member| {
+            Expr::Project(
+                *pi,
+                Projection {
+                    base: base.into(),
+                    select: ProductElement::Name(parser::Identifier::from_str(member)),
+                },
+            )
+        })
+}
+
 impl parser::SelfReference {
     fn resolve(
         &self,
         names: &mut DeBruijnIndex,
-        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+        symbols: &ParserCompilationContext,
     ) -> SelfReferential {
         if let Some(own_name) = self.own_name.try_as_simple() {
             names.bind(own_name, |names, name| SelfReferential {
@@ -819,11 +852,7 @@ impl parser::SelfReference {
 }
 
 impl parser::Lambda {
-    fn resolve(
-        &self,
-        names: &mut DeBruijnIndex,
-        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
-    ) -> Lambda {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Lambda {
         if let Some(parameter) = self.parameter.try_as_simple() {
             names.bind(parameter, |names, parameter| Lambda {
                 parameter,
@@ -836,11 +865,7 @@ impl parser::Lambda {
 }
 
 impl parser::Apply {
-    fn resolve(
-        &self,
-        names: &mut DeBruijnIndex,
-        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
-    ) -> Apply {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Apply {
         Apply {
             function: self.function.resolve(names, symbols).into(),
             argument: self.argument.resolve(names, symbols).into(),
@@ -849,11 +874,7 @@ impl parser::Apply {
 }
 
 impl parser::Binding {
-    fn resolve(
-        &self,
-        names: &mut DeBruijnIndex,
-        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
-    ) -> Binding {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Binding {
         if let Some(binder) = self.binder.try_as_simple() {
             let bound = Rc::new(self.bound.resolve(names, symbols));
             names.bind(binder, |names, binder| Binding {
@@ -868,11 +889,7 @@ impl parser::Binding {
 }
 
 impl parser::Record {
-    fn resolve(
-        &self,
-        names: &mut DeBruijnIndex,
-        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
-    ) -> Record {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Record {
         Record {
             fields: self
                 .fields
@@ -884,11 +901,7 @@ impl parser::Record {
 }
 
 impl parser::Tuple {
-    fn resolve(
-        &self,
-        names: &mut DeBruijnIndex,
-        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
-    ) -> Tuple {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Tuple {
         Tuple {
             elements: self
                 .elements
@@ -913,11 +926,7 @@ impl parser::Construct {
 }
 
 impl parser::Projection {
-    fn resolve(
-        &self,
-        names: &mut DeBruijnIndex,
-        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
-    ) -> Projection {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Projection {
         Projection {
             base: self.base.resolve(names, symbols).into(),
             select: self.select.clone(),
@@ -926,11 +935,7 @@ impl parser::Projection {
 }
 
 impl parser::Sequence {
-    fn resolve(
-        &self,
-        names: &mut DeBruijnIndex,
-        symbols: &CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
-    ) -> Sequence {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Sequence {
         Sequence {
             this: self.this.resolve(names, symbols).into(),
             and_then: self.and_then.resolve(names, symbols).into(),

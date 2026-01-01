@@ -140,12 +140,14 @@ impl namer::NamedCompilationContext {
         symbol: &TermSymbol<ParseInfo, namer::QualifiedName, Identifier>,
         ctx: &mut TypingContext,
     ) -> Typing<TypedSymbol> {
+        println!("compute_term_symbol: inferring {}", symbol.body);
         let (_, body) = ctx.infer_expr(&symbol.body)?;
+        println!("compute_term_symbol: inferring {} complete.", body);
 
         let qualified_name = &symbol.name;
         let inferred_type = &body.type_info().inferred_type;
 
-        println!("{qualified_name}::{inferred_type}");
+        println!("compute_term_symbol: {qualified_name} => {inferred_type}");
 
         ctx.bind_term(
             qualified_name.clone(),
@@ -201,7 +203,8 @@ pub enum TypeError {
     NoSuchRecordType(RecordType),
     UnquantifiedTypeParameter(parser::Identifier),
     WrongArity {
-        was: usize,
+        constructor: namer::QualifiedName,
+        was: Vec<Type>,
         expected: usize,
     },
     UnelaboratedConstructor(namer::QualifiedName),
@@ -237,9 +240,7 @@ pub struct RecordType(Vec<(parser::Identifier, Type)>);
 
 impl RecordType {
     fn from_fields(fields: &[(parser::Identifier, Type)]) -> Self {
-        let mut fields = fields.to_vec();
-        fields.sort_by(|(p, ..), (q, ..)| p.cmp(q));
-        Self(fields)
+        Self(fields.to_vec())
     }
 
     fn with_substitutions(self, subs: &Substitutions) -> Self {
@@ -983,15 +984,19 @@ pub struct TypingContext {
 }
 
 impl TypingContext {
-    pub fn reduce_applied(&self, ty: Type) -> Typing<Type> {
+    pub fn instantiate_applied_type_constructor(&self, ty: &Type) -> Typing<Type> {
         if let Type::Constructor(..) | Type::Apply { .. } = ty {
             self.reduce_applied_constructor(ty, &mut vec![])
         } else {
-            Ok(ty)
+            Ok(ty.clone())
         }
     }
 
-    fn reduce_applied_constructor(&self, applied: Type, arguments: &mut Vec<Type>) -> Typing<Type> {
+    fn reduce_applied_constructor(
+        &self,
+        applied: &Type,
+        arguments: &mut Vec<Type>,
+    ) -> Typing<Type> {
         match applied {
             Type::Constructor(name) => {
                 let constructor = self
@@ -1001,7 +1006,8 @@ impl TypingContext {
 
                 if constructor.arity() != arguments.len() {
                     Err(TypeError::WrongArity {
-                        was: arguments.len(),
+                        constructor: constructor.header().name.clone(),
+                        was: arguments.clone(),
                         expected: constructor.arity(),
                     })?;
                 }
@@ -1039,11 +1045,11 @@ impl TypingContext {
                 constructor,
                 argument,
             } => {
-                arguments.push(*argument);
-                self.reduce_applied_constructor(*constructor, arguments)
+                arguments.push(*argument.clone());
+                self.reduce_applied_constructor(constructor, arguments)
             }
 
-            _ => Ok(applied),
+            _ => Ok(applied.clone()),
         }
     }
 
@@ -1173,6 +1179,8 @@ impl TypingContext {
     //    }
 
     pub fn infer_expr(&mut self, expr: &UntypedExpr) -> Typing {
+        println!("infer_expr: {expr}");
+
         match expr {
             UntypedExpr::Variable(parse_info, name) => Ok((
                 Substitutions::default(),
@@ -1347,13 +1355,16 @@ impl TypingContext {
 
         match &projection.select {
             ProductElement::Name(field) => {
-                if let Type::Record(record) = base_type {
+                if let Type::Record(record) =
+                    self.instantiate_applied_type_constructor(base_type)?
+                {
                     if let Some((field_index, (_, field_type))) = record
                         .0
                         .iter()
                         .enumerate()
                         .find(|(_, (label, _))| label == field)
                     {
+                        println!("infer_projection: {field} @ {field_index}");
                         Ok((
                             substitutions,
                             Expr::Project(
@@ -1375,7 +1386,7 @@ impl TypingContext {
                         })
                     }
                 } else {
-                    todo!()
+                    panic!("{base_type}")
                 }
             }
 

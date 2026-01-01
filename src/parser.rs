@@ -224,7 +224,7 @@ impl<'a> Parser<'a> {
                     .collect::<Vec<_>>()
                     .join(" "),
                 indent = depth * 2,
-                pad = 50 - (depth * 2 + e.step.len())
+                pad = 60 - (depth * 2 + e.step.len())
             );
         } else {
             println!("Unknown caller.")
@@ -907,6 +907,8 @@ impl<'a> Parser<'a> {
 
     // All infices must be right of lhs.
     fn parse_expr_infix(&mut self, lhs: Expr, context_precedence: usize) -> Result<Expr> {
+        let _t = self.trace();
+
         let terminals = [
             TokenKind::RightParen,
             TokenKind::Semicolon,
@@ -915,9 +917,8 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::In),
             TokenKind::End,
         ];
-        let is_terminal = |t| terminals.contains(t);
 
-        let _t = self.trace();
+        let is_terminal = |t| terminals.contains(t);
 
         match self.remains() {
             [t, ..] if is_terminal(&t.kind) => Ok(lhs),
@@ -927,7 +928,7 @@ impl<'a> Parser<'a> {
             [t, ..] if Operator::is_defined(&t.kind) => {
                 let operator = Operator::try_from(&t.kind).expect("msg");
                 // the operator
-                self.consume()?;
+                self.advance(1);
                 self.parse_operator(lhs, operator, *t.location(), context_precedence)
             }
 
@@ -947,7 +948,7 @@ impl<'a> Parser<'a> {
                 //                    "Calling parse_juxtaposed(1); lhs pos {}",
                 //                    lhs.parse_info().location
                 //                );
-                self.consume()?; //the indent
+                self.advance(1); //the indent
                 self.parse_juxtaposed(lhs, context_precedence)
             }
 
@@ -1005,38 +1006,116 @@ impl<'a> Parser<'a> {
 
         let operator_precedence = operator.precedence();
         if operator_precedence > context_precedence {
-            println!("parse_operator(1)");
-            let operator_precedence = if operator.is_right_associative() {
-                operator_precedence - 1
+            if operator == Operator::Select {
+                let lhs = self.parse_select_operator(lhs)?;
+
+                self.parse_expr_infix(lhs, context_precedence)
             } else {
-                operator_precedence
-            };
-            let apply_lhs = Expr::Apply(
-                ParseInfo::from_position(*lhs.position()),
-                Apply {
-                    function: Expr::Variable(
-                        ParseInfo::from_position(operator_position),
-                        IdentifierPath::new(operator.name()),
-                    )
-                    .into(),
-                    argument: lhs.into(),
-                },
-            );
-            let rhs = self.parse_expression(operator_precedence)?;
-            let rhs = Expr::Apply(
-                ParseInfo::from_position(*rhs.position()),
-                Apply {
-                    function: apply_lhs.into(),
-                    argument: rhs.into(),
-                },
-            );
-            self.parse_expr_infix(rhs, context_precedence)
+                self.parse_operator_default(
+                    lhs,
+                    operator,
+                    operator_position,
+                    context_precedence,
+                    operator_precedence,
+                )
+            }
         } else {
-            // Symmetrical with the consume call befor entering parse_operator.
+            // Symmetrical with the consume call before entering parse_operator.
             // I would like these two to be in the same spot
             self.unconsume()?;
             Ok(lhs)
         }
+    }
+
+    fn parse_select_operator(&mut self, lhs: Expr) -> Result<Expr> {
+        let _t = self.trace();
+
+        if let Expr::Variable(pi, id) = lhs {
+            self.parse_identifier_path(pi, id)
+        } else {
+            self.parse_projection(lhs)
+        }
+    }
+
+    fn parse_identifier_path(&mut self, pi: ParseInfo, lhs: IdentifierPath) -> Result<Expr> {
+        let _t = self.trace();
+
+        let (_, rhs) = self.identifier()?;
+        Ok(Expr::Variable(pi, lhs.with_suffix(rhs.as_str())))
+    }
+
+    fn parse_projection(&mut self, lhs: Expr) -> Result<Expr> {
+        let _t = self.trace();
+
+        let rhs = match self.remains() {
+            [
+                Token {
+                    kind: TokenKind::Identifier(id),
+                    ..
+                },
+                ..,
+            ] => ast::ProductElement::Name(Identifier::from_str(id)),
+
+            [
+                Token {
+                    kind: TokenKind::Literal(Literal::Integer(id)),
+                    ..
+                },
+                ..,
+            ] => ast::ProductElement::Ordinal(*id as usize),
+
+            otherwise => panic!("{otherwise:?}"),
+        };
+
+        // The Id or Int literal
+        self.advance(1);
+
+        let parse_info = *lhs.parse_info();
+        let projection = Projection {
+            base: lhs.into(),
+            select: rhs,
+        };
+
+        println!("parse_projection: projection {projection:?}");
+
+        Ok(Expr::Project(parse_info, projection))
+    }
+
+    fn parse_operator_default(
+        &mut self,
+        lhs: Expr,
+        operator: Operator,
+        operator_position: SourceLocation,
+        context_precedence: usize,
+        operator_precedence: usize,
+    ) -> Result<Expr> {
+        let _t = self.trace();
+
+        let operator_precedence = if operator.is_right_associative() {
+            operator_precedence - 1
+        } else {
+            operator_precedence
+        };
+        let apply_lhs = Expr::Apply(
+            ParseInfo::from_position(*lhs.position()),
+            Apply {
+                function: Expr::Variable(
+                    ParseInfo::from_position(operator_position),
+                    IdentifierPath::new(operator.name()),
+                )
+                .into(),
+                argument: lhs.into(),
+            },
+        );
+        let rhs = self.parse_expression(operator_precedence)?;
+        let rhs = Expr::Apply(
+            ParseInfo::from_position(*rhs.position()),
+            Apply {
+                function: apply_lhs.into(),
+                argument: rhs.into(),
+            },
+        );
+        self.parse_expr_infix(rhs, context_precedence)
     }
 
     fn parse_type_signature(&mut self) -> Result<TypeSignature<ParseInfo, IdentifierPath>> {
