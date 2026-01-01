@@ -4,8 +4,8 @@ use backtrace::Backtrace;
 
 use crate::{
     ast::{
-        self, CompilationUnit, CoproductConstructor, CoproductDeclarator, Declaration,
-        FieldDeclarator, RecordDeclarator, Tree, TypeApply, TypeArrow, TypeDeclaration,
+        self, ApplyTypeExpr, ArrowTypeExpr, CompilationUnit, CoproductConstructor,
+        CoproductDeclarator, Declaration, FieldDeclarator, RecordDeclarator, Tree, TypeDeclaration,
         TypeDeclarator, TypeSignature, ValueDeclaration, ValueDeclarator,
     },
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
@@ -19,6 +19,7 @@ pub type Binding = ast::Binding<ParseInfo, IdentifierPath>;
 pub type Record = ast::Record<ParseInfo, IdentifierPath>;
 pub type Tuple = ast::Tuple<ParseInfo, IdentifierPath>;
 pub type Projection = ast::Projection<ParseInfo, IdentifierPath>;
+pub type Construct = ast::Construct<ParseInfo, IdentifierPath>;
 pub type Sequence = ast::Sequence<ParseInfo, IdentifierPath>;
 pub type TypeExpression = ast::TypeExpression<ParseInfo, IdentifierPath>;
 
@@ -612,7 +613,7 @@ impl<'a> Parser<'a> {
                     let rhs = self.parse_simple_type_expr_term(&id, position);
                     self.parse_type_expr_infix(TypeExpression::Apply(
                         ParseInfo::from_position(*position),
-                        TypeApply {
+                        ApplyTypeExpr {
                             function: lhs.into(),
                             argument: rhs.into(),
                             phase: PhantomData,
@@ -634,7 +635,7 @@ impl<'a> Parser<'a> {
                 let rhs = self.parse_type_expression()?;
                 self.parse_type_expr_infix(TypeExpression::Arrow(
                     ParseInfo::from_position(*position),
-                    TypeArrow {
+                    ArrowTypeExpr {
                         domain: lhs.into(),
                         codomain: rhs.into(),
                     },

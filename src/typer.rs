@@ -10,11 +10,11 @@ use std::{
 
 use crate::{
     ast::{
-        self, ProductElement, Tree,
+        self, ProductElement, Tree, TupleTypeExpr,
         annotation::Annotated,
         namer::{
-            self, CompilationContext, DependencyMatrix, Identifier, Symbol, SymbolName, TermSymbol,
-            TypeDefinition, TypeExpression, TypeSymbol,
+            self, CompilationContext, DependencyMatrix, Identifier, QualifiedName, Symbol,
+            SymbolName, TermSymbol, TypeDefinition, TypeExpression, TypeSymbol,
         },
     },
     parser::{self, ParseInfo},
@@ -27,10 +27,12 @@ pub type RecursiveLambda = ast::SelfReferential<TypeInfo, namer::Identifier>;
 pub type Lambda = ast::Lambda<TypeInfo, namer::Identifier>;
 pub type Binding = ast::Binding<TypeInfo, namer::Identifier>;
 pub type Tuple = ast::Tuple<TypeInfo, namer::Identifier>;
+pub type Construct = ast::Construct<TypeInfo, namer::Identifier>;
 pub type Record = ast::Record<TypeInfo, namer::Identifier>;
 pub type Projection = ast::Projection<TypeInfo, namer::Identifier>;
 
 pub type RecordSymbol = namer::RecordSymbol<namer::QualifiedName>;
+pub type CoproductSymbol = namer::CoproductSymbol<namer::QualifiedName>;
 
 type TypedSymbol = namer::Symbol<TypeInfo, namer::QualifiedName, namer::Identifier>;
 type TypedCompilationContext =
@@ -203,6 +205,8 @@ pub enum TypeError {
         expected: usize,
     },
     UnelaboratedConstructor(namer::QualifiedName),
+    InternalAssertion(String),
+    NoSuchCoproductType(namer::QualifiedName),
 }
 
 pub type Typing<A = (Substitutions, Expr)> = Result<A, TypeError>;
@@ -248,6 +252,28 @@ impl RecordType {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CoproductType(Vec<(QualifiedName, Vec<Type>)>);
+
+impl CoproductType {
+    fn with_substitutions(&self, subs: &Substitutions) -> Self {
+        Self(
+            self.0
+                .iter()
+                .map(|(id, signature)| {
+                    (
+                        id.clone(),
+                        signature
+                            .iter()
+                            .map(|ty| ty.with_substitutions(subs))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
 impl fmt::Display for RecordType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self(fields) = self;
@@ -276,6 +302,7 @@ pub enum Type {
     },
     Tuple(Vec<Type>),
     Record(RecordType),
+    Coproduct(CoproductType),
     Constructor(namer::QualifiedName),
     Apply {
         constructor: Box<Type>,
@@ -295,15 +322,27 @@ impl Type {
     pub fn variables(&self) -> HashSet<TypeParameter> {
         match self {
             Self::Variable(param) => [*param].into(),
+
             Self::Base(..) => [].into(),
+
             Self::Arrow { domain, codomain } => {
                 let mut variables = domain.variables();
                 variables.extend(codomain.variables());
                 variables
             }
-            Self::Tuple(elements) => elements.iter().flat_map(|el| el.variables()).collect(),
-            Self::Record(record) => record.0.iter().flat_map(|(_, e)| e.variables()).collect(),
+
+            Self::Tuple(elements) => elements.iter().flat_map(|ty| ty.variables()).collect(),
+
+            Self::Record(record) => record.0.iter().flat_map(|(_, ty)| ty.variables()).collect(),
+
+            Self::Coproduct(coproduct) => coproduct
+                .0
+                .iter()
+                .flat_map(|(_, ty)| ty.iter().flat_map(|ty| ty.variables()))
+                .collect(),
+
             Self::Constructor(..) => [].into(),
+
             Self::Apply {
                 constructor,
                 argument,
@@ -321,19 +360,29 @@ impl Type {
                 .substitution(param)
                 .map_or_else(|| p.clone(), |t| t.with_substitutions(subs))
                 .clone(),
+
             Self::Base(b) => Self::Base(b.clone()),
+
             Self::Arrow { domain, codomain } => Self::Arrow {
                 domain: domain.with_substitutions(subs).into(),
                 codomain: codomain.with_substitutions(subs).into(),
             },
+
             Self::Tuple(elements) => Self::Tuple(
                 elements
                     .iter()
                     .map(|ty| ty.with_substitutions(subs))
                     .collect(),
             ),
+
             Self::Record(record) => Self::Record(record.clone().with_substitutions(subs)),
+
+            Self::Coproduct(coproduct) => {
+                Self::Coproduct(coproduct.clone().with_substitutions(subs))
+            }
+
             Self::Constructor(..) => self.clone(),
+
             Self::Apply {
                 constructor,
                 argument,
@@ -468,6 +517,27 @@ impl RecordSymbol {
     }
 }
 
+impl CoproductSymbol {
+    pub fn synthesize_type(
+        &self,
+        type_param_map: &HashMap<parser::Identifier, TypeParameter>,
+        ctx: &TypingContext,
+    ) -> Typing<Type> {
+        Ok(Type::Coproduct(CoproductType(
+            self.constructors
+                .iter()
+                .map(|c| {
+                    c.signature
+                        .iter()
+                        .map(|te| te.synthesize_type(type_param_map, ctx))
+                        .collect::<Typing<Vec<_>>>()
+                        .map(|signature| (c.name.clone(), signature))
+                })
+                .collect::<Typing<Vec<_>>>()?,
+        )))
+    }
+}
+
 impl TypeExpression {
     fn synthesize_type(
         &self,
@@ -484,7 +554,7 @@ impl TypeExpression {
                 Ok(constructor
                     .header()
                     .as_base_type()
-                    .unwrap_or_else(|| constructor.type_apply_spine()))
+                    .unwrap_or_else(|| constructor.applied_type()))
             }
 
             Self::Parameter(_, p) => type_params
@@ -493,15 +563,27 @@ impl TypeExpression {
                 .map(Type::Variable)
                 .ok_or_else(|| TypeError::UnquantifiedTypeParameter(p.clone())),
 
-            Self::Apply(_, apply) => Ok(Type::Apply {
-                constructor: apply.function.synthesize_type(type_params, ctx)?.into(),
-                argument: apply.argument.synthesize_type(type_params, ctx)?.into(),
+            Self::Apply(
+                _,
+                ast::ApplyTypeExpr {
+                    function, argument, ..
+                },
+            ) => Ok(Type::Apply {
+                constructor: function.synthesize_type(type_params, ctx)?.into(),
+                argument: argument.synthesize_type(type_params, ctx)?.into(),
             }),
 
-            Self::Arrow(_, arrow) => Ok(Type::Arrow {
-                domain: arrow.domain.synthesize_type(type_params, ctx)?.into(),
-                codomain: arrow.codomain.synthesize_type(type_params, ctx)?.into(),
+            Self::Arrow(_, ast::ArrowTypeExpr { domain, codomain }) => Ok(Type::Arrow {
+                domain: domain.synthesize_type(type_params, ctx)?.into(),
+                codomain: codomain.synthesize_type(type_params, ctx)?.into(),
             }),
+
+            Self::Tuple(_, TupleTypeExpr(elements)) => Ok(Type::Tuple(
+                elements
+                    .iter()
+                    .map(|te| te.synthesize_type(type_params, ctx))
+                    .collect::<Typing<Vec<_>>>()?,
+            )),
         }
     }
 }
@@ -579,7 +661,11 @@ impl TypeConstructor {
                 TypeDefinition::Record(record) => {
                     record.synthesize_type(&constructor.type_param_map, ctx)?
                 }
-                TypeDefinition::Coproduct(..) => todo!(),
+
+                TypeDefinition::Coproduct(coproduct) => {
+                    coproduct.synthesize_type(&constructor.type_param_map, ctx)?
+                }
+
                 TypeDefinition::Builtin(base_type) => Type::Base(base_type.clone()),
             };
 
@@ -603,7 +689,7 @@ impl TypeConstructor {
         }
     }
 
-    fn type_apply_spine(&self) -> Type {
+    fn applied_type(&self) -> Type {
         match self {
             Self::Unelaborated(header) => header.apply(),
             Self::Elaborated(constructor) => constructor.header.apply(),
@@ -827,10 +913,27 @@ impl RecordTypeIndex {
 }
 
 #[derive(Debug, Clone, Default)]
+struct CoproductIndex(HashMap<namer::QualifiedName, Vec<namer::QualifiedName>>);
+
+impl CoproductIndex {
+    fn insert(&mut self, constructor: namer::QualifiedName, coproduct: namer::QualifiedName) {
+        self.0.entry(constructor).or_default().push(coproduct);
+    }
+
+    fn matching(
+        &self,
+        constructor: &namer::QualifiedName,
+    ) -> impl Iterator<Item = &namer::QualifiedName> {
+        self.0.get(constructor).into_iter().flatten()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct TypeSpace {
     bindings: HashMap<namer::QualifiedName, TypeConstructor>,
     // Is this the best datatype for this?
     record_type_index: RecordTypeIndex,
+    constructor_index: CoproductIndex,
 }
 
 impl TypeSpace {
@@ -849,6 +952,17 @@ impl TypeSpace {
             .collect()
     }
 
+    fn infer_coproduct_type_constructor(
+        &self,
+        name: &QualifiedName,
+    ) -> Typing<Vec<&TypeConstructor>> {
+        Ok(self
+            .constructor_index
+            .matching(name)
+            .flat_map(|name| self.lookup(name))
+            .collect())
+    }
+
     fn with_substitutions(&self, subs: &Substitutions) -> Self {
         Self {
             bindings: self
@@ -857,6 +971,7 @@ impl TypeSpace {
                 .map(|(id, tc)| (id.clone(), tc.with_substitutions(subs)))
                 .collect(),
             record_type_index: self.record_type_index.clone(),
+            constructor_index: self.constructor_index.clone(),
         }
     }
 }
@@ -967,6 +1082,22 @@ impl TypingContext {
 
         for constructor in self.types.bindings.values() {
             if let TypeConstructor::Elaborated(constructor) = constructor {
+                match &constructor.structure {
+                    Type::Record(image) => self
+                        .types
+                        .record_type_index
+                        .insert(image, constructor.header.name.clone()),
+
+                    Type::Coproduct(coproduct) => {
+                        for (constructor_name, _) in &coproduct.0 {
+                            self.types
+                                .constructor_index
+                                .insert(constructor_name.clone(), constructor.header.name.clone());
+                        }
+                    }
+
+                    _ => (),
+                }
                 if let Type::Record(image) = &constructor.structure {
                     println!(
                         "elaborate_type_constructors: {image} -> {}",
@@ -1091,12 +1222,73 @@ impl TypingContext {
 
             UntypedExpr::Tuple(parse_info, tuple) => self.infer_tuple(parse_info, tuple),
 
+            UntypedExpr::Construct(parse_info, constructor) => {
+                self.infer_coproduct_construct(parse_info, constructor)
+            }
+
             UntypedExpr::Project(parse_info, projection) => {
                 self.infer_projection(parse_info, projection)
             }
 
             UntypedExpr::Sequence(_parse_info, sequence) => self.infer_sequence(sequence),
         }
+    }
+
+    fn infer_coproduct_construct(
+        &mut self,
+        parse_info: &ParseInfo,
+        constructor: &namer::Construct,
+    ) -> Typing {
+        println!("infer_coproduct_construct: hi, mom");
+
+        let (substitutions, typed_arguments, argument_types) =
+            self.infer_several(&constructor.arguments)?;
+
+        for ty in &typed_arguments {
+            println!("infer_coproduct_construct: typed argument {}", ty);
+        }
+
+        for x in &argument_types {
+            println!("infer_coproduct_construct: argument type {}", x);
+        }
+
+        // Does it try more than one alternative if there are more? Pick the one
+        // with the best type? I could encode the name of the type constructor
+        // as a type of prefix to the constructor
+
+        // namer::Identifier is a shit type for this purpose
+        let constructor_name = constructor.name.try_as_free().ok_or_else(|| {
+            TypeError::InternalAssertion(format!(
+                "expected Identifier::Free, was: {}",
+                constructor.name
+            ))
+        })?;
+
+        let candidates = self
+            .types
+            .infer_coproduct_type_constructor(constructor_name)?;
+
+        let type_constructor = candidates
+            .first()
+            .ok_or_else(|| TypeError::NoSuchCoproductType(constructor_name.clone()))?;
+
+        Ok((
+            substitutions,
+            Expr::Construct(
+                TypeInfo {
+                    parse_info: *parse_info,
+                    inferred_type: type_constructor.applied_type(),
+                },
+                Construct {
+                    name: constructor.name.clone(),
+
+                    // Pick out the Type::Product so that its
+                    // elements can be put here
+                    arguments: typed_arguments,
+                }
+                .into(),
+            ),
+        ))
     }
 
     fn infer_record(&mut self, parse_info: &ParseInfo, record: &namer::Record) -> Typing {
@@ -1142,85 +1334,144 @@ impl TypingContext {
             Expr::Record(
                 TypeInfo {
                     parse_info: *parse_info,
-                    inferred_type: type_constructor.type_apply_spine(),
+                    inferred_type: type_constructor.applied_type(),
                 },
                 Record { fields },
             ),
         ))
     }
 
-    fn infer_projection(
-        &mut self,
-        parse_info: &ParseInfo,
-        projection: &ast::Projection<ParseInfo, namer::Identifier>,
-    ) -> Typing {
+    fn infer_projection(&mut self, pi: &ParseInfo, projection: &namer::Projection) -> Typing {
         let (substitutions, base) = self.infer_expr(&projection.base)?;
-        match (&base.type_info().inferred_type, &projection.select) {
-            (Type::Record(record), ProductElement::Name(field)) => {
-                if let Some((field_index, (_, field_type))) = record
-                    .0
-                    .iter()
-                    .enumerate()
-                    .find(|(_, (label, _))| label == field)
-                {
+        let base_type = &base.type_info().inferred_type;
+
+        match &projection.select {
+            ProductElement::Name(field) => {
+                if let Type::Record(record) = base_type {
+                    if let Some((field_index, (_, field_type))) = record
+                        .0
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (label, _))| label == field)
+                    {
+                        Ok((
+                            substitutions,
+                            Expr::Project(
+                                TypeInfo {
+                                    parse_info: *pi,
+                                    inferred_type: field_type.clone(),
+                                },
+                                Projection {
+                                    base: base.into(),
+                                    select: ProductElement::Ordinal(field_index),
+                                },
+                            ),
+                        ))
+                    } else {
+                        let inferred_type = base_type.clone();
+                        Err(TypeError::BadProjection {
+                            projection: projection.clone(),
+                            inferred_type,
+                        })
+                    }
+                } else {
+                    todo!()
+                }
+            }
+
+            ProductElement::Ordinal(element) => match base_type {
+                Type::Tuple(tuple) => Ok((
+                    substitutions,
+                    Expr::Project(
+                        TypeInfo {
+                            parse_info: *pi,
+                            inferred_type: tuple[*element].clone(),
+                        },
+                        Projection {
+                            base: base.into(),
+                            select: ProductElement::Ordinal(*element),
+                        },
+                    ),
+                )),
+                Type::Variable(..) => {
+                    let mut elems = Vec::with_capacity(element + 1);
+                    for _ in 0..=*element {
+                        elems.push(Type::fresh());
+                    }
+                    let tuple_ty = Type::Tuple(elems);
+                    let subs = base_type.unifed_with(&tuple_ty)?;
+                    let projected_ty = match tuple_ty.with_substitutions(&subs) {
+                        Type::Tuple(elems) => elems[*element].clone(),
+                        _ => unreachable!(),
+                    };
                     Ok((
-                        substitutions,
+                        substitutions.compose(&subs),
                         Expr::Project(
                             TypeInfo {
-                                parse_info: *parse_info,
-                                inferred_type: field_type.clone(),
+                                parse_info: *pi,
+                                inferred_type: projected_ty,
                             },
                             Projection {
                                 base: base.into(),
-                                select: ProductElement::Ordinal(field_index),
+                                select: ProductElement::Ordinal(*element),
                             },
                         ),
                     ))
-                } else {
-                    let inferred_type = base.type_info().inferred_type.clone();
-                    Err(TypeError::BadProjection {
-                        projection: projection.clone(),
-                        inferred_type,
-                    })
                 }
-            }
-            (ty, el) => panic!("{el:?} is not a member of {ty:?}"),
+                _ => Err(TypeError::BadProjection {
+                    projection: projection.clone(),
+                    inferred_type: base.type_info().inferred_type.clone(),
+                }),
+            },
+
+            el => panic!(
+                "{el:?} is not a member of {:?}",
+                base.type_info().inferred_type
+            ),
         }
     }
 
     fn infer_tuple(&mut self, parse_info: &ParseInfo, tuple: &namer::Tuple) -> Typing {
-        let mut substitutions = Substitutions::default();
-        let mut elements = Vec::with_capacity(tuple.elements.len());
-
-        for element in &tuple.elements {
-            let (subs, element) = self.infer_expr(element)?;
-            elements.push(element);
-            // compose_mut?
-            substitutions = substitutions.compose(&subs);
-        }
-
-        let elements = elements
-            .iter()
-            .map(|e| e.with_substitutions(&substitutions).into())
-            .collect::<Vec<_>>();
-
-        let inferred_type = Type::Tuple(
-            elements
-                .iter()
-                .map(|e: &Tree<TypeInfo, namer::Identifier>| e.type_info().inferred_type.clone())
-                .collect(),
-        );
+        println!("infer_tuple: calling infer_several");
+        let (substitutions, elements, element_types) = self.infer_several(&tuple.elements)?;
 
         Ok((
             substitutions,
             Expr::Tuple(
                 TypeInfo {
                     parse_info: *parse_info,
-                    inferred_type,
+                    inferred_type: Type::Tuple(element_types),
                 },
                 Tuple { elements },
             ),
         ))
+    }
+
+    fn infer_several(
+        &mut self,
+        elements: &Vec<Tree<ParseInfo, Identifier>>,
+    ) -> Typing<(Substitutions, Vec<Tree<TypeInfo, Identifier>>, Vec<Type>)> {
+        let mut substitutions = Substitutions::default();
+        let mut typed_elements = Vec::with_capacity(elements.len());
+
+        for element in elements {
+            let (subs, element) = self.infer_expr(element)?;
+            typed_elements.push(element);
+            // compose_mut?
+            substitutions = substitutions.compose(&subs);
+        }
+
+        let typed_elements = typed_elements
+            .iter()
+            .map(|e| e.with_substitutions(&substitutions).into())
+            .collect::<Vec<_>>();
+
+        let element_types = typed_elements
+            .iter()
+            .map(|e: &Tree<TypeInfo, namer::Identifier>| e.type_info().inferred_type.clone())
+            .collect();
+
+        Ok((substitutions, typed_elements, element_types))
     }
 
     fn infer_recursive_lambda(
@@ -1389,8 +1640,11 @@ impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Variable(TypeParameter(p)) => write!(f, "${p}"),
+
             Self::Base(base_type) => write!(f, "{base_type}"),
+
             Self::Arrow { domain, codomain } => write!(f, "({domain} -> {codomain})"),
+
             Self::Tuple(items) => {
                 let tuple_rendering = items
                     .iter()
@@ -1399,6 +1653,7 @@ impl fmt::Display for Type {
                     .join(", ");
                 write!(f, "({tuple_rendering})")
             }
+
             Self::Record(record) => {
                 let struct_rendering = record
                     .0
@@ -1408,7 +1663,22 @@ impl fmt::Display for Type {
                     .join("; ");
                 write!(f, "{{ {struct_rendering} }}")
             }
+
+            Self::Coproduct(coproduct) => {
+                let constructor_rendering = coproduct
+                    .0
+                    .iter()
+                    .map(|(constructor, signature)| {
+                        format!("{constructor} :: {}", Self::Tuple(signature.clone()))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+
+                write!(f, "{constructor_rendering}")
+            }
+
             Self::Constructor(name) => write!(f, "{name}"),
+
             Self::Apply {
                 constructor,
                 argument,

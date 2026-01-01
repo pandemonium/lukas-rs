@@ -34,6 +34,7 @@ where
                 Expr::Let(a, node) => Expr::Let(f(a), node.map_annotation(&f)),
                 Expr::Record(a, node) => Expr::Record(f(a), node.map_annotation(&f)),
                 Expr::Tuple(a, node) => Expr::Tuple(f(a), node.map_annotation(&f)),
+                Expr::Construct(a, node) => Expr::Construct(f(a), node.map_annotation(&f)),
                 Expr::Project(a, node) => Expr::Project(f(a), node.map_annotation(&f)),
                 Expr::Sequence(a, node) => Expr::Sequence(f(a), node.map_annotation(&f)),
             }
@@ -169,6 +170,27 @@ where
     {
         Tuple {
             elements: self.elements.iter().map(|e| e.map_annotation(&f)).collect(),
+        }
+    }
+}
+
+impl<A, B, Id> Annotated<A, B, Id> for Construct<A, Id>
+where
+    Id: Clone,
+{
+    type Output = Construct<B, Id>;
+
+    fn map_annotation<F>(&self, f: F) -> Self::Output
+    where
+        F: Fn(&A) -> B,
+    {
+        let Self { name, arguments } = self;
+        Construct {
+            name: name.clone(),
+            arguments: arguments
+                .iter()
+                .map(|expr| expr.map_annotation(&f))
+                .collect(),
         }
     }
 }

@@ -116,19 +116,23 @@ impl<A, TypeId1> TypeSignature<A, TypeId1> {
 pub enum TypeExpression<A, TypeId> {
     Constructor(A, TypeId),
     Parameter(A, Identifier),
-    Apply(A, TypeApply<A, TypeId>),
-    Arrow(A, TypeArrow<A, TypeId>),
+    Apply(A, ApplyTypeExpr<A, TypeId>),
+    Arrow(A, ArrowTypeExpr<A, TypeId>),
+    Tuple(A, TupleTypeExpr<A, TypeId>),
 }
 
 #[derive(Debug, Clone)]
-pub struct TypeApply<A, TypeId> {
+pub struct TupleTypeExpr<A, TypeId>(pub Vec<TypeExpression<A, TypeId>>);
+
+#[derive(Debug, Clone)]
+pub struct ApplyTypeExpr<A, TypeId> {
     pub function: Box<TypeExpression<A, TypeId>>,
     pub argument: Box<TypeExpression<A, TypeId>>,
     pub phase: PhantomData<TypeId>,
 }
 
 #[derive(Debug, Clone)]
-pub struct TypeArrow<A, TypeId> {
+pub struct ArrowTypeExpr<A, TypeId> {
     pub domain: Box<TypeExpression<A, TypeId>>,
     pub codomain: Box<TypeExpression<A, TypeId>>,
 }
@@ -145,6 +149,7 @@ pub enum Expr<A, Id> {
     Let(A, Binding<A, Id>),
     Tuple(A, Tuple<A, Id>),
     Record(A, Record<A, Id>),
+    Construct(A, Construct<A, Id>),
     Project(A, Projection<A, Id>),
     Sequence(A, Sequence<A, Id>),
 }
@@ -160,6 +165,7 @@ impl<A, Id> Expr<A, Id> {
             | Expr::Let(a, ..)
             | Expr::Record(a, ..)
             | Expr::Tuple(a, ..)
+            | Expr::Construct(a, ..)
             | Expr::Project(a, ..)
             | Expr::Sequence(a, ..) => a,
         }
@@ -238,6 +244,13 @@ pub enum ProductElement {
     Name(parser::Identifier),
 }
 
+// This thing needs to separate the name type for the name and the arguments
+#[derive(Debug, Clone)]
+pub struct Construct<A, Id> {
+    pub name: Id,
+    pub arguments: Vec<Tree<A, Id>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Sequence<A, Id> {
     pub this: Tree<A, Id>,
@@ -258,6 +271,16 @@ where
             Self::Let(_, x) => write!(f, "let {} = {} in {}", x.binder, x.bound, x.body),
             Self::Record(_, x) => write!(f, "{x}"),
             Self::Tuple(_, x) => write!(f, "{x}"),
+            Self::Construct(_, x) => {
+                write!(
+                    f,
+                    "{} {}",
+                    x.name,
+                    Tuple {
+                        elements: x.arguments.clone()
+                    }
+                )
+            }
             Self::Project(_, x) => write!(f, "{}.{}", x.base, x.select),
             Self::Sequence(_, x) => write!(f, "{}; {}", x.this, x.and_then),
         }
@@ -488,14 +511,28 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Constructor(_, name) => write!(f, "{name}"),
+
             Self::Parameter(_, name) => write!(f, "{name}"),
+
             Self::Apply(
                 _,
-                TypeApply {
+                ApplyTypeExpr {
                     function, argument, ..
                 },
             ) => write!(f, "({function} {argument})"),
-            Self::Arrow(_, TypeArrow { domain, codomain }) => write!(f, "({domain} -> {codomain})"),
+
+            Self::Arrow(_, ArrowTypeExpr { domain, codomain }) => {
+                write!(f, "({domain} -> {codomain})")
+            }
+
+            Self::Tuple(_, TupleTypeExpr(elements)) => {
+                let body = elements
+                    .iter()
+                    .map(|elt| elt.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "({body})")
+            }
         }
     }
 }

@@ -9,9 +9,10 @@ use std::{
 
 use crate::{
     ast::{
-        self, CompilationUnit, Declaration, ProductElement, TypeApply, TypeArrow, TypeSignature,
+        self, ApplyTypeExpr, ArrowTypeExpr, CompilationUnit, Declaration, ProductElement,
+        TupleTypeExpr, TypeSignature,
     },
-    parser::{self, IdentifierPath, ParseInfo},
+    parser::{self, ParseInfo},
     typer::BaseType,
 };
 
@@ -23,13 +24,14 @@ pub type Binding = ast::Binding<ParseInfo, Identifier>;
 pub type Record = ast::Record<ParseInfo, Identifier>;
 pub type Tuple = ast::Tuple<ParseInfo, Identifier>;
 pub type Projection = ast::Projection<ParseInfo, Identifier>;
+pub type Construct = ast::Construct<ParseInfo, Identifier>;
 pub type Sequence = ast::Sequence<ParseInfo, Identifier>;
 pub type TypeExpression = ast::TypeExpression<ParseInfo, QualifiedName>;
 
-type RawTermId = SymbolName<parser::IdentifierPath, parser::IdentifierPath>;
-type RawCompilationContext =
+type ParserTermId = SymbolName<parser::IdentifierPath, parser::IdentifierPath>;
+type ParserCompilationContext =
     CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
-type RawSymbol = Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
+type ParserSymbol = Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
 pub type TermId = SymbolName<QualifiedName, Identifier>;
 pub type NamedCompilationContext = CompilationContext<ParseInfo, QualifiedName, Identifier>;
 pub type NamedSymbol = Symbol<ParseInfo, QualifiedName, Identifier>;
@@ -84,14 +86,23 @@ impl TypeExpression {
             Self::Constructor(_, id) => {
                 free.insert(id);
             }
+
             Self::Parameter(..) => (),
+
             Self::Apply(_, apply) => {
                 apply.function.gather_free_variables(free);
                 apply.argument.gather_free_variables(free);
             }
+
             Self::Arrow(_, arrow) => {
                 arrow.domain.gather_free_variables(free);
                 arrow.codomain.gather_free_variables(free);
+            }
+
+            Self::Tuple(_, tuple) => {
+                for el in &tuple.0 {
+                    el.gather_free_variables(free);
+                }
             }
         }
     }
@@ -110,6 +121,16 @@ impl TypeExpression {
 pub enum Identifier {
     Bound(usize),
     Free(QualifiedName),
+}
+
+impl Identifier {
+    pub fn try_as_free(&self) -> Option<&QualifiedName> {
+        if let Self::Free(name) = self {
+            Some(name)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -272,7 +293,7 @@ impl<A, TypeId, ValueId> Default for CompilationContext<A, TypeId, ValueId> {
     }
 }
 
-impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath> {
+impl ParserCompilationContext {
     pub fn resolve_module_path_expr(
         &self,
         path: &parser::IdentifierPath,
@@ -361,7 +382,7 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
             match decl {
                 ast::Declaration::Value(_, ast::ValueDeclaration { name, declarator }) => {
                     let symbol_name = prefix.clone().with_suffix(name.as_str());
-                    let term = SymbolName::Value(symbol_name.clone());
+                    let name = SymbolName::Value(symbol_name.clone());
                     let symbol = Symbol::Term(TermSymbol {
                         name: symbol_name,
                         type_signature: declarator.type_signature.clone(),
@@ -372,7 +393,7 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
                     });
 
                     symbols.push(symbol.clone());
-                    symbol_table.insert(term, symbol);
+                    symbol_table.insert(name, symbol);
                 }
 
                 ast::Declaration::Module(_, decl) => {
@@ -380,7 +401,7 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
                 }
 
                 ast::Declaration::Type(
-                    _,
+                    parse_info,
                     ast::TypeDeclaration {
                         name,
                         type_parameters,
@@ -388,7 +409,7 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
                     },
                 ) => {
                     let symbol_name = prefix.clone().with_suffix(name.as_str());
-                    let term = SymbolName::Type(symbol_name.clone());
+                    let name = SymbolName::Type(symbol_name.clone());
                     let symbol = match declarator {
                         ast::TypeDeclarator::Record(_, record) => Symbol::Type(TypeSymbol {
                             definition: TypeDefinition::Record(RecordSymbol {
@@ -407,26 +428,48 @@ impl CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPat
                             arity: type_parameters.len(),
                         }),
 
-                        ast::TypeDeclarator::Coproduct(_, coproduct) => Symbol::Type(TypeSymbol {
-                            definition: TypeDefinition::Coproduct(CoproductSymbol {
-                                name: symbol_name,
-                                type_parameters: type_parameters.clone(),
-                                constructors: coproduct
-                                    .constructors
-                                    .iter()
-                                    .map(|decl| ConstructorSymbol::<IdentifierPath> {
-                                        name: IdentifierPath::new(decl.name.as_str()),
-                                        signature: decl.signature.clone(),
-                                    })
-                                    .collect(),
-                            }),
-                            origin: TypeOrigin::UserDefined,
-                            arity: type_parameters.len(),
-                        }),
+                        ast::TypeDeclarator::Coproduct(_, coproduct) => {
+                            let constructors = coproduct
+                                .constructors
+                                .iter()
+                                .map(|decl| ConstructorSymbol {
+                                    name: prefix.clone().with_suffix(decl.name.as_str()),
+                                    signature: decl.signature.clone(),
+                                })
+                                .collect::<Vec<_>>();
+
+                            for constructor in &constructors {
+                                let symbol = Symbol::Term(TermSymbol {
+                                    name: constructor.name.clone(),
+                                    type_signature: Some(TypeSignature {
+                                        universal_quantifiers: type_parameters.clone(),
+                                        body: parser::TypeExpression::Tuple(
+                                            *parse_info,
+                                            TupleTypeExpr(constructor.signature.clone()),
+                                        ),
+                                        phase: PhantomData,
+                                    }),
+                                    body: constructor.make_tuple_lambda(*parse_info).into(),
+                                });
+                                symbols.push(symbol.clone());
+                                symbol_table
+                                    .insert(SymbolName::Value(constructor.name.clone()), symbol);
+                            }
+
+                            Symbol::Type(TypeSymbol {
+                                definition: TypeDefinition::Coproduct(CoproductSymbol {
+                                    name: symbol_name,
+                                    type_parameters: type_parameters.clone(),
+                                    constructors,
+                                }),
+                                origin: TypeOrigin::UserDefined,
+                                arity: type_parameters.len(),
+                            })
+                        }
                     };
 
                     symbols.push(symbol.clone());
-                    symbol_table.insert(term, symbol);
+                    symbol_table.insert(name, symbol);
                 }
             };
         }
@@ -456,14 +499,7 @@ impl<A> Symbol<A, QualifiedName, Identifier> {
                 );
             }
 
-            Self::Type(..) => {
-                //deps.extend(
-                //    symbol
-                //        .free_variables()
-                //        .iter()
-                //        .map(|&id| SymbolName::Value(Identifier::Free(id.clone()))),
-                //);
-            }
+            Self::Type(..) => {}
         }
 
         deps
@@ -521,7 +557,7 @@ impl TypeSymbol<QualifiedName> {
         }
     }
 
-    pub fn free_variables(&self) -> HashSet<&QualifiedName> {
+    pub fn _free_variables(&self) -> HashSet<&QualifiedName> {
         match &self.definition {
             TypeDefinition::Record(symbol) => symbol.free_variables(),
             TypeDefinition::Coproduct(symbol) => symbol.free_variables(),
@@ -561,10 +597,11 @@ pub struct CoproductSymbol<GlobalName> {
 
 impl CoproductSymbol<QualifiedName> {
     pub fn free_variables(&self) -> HashSet<&QualifiedName> {
-        self.constructors
-            .iter()
-            .flat_map(|ctor| ctor.free_variables())
-            .collect()
+        todo!()
+        //        self.constructors
+        //            .iter()
+        //            .flat_map(|ctor| ctor.free_variables())
+        //            .collect()
     }
 }
 
@@ -572,18 +609,67 @@ impl CoproductSymbol<QualifiedName> {
 pub struct ConstructorSymbol<GlobalName> {
     pub name: GlobalName,
     pub signature: Vec<ast::TypeExpression<ParseInfo, GlobalName>>,
+    //    pub phase: PhantomData<LocalId>,
 }
 
-impl ConstructorSymbol<QualifiedName> {
-    pub fn free_variables(&self) -> HashSet<&QualifiedName> {
-        self.signature
-            .iter()
-            .flat_map(|ty_expr| ty_expr.free_variables())
-            .collect()
+impl ConstructorSymbol<parser::IdentifierPath> {
+    // How is this to work?
+    // Surely this has to happen before De Bruijn
+    // Does it have to be a lambda spine?
+    //    pub fn make_lambda_spine(&self, parse_info: ParseInfo) -> parser::Expr {
+    //        let construct = parser::Expr::Construct(
+    //            parse_info,
+    //            ast::Construct {
+    //                name: self.name.clone(),
+    //                arguments: (0..self.signature.len())
+    //                    .into_iter()
+    //                    .map(|i| {
+    //                        parser::Expr::Variable(
+    //                            parse_info,
+    //                            parser::IdentifierPath::new(&format!("p{i}")),
+    //                        )
+    //                        .into()
+    //                    })
+    //                    .collect(),
+    //            },
+    //        );
+    //        todo!()
+    //    }
+
+    pub fn make_tuple_lambda(&self, parse_info: ParseInfo) -> parser::Expr {
+        let construct = parser::Expr::Construct(
+            parse_info,
+            parser::Construct {
+                name: self.name.clone(),
+                arguments: (0..self.signature.len())
+                    .into_iter()
+                    .map(|i| {
+                        parser::Expr::Project(
+                            parse_info,
+                            parser::Projection {
+                                base: parser::Expr::Variable(
+                                    parse_info,
+                                    parser::IdentifierPath::new("x"),
+                                )
+                                .into(),
+                                select: ast::ProductElement::Ordinal(i),
+                            },
+                        )
+                        .into()
+                    })
+                    .collect(),
+            },
+        );
+
+        parser::Expr::Lambda(
+            parse_info,
+            parser::Lambda {
+                parameter: parser::IdentifierPath::new("x"),
+                body: construct.into(),
+            },
+        )
     }
 }
-
-impl<GlobalName> TypeSymbol<GlobalName> {}
 
 #[derive(Debug, Clone)]
 pub struct TermSymbol<A, GlobalName, LocalId> {
@@ -644,21 +730,29 @@ impl parser::TypeExpression {
 
                 TypeExpression::Constructor(*a, symbols.resolve_member_path(&new_name))
             }
+
             Self::Parameter(a, name) => TypeExpression::Parameter(*a, name.clone()),
+
             Self::Apply(a, apply) => TypeExpression::Apply(
                 *a,
-                TypeApply {
+                ApplyTypeExpr {
                     function: apply.function.resolve_names(symbols).into(),
                     argument: apply.argument.resolve_names(symbols).into(),
                     phase: PhantomData,
                 },
             ),
+
             Self::Arrow(a, arrow) => TypeExpression::Arrow(
                 *a,
-                TypeArrow {
+                ArrowTypeExpr {
                     domain: arrow.domain.resolve_names(symbols).into(),
                     codomain: arrow.codomain.resolve_names(symbols).into(),
                 },
+            ),
+
+            Self::Tuple(a, tuple) => TypeExpression::Tuple(
+                *a,
+                TupleTypeExpr(tuple.0.iter().map(|te| te.resolve_names(symbols)).collect()),
             ),
         }
     }
@@ -700,6 +794,7 @@ impl parser::Expr {
             Self::Let(a, node) => Expr::Let(*a, node.resolve(names, symbols)),
             Self::Record(a, node) => Expr::Record(*a, node.resolve(names, symbols)),
             Self::Tuple(a, node) => Expr::Tuple(*a, node.resolve(names, symbols)),
+            Self::Construct(a, node) => Expr::Construct(*a, node.resolve(names, symbols)),
             Self::Project(a, node) => Expr::Project(*a, node.resolve(names, symbols)),
             Self::Sequence(a, node) => Expr::Sequence(*a, node.resolve(names, symbols)),
         }
@@ -804,6 +899,19 @@ impl parser::Tuple {
     }
 }
 
+impl parser::Construct {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Construct {
+        Construct {
+            name: Identifier::Free(symbols.resolve_member_path(&self.name)),
+            arguments: self
+                .arguments
+                .iter()
+                .map(|e| e.resolve(names, symbols).into())
+                .collect(),
+        }
+    }
+}
+
 impl parser::Projection {
     fn resolve(
         &self,
@@ -830,7 +938,7 @@ impl parser::Sequence {
     }
 }
 
-impl RawCompilationContext {
+impl ParserCompilationContext {
     // Move to namer.rs
     // This does not need the symbols in any particular order, so long as all
     // modules are known
@@ -848,7 +956,7 @@ impl RawCompilationContext {
         }
     }
 
-    fn rename_term_id(&self, id: &RawTermId) -> TermId {
+    fn rename_term_id(&self, id: &ParserTermId) -> TermId {
         match id {
             SymbolName::Type(id) => {
                 // What is it really doing here?
@@ -879,7 +987,7 @@ impl RawCompilationContext {
     }
 
     // Own and move instead?
-    fn rename_symbol(&self, symbol: &RawSymbol) -> NamedSymbol {
+    fn rename_symbol(&self, symbol: &ParserSymbol) -> NamedSymbol {
         match symbol {
             Symbol::Term(symbol) => Symbol::Term(TermSymbol {
                 name: self.resolve_member_path(&symbol.name),
@@ -908,26 +1016,29 @@ impl RawCompilationContext {
                     arity: symbol.arity.clone(),
                 },
 
-                TypeDefinition::Coproduct(coproduct) => TypeSymbol {
-                    definition: TypeDefinition::Coproduct(CoproductSymbol {
-                        name: self.resolve_member_path(&coproduct.name),
-                        type_parameters: coproduct.type_parameters.clone(),
-                        constructors: coproduct
-                            .constructors
-                            .iter()
-                            .map(|symbol| ConstructorSymbol {
-                                name: self.resolve_member_path(&symbol.name),
-                                signature: symbol
-                                    .signature
-                                    .iter()
-                                    .map(|te| te.resolve_names(self))
-                                    .collect(),
-                            })
-                            .collect(),
-                    }),
-                    origin: symbol.origin.clone(),
-                    arity: symbol.arity.clone(),
-                },
+                TypeDefinition::Coproduct(coproduct) => {
+                    let type_name = self.resolve_member_path(&coproduct.name);
+                    TypeSymbol {
+                        definition: TypeDefinition::Coproduct(CoproductSymbol {
+                            name: type_name,
+                            type_parameters: coproduct.type_parameters.clone(),
+                            constructors: coproduct
+                                .constructors
+                                .iter()
+                                .map(|symbol| ConstructorSymbol {
+                                    name: self.resolve_member_path(&symbol.name),
+                                    signature: symbol
+                                        .signature
+                                        .iter()
+                                        .map(|ty| ty.resolve_names(self))
+                                        .collect(),
+                                })
+                                .collect(),
+                        }),
+                        origin: symbol.origin.clone(),
+                        arity: symbol.arity.clone(),
+                    }
+                }
 
                 TypeDefinition::Builtin(base_type) => TypeSymbol {
                     definition: TypeDefinition::Builtin(base_type.clone()),

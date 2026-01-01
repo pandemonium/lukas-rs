@@ -62,6 +62,16 @@ impl Expr<(), namer::Identifier> {
                     .collect::<Interpretation<_>>()?,
             )),
 
+            Self::Construct(_, the) => Ok(Value::Variant {
+                coproduct: the.name.clone(), // clearly not correct
+                constructor: the.name.clone(),
+                arguments: the
+                    .arguments
+                    .iter()
+                    .map(|e| e.reduce(env))
+                    .collect::<Interpretation<Vec<_>>>()?,
+            }),
+
             Self::Project(_, the) => match (the.base.reduce(env)?, &the.select) {
                 (Value::Product(values), ProductElement::Ordinal(index)) => {
                     Ok(values[*index].clone())
@@ -198,6 +208,13 @@ pub enum Value {
 
     // Is this problem free?
     Product(Vec<Value>),
+
+    Variant {
+        // Work out what this ought to be
+        coproduct: namer::Identifier,
+        constructor: namer::Identifier,
+        arguments: Vec<Value>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -280,7 +297,9 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Constant(x) => write!(f, "{x}"),
+
             Self::Closure(x) => write!(f, "`{}`", x.borrow()),
+
             Self::SelfReferential { name, inner } => {
                 if let Some(inner) = inner.upgrade() {
                     write!(f, "/{name}/ {}", inner.borrow())
@@ -288,6 +307,7 @@ impl fmt::Display for Value {
                     write!(f, "/{name}/ {{ value since dropped }}")
                 }
             }
+
             Self::Product(elements) => {
                 let elements = elements
                     .iter()
@@ -295,6 +315,22 @@ impl fmt::Display for Value {
                     .collect::<Vec<_>>()
                     .join(", ");
                 write!(f, "{elements}")
+            }
+
+            Self::Variant {
+                coproduct,
+                constructor,
+                arguments,
+            } => {
+                write!(
+                    f,
+                    "{coproduct}::{constructor} {}",
+                    arguments
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
             }
         }
     }
