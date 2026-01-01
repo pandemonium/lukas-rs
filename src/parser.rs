@@ -869,6 +869,20 @@ impl<'a> Parser<'a> {
 
             [t, ..] if t.is_keyword(Keyword::Let) => self.parse_local_binding(),
 
+            [
+                Token {
+                    kind: TokenKind::LeftParen,
+                    ..
+                },
+                ..,
+            ] => {
+                // '('
+                self.advance(1);
+                let expr = self.parse_expression(0);
+                self.expect(TokenKind::RightParen)?;
+                expr
+            }
+
             otherwise => panic!("{otherwise:?}"),
         }
     }
@@ -894,6 +908,7 @@ impl<'a> Parser<'a> {
     // All infices must be right of lhs.
     fn parse_expr_infix(&mut self, lhs: Expr, context_precedence: usize) -> Result<Expr> {
         let terminals = [
+            TokenKind::RightParen,
             TokenKind::Semicolon,
             TokenKind::Layout(Layout::Dedent),
             TokenKind::Keyword(Keyword::Let),
