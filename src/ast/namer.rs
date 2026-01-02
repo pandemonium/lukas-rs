@@ -463,7 +463,7 @@ impl ParserCompilationContext {
                                         ),
                                         phase: PhantomData,
                                     }),
-                                    body: constructor.make_tuple_lambda(*parse_info).into(),
+                                    body: constructor.make_tuple_lambda(*parse_info),
                                 });
                                 symbols.push(symbol.clone());
                                 symbol_table
@@ -533,7 +533,7 @@ pub struct TypeSymbol<GlobalName> {
     pub arity: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub enum TypeOrigin {
     UserDefined,
     Builtin,
@@ -646,7 +646,6 @@ impl ConstructorSymbol<parser::IdentifierPath> {
             parser::Construct {
                 name: self.name.clone(),
                 arguments: (0..self.signature.len())
-                    .into_iter()
                     .map(|i| {
                         parser::Expr::Project(
                             parse_info,
@@ -781,9 +780,6 @@ impl parser::Expr {
                     into_projection(a, bound, identifier_path)
                 } else if let Some(name) = identifier_path.try_as_simple() {
                     Expr::Variable(*a, names.resolve(&name))
-                } else if let Some(_path) = symbols.resolve_module_path_expr(identifier_path) {
-                    panic!("What causes this?(1) `{identifier_path}`");
-                    _path.into_expression(*a)
                 } else if let Some(path) =
                     symbols.resolve_module_path_expr(&identifier_path.as_root_module_member())
                 {
@@ -1005,8 +1001,8 @@ impl ParserCompilationContext {
                             })
                             .collect(),
                     }),
-                    origin: symbol.origin.clone(),
-                    arity: symbol.arity.clone(),
+                    origin: symbol.origin,
+                    arity: symbol.arity,
                 },
 
                 TypeDefinition::Coproduct(coproduct) => {
@@ -1028,13 +1024,13 @@ impl ParserCompilationContext {
                                 })
                                 .collect(),
                         }),
-                        origin: symbol.origin.clone(),
-                        arity: symbol.arity.clone(),
+                        origin: symbol.origin,
+                        arity: symbol.arity,
                     }
                 }
 
                 TypeDefinition::Builtin(base_type) => TypeSymbol {
-                    definition: TypeDefinition::Builtin(base_type.clone()),
+                    definition: TypeDefinition::Builtin(*base_type),
                     origin: symbol.origin.clone(),
                     arity: symbol.arity,
                 },

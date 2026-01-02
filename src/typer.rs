@@ -363,7 +363,7 @@ impl Type {
                 .map_or_else(|| p.clone(), |t| t.with_substitutions(subs))
                 .clone(),
 
-            Self::Base(b) => Self::Base(b.clone()),
+            Self::Base(b) => Self::Base(*b),
 
             Self::Arrow { domain, codomain } => Self::Arrow {
                 domain: domain.with_substitutions(subs).into(),
@@ -447,7 +447,7 @@ impl Type {
                     }
 
                     // compose_mut
-                    subs = subs.compose(&lhs.unifed_with(&rhs)?);
+                    subs = subs.compose(&lhs.unifed_with(rhs)?);
                 }
 
                 Ok(subs)
@@ -497,7 +497,7 @@ pub enum BaseType {
 
 impl BaseType {
     pub fn is_name(id: &str) -> bool {
-        BUILTIN_BASE_TYPE_NAMES.iter().any(|&n| n == id)
+        BUILTIN_BASE_TYPE_NAMES.contains(&id)
     }
 
     const fn local_name(&self) -> &str {
@@ -762,7 +762,7 @@ impl fmt::Display for TypeConstructor {
             Self::Elaborated(constructor) => {
                 write!(f, "{}", constructor.definition.name)?;
 
-                for (_, p) in &constructor.definition.instantiated_params {
+                for p in constructor.definition.instantiated_params.values() {
                     write!(f, " {p}")?;
                 }
 
@@ -984,7 +984,7 @@ impl TypeEnvironment {
 
     fn infer_record_type_constructor(&self, shape: &RecordShape) -> Vec<&TypeConstructor> {
         self.record_shapes
-            .matching(&shape)
+            .matching(shape)
             .flat_map(|name| self.lookup(name))
             .collect()
     }
@@ -1037,7 +1037,7 @@ impl TypingContext {
             Type::Constructor(name) => {
                 let constructor = self
                     .types
-                    .lookup(&name)
+                    .lookup(name)
                     .ok_or_else(|| TypeError::UndefinedType(name.clone()))?;
 
                 if constructor.arity() != arguments.len() {
@@ -1065,7 +1065,6 @@ impl TypingContext {
                                 .expect(&format!("Unmapped type parameter: {p}"))
                         })
                         .copied()
-                        .into_iter()
                         .zip(arguments.drain(..))
                         .collect::<Vec<_>>(),
                 );
@@ -1332,8 +1331,7 @@ impl TypingContext {
                     // Pick out the Type::Product so that its
                     // elements can be put here
                     arguments: typed_arguments,
-                }
-                .into(),
+                },
             ),
         ))
     }
@@ -1377,7 +1375,7 @@ impl TypingContext {
             .first()
             .ok_or_else(|| TypeError::NoSuchRecordType(record_type.clone()))?;
 
-        let type_constructor = type_constructor.instantiate(&self)?;
+        let type_constructor = type_constructor.instantiate(self)?;
 
         let structure = type_constructor.structure().ok_or_else(|| {
             TypeError::UnelaboratedConstructor(type_constructor.definition().name.clone())

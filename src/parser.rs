@@ -81,12 +81,12 @@ impl IdentifierPath {
             .prefigure(head, tail, ast::BUILTIN_MODULE_NAME.to_owned())
     }
 
-    fn prefigure(self, head: &String, tail: &Vec<String>, head1: String) -> IdentifierPath {
+    fn prefigure(self, head: &str, tail: &Vec<String>, head1: String) -> IdentifierPath {
         Self {
             head: head1,
             tail: {
                 let mut new_tail = Vec::with_capacity(1 + tail.capacity());
-                new_tail.push(head.clone());
+                new_tail.push(head.to_owned());
                 new_tail.extend_from_slice(tail);
                 new_tail
             },
@@ -152,7 +152,7 @@ struct TraceLogEntry<'a> {
 }
 
 thread_local! {
-    static STACK_DEPTH: Cell<usize> = Cell::new(0);
+    static STACK_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
 pub struct TraceGuard;
@@ -234,9 +234,7 @@ impl<'a> Parser<'a> {
     }
 
     fn peek(&self) -> Result<&Token> {
-        self.remains()
-            .first()
-            .ok_or_else(|| Fault::UnexpectedOverflow)
+        self.remains().first().ok_or(Fault::UnexpectedOverflow)
     }
 
     fn expect(&mut self, expected: TokenKind) -> Result<&Token> {
@@ -282,7 +280,8 @@ impl<'a> Parser<'a> {
 
     fn unconsume(&mut self) -> Result<()> {
         if self.offset > 0 {
-            Ok(self.offset -= 1)
+            self.offset -= 1;
+            Ok(())
         } else {
             Err(Fault::UnexpectedUnderflow)
         }
@@ -591,9 +590,9 @@ impl<'a> Parser<'a> {
     ) -> ast::TypeExpression<ParseInfo, IdentifierPath> {
         let parse_info = ParseInfo::from_position(*position);
         if is_lowercase(id) {
-            TypeExpression::Parameter(parse_info, Identifier::from_str(&id))
+            TypeExpression::Parameter(parse_info, Identifier::from_str(id))
         } else {
-            TypeExpression::Constructor(parse_info, IdentifierPath::new(&id))
+            TypeExpression::Constructor(parse_info, IdentifierPath::new(id))
         }
     }
 
@@ -610,7 +609,7 @@ impl<'a> Parser<'a> {
             ] => {
                 if lhs.is_applicable() {
                     self.advance(1);
-                    let rhs = self.parse_simple_type_expr_term(&id, position);
+                    let rhs = self.parse_simple_type_expr_term(id, position);
                     self.parse_type_expr_infix(TypeExpression::Apply(
                         ParseInfo::from_position(*position),
                         ApplyTypeExpr {
@@ -942,7 +941,7 @@ impl<'a> Parser<'a> {
                 if (t.is_indent() || t.is_newline())
                     && Self::is_expr_prefix(&u.kind)
                     && Operator::Juxtaposition.precedence() > context_precedence
-                    && u.location().is_descendant_of(&lhs.position()) =>
+                    && u.location().is_descendant_of(lhs.position()) =>
             {
                 //                println!(
                 //                    "Calling parse_juxtaposed(1); lhs pos {}",
