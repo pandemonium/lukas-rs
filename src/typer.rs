@@ -140,7 +140,7 @@ impl namer::NamedCompilationContext {
         symbol: &TermSymbol<ParseInfo, namer::QualifiedName, Identifier>,
         ctx: &mut TypingContext,
     ) -> Typing<TypedSymbol> {
-        let (_, body) = ctx.infer_expr(&symbol.body)?;
+        let (subs, body) = ctx.infer_expr(&symbol.body)?;
 
         let qualified_name = &symbol.name;
         let inferred_type = &body.type_info().inferred_type;
@@ -149,8 +149,7 @@ impl namer::NamedCompilationContext {
 
         ctx.bind_term(
             qualified_name.clone(),
-            //            TypeScheme::from_constant(inferred_type.clone()),
-            inferred_type.generalize(ctx),
+            inferred_type.generalize(&ctx.with_substitutions(&subs)),
         );
 
         Ok(namer::Symbol::Term(TermSymbol {
@@ -239,7 +238,10 @@ pub struct RecordType(Vec<(parser::Identifier, Type)>);
 
 impl RecordType {
     fn from_fields(fields: &[(parser::Identifier, Type)]) -> Self {
-        Self(fields.to_vec())
+        let mut fields = fields.to_vec();
+        fields.sort_by(|(t, _), (u, _)| t.cmp(u));
+
+        Self(fields)
     }
 
     fn with_substitutions(self, subs: &Substitutions) -> Self {
@@ -870,12 +872,12 @@ impl Deref for Substitutions {
 pub type Term = namer::SymbolName<namer::QualifiedName, namer::Identifier>;
 
 #[derive(Debug, Clone, Default)]
-pub struct TermSpace {
+pub struct TermEnvironment {
     bound: Vec<TypeScheme>,
     free: HashMap<namer::QualifiedName, TypeScheme>,
 }
 
-impl TermSpace {
+impl TermEnvironment {
     pub fn lookup_free(&self, term: &namer::QualifiedName) -> Option<&TypeScheme> {
         self.free.get(term)
     }
@@ -964,14 +966,14 @@ impl CoproductIndex {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct TypeSpace {
+pub struct TypeEnvironment {
     bindings: HashMap<namer::QualifiedName, TypeConstructor>,
     // Is this the best datatype for this?
-    record_shape_index: RecordShapeIndex,
-    constructor_index: CoproductIndex,
+    record_shapes: RecordShapeIndex,
+    coproduct_constructors: CoproductIndex,
 }
 
-impl TypeSpace {
+impl TypeEnvironment {
     fn bind(&mut self, name: namer::QualifiedName, tc: TypeConstructor) {
         self.bindings.insert(name, tc);
     }
@@ -981,7 +983,7 @@ impl TypeSpace {
     }
 
     fn infer_record_type_constructor(&self, shape: &RecordShape) -> Vec<&TypeConstructor> {
-        self.record_shape_index
+        self.record_shapes
             .matching(&shape)
             .flat_map(|name| self.lookup(name))
             .collect()
@@ -992,7 +994,7 @@ impl TypeSpace {
         name: &QualifiedName,
     ) -> Typing<Vec<&TypeConstructor>> {
         Ok(self
-            .constructor_index
+            .coproduct_constructors
             .matching(name)
             .flat_map(|name| self.lookup(name))
             .collect())
@@ -1005,16 +1007,16 @@ impl TypeSpace {
                 .iter()
                 .map(|(id, tc)| (id.clone(), tc.with_substitutions(subs)))
                 .collect(),
-            record_shape_index: self.record_shape_index.clone(),
-            constructor_index: self.constructor_index.clone(),
+            record_shapes: self.record_shapes.clone(),
+            coproduct_constructors: self.coproduct_constructors.clone(),
         }
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct TypingContext {
-    types: TypeSpace,
-    terms: TermSpace,
+    types: TypeEnvironment,
+    terms: TermEnvironment,
 }
 
 impl TypingContext {
@@ -1090,7 +1092,7 @@ impl TypingContext {
     pub fn with_substitutions(&self, subs: &Substitutions) -> Self {
         Self {
             types: self.types.with_substitutions(subs),
-            terms: TermSpace {
+            terms: TermEnvironment {
                 bound: Self::substitute_bound(&self.terms.bound, subs),
                 free: Self::substitute_free(&self.terms.free, subs),
             },
@@ -1125,12 +1127,12 @@ impl TypingContext {
                 match &constructor.structure {
                     Type::Record(shape) => self
                         .types
-                        .record_shape_index
+                        .record_shapes
                         .insert(shape, constructor.definition.name.clone()),
 
                     Type::Coproduct(coproduct) => {
                         for (constructor_name, _) in &coproduct.0 {
-                            self.types.constructor_index.insert(
+                            self.types.coproduct_constructors.insert(
                                 constructor_name.clone(),
                                 constructor.definition.name.clone(),
                             );
@@ -1145,7 +1147,7 @@ impl TypingContext {
                         constructor.definition.name
                     );
                     self.types
-                        .record_shape_index
+                        .record_shapes
                         .insert(image, constructor.definition.name.clone());
                 }
             }
@@ -1479,11 +1481,6 @@ impl TypingContext {
                     inferred_type: base.type_info().inferred_type.clone(),
                 }),
             },
-
-            el => panic!(
-                "{el:?} is not a member of {:?}",
-                base.type_info().inferred_type
-            ),
         }
     }
 

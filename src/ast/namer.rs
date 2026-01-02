@@ -13,7 +13,7 @@ use crate::{
         TupleTypeExpr, TypeSignature,
     },
     parser::{self, ParseInfo},
-    typer::{BaseType, TypeParameter},
+    typer::BaseType,
 };
 
 pub type Expr = ast::Expr<ParseInfo, Identifier>;
@@ -781,9 +781,9 @@ impl parser::Expr {
                     into_projection(a, bound, identifier_path)
                 } else if let Some(name) = identifier_path.try_as_simple() {
                     Expr::Variable(*a, names.resolve(&name))
-                } else if let Some(path) = symbols.resolve_module_path_expr(identifier_path) {
+                } else if let Some(_path) = symbols.resolve_module_path_expr(identifier_path) {
                     panic!("What causes this?(1) `{identifier_path}`");
-                    path.into_expression(*a)
+                    _path.into_expression(*a)
                 } else if let Some(path) =
                     symbols.resolve_module_path_expr(&identifier_path.as_root_module_member())
                 {

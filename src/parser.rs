@@ -723,7 +723,7 @@ impl<'a> Parser<'a> {
 
         Ok(Expr::Record(
             ParseInfo::from_position(column),
-            Record { fields },
+            Record::from_fields(&fields),
         ))
     }
 

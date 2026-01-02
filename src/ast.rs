@@ -184,6 +184,15 @@ pub struct Record<A, Id> {
     pub fields: Vec<(parser::Identifier, Tree<A, Id>)>,
 }
 
+impl<A, Id> Record<A, Id> {
+    pub fn from_fields(fields: &[(parser::Identifier, Tree<A, Id>)]) -> Self {
+        let mut fields = fields.to_vec();
+        fields.sort_by(|(t, _), (u, _)| t.cmp(u));
+
+        Self { fields }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Tuple<A, Id> {
     pub elements: Vec<Tree<A, Id>>,

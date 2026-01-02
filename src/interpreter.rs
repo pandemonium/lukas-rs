@@ -48,20 +48,12 @@ impl Expr<(), namer::Identifier> {
                 env.bind_and_then(the.bound.reduce(env)?, |env| the.body.reduce(env))
             }
 
-            Self::Record(_, the) => {
-                //                print!("reduce: record {{");
-                //                for field in &the.fields {
-                //                    print!(" {}", field.0);
-                //                }
-                //                println!(" }}.");
-
-                Ok(Value::Product(
-                    the.fields
-                        .iter()
-                        .map(|(_, e)| e.reduce(env))
-                        .collect::<Interpretation<_>>()?,
-                ))
-            }
+            Self::Record(_, the) => Ok(Value::Product(
+                the.fields
+                    .iter()
+                    .map(|(_, e)| e.reduce(env))
+                    .collect::<Interpretation<_>>()?,
+            )),
 
             Self::Tuple(_, the) => Ok(Value::Product(
                 the.elements
