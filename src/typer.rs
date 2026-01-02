@@ -140,18 +140,17 @@ impl namer::NamedCompilationContext {
         symbol: &TermSymbol<ParseInfo, namer::QualifiedName, Identifier>,
         ctx: &mut TypingContext,
     ) -> Typing<TypedSymbol> {
-        println!("compute_term_symbol: inferring {}", symbol.body);
         let (_, body) = ctx.infer_expr(&symbol.body)?;
-        println!("compute_term_symbol: inferring {} complete.", body);
 
         let qualified_name = &symbol.name;
         let inferred_type = &body.type_info().inferred_type;
 
-        println!("compute_term_symbol: {qualified_name} => {inferred_type}");
+        println!("{qualified_name} => {inferred_type}");
 
         ctx.bind_term(
             qualified_name.clone(),
-            TypeScheme::from_constant(inferred_type.clone()),
+            //            TypeScheme::from_constant(inferred_type.clone()),
+            inferred_type.generalize(ctx),
         );
 
         Ok(namer::Symbol::Term(TermSymbol {
@@ -435,6 +434,23 @@ impl Type {
                 Ok(subs)
             }
 
+            (Self::Record(lhs), Self::Record(rhs)) if lhs.0.len() == rhs.0.len() => {
+                let mut subs = Substitutions::default();
+
+                println!("unify_with: {lhs:?} {rhs:?}");
+                // Sort first?
+                for ((lhs_label, lhs), (rhs_label, rhs)) in lhs.0.iter().zip(&rhs.0) {
+                    if lhs_label != rhs_label {
+                        panic!("{lhs_label} != {rhs_label}");
+                    }
+
+                    // compose_mut
+                    subs = subs.compose(&lhs.unifed_with(&rhs)?);
+                }
+
+                Ok(subs)
+            }
+
             (
                 Self::Apply {
                     constructor: lhs_con,
@@ -553,9 +569,9 @@ impl TypeExpression {
                     .ok_or_else(|| TypeError::UndefinedType(name.clone()))?;
 
                 Ok(constructor
-                    .header()
+                    .definition()
                     .as_base_type()
-                    .unwrap_or_else(|| constructor.applied_type()))
+                    .unwrap_or_else(|| constructor.definition().head()))
             }
 
             Self::Parameter(_, p) => type_params
@@ -590,89 +606,80 @@ impl TypeExpression {
 }
 
 #[derive(Debug, Clone)]
-pub struct ElaboratedConstructor {
-    pub header: ConstructorHeader,
+pub struct ElaboratedTypeConstructor {
+    pub definition: TypeConstructorDefinition,
     pub structure: Type,
 }
 
 #[derive(Debug, Clone)]
-pub struct ConstructorHeader {
+pub struct TypeConstructorDefinition {
     pub name: namer::QualifiedName,
-    pub type_param_map: HashMap<parser::Identifier, TypeParameter>,
-    pub symbol: TypeSymbol<namer::QualifiedName>,
+    pub instantiated_params: HashMap<parser::Identifier, TypeParameter>,
+    pub defining_symbol: TypeSymbol<namer::QualifiedName>,
 }
 
-impl ConstructorHeader {
-    fn apply(&self) -> Type {
-        self.type_param_map.iter().fold(
+impl TypeConstructorDefinition {
+    fn make_spine(&self) -> Type {
+        self.defining_symbol.type_parameters().iter().fold(
             Type::Constructor(self.name.clone()),
-            |constructor, (_, at)| Type::Apply {
+            |constructor, param| Type::Apply {
                 constructor: constructor.into(),
-                argument: Type::Variable(*at).into(),
+                argument: Type::Variable(self.instantiated_params[param]).into(),
             },
         )
     }
 
     fn as_base_type(&self) -> Option<Type> {
-        if let TypeDefinition::Builtin(base_type) = self.symbol.definition {
+        if let TypeDefinition::Builtin(base_type) = self.defining_symbol.definition {
             Some(Type::Base(base_type))
         } else {
             None
         }
     }
+
+    fn head(&self) -> Type {
+        Type::Constructor(self.name.clone())
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum TypeConstructor {
-    Unelaborated(ConstructorHeader),
-    Elaborated(ElaboratedConstructor),
+    Unelaborated(TypeConstructorDefinition),
+    Elaborated(ElaboratedTypeConstructor),
 }
 
 impl TypeConstructor {
     fn arity(&self) -> usize {
-        self.header().symbol.arity
+        self.definition().defining_symbol.arity
     }
 
     fn from_symbol(symbol: &TypeSymbol<namer::QualifiedName>) -> Self {
         if let TypeDefinition::Builtin(base_type) = &symbol.definition {
-            Self::Elaborated(ElaboratedConstructor {
-                header: ConstructorHeader {
+            Self::Elaborated(ElaboratedTypeConstructor {
+                definition: TypeConstructorDefinition {
                     name: symbol.qualified_name(),
-                    type_param_map: HashMap::default(),
-                    symbol: symbol.clone(),
+                    instantiated_params: HashMap::default(),
+                    defining_symbol: symbol.clone(),
                 },
                 structure: Type::Base(*base_type),
             })
         } else {
-            Self::Unelaborated(ConstructorHeader {
+            Self::Unelaborated(TypeConstructorDefinition {
                 name: symbol.qualified_name(),
-                type_param_map: symbol
-                    .type_parameters()
-                    .iter()
-                    .map(|tp| (tp.clone(), TypeParameter::fresh()))
-                    .collect(),
-                symbol: symbol.clone(),
+                instantiated_params: fresh_type_parameters(symbol),
+                defining_symbol: symbol.clone(),
             })
         }
     }
 
     fn elaborate(&mut self, ctx: &TypingContext) -> Typing<()> {
         if let Self::Unelaborated(constructor) = self {
-            let structure = match &constructor.symbol.definition {
-                TypeDefinition::Record(record) => {
-                    record.synthesize_type(&constructor.type_param_map, ctx)?
-                }
-
-                TypeDefinition::Coproduct(coproduct) => {
-                    coproduct.synthesize_type(&constructor.type_param_map, ctx)?
-                }
-
-                TypeDefinition::Builtin(base_type) => Type::Base(base_type.clone()),
-            };
-
-            *self = Self::Elaborated(ElaboratedConstructor {
-                header: constructor.clone(),
-                structure,
+            *self = Self::Elaborated(ElaboratedTypeConstructor {
+                definition: constructor.clone(),
+                structure: constructor
+                    .defining_symbol
+                    .definition
+                    .synthesize_type(&constructor.instantiated_params, ctx)?,
             });
         }
 
@@ -681,8 +688,8 @@ impl TypeConstructor {
 
     fn with_substitutions(&self, subs: &Substitutions) -> Self {
         if let Self::Elaborated(constructor) = self {
-            Self::Elaborated(ElaboratedConstructor {
-                header: constructor.header.clone(),
+            Self::Elaborated(ElaboratedTypeConstructor {
+                definition: constructor.definition.clone(),
                 structure: constructor.structure.with_substitutions(subs),
             })
         } else {
@@ -690,17 +697,14 @@ impl TypeConstructor {
         }
     }
 
-    fn applied_type(&self) -> Type {
-        match self {
-            Self::Unelaborated(header) => header.apply(),
-            Self::Elaborated(constructor) => constructor.header.apply(),
-        }
+    fn make_spine(&self) -> Type {
+        self.definition().make_spine()
     }
 
-    fn header(&self) -> &ConstructorHeader {
+    fn definition(&self) -> &TypeConstructorDefinition {
         match self {
             Self::Unelaborated(header) => header,
-            Self::Elaborated(constructor) => &constructor.header,
+            Self::Elaborated(constructor) => &constructor.definition,
         }
     }
 
@@ -711,16 +715,52 @@ impl TypeConstructor {
             None
         }
     }
+
+    fn instantiate(&self, ctx: &TypingContext) -> Typing<Self> {
+        let mut the = Self::from_symbol(&self.definition().defining_symbol);
+        the.elaborate(ctx)?;
+        Ok(the)
+    }
+}
+
+fn fresh_type_parameters(
+    symbol: &TypeSymbol<QualifiedName>,
+) -> HashMap<parser::Identifier, TypeParameter> {
+    symbol
+        .type_parameters()
+        .iter()
+        .map(|tp| (tp.clone(), TypeParameter::fresh()))
+        .collect()
+}
+
+impl TypeDefinition<QualifiedName> {
+    pub fn synthesize_type(
+        &self,
+        type_param_map: &HashMap<parser::Identifier, TypeParameter>,
+        ctx: &TypingContext,
+    ) -> Typing<Type> {
+        match self {
+            Self::Record(record) => record.synthesize_type(type_param_map, ctx),
+            Self::Coproduct(coproduct) => coproduct.synthesize_type(type_param_map, ctx),
+            Self::Builtin(base_type) => Ok(Type::Base(*base_type)),
+        }
+    }
 }
 
 impl fmt::Display for TypeConstructor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unelaborated(header) => write!(f, "Suspended {}", header.symbol.qualified_name()),
+            Self::Unelaborated(definition) => {
+                write!(
+                    f,
+                    "Suspended {}",
+                    definition.defining_symbol.qualified_name()
+                )
+            }
             Self::Elaborated(constructor) => {
-                write!(f, "{}", constructor.header.name)?;
+                write!(f, "{}", constructor.definition.name)?;
 
-                for (_, p) in &constructor.header.type_param_map {
+                for (_, p) in &constructor.definition.instantiated_params {
                     write!(f, " {p}")?;
                 }
 
@@ -809,7 +849,7 @@ impl Substitutions {
     }
 
     fn remove(&mut self, param: TypeParameter) {
-        self.0.retain(|(tp, ..)| param == *tp);
+        self.0.retain(|(tp, ..)| param != *tp);
     }
 }
 
@@ -857,9 +897,9 @@ impl TermSpace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct RecordImage(Vec<parser::Identifier>);
+struct RecordShape(Vec<parser::Identifier>);
 
-impl RecordImage {
+impl RecordShape {
     fn from_record_type(record: &RecordType) -> Self {
         Self(
             record
@@ -873,7 +913,7 @@ impl RecordImage {
     }
 }
 
-impl fmt::Display for RecordImage {
+impl fmt::Display for RecordShape {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self(image) = self;
         let mut image = image.iter();
@@ -892,23 +932,17 @@ impl fmt::Display for RecordImage {
 }
 
 #[derive(Debug, Clone, Default)]
-struct RecordTypeIndex(HashMap<RecordImage, Vec<namer::QualifiedName>>);
+struct RecordShapeIndex(HashMap<RecordShape, Vec<namer::QualifiedName>>);
 
-impl RecordTypeIndex {
+impl RecordShapeIndex {
     fn insert(&mut self, record_type: &RecordType, name: namer::QualifiedName) {
         self.0
-            .entry(RecordImage::from_record_type(record_type))
+            .entry(RecordShape::from_record_type(record_type))
             .or_default()
             .push(name);
     }
 
-    fn matching(&self, image: &RecordImage) -> impl Iterator<Item = &namer::QualifiedName> {
-        for (image, names) in &self.0 {
-            for name in names {
-                println!("matching: {image} -> {name}");
-            }
-        }
-
+    fn matching(&self, image: &RecordShape) -> impl Iterator<Item = &namer::QualifiedName> {
         self.0.get(image).into_iter().flatten()
     }
 }
@@ -933,7 +967,7 @@ impl CoproductIndex {
 pub struct TypeSpace {
     bindings: HashMap<namer::QualifiedName, TypeConstructor>,
     // Is this the best datatype for this?
-    record_type_index: RecordTypeIndex,
+    record_shape_index: RecordShapeIndex,
     constructor_index: CoproductIndex,
 }
 
@@ -946,9 +980,9 @@ impl TypeSpace {
         self.bindings.get(name)
     }
 
-    fn infer_record_type_constructor(&self, image: &RecordImage) -> Vec<&TypeConstructor> {
-        self.record_type_index
-            .matching(&image)
+    fn infer_record_type_constructor(&self, shape: &RecordShape) -> Vec<&TypeConstructor> {
+        self.record_shape_index
+            .matching(&shape)
             .flat_map(|name| self.lookup(name))
             .collect()
     }
@@ -971,7 +1005,7 @@ impl TypeSpace {
                 .iter()
                 .map(|(id, tc)| (id.clone(), tc.with_substitutions(subs)))
                 .collect(),
-            record_type_index: self.record_type_index.clone(),
+            record_shape_index: self.record_shape_index.clone(),
             constructor_index: self.constructor_index.clone(),
         }
     }
@@ -984,7 +1018,7 @@ pub struct TypingContext {
 }
 
 impl TypingContext {
-    pub fn instantiate_applied_type_constructor(&self, ty: &Type) -> Typing<Type> {
+    pub fn normalize_type_application(&self, ty: &Type) -> Typing<Type> {
         if let Type::Constructor(..) | Type::Apply { .. } = ty {
             self.reduce_applied_constructor(ty, &mut vec![])
         } else {
@@ -1006,7 +1040,7 @@ impl TypingContext {
 
                 if constructor.arity() != arguments.len() {
                     Err(TypeError::WrongArity {
-                        constructor: constructor.header().name.clone(),
+                        constructor: constructor.definition().name.clone(),
                         was: arguments.clone(),
                         expected: constructor.arity(),
                     })?;
@@ -1016,15 +1050,15 @@ impl TypingContext {
                 // Apply node first.
                 arguments.reverse();
 
-                let header = constructor.header();
+                let definition = constructor.definition();
                 let subs = Substitutions::from(
-                    header
-                        .symbol
+                    definition
+                        .defining_symbol
                         .type_parameters()
                         .iter()
                         .map(|p| {
-                            header
-                                .type_param_map
+                            definition
+                                .instantiated_params
                                 .get(p)
                                 .expect(&format!("Unmapped type parameter: {p}"))
                         })
@@ -1089,16 +1123,17 @@ impl TypingContext {
         for constructor in self.types.bindings.values() {
             if let TypeConstructor::Elaborated(constructor) = constructor {
                 match &constructor.structure {
-                    Type::Record(image) => self
+                    Type::Record(shape) => self
                         .types
-                        .record_type_index
-                        .insert(image, constructor.header.name.clone()),
+                        .record_shape_index
+                        .insert(shape, constructor.definition.name.clone()),
 
                     Type::Coproduct(coproduct) => {
                         for (constructor_name, _) in &coproduct.0 {
-                            self.types
-                                .constructor_index
-                                .insert(constructor_name.clone(), constructor.header.name.clone());
+                            self.types.constructor_index.insert(
+                                constructor_name.clone(),
+                                constructor.definition.name.clone(),
+                            );
                         }
                     }
 
@@ -1107,11 +1142,11 @@ impl TypingContext {
                 if let Type::Record(image) = &constructor.structure {
                     println!(
                         "elaborate_type_constructors: {image} -> {}",
-                        constructor.header.name
+                        constructor.definition.name
                     );
                     self.types
-                        .record_type_index
-                        .insert(image, constructor.header.name.clone());
+                        .record_shape_index
+                        .insert(image, constructor.definition.name.clone());
                 }
             }
         }
@@ -1179,7 +1214,7 @@ impl TypingContext {
     //    }
 
     pub fn infer_expr(&mut self, expr: &UntypedExpr) -> Typing {
-        println!("infer_expr: {expr}");
+        //        println!("infer_expr: {expr}");
 
         match expr {
             UntypedExpr::Variable(parse_info, name) => Ok((
@@ -1244,7 +1279,7 @@ impl TypingContext {
 
     fn infer_coproduct_construct(
         &mut self,
-        parse_info: &ParseInfo,
+        pi: &ParseInfo,
         constructor: &namer::Construct,
     ) -> Typing {
         println!("infer_coproduct_construct: hi, mom");
@@ -1284,8 +1319,10 @@ impl TypingContext {
             substitutions,
             Expr::Construct(
                 TypeInfo {
-                    parse_info: *parse_info,
-                    inferred_type: type_constructor.applied_type(),
+                    parse_info: *pi,
+                    // I think this is incorrect - this must become
+                    // a TypeScheme with the correct quantification
+                    inferred_type: type_constructor.make_spine(),
                 },
                 Construct {
                     name: constructor.name.clone(),
@@ -1299,7 +1336,7 @@ impl TypingContext {
         ))
     }
 
-    fn infer_record(&mut self, parse_info: &ParseInfo, record: &namer::Record) -> Typing {
+    fn infer_record(&mut self, pi: &ParseInfo, record: &namer::Record) -> Typing {
         let mut substitutions = Substitutions::default();
         let mut fields = Vec::with_capacity(record.fields.len());
 
@@ -1332,17 +1369,28 @@ impl TypingContext {
 
         let type_constructors = self
             .types
-            .infer_record_type_constructor(&RecordImage::from_record_type(&record_type));
+            .infer_record_type_constructor(&RecordShape::from_record_type(&record_type));
+
         let type_constructor = type_constructors
             .first()
-            .ok_or_else(|| TypeError::NoSuchRecordType(record_type))?;
+            .ok_or_else(|| TypeError::NoSuchRecordType(record_type.clone()))?;
+
+        let type_constructor = type_constructor.instantiate(&self)?;
+
+        let structure = type_constructor.structure().ok_or_else(|| {
+            TypeError::UnelaboratedConstructor(type_constructor.definition().name.clone())
+        })?;
+
+        let subs = structure.unifed_with(&Type::Record(record_type))?;
 
         Ok((
-            substitutions,
+            substitutions.compose(&subs),
             Expr::Record(
                 TypeInfo {
-                    parse_info: *parse_info,
-                    inferred_type: type_constructor.applied_type(),
+                    parse_info: *pi,
+                    // I think this is incorrect - this must become
+                    // a TypeScheme with the correct quantification
+                    inferred_type: type_constructor.make_spine().with_substitutions(&subs),
                 },
                 Record { fields },
             ),
@@ -1355,16 +1403,13 @@ impl TypingContext {
 
         match &projection.select {
             ProductElement::Name(field) => {
-                if let Type::Record(record) =
-                    self.instantiate_applied_type_constructor(base_type)?
-                {
+                if let Type::Record(record) = self.normalize_type_application(base_type)? {
                     if let Some((field_index, (_, field_type))) = record
                         .0
                         .iter()
                         .enumerate()
                         .find(|(_, (label, _))| label == field)
                     {
-                        println!("infer_projection: {field} @ {field_index}");
                         Ok((
                             substitutions,
                             Expr::Project(
@@ -1610,7 +1655,10 @@ impl TypingContext {
 
     fn infer_binding(&mut self, parse_info: &ParseInfo, binding: &namer::Binding) -> Typing {
         let (bound_subs, bound) = self.infer_expr(&binding.bound)?;
-        let bound_type = bound.type_info().inferred_type.generalize(self);
+        let bound_type = bound
+            .type_info()
+            .inferred_type
+            .generalize(&self.with_substitutions(&bound_subs));
 
         self.bind_term_and_then(binding.binder.clone(), bound_type, |ctx| {
             let (body_subs, body) = ctx.infer_expr(&binding.body)?;

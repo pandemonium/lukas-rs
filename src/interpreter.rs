@@ -49,11 +49,11 @@ impl Expr<(), namer::Identifier> {
             }
 
             Self::Record(_, the) => {
-                print!("reduce: record {{");
-                for field in &the.fields {
-                    print!(" {}", field.0);
-                }
-                println!(" }}.");
+                //                print!("reduce: record {{");
+                //                for field in &the.fields {
+                //                    print!(" {}", field.0);
+                //                }
+                //                println!(" }}.");
 
                 Ok(Value::Product(
                     the.fields
@@ -80,15 +80,12 @@ impl Expr<(), namer::Identifier> {
                     .collect::<Interpretation<Vec<_>>>()?,
             }),
 
-            Self::Project(_, the) => {
-                println!("recuce: `{the:?}`");
-                match (the.base.reduce(env)?, &the.select) {
-                    (Value::Product(values), ProductElement::Ordinal(index)) => {
-                        Ok(values[*index].clone())
-                    }
-                    (base, select) => panic!("projection off of {base:?} with {select:?}"),
+            Self::Project(_, the) => match (the.base.reduce(env)?, &the.select) {
+                (Value::Product(values), ProductElement::Ordinal(index)) => {
+                    Ok(values[*index].clone())
                 }
-            }
+                (base, select) => panic!("projection off of {base:?} with {select:?}"),
+            },
 
             Self::Sequence(_, the) => {
                 env.bind_and_then(the.this.reduce(env)?, |env| the.and_then.reduce(env))

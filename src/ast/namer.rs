@@ -13,7 +13,7 @@ use crate::{
         TupleTypeExpr, TypeSignature,
     },
     parser::{self, ParseInfo},
-    typer::BaseType,
+    typer::{BaseType, TypeParameter},
 };
 
 pub type Expr = ast::Expr<ParseInfo, Identifier>;
@@ -560,22 +560,12 @@ impl TypeSymbol<QualifiedName> {
             TypeDefinition::Builtin(base_type) => base_type.qualified_name(),
         }
     }
-}
 
-impl TypeSymbol<QualifiedName> {
     pub fn type_parameters(&self) -> &[parser::Identifier] {
         match &self.definition {
             TypeDefinition::Record(sym) => &sym.type_parameters,
             TypeDefinition::Coproduct(sym) => &sym.type_parameters,
             TypeDefinition::Builtin(..) => &[],
-        }
-    }
-
-    pub fn _free_variables(&self) -> HashSet<&QualifiedName> {
-        match &self.definition {
-            TypeDefinition::Record(symbol) => symbol.free_variables(),
-            TypeDefinition::Coproduct(symbol) => symbol.free_variables(),
-            TypeDefinition::Builtin(..) => HashSet::default(),
         }
     }
 }
@@ -785,8 +775,6 @@ impl parser::Expr {
     fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Expr {
         match self {
             Self::Variable(a, identifier_path) => {
-                println!("resolve: {identifier_path}");
-
                 if let Some(bound) =
                     names.try_resolve_bound(&parser::Identifier::from_str(&identifier_path.head))
                 {

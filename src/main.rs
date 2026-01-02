@@ -10,7 +10,7 @@ fn main() {
     let _ctx = TypingContext::default();
 
     let mut lexer = LexicalAnalyzer::default();
-    let input = include_str!("../examples/4.txt");
+    let input = include_str!("../examples/5.txt");
 
     let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
 
