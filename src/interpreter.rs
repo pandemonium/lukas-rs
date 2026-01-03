@@ -110,13 +110,13 @@ pub struct Environment {
 
 #[derive(Debug, Default, Clone)]
 struct EnvironmentInner {
-    statics: HashMap<namer::QualifiedName, Value>,
+    globals: HashMap<namer::QualifiedName, Value>,
     locals: Vec<Value>,
 }
 
 impl Environment {
     pub fn call(&self, symbol: &namer::QualifiedName, argument: ast::Literal) -> Value {
-        let symbol = self.get_static(symbol);
+        let symbol = self.get_global(symbol);
         if let Some(Value::Closure(closure)) = symbol {
             apply_closure(closure, Value::Constant(argument.into())).unwrap()
         } else {
@@ -149,16 +149,16 @@ impl Environment {
     fn get(&self, id: &Identifier) -> Option<Value> {
         match id {
             Identifier::Bound(ix) => self.inner.borrow().locals.get(*ix).cloned(),
-            Identifier::Free(id) => self.inner.borrow().statics.get(id).cloned(),
+            Identifier::Free(id) => self.inner.borrow().globals.get(id).cloned(),
         }
     }
 
-    fn get_static(&self, id: &namer::QualifiedName) -> Option<Value> {
-        self.inner.borrow().statics.get(id).cloned()
+    fn get_global(&self, id: &namer::QualifiedName) -> Option<Value> {
+        self.inner.borrow().globals.get(id).cloned()
     }
 
-    fn put_static(&mut self, id: &namer::QualifiedName, value: Value) {
-        self.inner.borrow_mut().statics.insert(id.clone(), value);
+    fn define_global(&mut self, id: &namer::QualifiedName, value: Value) {
+        self.inner.borrow_mut().globals.insert(id.clone(), value);
     }
 
     // Ought to be Interpretation
@@ -178,12 +178,12 @@ impl Environment {
         if dependencies.are_sound() {
             for symbol in compilation
                 .compute_types(evaluation_order.iter())?
-                .static_values(evaluation_order.iter())
+                .initialize_terms(evaluation_order.iter())
             {
                 let value = Rc::new(symbol.body.erase_annotation())
                     .reduce(&environment)
                     .expect("successful static init");
-                environment.put_static(&symbol.name, value);
+                environment.define_global(&symbol.name, value);
             }
         } else {
             panic!("Bad dependencies")
@@ -276,7 +276,7 @@ impl fmt::Display for Environment {
             .join(", ");
 
         let static_prefix = env
-            .statics
+            .globals
             .iter()
             .take(5)
             .map(|(path, value)| format!("{path}: {value}"))

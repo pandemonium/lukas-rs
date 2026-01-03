@@ -181,7 +181,7 @@ impl QualifiedNameExpr {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct QualifiedName {
     module: parser::IdentifierPath,
     member: parser::Identifier,
@@ -286,7 +286,7 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SymbolName<TypeId, ValueId> {
     Type(TypeId),
-    Value(ValueId),
+    Term(ValueId),
 }
 
 // "Modules do not exist" - they should get their own table.
@@ -366,7 +366,7 @@ impl ParserCompilationContext {
             }),
         );
 
-        let _ = Self::index_module_contents(
+        Self::collect_symbols(
             parser::IdentifierPath::new(program.root.name.as_str()),
             &program.root.declarator.members,
             &mut modules,
@@ -382,113 +382,120 @@ impl ParserCompilationContext {
 
     // This could just as well keep a running module_path of varified
     // modules. Shouldn't I just rewrite this sucker?
-    pub fn index_module_contents(
-        prefix: parser::IdentifierPath,
+    pub fn collect_symbols(
+        module_path: parser::IdentifierPath,
         declarations: &[Declaration<ParseInfo>],
-        modules: &mut HashSet<parser::IdentifierPath>,
-        symbol_table: &mut HashMap<
+        known_modules: &mut HashSet<parser::IdentifierPath>,
+        symbols: &mut HashMap<
             SymbolName<parser::IdentifierPath, parser::IdentifierPath>,
             Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
         >,
-    ) -> Vec<Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>> {
-        let mut symbols = Vec::with_capacity(declarations.len());
+    ) {
         for decl in declarations {
             match decl {
                 ast::Declaration::Value(_, ast::ValueDeclaration { name, declarator }) => {
-                    let symbol_name = prefix.clone().with_suffix(name.as_str());
-                    let name = SymbolName::Value(symbol_name.clone());
-                    let symbol = Symbol::Term(TermSymbol {
-                        name: symbol_name,
+                    let name = module_path.clone().with_suffix(name.as_str());
+                    let symbol = TermSymbol {
+                        name: name.clone(),
                         type_signature: declarator.type_signature.clone(),
-
-                        // This is a very expensive clone
-                        // perhaps I _could_ move into here
                         body: declarator.body.clone(),
-                    });
+                    };
 
-                    symbols.push(symbol.clone());
-                    symbol_table.insert(name, symbol);
+                    symbols.insert(SymbolName::Term(name), Symbol::Term(symbol));
                 }
 
                 ast::Declaration::Module(_, decl) => {
-                    modules.insert(prefix.clone().with_suffix(decl.name.as_str()));
+                    known_modules.insert(module_path.clone().with_suffix(decl.name.as_str()));
                 }
 
                 ast::Declaration::Type(
-                    parse_info,
+                    pi,
                     ast::TypeDeclaration {
                         name,
                         type_parameters,
                         declarator,
                     },
                 ) => {
-                    let symbol_name = prefix.clone().with_suffix(name.as_str());
-                    let name = SymbolName::Type(symbol_name.clone());
+                    let name = module_path.clone().with_suffix(name.as_str());
                     let symbol = match declarator {
-                        ast::TypeDeclarator::Record(_, record) => Symbol::Type(TypeSymbol {
-                            definition: TypeDefinition::Record(RecordSymbol {
-                                name: symbol_name,
-                                type_parameters: type_parameters.clone(),
-                                fields: record
-                                    .fields
-                                    .iter()
-                                    .map(|decl| FieldSymbol {
-                                        name: decl.name.clone(),
-                                        type_signature: decl.type_signature.clone(),
-                                    })
-                                    .collect(),
-                            }),
-                            origin: TypeOrigin::UserDefined,
-                            arity: type_parameters.len(),
-                        }),
+                        ast::TypeDeclarator::Record(_, record) => {
+                            make_record_type_symbol(type_parameters, &name, record)
+                        }
 
                         ast::TypeDeclarator::Coproduct(_, coproduct) => {
                             let constructors = coproduct
                                 .constructors
                                 .iter()
                                 .map(|decl| ConstructorSymbol {
-                                    name: prefix.clone().with_suffix(decl.name.as_str()),
+                                    name: module_path.clone().with_suffix(decl.name.as_str()),
                                     signature: decl.signature.clone(),
                                 })
                                 .collect::<Vec<_>>();
 
-                            for constructor in &constructors {
-                                let symbol = Symbol::Term(TermSymbol {
-                                    name: constructor.name.clone(),
-                                    type_signature: Some(TypeSignature {
-                                        universal_quantifiers: type_parameters.clone(),
-                                        body: parser::TypeExpression::Tuple(
-                                            *parse_info,
-                                            TupleTypeExpr(constructor.signature.clone()),
-                                        ),
-                                        phase: PhantomData,
-                                    }),
-                                    body: constructor.make_tuple_lambda(*parse_info),
-                                });
-                                symbols.push(symbol.clone());
-                                symbol_table
-                                    .insert(SymbolName::Value(constructor.name.clone()), symbol);
-                            }
+                            collect_coproduct_constructors(
+                                symbols,
+                                pi,
+                                type_parameters,
+                                &constructors,
+                            );
 
-                            Symbol::Type(TypeSymbol {
+                            TypeSymbol {
                                 definition: TypeDefinition::Coproduct(CoproductSymbol {
-                                    name: symbol_name,
+                                    name: name.clone(),
                                     type_parameters: type_parameters.clone(),
                                     constructors,
                                 }),
                                 origin: TypeOrigin::UserDefined,
                                 arity: type_parameters.len(),
-                            })
+                            }
                         }
                     };
 
-                    symbols.push(symbol.clone());
-                    symbol_table.insert(name, symbol);
+                    symbols.insert(SymbolName::Type(name), Symbol::Type(symbol));
                 }
             };
         }
+    }
+}
 
-        symbols
+fn collect_coproduct_constructors(
+    symbols: &mut HashMap<
+        SymbolName<parser::IdentifierPath, parser::IdentifierPath>,
+        Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+    >,
+    pi: &ParseInfo,
+    type_parameters: &Vec<parser::Identifier>,
+    constructors: &Vec<ConstructorSymbol<parser::IdentifierPath>>,
+) {
+    for constructor in constructors {
+        let symbol = constructor.make_constructor_term(pi, type_parameters);
+        symbols.insert(
+            SymbolName::Term(constructor.name.clone()),
+            Symbol::Term(symbol),
+        );
+    }
+}
+
+fn make_record_type_symbol(
+    type_parameters: &Vec<parser::Identifier>,
+    symbol_name: &parser::IdentifierPath,
+    record: &ast::RecordDeclarator<ParseInfo>,
+) -> TypeSymbol<parser::IdentifierPath> {
+    TypeSymbol {
+        definition: TypeDefinition::Record(RecordSymbol {
+            name: symbol_name.clone(),
+            type_parameters: type_parameters.clone(),
+            fields: record
+                .fields
+                .iter()
+                .map(|decl| FieldSymbol {
+                    name: decl.name.clone(),
+                    type_signature: decl.type_signature.clone(),
+                })
+                .collect(),
+        }),
+        origin: TypeOrigin::UserDefined,
+        arity: type_parameters.len(),
     }
 }
 
@@ -509,7 +516,7 @@ impl<A> Symbol<A, QualifiedName, Identifier> {
                         .body
                         .free_variables()
                         .iter()
-                        .map(|&id| SymbolName::Value(Identifier::Free(id.clone()))),
+                        .map(|&id| SymbolName::Term(Identifier::Free(id.clone()))),
                 );
             }
 
@@ -599,16 +606,6 @@ pub struct CoproductSymbol<GlobalName> {
     pub constructors: Vec<ConstructorSymbol<GlobalName>>,
 }
 
-impl CoproductSymbol<QualifiedName> {
-    pub fn free_variables(&self) -> HashSet<&QualifiedName> {
-        todo!()
-        //        self.constructors
-        //            .iter()
-        //            .flat_map(|ctor| ctor.free_variables())
-        //            .collect()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ConstructorSymbol<GlobalName> {
     pub name: GlobalName,
@@ -617,6 +614,22 @@ pub struct ConstructorSymbol<GlobalName> {
 }
 
 impl ConstructorSymbol<parser::IdentifierPath> {
+    fn make_constructor_term(
+        &self,
+        pi: &ParseInfo,
+        type_parameters: &Vec<parser::Identifier>,
+    ) -> TermSymbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath> {
+        TermSymbol {
+            name: self.name.clone(),
+            type_signature: Some(TypeSignature {
+                universal_quantifiers: type_parameters.clone(),
+                body: parser::TypeExpression::Tuple(*pi, TupleTypeExpr(self.signature.clone())),
+                phase: PhantomData,
+            }),
+            body: self.make_tuple_lambda(*pi),
+        }
+    }
+
     // How is this to work?
     // Surely this has to happen before De Bruijn
     // Does it have to be a lambda spine?
@@ -963,8 +976,8 @@ impl ParserCompilationContext {
 
                 SymbolName::Type(self.resolve_member_path(&new_name))
             }
-            SymbolName::Value(id) => {
-                SymbolName::Value(Identifier::Free(self.resolve_member_path(id)))
+            SymbolName::Term(id) => {
+                SymbolName::Term(Identifier::Free(self.resolve_member_path(id)))
             }
         }
     }
@@ -1075,7 +1088,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Type(id) => write!(f, "{id}"),
-            Self::Value(id) => write!(f, "{id}"),
+            Self::Term(id) => write!(f, "{id}"),
         }
     }
 }

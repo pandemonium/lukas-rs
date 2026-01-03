@@ -42,7 +42,7 @@ impl<A> CompilationContext<A, namer::QualifiedName, namer::Identifier>
 where
     A: fmt::Debug,
 {
-    pub fn static_values(
+    pub fn initialize_terms(
         &self,
         order: Iter<&namer::TermId>,
     ) -> Vec<&TermSymbol<A, namer::QualifiedName, namer::Identifier>> {
@@ -258,6 +258,21 @@ impl RecordType {
 pub struct CoproductType(Vec<(QualifiedName, Vec<Type>)>);
 
 impl CoproductType {
+    fn from_constructors(constructors: &[(QualifiedName, Vec<Type>)]) -> Self {
+        let mut constructors = constructors.to_vec();
+        constructors.sort_by(|(t, _), (u, _)| t.cmp(u));
+
+        Self(constructors)
+    }
+
+    fn cardinality(&self) -> usize {
+        self.0.len()
+    }
+
+    fn constructor_names(&self) -> impl Iterator<Item = &QualifiedName> {
+        self.0.iter().map(|(name, _)| name)
+    }
+
     fn with_substitutions(&self, subs: &Substitutions) -> Self {
         Self(
             self.0
@@ -453,6 +468,15 @@ impl Type {
                 Ok(subs)
             }
 
+            (Self::Coproduct(lhs), Self::Coproduct(rhs))
+                if lhs.cardinality() == rhs.cardinality() /*&& {
+                    let rhs_names = rhs.constructor_names().collect::<HashSet<_>>();
+                    lhs.constructor_names().all(|lhs| rhs_names.contains(lhs))
+                }*/ =>
+            {
+                todo!()
+            }
+
             (
                 Self::Apply {
                     constructor: lhs_con,
@@ -542,8 +566,9 @@ impl CoproductSymbol {
         type_param_map: &HashMap<parser::Identifier, TypeParameter>,
         ctx: &TypingContext,
     ) -> Typing<Type> {
-        Ok(Type::Coproduct(CoproductType(
-            self.constructors
+        Ok(Type::Coproduct(CoproductType::from_constructors(
+            &self
+                .constructors
                 .iter()
                 .map(|c| {
                     c.signature

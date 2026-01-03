@@ -44,7 +44,7 @@ impl ParseInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Hash, Eq)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, PartialOrd, Ord)]
 pub struct IdentifierPath {
     pub head: String,
     pub tail: Vec<String>,
