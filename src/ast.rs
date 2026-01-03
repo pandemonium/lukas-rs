@@ -256,7 +256,7 @@ pub enum ProductElement {
 // This thing needs to separate the name type for the name and the arguments
 #[derive(Debug, Clone)]
 pub struct Construct<A, Id> {
-    pub name: Id,
+    pub constructor: Id,
     pub arguments: Vec<Tree<A, Id>>,
 }
 
@@ -284,7 +284,7 @@ where
                 write!(
                     f,
                     "{} {}",
-                    x.name,
+                    x.constructor,
                     Tuple {
                         elements: x.arguments.clone()
                     }

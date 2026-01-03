@@ -735,11 +735,13 @@ impl TypeConstructor {
         }
     }
 
-    fn structure(&self) -> Option<&Type> {
+    fn structure(&self) -> Typing<&Type> {
         if let Self::Elaborated(c) = self {
-            Some(&c.structure)
+            Ok(&c.structure)
         } else {
-            None
+            Err(TypeError::UnelaboratedConstructor(
+                self.definition().name.clone(),
+            ))
         }
     }
 
@@ -1014,7 +1016,7 @@ impl TypeEnvironment {
             .collect()
     }
 
-    fn infer_coproduct_type_constructor(
+    fn infer_coproduct_type_constructors(
         &self,
         name: &QualifiedName,
     ) -> Typing<Vec<&TypeConstructor>> {
@@ -1094,11 +1096,7 @@ impl TypingContext {
                         .collect::<Vec<_>>(),
                 );
 
-                let structure = constructor
-                    .structure()
-                    .ok_or_else(|| TypeError::UnelaboratedConstructor(name.clone()))?;
-
-                Ok(structure.with_substitutions(&subs))
+                Ok(constructor.structure()?.with_substitutions(&subs))
             }
 
             Type::Apply {
@@ -1306,12 +1304,12 @@ impl TypingContext {
     fn infer_coproduct_construct(
         &mut self,
         pi: &ParseInfo,
-        constructor: &namer::Construct,
+        construct: &namer::Construct,
     ) -> Typing {
         println!("infer_coproduct_construct: hi, mom");
 
         let (substitutions, typed_arguments, argument_types) =
-            self.infer_several(&constructor.arguments)?;
+            self.infer_several(&construct.arguments)?;
 
         for ty in &typed_arguments {
             println!("infer_coproduct_construct: typed argument {}", ty);
@@ -1325,25 +1323,30 @@ impl TypingContext {
         // with the best type? I could encode the name of the type constructor
         // as a type of prefix to the constructor
 
-        // namer::Identifier is a shit type for this purpose
-        let constructor_name = constructor.name.try_as_free().ok_or_else(|| {
+        // TODO: namer::Identifier is a shit type for this purpose
+        let constructor_name = construct.constructor.try_as_free().ok_or_else(|| {
             TypeError::InternalAssertion(format!(
                 "expected Identifier::Free, was: {}",
-                constructor.name
+                construct.constructor
             ))
         })?;
 
         let candidates = self
             .types
-            .infer_coproduct_type_constructor(constructor_name)?;
+            .infer_coproduct_type_constructors(constructor_name)?;
 
         let type_constructor = candidates
+            // It could go for the first constructor that unifies
+            // but it is probably better to crash here and ask
+            // the user to qualify the name with a <Coproduct name>.<Constructor name>
+            // type of deal
             .first()
             .ok_or_else(|| TypeError::NoSuchCoproductType(constructor_name.clone()))?;
 
         Ok((
             substitutions,
             Expr::Construct(
+                // ParseInfo::with_inferred_type(self, ...) in typer.rs
                 TypeInfo {
                     parse_info: *pi,
                     // I think this is incorrect - this must become
@@ -1351,7 +1354,7 @@ impl TypingContext {
                     inferred_type: type_constructor.make_spine(),
                 },
                 Construct {
-                    name: constructor.name.clone(),
+                    constructor: construct.constructor.clone(),
 
                     // Pick out the Type::Product so that its
                     // elements can be put here
@@ -1402,11 +1405,9 @@ impl TypingContext {
 
         let type_constructor = type_constructor.instantiate(self)?;
 
-        let structure = type_constructor.structure().ok_or_else(|| {
-            TypeError::UnelaboratedConstructor(type_constructor.definition().name.clone())
-        })?;
-
-        let subs = structure.unifed_with(&Type::Record(record_type))?;
+        let subs = type_constructor
+            .structure()?
+            .unifed_with(&Type::Record(record_type))?;
 
         Ok((
             substitutions.compose(&subs),

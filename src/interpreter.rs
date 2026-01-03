@@ -63,8 +63,8 @@ impl Expr<(), namer::Identifier> {
             )),
 
             Self::Construct(_, the) => Ok(Value::Variant {
-                coproduct: the.name.clone(), // clearly not correct
-                constructor: the.name.clone(),
+                coproduct: the.constructor.clone(), // clearly not correct
+                constructor: the.constructor.clone(),
                 arguments: the
                     .arguments
                     .iter()
@@ -324,7 +324,7 @@ impl fmt::Display for Value {
             } => {
                 write!(
                     f,
-                    "{coproduct}::{constructor} {}",
+                    "{coproduct}.{constructor} {}",
                     arguments
                         .iter()
                         .map(|v| v.to_string())

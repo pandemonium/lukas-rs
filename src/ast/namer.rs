@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     ast::{
-        self, ApplyTypeExpr, ArrowTypeExpr, CompilationUnit, Declaration, ProductElement,
+        self, ApplyTypeExpr, ArrowTypeExpr, CompilationUnit, Declaration, ProductElement, Tree,
         TupleTypeExpr, TypeSignature,
     },
     parser::{self, ParseInfo},
@@ -388,7 +388,7 @@ impl ParserCompilationContext {
         known_modules: &mut HashSet<parser::IdentifierPath>,
         symbols: &mut HashMap<
             SymbolName<parser::IdentifierPath, parser::IdentifierPath>,
-            Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+            ParserSymbol,
         >,
     ) {
         for decl in declarations {
@@ -459,10 +459,7 @@ impl ParserCompilationContext {
 }
 
 fn collect_coproduct_constructors(
-    symbols: &mut HashMap<
-        SymbolName<parser::IdentifierPath, parser::IdentifierPath>,
-        Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
-    >,
+    symbols: &mut HashMap<SymbolName<parser::IdentifierPath, parser::IdentifierPath>, ParserSymbol>,
     pi: &ParseInfo,
     type_parameters: &Vec<parser::Identifier>,
     constructors: &Vec<ConstructorSymbol<parser::IdentifierPath>>,
@@ -626,7 +623,7 @@ impl ConstructorSymbol<parser::IdentifierPath> {
                 body: parser::TypeExpression::Tuple(*pi, TupleTypeExpr(self.signature.clone())),
                 phase: PhantomData,
             }),
-            body: self.make_tuple_lambda(*pi),
+            body: self.make_tuple_argument_lambda(*pi),
         }
     }
 
@@ -653,37 +650,66 @@ impl ConstructorSymbol<parser::IdentifierPath> {
     //        todo!()
     //    }
 
-    pub fn make_tuple_lambda(&self, parse_info: ParseInfo) -> parser::Expr {
-        let construct = parser::Expr::Construct(
-            parse_info,
-            parser::Construct {
-                name: self.name.clone(),
-                arguments: (0..self.signature.len())
-                    .map(|i| {
-                        parser::Expr::Project(
-                            parse_info,
-                            parser::Projection {
-                                base: parser::Expr::Variable(
-                                    parse_info,
-                                    parser::IdentifierPath::new("x"),
-                                )
-                                .into(),
-                                select: ast::ProductElement::Ordinal(i),
-                            },
-                        )
-                        .into()
-                    })
-                    .collect(),
+    pub fn make_tuple_argument_lambda(&self, pi: ParseInfo) -> parser::Expr {
+        let construct = self.make_construct_tree(
+            pi,
+            if self.signature.len() > 1 {
+                self.make_tuple_projections(pi)
+            } else {
+                self.make_single(pi)
             },
         );
 
-        parser::Expr::Lambda(
-            parse_info,
-            parser::Lambda {
-                parameter: parser::IdentifierPath::new("x"),
-                body: construct.into(),
+        // if the signature is empty, i.e.: Nothing :: Maybe a.la
+        // Haskell, then we need to figure out how to not be
+        // forced to provide a unit () to it upon construction
+        if self.signature.is_empty() {
+            self.make_construct_tree(pi, vec![])
+        } else {
+            parser::Expr::Lambda(
+                pi,
+                parser::Lambda {
+                    parameter: parser::IdentifierPath::new("x"),
+                    body: construct.into(),
+                },
+            )
+        }
+    }
+
+    fn make_construct_tree(
+        &self,
+        pi: ParseInfo,
+        arguments: Vec<Tree<ParseInfo, parser::IdentifierPath>>,
+    ) -> parser::Expr {
+        parser::Expr::Construct(
+            pi,
+            parser::Construct {
+                constructor: self.name.clone(),
+                arguments,
             },
         )
+    }
+
+    fn make_single(&self, pi: ParseInfo) -> Vec<ast::Tree<ParseInfo, parser::IdentifierPath>> {
+        vec![parser::Expr::Variable(pi, parser::IdentifierPath::new("x")).into()]
+    }
+
+    fn make_tuple_projections(
+        &self,
+        pi: ParseInfo,
+    ) -> Vec<ast::Tree<ParseInfo, parser::IdentifierPath>> {
+        (0..self.signature.len())
+            .map(|i| {
+                parser::Expr::Project(
+                    pi,
+                    parser::Projection {
+                        base: parser::Expr::Variable(pi, parser::IdentifierPath::new("x")).into(),
+                        select: ast::ProductElement::Ordinal(i),
+                    },
+                )
+                .into()
+            })
+            .collect()
     }
 }
 
@@ -912,7 +938,7 @@ impl parser::Tuple {
 impl parser::Construct {
     fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Construct {
         Construct {
-            name: Identifier::Free(symbols.resolve_member_path(&self.name)),
+            constructor: Identifier::Free(symbols.resolve_member_path(&self.constructor)),
             arguments: self
                 .arguments
                 .iter()

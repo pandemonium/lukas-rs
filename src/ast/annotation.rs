@@ -184,9 +184,12 @@ where
     where
         F: Fn(&A) -> B,
     {
-        let Self { name, arguments } = self;
+        let Self {
+            constructor: name,
+            arguments,
+        } = self;
         Construct {
-            name: name.clone(),
+            constructor: name.clone(),
             arguments: arguments
                 .iter()
                 .map(|expr| expr.map_annotation(&f))
