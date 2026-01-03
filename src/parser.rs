@@ -1157,10 +1157,12 @@ impl<'a> Parser<'a> {
         ) {
             if self.peek()?.is_identifier() {
                 let (pos, id) = self.identifier()?;
-                signature.push(TypeExpression::Constructor(
-                    ParseInfo::from_position(pos),
-                    IdentifierPath::new(&id),
-                ));
+                let pi = ParseInfo::from_position(pos);
+                signature.push(if is_lowercase(&id) {
+                    TypeExpression::Parameter(pi, Identifier::from_str(&id))
+                } else {
+                    TypeExpression::Constructor(pi, IdentifierPath::new(&id))
+                });
             } else {
                 signature.push(self.parse_type_expression()?);
                 self.expect(TokenKind::RightParen)?;

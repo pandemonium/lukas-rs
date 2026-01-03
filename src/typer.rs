@@ -207,7 +207,7 @@ pub enum TypeError {
     },
     UnelaboratedConstructor(namer::QualifiedName),
     InternalAssertion(String),
-    NoSuchCoproductType(namer::QualifiedName),
+    NoSuchCoproductConstructor(namer::QualifiedName),
 }
 
 pub type Typing<A = (Substitutions, Expr)> = Result<A, TypeError>;
@@ -288,6 +288,12 @@ impl CoproductType {
                 })
                 .collect(),
         )
+    }
+
+    fn signature(&self, constructor: &namer::QualifiedName) -> Option<&[Type]> {
+        self.0
+            .iter()
+            .find_map(|(id, signature)| (id == constructor).then_some(signature.as_slice()))
     }
 }
 
@@ -563,7 +569,7 @@ impl RecordSymbol {
 impl CoproductSymbol {
     pub fn synthesize_type(
         &self,
-        type_param_map: &HashMap<parser::Identifier, TypeParameter>,
+        type_params: &HashMap<parser::Identifier, TypeParameter>,
         ctx: &TypingContext,
     ) -> Typing<Type> {
         Ok(Type::Coproduct(CoproductType::from_constructors(
@@ -573,7 +579,7 @@ impl CoproductSymbol {
                 .map(|c| {
                     c.signature
                         .iter()
-                        .map(|te| te.synthesize_type(type_param_map, ctx))
+                        .map(|te| te.synthesize_type(type_params, ctx))
                         .collect::<Typing<Vec<_>>>()
                         .map(|signature| (c.name.clone(), signature))
                 })
@@ -745,6 +751,7 @@ impl TypeConstructor {
         }
     }
 
+    // Move this to TypingContext?
     fn instantiate(&self, ctx: &TypingContext) -> Typing<Self> {
         let mut the = Self::from_symbol(&self.definition().defining_symbol);
         the.elaborate(ctx)?;
@@ -1306,8 +1313,6 @@ impl TypingContext {
         pi: &ParseInfo,
         construct: &namer::Construct,
     ) -> Typing {
-        println!("infer_coproduct_construct: hi, mom");
-
         let (substitutions, typed_arguments, argument_types) =
             self.infer_several(&construct.arguments)?;
 
@@ -1341,17 +1346,31 @@ impl TypingContext {
             // the user to qualify the name with a <Coproduct name>.<Constructor name>
             // type of deal
             .first()
-            .ok_or_else(|| TypeError::NoSuchCoproductType(constructor_name.clone()))?;
+            .ok_or_else(|| TypeError::NoSuchCoproductConstructor(constructor_name.clone()))?;
+
+        let type_constructor = type_constructor.instantiate(self)?;
+
+        let subs = if let Type::Coproduct(coproduct) = type_constructor.structure()? {
+            println!(
+                "infer_coproduct_construct: coproduct {coproduct:?}, argument typrs {argument_types:?}"
+            );
+            let signature = coproduct
+                .signature(constructor_name)
+                .ok_or_else(|| TypeError::NoSuchCoproductConstructor(constructor_name.clone()))?;
+            Type::Tuple(signature.to_vec()).unifed_with(&Type::Tuple(argument_types))?
+        } else {
+            Err(TypeError::InternalAssertion(format!("Expected ")))?
+        };
 
         Ok((
-            substitutions,
+            substitutions.compose(&subs),
             Expr::Construct(
                 // ParseInfo::with_inferred_type(self, ...) in typer.rs
                 TypeInfo {
                     parse_info: *pi,
                     // I think this is incorrect - this must become
                     // a TypeScheme with the correct quantification
-                    inferred_type: type_constructor.make_spine(),
+                    inferred_type: type_constructor.make_spine().with_substitutions(&subs),
                 },
                 Construct {
                     constructor: construct.constructor.clone(),
@@ -1403,6 +1422,7 @@ impl TypingContext {
             .first()
             .ok_or_else(|| TypeError::NoSuchRecordType(record_type.clone()))?;
 
+        // This is needed for coproducts too
         let type_constructor = type_constructor.instantiate(self)?;
 
         let subs = type_constructor
