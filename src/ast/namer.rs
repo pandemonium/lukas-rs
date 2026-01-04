@@ -623,32 +623,40 @@ impl ConstructorSymbol<parser::IdentifierPath> {
                 body: parser::TypeExpression::Tuple(*pi, TupleTypeExpr(self.signature.clone())),
                 phase: PhantomData,
             }),
-            body: self.make_tuple_argument_lambda(*pi),
+            //            body: self.make_tuple_argument_lambda(*pi),
+            body: self.make_curried_argument_lambda(*pi),
         }
     }
 
     // How is this to work?
     // Surely this has to happen before De Bruijn
     // Does it have to be a lambda spine?
-    //    pub fn make_lambda_spine(&self, parse_info: ParseInfo) -> parser::Expr {
-    //        let construct = parser::Expr::Construct(
-    //            parse_info,
-    //            ast::Construct {
-    //                name: self.name.clone(),
-    //                arguments: (0..self.signature.len())
-    //                    .into_iter()
-    //                    .map(|i| {
-    //                        parser::Expr::Variable(
-    //                            parse_info,
-    //                            parser::IdentifierPath::new(&format!("p{i}")),
-    //                        )
-    //                        .into()
-    //                    })
-    //                    .collect(),
-    //            },
-    //        );
-    //        todo!()
-    //    }
+    pub fn make_curried_argument_lambda(&self, pi: ParseInfo) -> parser::Expr {
+        let terms = (0..self.signature.len()).into_iter();
+        let construct = parser::Expr::Construct(
+            pi,
+            ast::Construct {
+                constructor: self.name.clone(),
+                arguments: terms
+                    .clone()
+                    .map(|i| {
+                        parser::Expr::Variable(pi, parser::IdentifierPath::new(&format!("p{i}")))
+                            .into()
+                    })
+                    .collect(),
+            },
+        );
+
+        terms.rfold(construct, |z, i| {
+            parser::Expr::Lambda(
+                pi,
+                parser::Lambda {
+                    parameter: parser::IdentifierPath::new(&format!("p{i}")),
+                    body: z.into(),
+                },
+            )
+        })
+    }
 
     pub fn make_tuple_argument_lambda(&self, pi: ParseInfo) -> parser::Expr {
         let construct = self.make_construct_tree(
@@ -976,8 +984,6 @@ impl ParserCompilationContext {
             symbols: self
                 .symbols
                 .iter()
-                //                   The builtins must receive a name prefigured with __builtin__ here
-                //                   or they cannot be resolved
                 .map(|(id, symbol)| (self.rename_term_id(id), self.rename_symbol(symbol)))
                 .collect(),
             phase: PhantomData,

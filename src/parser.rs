@@ -1,4 +1,4 @@
-use std::{cell::Cell, fmt, iter, marker::PhantomData, result};
+use std::{cell::Cell, fmt, iter, marker::PhantomData, result, vec};
 
 use backtrace::Backtrace;
 
@@ -224,7 +224,7 @@ impl<'a> Parser<'a> {
                     .collect::<Vec<_>>()
                     .join(" "),
                 indent = depth * 2,
-                pad = 60 - (depth * 2 + e.step.len())
+                pad = 80 - (depth * 2 + e.step.len())
             );
         } else {
             println!("Unknown caller.")
@@ -1003,20 +1003,30 @@ impl<'a> Parser<'a> {
     ) -> Result<Expr> {
         let _t = self.trace();
 
-        let operator_precedence = operator.precedence();
-        if operator_precedence > context_precedence {
-            if operator == Operator::Select {
-                let lhs = self.parse_select_operator(lhs)?;
+        let computed_precedence = if operator.is_right_associative() {
+            operator.precedence() - 1
+        } else {
+            operator.precedence()
+        };
 
-                self.parse_expr_infix(lhs, context_precedence)
-            } else {
-                self.parse_operator_default(
+        if computed_precedence > context_precedence {
+            match operator {
+                Operator::Select => {
+                    let lhs = self.parse_select_operator(lhs)?;
+                    self.parse_expr_infix(lhs, context_precedence)
+                }
+
+                Operator::Tuple => {
+                    self.parse_tuple_expression(lhs, operator_position, context_precedence)
+                }
+
+                _ => self.parse_operator_default(
                     lhs,
                     operator,
                     operator_position,
                     context_precedence,
-                    operator_precedence,
-                )
+                    computed_precedence,
+                ),
             }
         } else {
             // Symmetrical with the consume call before entering parse_operator.
@@ -1024,6 +1034,24 @@ impl<'a> Parser<'a> {
             self.unconsume()?;
             Ok(lhs)
         }
+    }
+
+    fn parse_tuple_expression(
+        &mut self,
+        lhs: Expr,
+        operator_position: SourceLocation,
+        context_precedence: usize,
+    ) -> result::Result<ast::Expr<ParseInfo, IdentifierPath>, Fault> {
+        let rhs = self.parse_expression(context_precedence)?;
+        self.parse_expr_infix(
+            Expr::Tuple(
+                ParseInfo::from_position(operator_position),
+                Tuple {
+                    elements: vec![lhs.into(), rhs.into()],
+                },
+            ),
+            context_precedence,
+        )
     }
 
     fn parse_select_operator(&mut self, lhs: Expr) -> Result<Expr> {
@@ -1075,8 +1103,6 @@ impl<'a> Parser<'a> {
             select: rhs,
         };
 
-        println!("parse_projection: projection {projection:?}");
-
         Ok(Expr::Project(parse_info, projection))
     }
 
@@ -1086,15 +1112,10 @@ impl<'a> Parser<'a> {
         operator: Operator,
         operator_position: SourceLocation,
         context_precedence: usize,
-        operator_precedence: usize,
+        computed_precedence: usize,
     ) -> Result<Expr> {
         let _t = self.trace();
 
-        let operator_precedence = if operator.is_right_associative() {
-            operator_precedence - 1
-        } else {
-            operator_precedence
-        };
         let apply_lhs = Expr::Apply(
             ParseInfo::from_position(*lhs.position()),
             Apply {
@@ -1106,15 +1127,18 @@ impl<'a> Parser<'a> {
                 argument: lhs.into(),
             },
         );
-        let rhs = self.parse_expression(operator_precedence)?;
-        let rhs = Expr::Apply(
-            ParseInfo::from_position(*rhs.position()),
-            Apply {
-                function: apply_lhs.into(),
-                argument: rhs.into(),
-            },
-        );
-        self.parse_expr_infix(rhs, context_precedence)
+
+        let rhs = self.parse_expression(computed_precedence)?;
+        self.parse_expr_infix(
+            Expr::Apply(
+                ParseInfo::from_position(*rhs.position()),
+                Apply {
+                    function: apply_lhs.into(),
+                    argument: rhs.into(),
+                },
+            ),
+            context_precedence,
+        )
     }
 
     fn parse_type_signature(&mut self) -> Result<TypeSignature<ParseInfo, IdentifierPath>> {

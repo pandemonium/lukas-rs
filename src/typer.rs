@@ -38,6 +38,16 @@ type TypedSymbol = namer::Symbol<TypeInfo, namer::QualifiedName, namer::Identifi
 type TypedCompilationContext =
     namer::CompilationContext<TypeInfo, namer::QualifiedName, namer::Identifier>;
 
+fn display_list<A>(sep: &str, xs: &[A]) -> String
+where
+    A: fmt::Display,
+{
+    xs.iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
 impl<A> CompilationContext<A, namer::QualifiedName, namer::Identifier>
 where
     A: fmt::Debug,
@@ -418,90 +428,92 @@ impl Type {
 
     pub fn unifed_with(&self, rhs: &Self) -> Typing<Substitutions> {
         match (self, rhs) {
-            (Self::Variable(p), ty) | (ty, Self::Variable(p)) => {
-                if ty.variables().contains(p) {
-                    Err(TypeError::InfiniteType {
-                        param: *p,
-                        ty: ty.clone(),
-                    })
-                } else {
-                    Ok(vec![(*p, ty.clone())].into())
-                }
-            }
-
-            (
-                Self::Arrow {
-                    domain: lhs_dom,
-                    codomain: lhs_codom,
-                },
-                Self::Arrow {
-                    domain: rhs_dom,
-                    codomain: rhs_codom,
-                },
-            ) => {
-                let domain = lhs_dom.unifed_with(rhs_dom)?;
-                let codomain = lhs_codom.unifed_with(rhs_codom)?;
-                Ok(domain.compose(&codomain))
-            }
-
-            (Self::Tuple(lhs), Self::Tuple(rhs)) if lhs.len() == rhs.len() => {
-                let mut subs = Substitutions::default();
-
-                println!("unify_with: {lhs:?} {rhs:?}");
-
-                for (lhs, rhs) in lhs.iter().zip(rhs) {
-                    // compose_mut
-                    subs = subs.compose(&lhs.unifed_with(rhs)?);
+                (Self::Variable(p), ty) | (ty, Self::Variable(p)) => {
+                    if ty.variables().contains(p) {
+                        Err(TypeError::InfiniteType {
+                            param: *p,
+                            ty: ty.clone(),
+                        })
+                    } else {
+                        Ok(vec![(*p, ty.clone())].into())
+                    }
                 }
 
-                Ok(subs)
-            }
+                (
+                    Self::Arrow {
+                        domain: lhs_dom,
+                        codomain: lhs_codom,
+                    },
+                    Self::Arrow {
+                        domain: rhs_dom,
+                        codomain: rhs_codom,
+                    },
+                ) => {
+                    let domain = lhs_dom.unifed_with(rhs_dom)?;
+                    let codomain = lhs_codom.unifed_with(rhs_codom)?;
+                    Ok(domain.compose(&codomain))
+                }
 
-            (Self::Record(lhs), Self::Record(rhs)) if lhs.0.len() == rhs.0.len() => {
-                let mut subs = Substitutions::default();
+                (Self::Tuple(lhs), Self::Tuple(rhs)) if lhs.len() == rhs.len() => {
+                    let mut subs = Substitutions::default();
 
-                println!("unify_with: {lhs:?} {rhs:?}");
-                // Sort first?
-                for ((lhs_label, lhs), (rhs_label, rhs)) in lhs.0.iter().zip(&rhs.0) {
-                    if lhs_label != rhs_label {
-                        panic!("{lhs_label} != {rhs_label}");
+                    println!("unifed_with: {} ~ {}", display_list("; ", lhs), display_list("; ", rhs));
+
+                    for (lhs, rhs) in lhs.iter().zip(rhs) {
+                        // compose_mut
+                        subs = subs.compose(&lhs.unifed_with(rhs)?);
                     }
 
-                    // compose_mut
-                    subs = subs.compose(&lhs.unifed_with(rhs)?);
+                    println!("unified_with: substitutions {subs}");
+
+                    Ok(subs)
                 }
 
-                Ok(subs)
+                (Self::Record(lhs), Self::Record(rhs)) if lhs.0.len() == rhs.0.len() => {
+                    let mut subs = Substitutions::default();
+
+                    println!("unify_with: {lhs:?} {rhs:?}");
+                    // Sort first?
+                    for ((lhs_label, lhs), (rhs_label, rhs)) in lhs.0.iter().zip(&rhs.0) {
+                        if lhs_label != rhs_label {
+                            panic!("{lhs_label} != {rhs_label}");
+                        }
+
+                        // compose_mut
+                        subs = subs.compose(&lhs.unifed_with(rhs)?);
+                    }
+
+                    Ok(subs)
+                }
+
+                (Self::Coproduct(lhs), Self::Coproduct(rhs))
+                    if lhs.cardinality() == rhs.cardinality() /*&& {
+                        let rhs_names = rhs.constructor_names().collect::<HashSet<_>>();
+                        lhs.constructor_names().all(|lhs| rhs_names.contains(lhs))
+                    }*/ =>
+                {
+                    todo!()
+                }
+
+                (
+                    Self::Apply {
+                        constructor: lhs_con,
+                        argument: lhs_arg,
+                    },
+                    Self::Apply {
+                        constructor: rhs_con,
+                        argument: rhs_arg,
+                    },
+                ) => {
+                    let constructor = lhs_con.unifed_with(rhs_con)?;
+                    let argument = lhs_arg.unifed_with(rhs_arg)?;
+                    Ok(constructor.compose(&argument))
+                }
+
+                (lhs, rhs) if lhs == rhs => Ok(Substitutions::default()),
+
+                otherwise => panic!("{otherwise:?}"),
             }
-
-            (Self::Coproduct(lhs), Self::Coproduct(rhs))
-                if lhs.cardinality() == rhs.cardinality() /*&& {
-                    let rhs_names = rhs.constructor_names().collect::<HashSet<_>>();
-                    lhs.constructor_names().all(|lhs| rhs_names.contains(lhs))
-                }*/ =>
-            {
-                todo!()
-            }
-
-            (
-                Self::Apply {
-                    constructor: lhs_con,
-                    argument: lhs_arg,
-                },
-                Self::Apply {
-                    constructor: rhs_con,
-                    argument: rhs_arg,
-                },
-            ) => {
-                let constructor = lhs_con.unifed_with(rhs_con)?;
-                let argument = lhs_arg.unifed_with(rhs_arg)?;
-                Ok(constructor.compose(&argument))
-            }
-
-            (lhs, rhs) if lhs == rhs => Ok(Substitutions::default()),
-
-            otherwise => panic!("{otherwise:?}"),
-        }
     }
 
     pub fn generalize(&self, ctx: &TypingContext) -> TypeScheme {
@@ -886,6 +898,24 @@ impl Substitutions {
 
     fn remove(&mut self, param: TypeParameter) {
         self.0.retain(|(tp, ..)| param != *tp);
+    }
+}
+
+impl fmt::Display for Substitutions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(subs) = self;
+        let mut subs = subs.iter();
+        write!(f, "{{")?;
+
+        if let Some((p, ty)) = subs.next() {
+            write!(f, " {p} -> {ty}")?;
+        }
+
+        for (p, ty) in subs {
+            write!(f, "; {p} -> {ty}")?;
+        }
+
+        write!(f, " }}")
     }
 }
 
@@ -1556,6 +1586,7 @@ impl TypingContext {
             typed_elements.push(element);
             // compose_mut?
             substitutions = substitutions.compose(&subs);
+            *self = self.with_substitutions(&substitutions);
         }
 
         let typed_elements = typed_elements
