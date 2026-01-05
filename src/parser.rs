@@ -12,7 +12,7 @@ use crate::{
 };
 
 pub type Expr = ast::Expr<ParseInfo, IdentifierPath>;
-pub type SelfReference = ast::SelfReferential<ParseInfo, IdentifierPath>;
+pub type SelfReferential = ast::SelfReferential<ParseInfo, IdentifierPath>;
 pub type Lambda = ast::Lambda<ParseInfo, IdentifierPath>;
 pub type Apply = ast::Apply<ParseInfo, IdentifierPath>;
 pub type Binding = ast::Binding<ParseInfo, IdentifierPath>;
@@ -224,7 +224,7 @@ impl<'a> Parser<'a> {
                     .collect::<Vec<_>>()
                     .join(" "),
                 indent = depth * 2,
-                pad = 80 - (depth * 2 + e.step.len())
+                pad = 90 - (depth * 2 + e.step.len())
             );
         } else {
             println!("Unknown caller.")

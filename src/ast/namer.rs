@@ -12,7 +12,7 @@ use crate::{
         self, ApplyTypeExpr, ArrowTypeExpr, CompilationUnit, Declaration, ProductElement, Tree,
         TupleTypeExpr, TypeSignature,
     },
-    parser::{self, ParseInfo},
+    parser::{self, IdentifierPath, ParseInfo},
     typer::BaseType,
 };
 
@@ -32,7 +32,7 @@ type ParserTermId = SymbolName<parser::IdentifierPath, parser::IdentifierPath>;
 type ParserCompilationContext =
     CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
 type ParserSymbol = Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
-pub type TermId = SymbolName<QualifiedName, Identifier>;
+pub type TermName = SymbolName<QualifiedName, Identifier>;
 pub type NamedCompilationContext = CompilationContext<ParseInfo, QualifiedName, Identifier>;
 pub type NamedSymbol = Symbol<ParseInfo, QualifiedName, Identifier>;
 
@@ -398,7 +398,7 @@ impl ParserCompilationContext {
                     let symbol = TermSymbol {
                         name: name.clone(),
                         type_signature: declarator.type_signature.clone(),
-                        body: declarator.body.clone(),
+                        body: declarator.body.clone().into(),
                     };
 
                     symbols.insert(SymbolName::Term(name), Symbol::Term(symbol));
@@ -510,7 +510,7 @@ impl<A> Symbol<A, QualifiedName, Identifier> {
             Self::Term(symbol) => {
                 deps.extend(
                     symbol
-                        .body
+                        .body()
                         .free_variables()
                         .iter()
                         .map(|&id| SymbolName::Term(Identifier::Free(id.clone()))),
@@ -624,7 +624,7 @@ impl ConstructorSymbol<parser::IdentifierPath> {
                 phase: PhantomData,
             }),
             //            body: self.make_tuple_argument_lambda(*pi),
-            body: self.make_curried_argument_lambda(*pi),
+            body: self.make_curried_argument_lambda(*pi).into(),
         }
     }
 
@@ -725,7 +725,15 @@ impl ConstructorSymbol<parser::IdentifierPath> {
 pub struct TermSymbol<A, GlobalName, LocalId> {
     pub name: GlobalName,
     pub type_signature: Option<TypeSignature<ParseInfo, GlobalName>>,
-    pub body: ast::Expr<A, LocalId>,
+    pub body: Option<ast::Expr<A, LocalId>>,
+}
+
+impl<A, GlobalName, LocalId> TermSymbol<A, GlobalName, LocalId> {
+    pub fn body(&self) -> &ast::Expr<A, LocalId> {
+        self.body
+            .as_ref()
+            .expect("Internal assertion - empty TermSymbol body.")
+    }
 }
 
 // Is this thing necessary?
@@ -813,7 +821,102 @@ impl parser::TypeExpression {
     }
 }
 
+fn map_lower_tuples(body: Tree<ParseInfo, IdentifierPath>) -> Tree<ParseInfo, IdentifierPath> {
+    Rc::unwrap_or_clone(body).lower_tuples().into()
+}
+
 impl parser::Expr {
+    pub fn lower_tuples(self) -> parser::Expr {
+        match self {
+            parser::Expr::Variable(..) | parser::Expr::Constant(..) => self,
+
+            parser::Expr::RecursiveLambda(a, self_referential) => parser::Expr::RecursiveLambda(
+                a,
+                parser::SelfReferential {
+                    own_name: self_referential.own_name,
+                    lambda: parser::Lambda {
+                        parameter: self_referential.lambda.parameter,
+                        body: map_lower_tuples(self_referential.lambda.body),
+                    },
+                },
+            ),
+
+            parser::Expr::Lambda(a, lambda) => parser::Expr::Lambda(
+                a,
+                parser::Lambda {
+                    parameter: lambda.parameter,
+                    body: map_lower_tuples(lambda.body),
+                },
+            ),
+
+            parser::Expr::Apply(a, apply) => parser::Expr::Apply(
+                a,
+                parser::Apply {
+                    function: map_lower_tuples(apply.function),
+                    argument: map_lower_tuples(apply.argument),
+                },
+            ),
+
+            parser::Expr::Let(a, binding) => parser::Expr::Let(
+                a,
+                parser::Binding {
+                    binder: binding.binder,
+                    bound: map_lower_tuples(binding.bound),
+                    body: map_lower_tuples(binding.body),
+                },
+            ),
+
+            parser::Expr::Tuple(a, tuple) => {
+                let elements = tuple.elements;
+                parser::Expr::Tuple(
+                    a,
+                    parser::Tuple {
+                        elements: unspine_tuple(elements),
+                    },
+                )
+            }
+
+            parser::Expr::Record(a, record) => parser::Expr::Record(
+                a,
+                parser::Record {
+                    fields: record
+                        .fields
+                        .into_iter()
+                        .map(|(label, e)| (label, map_lower_tuples(e)))
+                        .collect(),
+                },
+            ),
+
+            parser::Expr::Construct(a, construct) => parser::Expr::Construct(
+                a,
+                parser::Construct {
+                    constructor: construct.constructor,
+                    arguments: construct
+                        .arguments
+                        .into_iter()
+                        .map(|e| map_lower_tuples(e))
+                        .collect(),
+                },
+            ),
+
+            parser::Expr::Project(a, projection) => parser::Expr::Project(
+                a,
+                parser::Projection {
+                    base: map_lower_tuples(projection.base),
+                    select: projection.select,
+                },
+            ),
+
+            parser::Expr::Sequence(a, sequence) => parser::Expr::Sequence(
+                a,
+                parser::Sequence {
+                    this: map_lower_tuples(sequence.this),
+                    and_then: map_lower_tuples(sequence.and_then),
+                },
+            ),
+        }
+    }
+
     pub fn resolve_names(&self, symbols: &ParserCompilationContext) -> Expr {
         self.resolve(&mut DeBruijnIndex::default(), symbols)
     }
@@ -851,6 +954,18 @@ impl parser::Expr {
     }
 }
 
+fn unspine_tuple(
+    elements: Vec<ast::Tree<ParseInfo, IdentifierPath>>,
+) -> Vec<ast::Tree<ParseInfo, IdentifierPath>> {
+    elements
+        .into_iter()
+        .flat_map(|e| match (*e).clone() {
+            parser::Expr::Tuple(_, tuple) => unspine_tuple(tuple.elements.to_vec()),
+            atom => vec![atom.into()],
+        })
+        .collect()
+}
+
 fn into_projection(pi: &ParseInfo, base: Identifier, path: &parser::IdentifierPath) -> Expr {
     path.tail
         .iter()
@@ -865,7 +980,7 @@ fn into_projection(pi: &ParseInfo, base: Identifier, path: &parser::IdentifierPa
         })
 }
 
-impl parser::SelfReference {
+impl parser::SelfReferential {
     fn resolve(
         &self,
         names: &mut DeBruijnIndex,
@@ -975,6 +1090,21 @@ impl parser::Sequence {
 }
 
 impl ParserCompilationContext {
+    pub fn lower_tuples(&mut self) {
+        for symbol in self.symbols.values_mut() {
+            match symbol {
+                Symbol::Term(symbol) => {
+                    let body = symbol
+                        .body
+                        .take()
+                        .expect("Internal Assertion - expected a symbol body.");
+                    symbol.body = body.lower_tuples().into();
+                }
+                _ => (),
+            }
+        }
+    }
+
     // Move to namer.rs
     // This does not need the symbols in any particular order, so long as all
     // modules are known
@@ -990,7 +1120,7 @@ impl ParserCompilationContext {
         }
     }
 
-    fn rename_term_id(&self, id: &ParserTermId) -> TermId {
+    fn rename_term_id(&self, id: &ParserTermId) -> TermName {
         match id {
             SymbolName::Type(id) => {
                 // What is it really doing here?
@@ -1029,7 +1159,7 @@ impl ParserCompilationContext {
                     .type_signature
                     .clone()
                     .map(|ts| ts.map(|te| te.resolve_names(self))),
-                body: symbol.body.resolve_names(self),
+                body: symbol.body().resolve_names(self).into(),
             }),
 
             Symbol::Type(symbol) => Symbol::Type(match &symbol.definition {

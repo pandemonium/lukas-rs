@@ -63,7 +63,7 @@ impl Expr<(), namer::Identifier> {
             )),
 
             Self::Construct(_, the) => Ok(Value::Variant {
-                coproduct: the.constructor.clone(), // clearly not correct
+                coproduct: the.constructor.clone(),
                 constructor: the.constructor.clone(),
                 arguments: the
                     .arguments
@@ -163,8 +163,9 @@ impl Environment {
 
     // Ought to be Interpretation
     pub fn typecheck_and_initialize(program: CompilationUnit<ParseInfo>) -> typer::Typing<Self> {
-        let compilation = CompilationContext::from(&program);
         let mut environment = Self::default();
+        let mut compilation = CompilationContext::from(&program);
+        compilation.lower_tuples();
 
         let compilation = compilation.rename_symbols();
 
@@ -178,9 +179,9 @@ impl Environment {
         if dependencies.are_sound() {
             for symbol in compilation
                 .compute_types(evaluation_order.iter())?
-                .initialize_terms(evaluation_order.iter())
+                .terms(evaluation_order.iter())
             {
-                let value = Rc::new(symbol.body.erase_annotation())
+                let value = Rc::new(symbol.body().erase_annotation())
                     .reduce(&environment)
                     .expect("successful static init");
                 environment.define_global(&symbol.name, value);

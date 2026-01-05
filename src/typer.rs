@@ -3,6 +3,7 @@ use std::{
     fmt,
     marker::PhantomData,
     ops::Deref,
+    rc::Rc,
     slice::Iter,
     sync::atomic::{AtomicU32, Ordering},
     vec,
@@ -22,14 +23,16 @@ use crate::{
 
 type UntypedExpr = namer::Expr;
 pub type Expr = ast::Expr<TypeInfo, namer::Identifier>;
+pub type TypedTree = Rc<Expr>;
 pub type Apply = ast::Apply<TypeInfo, namer::Identifier>;
-pub type RecursiveLambda = ast::SelfReferential<TypeInfo, namer::Identifier>;
+pub type SelfReferential = ast::SelfReferential<TypeInfo, namer::Identifier>;
 pub type Lambda = ast::Lambda<TypeInfo, namer::Identifier>;
 pub type Binding = ast::Binding<TypeInfo, namer::Identifier>;
 pub type Tuple = ast::Tuple<TypeInfo, namer::Identifier>;
 pub type Construct = ast::Construct<TypeInfo, namer::Identifier>;
 pub type Record = ast::Record<TypeInfo, namer::Identifier>;
 pub type Projection = ast::Projection<TypeInfo, namer::Identifier>;
+pub type Sequence = ast::Sequence<TypeInfo, namer::Identifier>;
 
 pub type RecordSymbol = namer::RecordSymbol<namer::QualifiedName>;
 pub type CoproductSymbol = namer::CoproductSymbol<namer::QualifiedName>;
@@ -52,9 +55,9 @@ impl<A> CompilationContext<A, namer::QualifiedName, namer::Identifier>
 where
     A: fmt::Debug,
 {
-    pub fn initialize_terms(
+    pub fn terms(
         &self,
-        order: Iter<&namer::TermId>,
+        order: Iter<&namer::TermName>,
     ) -> Vec<&TermSymbol<A, namer::QualifiedName, namer::Identifier>> {
         self.extract_symbols(order, |sym| {
             if let namer::Symbol::Term(sym) = sym {
@@ -67,7 +70,7 @@ where
 
     pub fn type_symbols(
         &self,
-        order: Iter<&namer::TermId>,
+        order: Iter<&namer::TermName>,
     ) -> Vec<&namer::TypeSymbol<namer::QualifiedName>> {
         self.extract_symbols(order, |sym| {
             if let namer::Symbol::Type(sym) = sym {
@@ -78,7 +81,7 @@ where
         })
     }
 
-    fn extract_symbols<F, Sym>(&self, terms: Iter<&namer::TermId>, select: F) -> Vec<&Sym>
+    fn extract_symbols<F, Sym>(&self, terms: Iter<&namer::TermName>, select: F) -> Vec<&Sym>
     where
         F: Fn(&namer::Symbol<A, namer::QualifiedName, namer::Identifier>) -> Option<&Sym>,
     {
@@ -105,7 +108,7 @@ where
 impl namer::NamedCompilationContext {
     pub fn compute_types(
         self,
-        evaluation_order: Iter<&namer::TermId>,
+        evaluation_order: Iter<&namer::TermName>,
     ) -> Typing<TypedCompilationContext> {
         let mut ctx = TypingContext::default();
         let mut symbols = HashMap::with_capacity(self.symbols.len());
@@ -150,7 +153,7 @@ impl namer::NamedCompilationContext {
         symbol: &TermSymbol<ParseInfo, namer::QualifiedName, Identifier>,
         ctx: &mut TypingContext,
     ) -> Typing<TypedSymbol> {
-        let (subs, body) = ctx.infer_expr(&symbol.body)?;
+        let (subs, body) = ctx.infer_expr(&symbol.body())?;
 
         let qualified_name = &symbol.name;
         let inferred_type = &body.type_info().inferred_type;
@@ -165,7 +168,7 @@ impl namer::NamedCompilationContext {
         Ok(namer::Symbol::Term(TermSymbol {
             name: symbol.name.clone(),
             type_signature: symbol.type_signature.clone(),
-            body,
+            body: body.into(),
         }))
     }
 }
@@ -218,6 +221,7 @@ pub enum TypeError {
     UnelaboratedConstructor(namer::QualifiedName),
     InternalAssertion(String),
     NoSuchCoproductConstructor(namer::QualifiedName),
+    ExpectedTuple,
 }
 
 pub type Typing<A = (Substitutions, Expr)> = Result<A, TypeError>;
@@ -279,10 +283,6 @@ impl CoproductType {
         self.0.len()
     }
 
-    fn constructor_names(&self) -> impl Iterator<Item = &QualifiedName> {
-        self.0.iter().map(|(name, _)| name)
-    }
-
     fn with_substitutions(&self, subs: &Substitutions) -> Self {
         Self(
             self.0
@@ -307,24 +307,6 @@ impl CoproductType {
     }
 }
 
-impl fmt::Display for RecordType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self(fields) = self;
-        write!(f, "{{ ")?;
-        let mut fields = fields.iter();
-
-        if let Some((label, ty)) = fields.next() {
-            write!(f, "{label} : {ty}")?;
-        }
-
-        for (label, ty) in fields {
-            write!(f, "; {label} : {ty}")?;
-        }
-
-        write!(f, " }}")
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Variable(TypeParameter),
@@ -333,7 +315,7 @@ pub enum Type {
         domain: Box<Type>,
         codomain: Box<Type>,
     },
-    Tuple(Vec<Type>),
+    Tuple(TupleType),
     Record(RecordType),
     Coproduct(CoproductType),
     Constructor(namer::QualifiedName),
@@ -364,7 +346,11 @@ impl Type {
                 variables
             }
 
-            Self::Tuple(elements) => elements.iter().flat_map(|ty| ty.variables()).collect(),
+            Self::Tuple(tuple) => tuple
+                .elements()
+                .iter()
+                .flat_map(|ty| ty.variables())
+                .collect(),
 
             Self::Record(record) => record.0.iter().flat_map(|(_, ty)| ty.variables()).collect(),
 
@@ -401,12 +387,13 @@ impl Type {
                 codomain: codomain.with_substitutions(subs).into(),
             },
 
-            Self::Tuple(elements) => Self::Tuple(
-                elements
+            Self::Tuple(tuple) => Self::Tuple(TupleType::from_signature(
+                &tuple
+                    .elements()
                     .iter()
                     .map(|ty| ty.with_substitutions(subs))
-                    .collect(),
-            ),
+                    .collect::<Vec<_>>(),
+            )),
 
             Self::Record(record) => Self::Record(record.clone().with_substitutions(subs)),
 
@@ -454,12 +441,12 @@ impl Type {
                     Ok(domain.compose(&codomain))
                 }
 
-                (Self::Tuple(lhs), Self::Tuple(rhs)) if lhs.len() == rhs.len() => {
+                (Self::Tuple(lhs), Self::Tuple(rhs)) if lhs.arity() == rhs.arity() => {
                     let mut subs = Substitutions::default();
 
-                    println!("unifed_with: {} ~ {}", display_list("; ", lhs), display_list("; ", rhs));
+                    println!("unifed_with: {} ~ {}", display_list("; ", lhs.elements()), display_list("; ", rhs.elements()));
 
-                    for (lhs, rhs) in lhs.iter().zip(rhs) {
+                    for (lhs, rhs) in lhs.elements().iter().zip(rhs.elements()) {
                         // compose_mut
                         subs = subs.compose(&lhs.unifed_with(rhs)?);
                     }
@@ -557,6 +544,23 @@ impl BaseType {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TupleType(pub Vec<Type>);
+
+impl TupleType {
+    pub fn from_signature(signature: &[Type]) -> Self {
+        Self(signature.to_vec())
+    }
+
+    pub fn elements(&self) -> &[Type] {
+        self.0.as_slice()
+    }
+
+    pub fn arity(&self) -> usize {
+        self.0.len()
+    }
+}
+
 impl RecordSymbol {
     fn synthesize_type(
         &self,
@@ -640,12 +644,12 @@ impl TypeExpression {
                 codomain: codomain.synthesize_type(type_params, ctx)?.into(),
             }),
 
-            Self::Tuple(_, TupleTypeExpr(elements)) => Ok(Type::Tuple(
-                elements
+            Self::Tuple(_, TupleTypeExpr(elements)) => Ok(Type::Tuple(TupleType::from_signature(
+                &elements
                     .iter()
                     .map(|te| te.synthesize_type(type_params, ctx))
                     .collect::<Typing<Vec<_>>>()?,
-            )),
+            ))),
         }
     }
 }
@@ -791,29 +795,6 @@ impl TypeDefinition<QualifiedName> {
             Self::Record(record) => record.synthesize_type(type_param_map, ctx),
             Self::Coproduct(coproduct) => coproduct.synthesize_type(type_param_map, ctx),
             Self::Builtin(base_type) => Ok(Type::Base(*base_type)),
-        }
-    }
-}
-
-impl fmt::Display for TypeConstructor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unelaborated(definition) => {
-                write!(
-                    f,
-                    "Suspended {}",
-                    definition.defining_symbol.qualified_name()
-                )
-            }
-            Self::Elaborated(constructor) => {
-                write!(f, "{}", constructor.definition.name)?;
-
-                for p in constructor.definition.instantiated_params.values() {
-                    write!(f, " {p}")?;
-                }
-
-                write!(f, " ::= {}", constructor.structure)
-            }
         }
     }
 }
@@ -1387,7 +1368,8 @@ impl TypingContext {
             let signature = coproduct
                 .signature(constructor_name)
                 .ok_or_else(|| TypeError::NoSuchCoproductConstructor(constructor_name.clone()))?;
-            Type::Tuple(signature.to_vec()).unifed_with(&Type::Tuple(argument_types))?
+            Type::Tuple(TupleType::from_signature(signature))
+                .unifed_with(&Type::Tuple(TupleType::from_signature(&argument_types)))?
         } else {
             Err(TypeError::InternalAssertion(format!("Expected ")))?
         };
@@ -1476,10 +1458,13 @@ impl TypingContext {
     fn infer_projection(&mut self, pi: &ParseInfo, projection: &namer::Projection) -> Typing {
         let (substitutions, base) = self.infer_expr(&projection.base)?;
         let base_type = &base.type_info().inferred_type;
+        let normalized_base_type = self.normalize_type_application(base_type)?;
+
+        println!("infer_projection: {normalized_base_type}");
 
         match &projection.select {
             ProductElement::Name(field) => {
-                if let Type::Record(record) = self.normalize_type_application(base_type)? {
+                if let Type::Record(record) = &normalized_base_type {
                     if let Some((field_index, (_, field_type))) = record
                         .0
                         .iter()
@@ -1500,10 +1485,9 @@ impl TypingContext {
                             ),
                         ))
                     } else {
-                        let inferred_type = base_type.clone();
                         Err(TypeError::BadProjection {
                             projection: projection.clone(),
-                            inferred_type,
+                            inferred_type: base_type.clone(),
                         })
                     }
                 } else {
@@ -1511,13 +1495,13 @@ impl TypingContext {
                 }
             }
 
-            ProductElement::Ordinal(element) => match base_type {
+            ProductElement::Ordinal(element) => match normalized_base_type {
                 Type::Tuple(tuple) => Ok((
                     substitutions,
                     Expr::Project(
                         TypeInfo {
                             parse_info: *pi,
-                            inferred_type: tuple[*element].clone(),
+                            inferred_type: tuple.elements()[*element].clone(),
                         },
                         Projection {
                             base: base.into(),
@@ -1525,15 +1509,16 @@ impl TypingContext {
                         },
                     ),
                 )),
+
                 Type::Variable(..) => {
                     let mut elems = Vec::with_capacity(element + 1);
                     for _ in 0..=*element {
                         elems.push(Type::fresh());
                     }
-                    let tuple_ty = Type::Tuple(elems);
+                    let tuple_ty = Type::Tuple(TupleType::from_signature(&elems));
                     let subs = base_type.unifed_with(&tuple_ty)?;
                     let projected_ty = match tuple_ty.with_substitutions(&subs) {
-                        Type::Tuple(elems) => elems[*element].clone(),
+                        Type::Tuple(tuple) => tuple.elements()[*element].clone(),
                         _ => unreachable!(),
                     };
                     Ok((
@@ -1550,6 +1535,7 @@ impl TypingContext {
                         ),
                     ))
                 }
+
                 _ => Err(TypeError::BadProjection {
                     projection: projection.clone(),
                     inferred_type: base.type_info().inferred_type.clone(),
@@ -1559,7 +1545,6 @@ impl TypingContext {
     }
 
     fn infer_tuple(&mut self, parse_info: &ParseInfo, tuple: &namer::Tuple) -> Typing {
-        println!("infer_tuple: calling infer_several");
         let (substitutions, elements, element_types) = self.infer_several(&tuple.elements)?;
 
         Ok((
@@ -1567,7 +1552,7 @@ impl TypingContext {
             Expr::Tuple(
                 TypeInfo {
                     parse_info: *parse_info,
-                    inferred_type: Type::Tuple(element_types),
+                    inferred_type: Type::Tuple(TupleType::from_signature(&element_types)),
                 },
                 Tuple { elements },
             ),
@@ -1635,7 +1620,7 @@ impl TypingContext {
                             substitutions,
                             Expr::RecursiveLambda(
                                 typing_info,
-                                RecursiveLambda {
+                                SelfReferential {
                                     own_name: rec_lambda.own_name.clone(),
                                     lambda: underlying,
                                 },
@@ -1776,8 +1761,9 @@ impl fmt::Display for Type {
 
             Self::Arrow { domain, codomain } => write!(f, "({domain} -> {codomain})"),
 
-            Self::Tuple(items) => {
-                let tuple_rendering = items
+            Self::Tuple(tuple) => {
+                let tuple_rendering = tuple
+                    .elements()
                     .iter()
                     .map(|x| x.to_string())
                     .collect::<Vec<_>>()
@@ -1800,7 +1786,10 @@ impl fmt::Display for Type {
                     .0
                     .iter()
                     .map(|(constructor, signature)| {
-                        format!("{constructor} :: {}", Self::Tuple(signature.clone()))
+                        format!(
+                            "{constructor} :: {}",
+                            Self::Tuple(TupleType::from_signature(signature))
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(" | ");
@@ -1844,5 +1833,46 @@ impl fmt::Display for TypeScheme {
 impl fmt::Display for TypeParameter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "${}", self.0)
+    }
+}
+
+impl fmt::Display for TypeConstructor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unelaborated(definition) => {
+                write!(
+                    f,
+                    "Suspended {}",
+                    definition.defining_symbol.qualified_name()
+                )
+            }
+            Self::Elaborated(constructor) => {
+                write!(f, "{}", constructor.definition.name)?;
+
+                for p in constructor.definition.instantiated_params.values() {
+                    write!(f, " {p}")?;
+                }
+
+                write!(f, " ::= {}", constructor.structure)
+            }
+        }
+    }
+}
+
+impl fmt::Display for RecordType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(fields) = self;
+        write!(f, "{{ ")?;
+        let mut fields = fields.iter();
+
+        if let Some((label, ty)) = fields.next() {
+            write!(f, "{label} : {ty}")?;
+        }
+
+        for (label, ty) in fields {
+            write!(f, "; {label} : {ty}")?;
+        }
+
+        write!(f, " }}")
     }
 }
