@@ -222,6 +222,10 @@ pub enum TypeError {
     InternalAssertion(String),
     NoSuchCoproductConstructor(namer::QualifiedName),
     ExpectedTuple,
+    TupleOrdinalOutOfBounds {
+        base: ast::Expr<ParseInfo, Identifier>,
+        select: ProductElement,
+    },
 }
 
 pub type Typing<A = (Substitutions, Expr)> = Result<A, TypeError>;
@@ -1495,30 +1499,40 @@ impl TypingContext {
                 }
             }
 
-            ProductElement::Ordinal(element) => match normalized_base_type {
-                Type::Tuple(tuple) => Ok((
-                    substitutions,
-                    Expr::Project(
-                        TypeInfo {
-                            parse_info: *pi,
-                            inferred_type: tuple.elements()[*element].clone(),
-                        },
-                        Projection {
-                            base: base.into(),
-                            select: ProductElement::Ordinal(*element),
-                        },
-                    ),
-                )),
+            ProductElement::Ordinal(ordinal) => match normalized_base_type {
+                Type::Tuple(tuple) => {
+                    if let Some(element) = tuple.elements().get(*ordinal) {
+                        Ok((
+                            substitutions,
+                            Expr::Project(
+                                TypeInfo {
+                                    parse_info: *pi,
+                                    inferred_type: element.clone(),
+                                },
+                                Projection {
+                                    base: base.into(),
+                                    select: ProductElement::Ordinal(*ordinal),
+                                },
+                            ),
+                        ))
+                    } else {
+                        Err(TypeError::TupleOrdinalOutOfBounds {
+                            base: (*projection.base).clone(),
+                            select: projection.select.clone(),
+                        })?
+                    }
+                }
 
                 Type::Variable(..) => {
-                    let mut elems = Vec::with_capacity(element + 1);
-                    for _ in 0..=*element {
+                    println!("infer_projection: Am i audible?");
+                    let mut elems = Vec::with_capacity(ordinal + 1);
+                    for _ in 0..=*ordinal {
                         elems.push(Type::fresh());
                     }
                     let tuple_ty = Type::Tuple(TupleType::from_signature(&elems));
                     let subs = base_type.unifed_with(&tuple_ty)?;
                     let projected_ty = match tuple_ty.with_substitutions(&subs) {
-                        Type::Tuple(tuple) => tuple.elements()[*element].clone(),
+                        Type::Tuple(tuple) => tuple.elements()[*ordinal].clone(),
                         _ => unreachable!(),
                     };
                     Ok((
@@ -1530,7 +1544,7 @@ impl TypingContext {
                             },
                             Projection {
                                 base: base.into(),
-                                select: ProductElement::Ordinal(*element),
+                                select: ProductElement::Ordinal(*ordinal),
                             },
                         ),
                     ))
