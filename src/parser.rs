@@ -1057,8 +1057,10 @@ impl<'a> Parser<'a> {
     fn parse_select_operator(&mut self, lhs: Expr) -> Result<Expr> {
         let _t = self.trace();
 
-        if let Expr::Variable(pi, id) = lhs {
-            self.parse_identifier_path(pi, id)
+        if let Expr::Variable(pi, id) = &lhs
+            && !matches!(self.peek()?.kind, TokenKind::Literal(..))
+        {
+            self.parse_identifier_path(*pi, id.clone())
         } else {
             self.parse_projection(lhs)
         }
