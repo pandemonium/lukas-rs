@@ -7,6 +7,7 @@ use crate::{
 
 pub mod annotation;
 pub mod namer;
+pub mod pattern;
 
 pub const ROOT_MODULE_NAME: &str = "Root"; // This should be the main source file name
 pub const BUILTIN_MODULE_NAME: &str = "__builtin__";
@@ -152,6 +153,7 @@ pub enum Expr<A, Id> {
     Construct(A, Construct<A, Id>),
     Project(A, Projection<A, Id>),
     Sequence(A, Sequence<A, Id>),
+    Deconstruct(A, Deconstruct<A, Id>),
 }
 
 impl<A, Id> Expr<A, Id> {
@@ -167,7 +169,8 @@ impl<A, Id> Expr<A, Id> {
             | Expr::Tuple(a, ..)
             | Expr::Construct(a, ..)
             | Expr::Project(a, ..)
-            | Expr::Sequence(a, ..) => a,
+            | Expr::Sequence(a, ..)
+            | Expr::Deconstruct(a, ..) => a,
         }
     }
 
@@ -175,8 +178,14 @@ impl<A, Id> Expr<A, Id> {
     where
         Self: Annotated<A, (), Id, Output = Expr<(), Id>>,
     {
-        self.map_annotation(|_| ())
+        self.map_annotation(&|_| ())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct Deconstruct<A, Id> {
+    pub scrutinee: Tree<A, Id>,
+    pub alternates: Vec<pattern::MatchClause<A, Id>>,
 }
 
 #[derive(Debug, Clone)]
@@ -292,7 +301,27 @@ where
             }
             Self::Project(_, x) => write!(f, "{}.{}", x.base, x.select),
             Self::Sequence(_, x) => write!(f, "{}; {}", x.this, x.and_then),
+            Self::Deconstruct(_, x) => write!(f, "{x}"),
         }
+    }
+}
+
+impl<A, Id> fmt::Display for Deconstruct<A, Id>
+where
+    Id: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            scrutinee,
+            alternates: alternatives,
+        } = self;
+        write!(f, "deconstruct {scrutinee}:")?;
+
+        for clause in alternatives {
+            write!(f, "| {} -> {}", clause.pattern, clause.consequent)?;
+        }
+
+        Ok(())
     }
 }
 

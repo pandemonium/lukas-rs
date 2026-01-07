@@ -21,6 +21,9 @@ pub type Tuple = ast::Tuple<ParseInfo, IdentifierPath>;
 pub type Projection = ast::Projection<ParseInfo, IdentifierPath>;
 pub type Construct = ast::Construct<ParseInfo, IdentifierPath>;
 pub type Sequence = ast::Sequence<ParseInfo, IdentifierPath>;
+pub type Deconstruct = ast::Deconstruct<ParseInfo, IdentifierPath>;
+pub type Pattern = ast::pattern::Pattern<ParseInfo, IdentifierPath>;
+pub type MatchClause = ast::pattern::MatchClause<ParseInfo, IdentifierPath>;
 pub type TypeExpression = ast::TypeExpression<ParseInfo, IdentifierPath>;
 
 impl Expr {

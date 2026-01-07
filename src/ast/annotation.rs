@@ -1,8 +1,10 @@
+use crate::ast::pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern};
+
 use super::*;
 
 pub trait Annotated<A, B, Id> {
     type Output;
-    fn map_annotation<F>(&self, f: F) -> Self::Output
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
     where
         F: Fn(&A) -> B;
 }
@@ -13,7 +15,7 @@ where
 {
     type Output = Expr<B, Id>;
 
-    fn map_annotation<F>(&self, f: F) -> Self::Output
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
     where
         F: Fn(&A) -> B,
     {
@@ -37,6 +39,7 @@ where
                 Expr::Construct(a, node) => Expr::Construct(f(a), node.map_annotation(&f)),
                 Expr::Project(a, node) => Expr::Project(f(a), node.map_annotation(&f)),
                 Expr::Sequence(a, node) => Expr::Sequence(f(a), node.map_annotation(&f)),
+                Expr::Deconstruct(a, node) => Expr::Deconstruct(f(a), node.map_annotation(&f)),
             }
         }
 
@@ -50,11 +53,11 @@ where
 {
     type Output = Rc<T::Output>;
 
-    fn map_annotation<F>(&self, f: F) -> Self::Output
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
     where
         F: Fn(&A) -> B,
     {
-        Rc::new((**self).map_annotation(&f))
+        Rc::new((**self).map_annotation(f))
     }
 }
 
@@ -64,7 +67,7 @@ where
 {
     type Output = SelfReferential<B, Id>;
 
-    fn map_annotation<F>(&self, f: F) -> Self::Output
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
     where
         F: Fn(&A) -> B,
     {
@@ -74,7 +77,7 @@ where
         } = self;
         SelfReferential {
             own_name: name.clone(),
-            lambda: lambda.map_annotation(&f),
+            lambda: lambda.map_annotation(f),
         }
     }
 }
@@ -85,14 +88,14 @@ where
 {
     type Output = Lambda<B, Id>;
 
-    fn map_annotation<F>(&self, f: F) -> Self::Output
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
     where
         F: Fn(&A) -> B,
     {
         let Lambda { parameter, body } = self;
         Lambda {
             parameter: parameter.clone(),
-            body: body.map_annotation(&f),
+            body: body.map_annotation(f),
         }
     }
 }
@@ -103,14 +106,14 @@ where
 {
     type Output = Apply<B, Id>;
 
-    fn map_annotation<F>(&self, f: F) -> Self::Output
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
     where
         F: Fn(&A) -> B,
     {
         let Apply { function, argument } = self;
         Apply {
-            function: function.map_annotation(&f),
-            argument: argument.map_annotation(&f),
+            function: function.map_annotation(f),
+            argument: argument.map_annotation(f),
         }
     }
 }
@@ -121,7 +124,7 @@ where
 {
     type Output = Binding<B, Id>;
 
-    fn map_annotation<F>(&self, f: F) -> Self::Output
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
     where
         F: Fn(&A) -> B,
     {
@@ -132,8 +135,8 @@ where
         } = self;
         Binding {
             binder: binder.clone(),
-            bound: bound.map_annotation(&f),
-            body: body.map_annotation(&f),
+            bound: bound.map_annotation(f),
+            body: body.map_annotation(f),
         }
     }
 }
@@ -144,7 +147,7 @@ where
 {
     type Output = Record<B, Id>;
 
-    fn map_annotation<F>(&self, f: F) -> Self::Output
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
     where
         F: Fn(&A) -> B,
     {
@@ -152,7 +155,7 @@ where
             fields: self
                 .fields
                 .iter()
-                .map(|(label, e)| (label.clone(), e.map_annotation(&f)))
+                .map(|(label, e)| (label.clone(), e.map_annotation(f)))
                 .collect(),
         }
     }
@@ -164,12 +167,12 @@ where
 {
     type Output = Tuple<B, Id>;
 
-    fn map_annotation<F>(&self, f: F) -> Self::Output
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
     where
         F: Fn(&A) -> B,
     {
         Tuple {
-            elements: self.elements.iter().map(|e| e.map_annotation(&f)).collect(),
+            elements: self.elements.iter().map(|e| e.map_annotation(f)).collect(),
         }
     }
 }
@@ -180,7 +183,7 @@ where
 {
     type Output = Construct<B, Id>;
 
-    fn map_annotation<F>(&self, f: F) -> Self::Output
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
     where
         F: Fn(&A) -> B,
     {
@@ -192,7 +195,7 @@ where
             constructor: name.clone(),
             arguments: arguments
                 .iter()
-                .map(|expr| expr.map_annotation(&f))
+                .map(|expr| expr.map_annotation(f))
                 .collect(),
         }
     }
@@ -204,7 +207,7 @@ where
 {
     type Output = Projection<B, Id>;
 
-    fn map_annotation<F>(&self, f: F) -> Self::Output
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
     where
         F: Fn(&A) -> B,
     {
@@ -221,13 +224,85 @@ where
 {
     type Output = Sequence<B, Id>;
 
-    fn map_annotation<F>(&self, f: F) -> Self::Output
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
     where
         F: Fn(&A) -> B,
     {
         Sequence {
-            this: self.this.map_annotation(&f),
-            and_then: self.and_then.map_annotation(&f),
+            this: self.this.map_annotation(f),
+            and_then: self.and_then.map_annotation(f),
+        }
+    }
+}
+
+impl<A, B, Id> Annotated<A, B, Id> for Deconstruct<A, Id>
+where
+    Id: Clone,
+{
+    type Output = Deconstruct<B, Id>;
+
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
+    where
+        F: Fn(&A) -> B,
+    {
+        Deconstruct {
+            scrutinee: self.scrutinee.map_annotation(f).into(),
+            alternates: self
+                .alternates
+                .iter()
+                .map(|clause| MatchClause {
+                    pattern: clause.pattern.map_annotation(f),
+                    consequent: clause.consequent.map_annotation(f).into(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl<A, B, Id> Annotated<A, B, Id> for Pattern<A, Id>
+where
+    Id: Clone,
+{
+    type Output = Pattern<B, Id>;
+
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
+    where
+        F: Fn(&A) -> B,
+    {
+        match self {
+            Self::Coproduct(a, pattern) => Pattern::Coproduct(
+                f(a),
+                ConstructorPattern {
+                    constructor: pattern.constructor.clone(),
+                    arguments: pattern
+                        .arguments
+                        .iter()
+                        .map(|arg| arg.map_annotation(f))
+                        .collect(),
+                },
+            ),
+            Self::Tuple(a, pattern) => Pattern::Tuple(
+                f(a),
+                TuplePattern {
+                    elements: pattern
+                        .elements
+                        .iter()
+                        .map(|elt| elt.map_annotation(f))
+                        .collect(),
+                },
+            ),
+            Self::Struct(a, pattern) => Pattern::Struct(
+                f(a),
+                StructPattern {
+                    fields: pattern
+                        .fields
+                        .iter()
+                        .map(|(field, pattern)| (field.clone(), pattern.map_annotation(f)))
+                        .collect(),
+                },
+            ),
+            Self::Literally(a, pattern) => Pattern::Literally(f(a), pattern.clone()),
+            Self::Bind(a, pattern) => Pattern::Bind(f(a), pattern.clone()),
         }
     }
 }

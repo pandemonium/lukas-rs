@@ -11,6 +11,7 @@ use crate::{
     ast::{
         self, ApplyTypeExpr, ArrowTypeExpr, CompilationUnit, Declaration, ProductElement, Tree,
         TupleTypeExpr, TypeSignature,
+        pattern::{StructPattern, TuplePattern},
     },
     parser::{self, IdentifierPath, ParseInfo},
     typer::BaseType,
@@ -26,6 +27,10 @@ pub type Tuple = ast::Tuple<ParseInfo, Identifier>;
 pub type Projection = ast::Projection<ParseInfo, Identifier>;
 pub type Construct = ast::Construct<ParseInfo, Identifier>;
 pub type Sequence = ast::Sequence<ParseInfo, Identifier>;
+pub type Deconstruct = ast::Deconstruct<ParseInfo, Identifier>;
+pub type MatchClause = ast::pattern::MatchClause<ParseInfo, Identifier>;
+pub type Pattern = ast::pattern::Pattern<ParseInfo, Identifier>;
+pub type ConstructorPattern = ast::pattern::ConstructorPattern<ParseInfo, Identifier>;
 pub type TypeExpression = ast::TypeExpression<ParseInfo, QualifiedName>;
 
 type ParserTermId = SymbolName<parser::IdentifierPath, parser::IdentifierPath>;
@@ -744,9 +749,24 @@ pub struct ModuleSymbol<A, GlobalName, LocalId> {
 }
 
 #[derive(Debug, Default)]
-struct DeBruijnIndex(Vec<parser::Identifier>);
+struct DeBruijnIndex {
+    stack: Vec<parser::Identifier>,
+    restore_points: Vec<usize>,
+}
 
 impl DeBruijnIndex {
+    fn mark(&mut self) {
+        self.restore_points.push(self.stack.len() - 1);
+    }
+
+    fn restore(&mut self) {
+        self.stack.truncate(
+            self.restore_points
+                .pop()
+                .expect("Restore without restore points"),
+        );
+    }
+
     fn try_resolve_bound(&self, id: &parser::Identifier) -> Option<Identifier> {
         if let bound @ Identifier::Bound(..) = self.resolve(id) {
             Some(bound)
@@ -756,22 +776,28 @@ impl DeBruijnIndex {
     }
 
     fn resolve(&self, id: &parser::Identifier) -> Identifier {
-        if let Some(index) = self.0.iter().rposition(|n| n == id) {
+        if let Some(index) = self.stack.iter().rposition(|n| n == id) {
             Identifier::Bound(index)
         } else {
             Identifier::Free(QualifiedName::from_root_symbol(id.to_owned()))
         }
     }
 
-    fn bind<F, A>(&mut self, id: parser::Identifier, mut block: F) -> A
+    fn bind_and_then<F, A>(&mut self, id: parser::Identifier, mut block: F) -> A
     where
         F: FnMut(&mut DeBruijnIndex, Identifier) -> A,
     {
-        let de_bruijn_index = self.0.len();
-        self.0.push(id);
+        let de_bruijn_index = self.stack.len();
+        self.stack.push(id);
         let a = block(self, Identifier::Bound(de_bruijn_index));
-        self.0.pop();
+        self.stack.pop();
         a
+    }
+
+    fn bind(&mut self, id: parser::Identifier) -> usize {
+        let de_bruijn_index = self.stack.len();
+        self.stack.push(id);
+        de_bruijn_index
     }
 }
 
@@ -914,6 +940,21 @@ impl parser::Expr {
                     and_then: map_lower_tuples(sequence.and_then),
                 },
             ),
+
+            parser::Expr::Deconstruct(a, deconstruct) => parser::Expr::Deconstruct(
+                a,
+                parser::Deconstruct {
+                    scrutinee: map_lower_tuples(deconstruct.scrutinee),
+                    alternates: deconstruct
+                        .alternates
+                        .iter()
+                        .map(|clause| parser::MatchClause {
+                            pattern: clause.pattern.clone(),
+                            consequent: map_lower_tuples(clause.consequent.clone()),
+                        })
+                        .collect(),
+                },
+            ),
         }
     }
 
@@ -950,6 +991,7 @@ impl parser::Expr {
             Self::Construct(a, node) => Expr::Construct(*a, node.resolve(names, symbols)),
             Self::Project(a, node) => Expr::Project(*a, node.resolve(names, symbols)),
             Self::Sequence(a, node) => Expr::Sequence(*a, node.resolve(names, symbols)),
+            Self::Deconstruct(a, node) => Expr::Deconstruct(*a, node.resolve(names, symbols)),
         }
     }
 }
@@ -987,7 +1029,7 @@ impl parser::SelfReferential {
         symbols: &ParserCompilationContext,
     ) -> SelfReferential {
         if let Some(own_name) = self.own_name.try_as_simple() {
-            names.bind(own_name, |names, name| SelfReferential {
+            names.bind_and_then(own_name, |names, name| SelfReferential {
                 own_name: name,
                 lambda: self.lambda.resolve(names, symbols),
             })
@@ -1000,7 +1042,7 @@ impl parser::SelfReferential {
 impl parser::Lambda {
     fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Lambda {
         if let Some(parameter) = self.parameter.try_as_simple() {
-            names.bind(parameter, |names, parameter| Lambda {
+            names.bind_and_then(parameter, |names, parameter| Lambda {
                 parameter,
                 body: self.body.resolve(names, symbols).into(),
             })
@@ -1023,7 +1065,7 @@ impl parser::Binding {
     fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Binding {
         if let Some(binder) = self.binder.try_as_simple() {
             let bound = Rc::new(self.bound.resolve(names, symbols));
-            names.bind(binder, |names, binder| Binding {
+            names.bind_and_then(binder, |names, binder| Binding {
                 binder,
                 bound: Rc::clone(&bound),
                 body: self.body.resolve(names, symbols).into(),
@@ -1085,6 +1127,99 @@ impl parser::Sequence {
         Sequence {
             this: self.this.resolve(names, symbols).into(),
             and_then: self.and_then.resolve(names, symbols).into(),
+        }
+    }
+}
+
+impl parser::Deconstruct {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &ParserCompilationContext,
+    ) -> Deconstruct {
+        Deconstruct {
+            scrutinee: self.scrutinee.resolve(names, symbols).into(),
+            alternates: self
+                .alternates
+                .iter()
+                .map(|clause| clause.resolve(names, symbols))
+                .collect(),
+        }
+    }
+}
+
+impl parser::MatchClause {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &ParserCompilationContext,
+    ) -> MatchClause {
+        let Self {
+            pattern,
+            consequent,
+        } = self;
+        names.mark();
+
+        let clause = MatchClause {
+            pattern: pattern.resolve(names, symbols),
+            consequent: consequent.resolve(names, symbols).into(),
+        };
+
+        names.restore();
+        clause
+    }
+}
+
+impl parser::Pattern {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Pattern {
+        match self {
+            parser::Pattern::Coproduct(a, pattern) => Pattern::Coproduct(
+                *a,
+                ConstructorPattern {
+                    constructor: Identifier::Free(
+                        symbols.resolve_member_path(&pattern.constructor),
+                    ),
+                    arguments: pattern
+                        .arguments
+                        .iter()
+                        .map(|arg| arg.resolve(names, symbols))
+                        .collect(),
+                },
+            ),
+
+            parser::Pattern::Tuple(a, pattern) => Pattern::Tuple(
+                *a,
+                TuplePattern {
+                    elements: pattern
+                        .elements
+                        .iter()
+                        .map(|p| p.resolve(names, symbols))
+                        .collect(),
+                },
+            ),
+
+            parser::Pattern::Struct(a, pattern) => Pattern::Struct(
+                *a,
+                StructPattern {
+                    fields: pattern
+                        .fields
+                        .iter()
+                        .map(|(field, pattern)| (field.clone(), pattern.resolve(names, symbols)))
+                        .collect(),
+                },
+            ),
+
+            parser::Pattern::Literally(a, pattern) => Pattern::Literally(*a, pattern.clone()),
+
+            parser::Pattern::Bind(a, pattern) => {
+                if let Some(id) = pattern.try_as_simple() {
+                    Pattern::Bind(*a, Identifier::Bound(names.bind(id)))
+                } else {
+                    panic!(
+                        "Parser erroneously accepted a pathed identifier for recursive function name"
+                    )
+                }
+            }
         }
     }
 }

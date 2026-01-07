@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     ast::{
-        self, ProductElement, Tree, TupleTypeExpr,
+        self, Literal, ProductElement, Tree, TupleTypeExpr,
         annotation::Annotated,
         namer::{
             self, CompilationContext, DependencyMatrix, Identifier, QualifiedName, Symbol,
@@ -33,6 +33,10 @@ pub type Construct = ast::Construct<TypeInfo, namer::Identifier>;
 pub type Record = ast::Record<TypeInfo, namer::Identifier>;
 pub type Projection = ast::Projection<TypeInfo, namer::Identifier>;
 pub type Sequence = ast::Sequence<TypeInfo, namer::Identifier>;
+pub type Deconstruct = ast::Deconstruct<TypeInfo, namer::Identifier>;
+pub type MatchClause = ast::pattern::MatchClause<TypeInfo, namer::Identifier>;
+pub type Pattern = ast::pattern::Pattern<TypeInfo, namer::Identifier>;
+pub type ConstructorPattern = ast::pattern::ConstructorPattern<TypeInfo, namer::Identifier>;
 
 pub type RecordSymbol = namer::RecordSymbol<namer::QualifiedName>;
 pub type CoproductSymbol = namer::CoproductSymbol<namer::QualifiedName>;
@@ -160,7 +164,7 @@ impl namer::NamedCompilationContext {
 
         println!("{qualified_name} => {inferred_type}");
 
-        ctx.bind_term(
+        ctx.bind_free_term(
             qualified_name.clone(),
             inferred_type.generalize(&ctx.with_substitutions(&subs)),
         );
@@ -190,7 +194,7 @@ where
 {
     type Output = T::Output;
     fn with_substitutions(&self, subs: &Substitutions) -> Self::Output {
-        self.map_annotation(move |ti| ti.with_substitutions(subs))
+        self.map_annotation(&move |ti| ti.with_substitutions(subs))
     }
 }
 
@@ -1031,14 +1035,14 @@ impl TypeEnvironment {
         self.bindings.get(name)
     }
 
-    fn infer_record_type_constructor(&self, shape: &RecordShape) -> Vec<&TypeConstructor> {
+    fn query_record_type_constructor(&self, shape: &RecordShape) -> Vec<&TypeConstructor> {
         self.record_shapes
             .matching(shape)
             .flat_map(|name| self.lookup(name))
             .collect()
     }
 
-    fn infer_coproduct_type_constructors(
+    fn query_coproduct_type_constructors(
         &self,
         name: &QualifiedName,
     ) -> Typing<Vec<&TypeConstructor>> {
@@ -1204,8 +1208,24 @@ impl TypingContext {
         self.types.bind(name, constructor);
     }
 
-    pub fn bind_term(&mut self, name: namer::QualifiedName, scheme: TypeScheme) {
+    pub fn bind_free_term(&mut self, name: namer::QualifiedName, scheme: TypeScheme) {
         self.terms.free.insert(name, scheme);
+    }
+
+    pub fn bind_term(&mut self, name: Identifier, scheme: TypeScheme) {
+        match name {
+            // How in the f is this supposed to work?
+            // Just push and hope they get the correct DeBruijn index?
+            // Assertion here that  self.terms.bound.len() == id?
+            Identifier::Bound(id) => {
+                println!(
+                    "bind_term: {id} -> {scheme}, pushed at {}",
+                    self.terms.bound.len()
+                );
+                self.terms.bound.push(scheme)
+            }
+            Identifier::Free(name) => self.bind_free_term(name, scheme),
+        }
     }
 
     pub fn bind_term_and_then<F, A>(
@@ -1263,11 +1283,11 @@ impl TypingContext {
         //        println!("infer_expr: {expr}");
 
         match expr {
-            UntypedExpr::Variable(parse_info, name) => Ok((
+            UntypedExpr::Variable(pi, name) => Ok((
                 Substitutions::default(),
                 Expr::Variable(
                     TypeInfo {
-                        parse_info: *parse_info,
+                        parse_info: *pi,
                         inferred_type: self
                             .terms
                             .lookup(name)
@@ -1278,48 +1298,209 @@ impl TypingContext {
                 ),
             )),
 
-            UntypedExpr::Constant(parse_info, x) => Ok((
+            UntypedExpr::Constant(pi, literal) => Ok((
                 Substitutions::default(),
                 Expr::Constant(
                     TypeInfo {
-                        parse_info: *parse_info,
-                        inferred_type: Type::Base(match x {
-                            ast::Literal::Int(..) => BaseType::Int,
-                            ast::Literal::Text(..) => BaseType::Text,
-                        }),
+                        parse_info: *pi,
+                        inferred_type: literal.synthesize_type(),
                     },
-                    x.clone(),
+                    literal.clone(),
                 ),
             )),
 
-            UntypedExpr::RecursiveLambda(parse_info, rec_lambda) => {
-                self.infer_recursive_lambda(parse_info, rec_lambda)
+            UntypedExpr::RecursiveLambda(pi, rec_lambda) => {
+                self.infer_recursive_lambda(pi, rec_lambda)
             }
 
-            UntypedExpr::Lambda(parse_info, lambda) => {
-                let (substitutions, typing_info, lambda) = self.infer_lambda(parse_info, lambda)?;
+            UntypedExpr::Lambda(pi, lambda) => {
+                let (substitutions, typing_info, lambda) = self.infer_lambda(pi, lambda)?;
                 Ok((substitutions, Expr::Lambda(typing_info, lambda)))
             }
 
-            UntypedExpr::Apply(parse_info, ast::Apply { function, argument }) => {
-                self.infer_apply(parse_info, function, argument)
+            UntypedExpr::Apply(pi, ast::Apply { function, argument }) => {
+                self.infer_apply(pi, function, argument)
             }
 
-            UntypedExpr::Let(parse_info, binding) => self.infer_binding(parse_info, binding),
+            UntypedExpr::Let(pi, binding) => self.infer_binding(pi, binding),
 
-            UntypedExpr::Record(parse_info, record) => self.infer_record(parse_info, record),
+            UntypedExpr::Record(pi, record) => self.infer_record(pi, record),
 
-            UntypedExpr::Tuple(parse_info, tuple) => self.infer_tuple(parse_info, tuple),
+            UntypedExpr::Tuple(pi, tuple) => self.infer_tuple(pi, tuple),
 
-            UntypedExpr::Construct(parse_info, constructor) => {
-                self.infer_coproduct_construct(parse_info, constructor)
+            UntypedExpr::Construct(pi, constructor) => {
+                self.infer_coproduct_construct(pi, constructor)
             }
 
-            UntypedExpr::Project(parse_info, projection) => {
-                self.infer_projection(parse_info, projection)
+            UntypedExpr::Project(pi, projection) => self.infer_projection(pi, projection),
+
+            UntypedExpr::Sequence(_pi, sequence) => self.infer_sequence(sequence),
+
+            UntypedExpr::Deconstruct(pi, deconstruct) => {
+                self.infer_deconstruction(*pi, deconstruct)
+            }
+        }
+    }
+
+    fn infer_deconstruction(&mut self, pi: ParseInfo, deconstruct: &namer::Deconstruct) -> Typing {
+        let (mut substitutions, scrutinee) = self.infer_expr(&deconstruct.scrutinee)?;
+        let scrutinee_type = &scrutinee.type_info().inferred_type;
+        let mut alternates = deconstruct.alternates.iter();
+        let mut typed_alternates = Vec::with_capacity(deconstruct.alternates.len());
+
+        if let Some(clause) = alternates.next() {
+            let mut consequent_type = {
+                let mut clause_ctx = self.clone();
+                let mut bindings = HashMap::default();
+                let (subs1, pattern) =
+                    clause_ctx.infer_pattern(&clause.pattern, &mut bindings, scrutinee_type)?;
+                let mut clause_ctx = clause_ctx.with_substitutions(&subs1);
+                for (binding, ty) in bindings {
+                    clause_ctx.bind_term(binding, TypeScheme::from_constant(ty));
+                }
+                let (subs, expr) = clause_ctx.infer_expr(&clause.consequent)?;
+                substitutions = substitutions.compose(&subs).compose(&subs1);
+                let consequent_type = expr
+                    .type_info()
+                    .inferred_type
+                    .with_substitutions(&substitutions);
+                typed_alternates.push(MatchClause {
+                    pattern,
+                    consequent: expr.into(),
+                });
+                consequent_type
+            };
+
+            for clause in alternates {
+                let mut clause_ctx = self.clone();
+                let mut bindings = HashMap::default();
+                let (subs1, pattern) =
+                    clause_ctx.infer_pattern(&clause.pattern, &mut bindings, scrutinee_type)?;
+                let mut clause_ctx = clause_ctx.with_substitutions(&subs1);
+                for (binding, ty) in bindings {
+                    clause_ctx.bind_term(binding, TypeScheme::from_constant(ty));
+                }
+                let (subs, expr) = clause_ctx.infer_expr(&clause.consequent)?;
+                substitutions = substitutions.compose(&subs).compose(&subs1);
+                let subs = expr
+                    .type_info()
+                    .inferred_type
+                    .with_substitutions(&substitutions)
+                    .unifed_with(&consequent_type)?;
+                consequent_type = consequent_type.with_substitutions(&subs);
+                typed_alternates.push(MatchClause {
+                    pattern,
+                    consequent: expr.into(),
+                });
             }
 
-            UntypedExpr::Sequence(_parse_info, sequence) => self.infer_sequence(sequence),
+            Ok((
+                substitutions,
+                Expr::Deconstruct(
+                    TypeInfo {
+                        parse_info: pi,
+                        inferred_type: consequent_type,
+                    },
+                    Deconstruct {
+                        scrutinee: scrutinee.clone().into(),
+                        alternates: typed_alternates,
+                    },
+                ),
+            ))
+        } else {
+            panic!("Now wtf?")
+        }
+    }
+
+    fn infer_pattern(
+        &mut self,
+        pattern: &namer::Pattern,
+        bindings: &mut HashMap<namer::Identifier, Type>,
+        scrutinee: &Type,
+    ) -> Typing<(Substitutions, Pattern)> {
+        let normalized_scrutinee = self.normalize_type_application(&scrutinee)?;
+
+        match (pattern, &normalized_scrutinee) {
+            (namer::Pattern::Coproduct(pi, pattern), Type::Coproduct(coproduct)) => {
+                if let namer::Identifier::Free(constructor) = &pattern.constructor
+                    && let Some(signature) = coproduct.signature(constructor)
+                    && pattern.arguments.len() == signature.len()
+                {
+                    // I want to do something here to make sure that the signature
+                    // and the patterns match in count.
+
+                    let (substitutions, arguments) = signature
+                        .iter()
+                        .zip(&pattern.arguments)
+                        .map(|(scrutinee, pattern)| {
+                            self.infer_pattern(pattern, bindings, scrutinee)
+                        })
+                        .collect::<Typing<Vec<_>>>()?
+                        .into_iter()
+                        .fold(
+                            (Substitutions::default(), vec![]),
+                            |(substitutions, mut arguments), (sub, argument)| {
+                                (substitutions.compose(&sub), {
+                                    arguments.push(argument);
+                                    arguments
+                                })
+                            },
+                        );
+
+                    Ok((
+                        substitutions,
+                        Pattern::Coproduct(
+                            TypeInfo {
+                                parse_info: *pi,
+                                inferred_type: scrutinee.clone(),
+                            },
+                            ConstructorPattern {
+                                constructor: namer::Identifier::Free(constructor.clone()),
+                                arguments,
+                            },
+                        ),
+                    ))
+                } else {
+                    panic!("Bad coproduct deconstruction")
+                }
+            }
+
+            (namer::Pattern::Tuple(_pi, _pattern), _ty) => todo!(),
+
+            (namer::Pattern::Struct(_pi, _pattern), _ty) => todo!(),
+
+            // Check pattern at ty
+            (namer::Pattern::Literally(pi, pattern), ..) => {
+                let inferred = pattern.synthesize_type();
+                let subs = inferred.unifed_with(&scrutinee)?;
+
+                Ok((
+                    subs,
+                    Pattern::Literally(
+                        TypeInfo {
+                            parse_info: *pi,
+                            inferred_type: inferred,
+                        },
+                        pattern.clone(),
+                    ),
+                ))
+            }
+
+            (namer::Pattern::Bind(pi, pattern), ..) => {
+                bindings.insert(pattern.clone(), scrutinee.clone());
+                Ok((
+                    Substitutions::default(),
+                    Pattern::Bind(
+                        TypeInfo {
+                            parse_info: *pi,
+                            inferred_type: scrutinee.clone(),
+                        },
+                        pattern.clone(),
+                    ),
+                ))
+            }
+
+            (pattern, ty) => panic!("Type error. Illegal pattern."),
         }
     }
 
@@ -1353,7 +1534,7 @@ impl TypingContext {
 
         let candidates = self
             .types
-            .infer_coproduct_type_constructors(constructor_name)?;
+            .query_coproduct_type_constructors(constructor_name)?;
 
         let type_constructor = candidates
             // It could go for the first constructor that unifies
@@ -1432,7 +1613,7 @@ impl TypingContext {
 
         let type_constructors = self
             .types
-            .infer_record_type_constructor(&RecordShape::from_record_type(&record_type));
+            .query_record_type_constructor(&RecordShape::from_record_type(&record_type));
 
         let type_constructor = type_constructors
             .first()
@@ -1763,6 +1944,15 @@ impl TypingContext {
 
     fn free_variables(&self) -> HashSet<TypeParameter> {
         self.terms.free_variables()
+    }
+}
+
+impl Literal {
+    fn synthesize_type(&self) -> Type {
+        Type::Base(match self {
+            ast::Literal::Int(..) => BaseType::Int,
+            ast::Literal::Text(..) => BaseType::Text,
+        })
     }
 }
 

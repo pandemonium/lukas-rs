@@ -82,6 +82,10 @@ impl Expr<(), namer::Identifier> {
             Self::Sequence(_, the) => {
                 env.bind_and_then(the.this.reduce(env)?, |env| the.and_then.reduce(env))
             }
+
+            Self::Deconstruct(_, the) => {
+                todo!()
+            }
         }
     }
 }
