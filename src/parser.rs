@@ -24,6 +24,9 @@ pub type Sequence = ast::Sequence<ParseInfo, IdentifierPath>;
 pub type Deconstruct = ast::Deconstruct<ParseInfo, IdentifierPath>;
 pub type Pattern = ast::pattern::Pattern<ParseInfo, IdentifierPath>;
 pub type MatchClause = ast::pattern::MatchClause<ParseInfo, IdentifierPath>;
+pub type ConstructorPattern = ast::pattern::ConstructorPattern<ParseInfo, IdentifierPath>;
+pub type TuplePattern = ast::pattern::TuplePattern<ParseInfo, IdentifierPath>;
+pub type StructPattern = ast::pattern::StructPattern<ParseInfo, IdentifierPath>;
 pub type TypeExpression = ast::TypeExpression<ParseInfo, IdentifierPath>;
 
 impl Expr {
@@ -871,6 +874,8 @@ impl<'a> Parser<'a> {
 
             [t, ..] if t.is_keyword(Keyword::Let) => self.parse_local_binding(),
 
+            [t, ..] if t.is_keyword(Keyword::Deconstruct) => self.parse_deconstruct_into(),
+
             [
                 Token {
                     kind: TokenKind::LeftParen,
@@ -917,6 +922,7 @@ impl<'a> Parser<'a> {
             TokenKind::Layout(Layout::Dedent),
             TokenKind::Keyword(Keyword::Let),
             TokenKind::Keyword(Keyword::In),
+            TokenKind::Keyword(Keyword::Into),
             TokenKind::End,
         ];
 
@@ -1044,7 +1050,7 @@ impl<'a> Parser<'a> {
         lhs: Expr,
         operator_position: SourceLocation,
         context_precedence: usize,
-    ) -> result::Result<ast::Expr<ParseInfo, IdentifierPath>, Fault> {
+    ) -> Result<Expr> {
         let rhs = self.parse_expression(context_precedence)?;
         self.parse_expr_infix(
             Expr::Tuple(
@@ -1203,10 +1209,160 @@ impl<'a> Parser<'a> {
             signature,
         })
     }
+
+    fn parse_deconstruct_into(&mut self) -> Result<Expr> {
+        // deconstruct
+        self.advance(1);
+
+        let scrutinee = self.parse_block(|parser| parser.parse_expression(0))?;
+
+        self.expect(TokenKind::Keyword(Keyword::Into))?;
+
+        let mut match_clauses = vec![self.parse_match_clause()?];
+
+        while self.peek()?.kind == TokenKind::Pipe {
+            // |
+            self.advance(1);
+            match_clauses.push(self.parse_match_clause()?);
+        }
+
+        Ok(Expr::Deconstruct(
+            *scrutinee.parse_info(),
+            Deconstruct {
+                scrutinee: scrutinee.into(),
+                alternates: match_clauses,
+            },
+        ))
+    }
+
+    fn parse_match_clause(&mut self) -> Result<MatchClause> {
+        let pattern = self.parse_pattern()?;
+        self.expect(TokenKind::Arrow)?;
+        let consequent = self.parse_expression(0)?;
+        Ok(MatchClause {
+            pattern,
+            consequent: consequent.into(),
+        })
+    }
+
+    // parse_pattern_prefix/ parse_pattern_infix
+    //   or how does tuple parsing happen? Is that
+    //   the only infix continuation though? | too.
+    fn parse_pattern(&mut self) -> Result<Pattern> {
+        let prefix = self.parse_pattern_prefix()?;
+        self.parse_pattern_infix(prefix)
+    }
+
+    fn parse_pattern_prefix(&mut self) -> Result<Pattern> {
+        // 1. Coproduct: Constructor pat1 pat2 pat3
+        // 2. Record: { field1; field2: pat1 }
+        // 3. Tuple: patt1, patt2, patt3
+        // 4. Literal: "foo" 1
+        // 5. Bind: pat1
+        match self.remains() {
+            [
+                Token {
+                    kind: TokenKind::Identifier(id),
+                    ..
+                },
+                ..,
+            ] if is_capital_case(id) => self.parse_constructor_pattern(),
+
+            [
+                Token {
+                    kind: TokenKind::Identifier(..),
+                    ..
+                },
+                ..,
+            ] => self.parse_pattern_binder(),
+
+            [
+                Token {
+                    kind: TokenKind::LeftBrace,
+                    ..
+                },
+                ..,
+            ] => self.parse_struct_pattern(),
+
+            otherwise => panic!("{otherwise:?}"),
+        }
+    }
+
+    fn parse_pattern_infix(&mut self, lhs: Pattern) -> Result<Pattern> {
+        match self.remains() {
+            [t, ..] if t.kind == TokenKind::Comma => {
+                // ,
+                self.advance(1);
+                let rhs = self.parse_pattern()?;
+                self.parse_pattern_infix(Pattern::Tuple(
+                    ParseInfo::from_position(*t.location()),
+                    TuplePattern {
+                        elements: vec![lhs, rhs],
+                    },
+                ))
+            }
+
+            _otherwise => Ok(lhs),
+        }
+    }
+
+    fn parse_constructor_pattern(&mut self) -> Result<Pattern> {
+        let (pos, id) = self.identifier()?;
+        let mut arguments = vec![self.parse_pattern()?];
+
+        while !matches!(self.peek()?.kind, TokenKind::Arrow | TokenKind::Comma) {
+            arguments.push(self.parse_pattern()?);
+        }
+
+        Ok(Pattern::Coproduct(
+            ParseInfo::from_position(pos),
+            ConstructorPattern {
+                constructor: IdentifierPath::new(&id),
+                arguments,
+            },
+        ))
+    }
+
+    fn parse_pattern_binder(&mut self) -> Result<Pattern> {
+        let (pos, id) = self.identifier()?;
+        Ok(Pattern::Bind(
+            ParseInfo::from_position(pos),
+            IdentifierPath::new(&id),
+        ))
+    }
+
+    fn parse_struct_pattern(&mut self) -> Result<Pattern> {
+        // {
+        let brace_location = *self.consume()?.location();
+
+        let mut fields = vec![self.parse_struct_pattern_field()?];
+
+        while matches!(self.peek()?.kind, TokenKind::Semicolon) {
+            // ;
+            self.advance(1);
+            fields.push(self.parse_struct_pattern_field()?);
+        }
+
+        Ok(Pattern::Struct(
+            ParseInfo::from_position(brace_location),
+            StructPattern { fields },
+        ))
+    }
+
+    fn parse_struct_pattern_field(&mut self) -> Result<(Identifier, Pattern)> {
+        let (_pos, label) = self.identifier()?;
+        self.expect(TokenKind::Colon)?;
+        let pattern = self.parse_pattern()?;
+        Ok((Identifier::from_str(&label), pattern))
+    }
 }
 
 fn is_lowercase(id: &str) -> bool {
     id.chars().all(char::is_lowercase)
+}
+
+fn is_capital_case(id: &str) -> bool {
+    id.chars().nth(0).is_some_and(|c| c.is_uppercase())
 }
 
 impl TypeExpression {

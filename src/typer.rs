@@ -1500,7 +1500,7 @@ impl TypingContext {
                 ))
             }
 
-            (pattern, ty) => panic!("Type error. Illegal pattern."),
+            (_pattern, _ty) => panic!("Type error. Illegal pattern."),
         }
     }
 
