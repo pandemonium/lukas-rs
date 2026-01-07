@@ -756,7 +756,7 @@ struct DeBruijnIndex {
 
 impl DeBruijnIndex {
     fn mark(&mut self) {
-        self.restore_points.push(self.stack.len() - 1);
+        self.restore_points.push(self.stack.len());
     }
 
     fn restore(&mut self) {
