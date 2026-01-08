@@ -212,7 +212,10 @@ pub enum TypeError {
         projection: namer::Projection,
         inferred_type: Type,
     },
-    UndefinedName(Identifier),
+    UndefinedName {
+        parse_info: ParseInfo,
+        name: Identifier,
+    },
     UndefinedType(namer::QualifiedName),
     UndefinedTerm(SymbolName<namer::QualifiedName, namer::Identifier>),
     NoSuchRecordType(RecordType),
@@ -1291,7 +1294,10 @@ impl TypingContext {
                         inferred_type: self
                             .terms
                             .lookup(name)
-                            .ok_or_else(|| TypeError::UndefinedName(name.clone()))?
+                            .ok_or_else(|| TypeError::UndefinedName {
+                                parse_info: *pi,
+                                name: name.clone(),
+                            })?
                             .instantiate(),
                     },
                     name.clone(),
