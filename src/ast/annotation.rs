@@ -247,8 +247,8 @@ where
     {
         Deconstruct {
             scrutinee: self.scrutinee.map_annotation(f).into(),
-            alternates: self
-                .alternates
+            match_clauses: self
+                .match_clauses
                 .iter()
                 .map(|clause| MatchClause {
                     pattern: clause.pattern.map_annotation(f),

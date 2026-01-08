@@ -9,6 +9,7 @@ use crate::{
     ast::{
         self, CompilationUnit, Expr, ProductElement, Tree,
         namer::{self, CompilationContext, Identifier},
+        pattern::Pattern,
     },
     parser::ParseInfo,
     typer,
@@ -84,8 +85,87 @@ impl Expr<(), namer::Identifier> {
             }
 
             Self::Deconstruct(_, the) => {
-                todo!()
+                let scrutinee = the.scrutinee.reduce(env)?;
+                let (extraction, consequent) = the
+                    .match_clauses
+                    .iter()
+                    .find_map(|match_clause| {
+                        match_clause
+                            .pattern
+                            .deconstruct(&scrutinee)
+                            .map(|bindings| (bindings, Rc::clone(&match_clause.consequent)))
+                    })
+                    .ok_or_else(|| RuntimeError::ExpectedMatch)?;
+                env.bind_several_and_then(extraction.iter().map(|(_, v)| v.clone()), |env| {
+                    consequent.reduce(env)
+                })
             }
+        }
+    }
+}
+
+impl Pattern<(), namer::Identifier> {
+    fn deconstruct(&self, scrutinee: &Value) -> Option<Vec<(Identifier, Value)>> {
+        match (self, scrutinee) {
+            (
+                Self::Coproduct(_, pattern),
+                Value::Variant {
+                    constructor,
+                    arguments,
+                    ..
+                },
+            ) if &pattern.constructor == constructor
+                && arguments.len() == pattern.arguments.len() =>
+            {
+                let bindings = pattern
+                    .arguments
+                    .iter()
+                    .zip(arguments)
+                    .map(|(pattern, scrutinee)| pattern.deconstruct(scrutinee))
+                    .collect::<Option<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+
+                Some(bindings)
+            }
+
+            (Self::Tuple(_, pattern), Value::Product(elements)) => {
+                let bindings = pattern
+                    .elements
+                    .iter()
+                    .zip(elements)
+                    .map(|(pattern, scrutinee)| pattern.deconstruct(scrutinee))
+                    .collect::<Option<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+
+                Some(bindings)
+            }
+
+            (Self::Struct(_, pattern), Value::Product(field_values)) => {
+                let bindings = pattern
+                    .fields
+                    .iter()
+                    .map(|(_, pattern)| pattern)
+                    .zip(field_values)
+                    .map(|(pattern, scrutinee)| pattern.deconstruct(scrutinee))
+                    .collect::<Option<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+
+                Some(bindings)
+            }
+
+            (pattern @ Self::Literally(..), scrutinee @ Value::Constant(..)) => {
+                pattern.deconstruct(scrutinee)
+            }
+
+            (Self::Bind(_, binder), x) => Some(vec![(binder.clone(), x.clone())]),
+
+            _otherwise => None,
         }
     }
 }
@@ -101,6 +181,7 @@ fn apply_closure(closure: Rc<RefCell<Closure>>, argument: Value) -> Interpretati
 pub enum RuntimeError {
     NoSuchSymbol(Identifier),
     ExpectedClosure(Value),
+    ExpectedMatch,
 }
 
 pub type Interpretation<A = Value> = Result<A, RuntimeError>;
@@ -124,7 +205,7 @@ impl Environment {
         if let Some(Value::Closure(closure)) = symbol {
             apply_closure(closure, Value::Constant(argument.into())).unwrap()
         } else {
-            // It did not find __root__/start
+            // It did not find Root/start
             panic!("{symbol:?}")
         }
     }
@@ -141,6 +222,27 @@ impl Environment {
 
         {
             self.inner.borrow_mut().locals.pop();
+        }
+
+        v
+    }
+
+    fn bind_several_and_then<F, A>(&self, xs: impl Iterator<Item = Value>, mut block: F) -> A
+    where
+        F: FnMut(&Self) -> A,
+    {
+        let count = {
+            let values = &mut self.inner.borrow_mut().locals;
+            let baseline = values.len();
+            values.extend(xs);
+            values.len() - baseline
+        };
+
+        let v = block(self);
+
+        {
+            let values = &mut self.inner.borrow_mut().locals;
+            values.truncate(values.len() - count);
         }
 
         v

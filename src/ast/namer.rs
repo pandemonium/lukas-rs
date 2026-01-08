@@ -945,8 +945,8 @@ impl parser::Expr {
                 a,
                 parser::Deconstruct {
                     scrutinee: map_lower_tuples(deconstruct.scrutinee),
-                    alternates: deconstruct
-                        .alternates
+                    match_clauses: deconstruct
+                        .match_clauses
                         .iter()
                         .map(|clause| parser::MatchClause {
                             pattern: clause.pattern.clone(),
@@ -1139,8 +1139,8 @@ impl parser::Deconstruct {
     ) -> Deconstruct {
         Deconstruct {
             scrutinee: self.scrutinee.resolve(names, symbols).into(),
-            alternates: self
-                .alternates
+            match_clauses: self
+                .match_clauses
                 .iter()
                 .map(|clause| clause.resolve(names, symbols))
                 .collect(),

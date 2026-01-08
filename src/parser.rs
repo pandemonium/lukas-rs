@@ -1230,7 +1230,7 @@ impl<'a> Parser<'a> {
             *scrutinee.parse_info(),
             Deconstruct {
                 scrutinee: scrutinee.into(),
-                alternates: match_clauses,
+                match_clauses,
             },
         ))
     }
@@ -1245,9 +1245,6 @@ impl<'a> Parser<'a> {
         })
     }
 
-    // parse_pattern_prefix/ parse_pattern_infix
-    //   or how does tuple parsing happen? Is that
-    //   the only infix continuation though? | too.
     fn parse_pattern(&mut self) -> Result<Pattern> {
         let prefix = self.parse_pattern_prefix()?;
         self.parse_pattern_infix(prefix)

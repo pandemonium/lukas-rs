@@ -1345,10 +1345,10 @@ impl TypingContext {
     fn infer_deconstruction(&mut self, pi: ParseInfo, deconstruct: &namer::Deconstruct) -> Typing {
         let (mut substitutions, scrutinee) = self.infer_expr(&deconstruct.scrutinee)?;
         let scrutinee_type = &scrutinee.type_info().inferred_type;
-        let mut alternates = deconstruct.alternates.iter();
-        let mut typed_alternates = Vec::with_capacity(deconstruct.alternates.len());
+        let mut match_clauses = deconstruct.match_clauses.iter();
+        let mut typed_match_clauses = Vec::with_capacity(deconstruct.match_clauses.len());
 
-        if let Some(clause) = alternates.next() {
+        if let Some(clause) = match_clauses.next() {
             let mut consequent_type = {
                 let mut clause_ctx = self.clone();
                 let mut bindings = HashMap::default();
@@ -1364,14 +1364,14 @@ impl TypingContext {
                     .type_info()
                     .inferred_type
                     .with_substitutions(&substitutions);
-                typed_alternates.push(MatchClause {
+                typed_match_clauses.push(MatchClause {
                     pattern,
                     consequent: expr.into(),
                 });
                 consequent_type
             };
 
-            for clause in alternates {
+            for clause in match_clauses {
                 let mut clause_ctx = self.clone();
                 let mut bindings = HashMap::default();
                 let (subs1, pattern) =
@@ -1388,7 +1388,7 @@ impl TypingContext {
                     .with_substitutions(&substitutions)
                     .unifed_with(&consequent_type)?;
                 consequent_type = consequent_type.with_substitutions(&subs);
-                typed_alternates.push(MatchClause {
+                typed_match_clauses.push(MatchClause {
                     pattern,
                     consequent: expr.into(),
                 });
@@ -1403,7 +1403,7 @@ impl TypingContext {
                     },
                     Deconstruct {
                         scrutinee: scrutinee.clone().into(),
-                        alternates: typed_alternates,
+                        match_clauses: typed_match_clauses,
                     },
                 ),
             ))

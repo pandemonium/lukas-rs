@@ -185,7 +185,7 @@ impl<A, Id> Expr<A, Id> {
 #[derive(Debug, Clone)]
 pub struct Deconstruct<A, Id> {
     pub scrutinee: Tree<A, Id>,
-    pub alternates: Vec<pattern::MatchClause<A, Id>>,
+    pub match_clauses: Vec<pattern::MatchClause<A, Id>>,
 }
 
 #[derive(Debug, Clone)]
@@ -313,11 +313,11 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             scrutinee,
-            alternates: alternatives,
+            match_clauses,
         } = self;
         write!(f, "deconstruct {scrutinee}:")?;
 
-        for clause in alternatives {
+        for clause in match_clauses {
             write!(f, "| {} -> {}", clause.pattern, clause.consequent)?;
         }
 
