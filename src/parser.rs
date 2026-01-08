@@ -1216,7 +1216,7 @@ impl<'a> Parser<'a> {
     fn parse_deconstruct_into(&mut self) -> Result<Expr> {
         let _t = self.trace();
         // deconstruct
-        let deconstruct = *self.consume()?.location();
+        let _deconstruct = *self.consume()?.location();
 
         let scrutinee = self.parse_block(|parser| parser.parse_expression(0))?;
 
@@ -1412,6 +1412,10 @@ impl<'a> Parser<'a> {
             self.advance(1);
             fields.push(self.parse_struct_pattern_field()?);
         }
+
+        self.expect(TokenKind::RightBrace)?;
+
+        fields.sort_by(|t, u| t.0.cmp(&u.0));
 
         Ok(Pattern::Struct(
             ParseInfo::from_position(brace_location),

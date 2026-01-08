@@ -37,6 +37,7 @@ pub type Deconstruct = ast::Deconstruct<TypeInfo, namer::Identifier>;
 pub type MatchClause = ast::pattern::MatchClause<TypeInfo, namer::Identifier>;
 pub type Pattern = ast::pattern::Pattern<TypeInfo, namer::Identifier>;
 pub type ConstructorPattern = ast::pattern::ConstructorPattern<TypeInfo, namer::Identifier>;
+pub type StructPattern = ast::pattern::StructPattern<TypeInfo, namer::Identifier>;
 
 pub type RecordSymbol = namer::RecordSymbol<namer::QualifiedName>;
 pub type CoproductSymbol = namer::CoproductSymbol<namer::QualifiedName>;
@@ -233,6 +234,10 @@ pub enum TypeError {
         base: ast::Expr<ParseInfo, Identifier>,
         select: ProductElement,
     },
+    BadRecordPatternField {
+        record_type: Type,
+        field: parser::Identifier,
+    },
 }
 
 pub type Typing<A = (Substitutions, Expr)> = Result<A, TypeError>;
@@ -276,6 +281,14 @@ impl RecordType {
                 .map(|(id, t)| (id, t.with_substitutions(subs)))
                 .collect(),
         )
+    }
+
+    fn arity(&self) -> usize {
+        self.0.len()
+    }
+
+    fn fields(&self) -> &[(parser::Identifier, Type)] {
+        &self.0
     }
 }
 
@@ -1357,7 +1370,7 @@ impl TypingContext {
         if let Some(clause) = match_clauses.next() {
             let mut consequent_type = {
                 let mut clause_ctx = self.clone();
-                let mut bindings = HashMap::default();
+                let mut bindings = Vec::default();
                 let (subs1, pattern) =
                     clause_ctx.infer_pattern(&clause.pattern, &mut bindings, scrutinee_type)?;
                 let mut clause_ctx = clause_ctx.with_substitutions(&subs1);
@@ -1379,7 +1392,7 @@ impl TypingContext {
 
             for clause in match_clauses {
                 let mut clause_ctx = self.clone();
-                let mut bindings = HashMap::default();
+                let mut bindings = Vec::default();
                 let (subs1, pattern) =
                     clause_ctx.infer_pattern(&clause.pattern, &mut bindings, scrutinee_type)?;
                 let mut clause_ctx = clause_ctx.with_substitutions(&subs1);
@@ -1421,7 +1434,7 @@ impl TypingContext {
     fn infer_pattern(
         &mut self,
         pattern: &namer::Pattern,
-        bindings: &mut HashMap<namer::Identifier, Type>,
+        bindings: &mut Vec<(namer::Identifier, Type)>,
         scrutinee: &Type,
     ) -> Typing<(Substitutions, Pattern)> {
         let normalized_scrutinee = self.normalize_type_application(&scrutinee)?;
@@ -1432,26 +1445,14 @@ impl TypingContext {
                     && let Some(signature) = coproduct.signature(constructor)
                     && pattern.arguments.len() == signature.len()
                 {
-                    // I want to do something here to make sure that the signature
-                    // and the patterns match in count.
+                    let mut arguments = Vec::with_capacity(signature.len());
+                    let mut substitutions = Substitutions::default();
 
-                    let (substitutions, arguments) = signature
-                        .iter()
-                        .zip(&pattern.arguments)
-                        .map(|(scrutinee, pattern)| {
-                            self.infer_pattern(pattern, bindings, scrutinee)
-                        })
-                        .collect::<Typing<Vec<_>>>()?
-                        .into_iter()
-                        .fold(
-                            (Substitutions::default(), vec![]),
-                            |(substitutions, mut arguments), (sub, argument)| {
-                                (substitutions.compose(&sub), {
-                                    arguments.push(argument);
-                                    arguments
-                                })
-                            },
-                        );
+                    for (scrutinee, pattern) in signature.iter().zip(&pattern.arguments) {
+                        let (subs, argument) = self.infer_pattern(pattern, bindings, scrutinee)?;
+                        arguments.push(argument);
+                        substitutions = substitutions.compose(&subs);
+                    }
 
                     Ok((
                         substitutions,
@@ -1471,9 +1472,47 @@ impl TypingContext {
                 }
             }
 
-            (namer::Pattern::Tuple(_pi, _pattern), _ty) => todo!(),
+            (namer::Pattern::Tuple(_pi, _pattern), _ty) => {
+                todo!()
+            }
 
-            (namer::Pattern::Struct(_pi, _pattern), _ty) => todo!(),
+            (namer::Pattern::Struct(pi, pattern), Type::Record(record))
+                if pattern.fields.len() == record.arity() =>
+            {
+                let mut pattern = pattern.fields.iter().cloned().collect::<Vec<_>>();
+                //                pattern.sort_by(|t, u| t.0.cmp(&u.0));
+
+                println!("infer_pattern: {:?}", pattern);
+
+                let mut arguments = Vec::with_capacity(record.arity());
+                let mut substitutions = Substitutions::default();
+
+                for ((pattern_field, pattern), (scrutinee_field, scrutinee)) in
+                    pattern.iter().zip(record.fields().iter())
+                {
+                    if pattern_field != scrutinee_field {
+                        Err(TypeError::BadRecordPatternField {
+                            record_type: scrutinee.clone(),
+                            field: pattern_field.clone(),
+                        })?;
+                    }
+
+                    let (subs, pattern) = self.infer_pattern(pattern, bindings, scrutinee)?;
+                    arguments.push((pattern_field.clone(), pattern));
+                    substitutions = substitutions.compose(&subs);
+                }
+
+                Ok((
+                    substitutions,
+                    Pattern::Struct(
+                        TypeInfo {
+                            parse_info: *pi,
+                            inferred_type: scrutinee.clone(),
+                        },
+                        StructPattern { fields: arguments },
+                    ),
+                ))
+            }
 
             // Check pattern at ty
             (namer::Pattern::Literally(pi, pattern), ..) => {
@@ -1493,7 +1532,7 @@ impl TypingContext {
             }
 
             (namer::Pattern::Bind(pi, pattern), ..) => {
-                bindings.insert(pattern.clone(), scrutinee.clone());
+                bindings.push((pattern.clone(), scrutinee.clone()));
                 Ok((
                     Substitutions::default(),
                     Pattern::Bind(
@@ -1518,13 +1557,13 @@ impl TypingContext {
         let (substitutions, typed_arguments, argument_types) =
             self.infer_several(&construct.arguments)?;
 
-        for ty in &typed_arguments {
-            println!("infer_coproduct_construct: typed argument {}", ty);
-        }
-
-        for x in &argument_types {
-            println!("infer_coproduct_construct: argument type {}", x);
-        }
+        //        for ty in &typed_arguments {
+        //            println!("infer_coproduct_construct: typed argument {}", ty);
+        //        }
+        //
+        //        for x in &argument_types {
+        //            println!("infer_coproduct_construct: argument type {}", x);
+        //        }
 
         // Does it try more than one alternative if there are more? Pick the one
         // with the best type? I could encode the name of the type constructor

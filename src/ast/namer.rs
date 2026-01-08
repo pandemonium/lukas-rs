@@ -112,10 +112,7 @@ impl<A> ast::Expr<A, Identifier> {
                 }
             }
 
-            otherwise => {
-                println!("gather_free_variables: ignoring {otherwise}");
-                ()
-            }
+            otherwise => (),
         }
     }
 }
