@@ -117,50 +117,46 @@ impl Pattern<(), namer::Identifier> {
             ) if &pattern.constructor == constructor
                 && arguments.len() == pattern.arguments.len() =>
             {
-                let bindings = pattern
-                    .arguments
-                    .iter()
-                    .zip(arguments)
-                    .map(|(pattern, scrutinee)| pattern.deconstruct(scrutinee))
-                    .collect::<Option<Vec<_>>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>();
+                let mut bindings = Vec::with_capacity(arguments.len());
+
+                for (pattern, scrutinee) in pattern.arguments.iter().zip(arguments) {
+                    bindings.extend(pattern.deconstruct(scrutinee)?);
+                }
 
                 Some(bindings)
             }
 
-            (Self::Tuple(_, pattern), Value::Product(elements)) => {
-                let bindings = pattern
-                    .elements
-                    .iter()
-                    .zip(elements)
-                    .map(|(pattern, scrutinee)| pattern.deconstruct(scrutinee))
-                    .collect::<Option<Vec<_>>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>();
+            (Self::Tuple(_, pattern), Value::Product(elements))
+                if pattern.elements.len() == elements.len() =>
+            {
+                let mut bindings = Vec::with_capacity(elements.len());
+
+                for (pattern, scrutinee) in pattern.elements.iter().zip(elements) {
+                    bindings.extend(pattern.deconstruct(scrutinee)?);
+                }
 
                 Some(bindings)
             }
 
-            (Self::Struct(_, pattern), Value::Product(field_values)) => {
-                let bindings = pattern
+            (Self::Struct(_, pattern), Value::Product(field_values))
+                if pattern.fields.len() == field_values.len() =>
+            {
+                let mut bindings = Vec::with_capacity(field_values.len());
+
+                for (pattern, scrutinee) in pattern
                     .fields
                     .iter()
                     .map(|(_, pattern)| pattern)
                     .zip(field_values)
-                    .map(|(pattern, scrutinee)| pattern.deconstruct(scrutinee))
-                    .collect::<Option<Vec<_>>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>();
+                {
+                    bindings.extend(pattern.deconstruct(scrutinee)?);
+                }
 
                 Some(bindings)
             }
 
-            (pattern @ Self::Literally(..), scrutinee @ Value::Constant(..)) => {
-                pattern.deconstruct(scrutinee)
+            (Self::Literally(_, lhs), Value::Constant(rhs)) => {
+                (&Literal::from(lhs.clone()) == rhs).then_some(vec![])
             }
 
             (Self::Bind(_, binder), x) => Some(vec![(binder.clone(), x.clone())]),
@@ -324,7 +320,7 @@ pub enum Value {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Literal {
     Int(i64),
     Text(String),

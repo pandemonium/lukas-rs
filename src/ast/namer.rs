@@ -86,7 +86,36 @@ impl<A> ast::Expr<A, Identifier> {
 
             Self::Project(_, projection) => projection.base.gather_free_variables(free),
 
-            _otherwise => (),
+            Self::Construct(
+                _,
+                ast::Construct {
+                    constructor: Identifier::Free(id),
+                    arguments,
+                },
+            ) => {
+                free.insert(id);
+                for arg in arguments {
+                    arg.gather_free_variables(free);
+                }
+            }
+
+            Self::Deconstruct(
+                _,
+                ast::Deconstruct {
+                    scrutinee,
+                    match_clauses,
+                },
+            ) => {
+                scrutinee.gather_free_variables(free);
+                for clause in match_clauses {
+                    clause.consequent.gather_free_variables(free);
+                }
+            }
+
+            otherwise => {
+                println!("gather_free_variables: ignoring {otherwise}");
+                ()
+            }
         }
     }
 }
@@ -158,24 +187,23 @@ pub struct QualifiedNameExpr {
 }
 
 impl QualifiedNameExpr {
-    fn into_expression(self, parse_info: ParseInfo) -> Expr {
+    fn into_projection(self, pi: ParseInfo) -> Expr {
         let path = QualifiedName {
             module: self.module_prefix,
             member: parser::Identifier::from_str(&self.member),
         };
 
-        self.member_suffix.iter().fold(
-            Expr::Variable(parse_info, Identifier::Free(path)),
-            |base, field| {
+        self.member_suffix
+            .iter()
+            .fold(Expr::Variable(pi, Identifier::Free(path)), |base, field| {
                 ast::Expr::Project(
-                    parse_info,
+                    pi,
                     ast::Projection {
                         base: base.into(),
                         select: ProductElement::Name(parser::Identifier::from_str(field.as_str())),
                     },
                 )
-            },
-        )
+            })
     }
 
     pub fn into_member_path(self) -> QualifiedName {
@@ -621,6 +649,7 @@ impl ConstructorSymbol<parser::IdentifierPath> {
         pi: &ParseInfo,
         type_parameters: &Vec<parser::Identifier>,
     ) -> TermSymbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath> {
+        println!("make_constructor_term: name {}", self.name);
         TermSymbol {
             name: self.name.clone(),
             type_signature: Some(TypeSignature {
@@ -628,7 +657,6 @@ impl ConstructorSymbol<parser::IdentifierPath> {
                 body: parser::TypeExpression::Tuple(*pi, TupleTypeExpr(self.signature.clone())),
                 phase: PhantomData,
             }),
-            //            body: self.make_tuple_argument_lambda(*pi),
             body: self.make_curried_argument_lambda(*pi).into(),
         }
     }
@@ -756,10 +784,16 @@ struct DeBruijnIndex {
 
 impl DeBruijnIndex {
     fn mark(&mut self) {
+        println!("mark: push restore point {}", self.stack.len());
         self.restore_points.push(self.stack.len());
     }
 
     fn restore(&mut self) {
+        println!(
+            "restore: len {}, restore to: {}",
+            self.stack.len(),
+            self.restore_points.last().unwrap()
+        );
         self.stack.truncate(
             self.restore_points
                 .pop()
@@ -796,6 +830,7 @@ impl DeBruijnIndex {
 
     fn bind(&mut self, id: parser::Identifier) -> usize {
         let de_bruijn_index = self.stack.len();
+        println!("Push {de_bruijn_index}");
         self.stack.push(id);
         de_bruijn_index
     }
@@ -972,9 +1007,13 @@ impl parser::Expr {
                 } else if let Some(name) = identifier_path.try_as_simple() {
                     Expr::Variable(*a, names.resolve(&name))
                 } else if let Some(path) =
-                    symbols.resolve_module_path_expr(&identifier_path.as_root_module_member())
+                    // I guess this would have to resolve the this name against every
+                    // imported namespace
+                    symbols.resolve_module_path_expr(
+                        &identifier_path.as_root_module_member(),
+                    )
                 {
-                    path.into_expression(*a)
+                    path.into_projection(*a)
                 } else {
                     panic!("Unresolved symbol {}", identifier_path)
                 }
@@ -1177,7 +1216,8 @@ impl parser::Pattern {
                 *a,
                 ConstructorPattern {
                     constructor: Identifier::Free(
-                        symbols.resolve_member_path(&pattern.constructor),
+                        // Resolve this against imported namespaces
+                        symbols.resolve_member_path(&pattern.constructor.as_root_module_member()),
                     ),
                     arguments: pattern
                         .arguments

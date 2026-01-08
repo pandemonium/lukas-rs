@@ -899,6 +899,7 @@ impl<'a> Parser<'a> {
             kind,
             TokenKind::Layout(Layout::Dedent | Layout::Indent | Layout::Newline)
                 | TokenKind::RightBrace
+                | TokenKind::Pipe
                 | TokenKind::End
                 | TokenKind::Keyword(
                     Keyword::And
@@ -919,6 +920,7 @@ impl<'a> Parser<'a> {
         let terminals = [
             TokenKind::RightParen,
             TokenKind::Semicolon,
+            TokenKind::Pipe,
             TokenKind::Layout(Layout::Dedent),
             TokenKind::Keyword(Keyword::Let),
             TokenKind::Keyword(Keyword::In),
@@ -963,9 +965,10 @@ impl<'a> Parser<'a> {
             // f x
             [t, u, ..]
                 if Self::is_expr_prefix(&t.kind)
+                    && u.kind != TokenKind::Assign
                     && Operator::Juxtaposition.precedence() > context_precedence =>
             {
-                //                println!("Calling parse_juxtaposed(2)");
+                println!("Calling parse_juxtaposed(2) with u {u:?}");
                 self.parse_juxtaposed(lhs, context_precedence)
             }
 
@@ -1211,18 +1214,51 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_deconstruct_into(&mut self) -> Result<Expr> {
+        let _t = self.trace();
         // deconstruct
-        self.advance(1);
+        let deconstruct = *self.consume()?.location();
 
         let scrutinee = self.parse_block(|parser| parser.parse_expression(0))?;
 
         self.expect(TokenKind::Keyword(Keyword::Into))?;
 
-        let mut match_clauses = vec![self.parse_match_clause()?];
-
-        while self.peek()?.kind == TokenKind::Pipe {
-            // |
+        // Annoying
+        if self.peek()?.is_indent() {
             self.advance(1);
+        }
+
+        let mut match_clauses = vec![self.parse_match_clause()?];
+        println!("parse_deconstruct_into: parsed match clause");
+
+        // Annoying
+        if self.peek()?.is_dedent() {
+            self.advance(1);
+        }
+
+        let is_match_clause_separator = |remains: &[Token]| match remains {
+            [
+                Token {
+                    kind: TokenKind::Pipe,
+                    ..
+                },
+                ..,
+            ] => Some(1),
+
+            [
+                t,
+                Token {
+                    kind: TokenKind::Pipe,
+                    ..
+                },
+                ..,
+            ] if t.is_layout() => Some(2),
+
+            _ => None,
+        };
+
+        while let Some(separator) = is_match_clause_separator(self.remains()) {
+            // |
+            self.advance(separator);
             match_clauses.push(self.parse_match_clause()?);
         }
 
@@ -1236,6 +1272,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_match_clause(&mut self) -> Result<MatchClause> {
+        let _t = self.trace();
+
         let pattern = self.parse_pattern()?;
         self.expect(TokenKind::Arrow)?;
         let consequent = self.parse_expression(0)?;
@@ -1246,11 +1284,15 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern> {
+        let _t = self.trace();
+
         let prefix = self.parse_pattern_prefix()?;
         self.parse_pattern_infix(prefix)
     }
 
     fn parse_pattern_prefix(&mut self) -> Result<Pattern> {
+        let _t = self.trace();
+
         // 1. Coproduct: Constructor pat1 pat2 pat3
         // 2. Record: { field1; field2: pat1 }
         // 3. Tuple: patt1, patt2, patt3
@@ -1281,11 +1323,21 @@ impl<'a> Parser<'a> {
                 ..,
             ] => self.parse_struct_pattern(),
 
+            [
+                Token {
+                    kind: TokenKind::Literal(literal),
+                    position,
+                },
+                ..,
+            ] => self.parse_literal_pattern(*position, literal),
+
             otherwise => panic!("{otherwise:?}"),
         }
     }
 
     fn parse_pattern_infix(&mut self, lhs: Pattern) -> Result<Pattern> {
+        let _t = self.trace();
+
         match self.remains() {
             [t, ..] if t.kind == TokenKind::Comma => {
                 // ,
@@ -1304,6 +1356,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_constructor_pattern(&mut self) -> Result<Pattern> {
+        let _t = self.trace();
+
         let (pos, id) = self.identifier()?;
         let mut arguments = vec![self.parse_pattern()?];
 
@@ -1320,7 +1374,24 @@ impl<'a> Parser<'a> {
         ))
     }
 
+    fn parse_literal_pattern(
+        &mut self,
+        position: SourceLocation,
+        literal: &Literal,
+    ) -> Result<Pattern> {
+        let _t = self.trace();
+
+        // the literal
+        self.advance(1);
+        Ok(Pattern::Literally(
+            ParseInfo::from_position(position),
+            literal.clone().into(),
+        ))
+    }
+
     fn parse_pattern_binder(&mut self) -> Result<Pattern> {
+        let _t = self.trace();
+
         let (pos, id) = self.identifier()?;
         Ok(Pattern::Bind(
             ParseInfo::from_position(pos),
@@ -1329,6 +1400,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_struct_pattern(&mut self) -> Result<Pattern> {
+        let _t = self.trace();
+
         // {
         let brace_location = *self.consume()?.location();
 
@@ -1347,6 +1420,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_struct_pattern_field(&mut self) -> Result<(Identifier, Pattern)> {
+        let _t = self.trace();
+
         let (_pos, label) = self.identifier()?;
         self.expect(TokenKind::Colon)?;
         let pattern = self.parse_pattern()?;
