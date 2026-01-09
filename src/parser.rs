@@ -1275,6 +1275,7 @@ impl<'a> Parser<'a> {
         let _t = self.trace();
 
         let pattern = self.parse_pattern()?;
+
         self.expect(TokenKind::Arrow)?;
         let consequent = self.parse_expression(0)?;
         Ok(MatchClause {
@@ -1359,10 +1360,13 @@ impl<'a> Parser<'a> {
         let _t = self.trace();
 
         let (pos, id) = self.identifier()?;
-        let mut arguments = vec![self.parse_pattern()?];
+        let mut arguments = vec![self.parse_pattern_prefix()?];
 
-        while !matches!(self.peek()?.kind, TokenKind::Arrow | TokenKind::Comma) {
-            arguments.push(self.parse_pattern()?);
+        while !matches!(
+            self.peek()?.kind,
+            TokenKind::Arrow | TokenKind::Comma | TokenKind::RightBrace
+        ) {
+            arguments.push(self.parse_pattern_prefix()?);
         }
 
         Ok(Pattern::Coproduct(
@@ -1439,6 +1443,55 @@ fn is_lowercase(id: &str) -> bool {
 
 fn is_capital_case(id: &str) -> bool {
     id.chars().nth(0).is_some_and(|c| c.is_uppercase())
+}
+
+impl Pattern {
+    pub fn normalize(&self) -> Pattern {
+        match self {
+            Self::Coproduct(
+                pi,
+                ConstructorPattern {
+                    constructor,
+                    arguments,
+                },
+            ) => Self::Coproduct(
+                *pi,
+                ConstructorPattern {
+                    constructor: constructor.clone(),
+                    arguments: arguments.iter().map(|p| p.normalize()).collect(),
+                },
+            ),
+
+            Self::Tuple(pi, TuplePattern { elements }) => Self::Tuple(
+                *pi,
+                TuplePattern {
+                    elements: unspine_tuple_pattern(elements.clone()),
+                },
+            ),
+
+            Self::Struct(pi, StructPattern { fields }) => Self::Struct(
+                *pi,
+                StructPattern {
+                    fields: fields
+                        .iter()
+                        .map(|(field, pattern)| (field.clone(), pattern.normalize()))
+                        .collect(),
+                },
+            ),
+
+            Self::Literally(..) | Self::Bind(..) => self.clone(),
+        }
+    }
+}
+
+fn unspine_tuple_pattern(elements: Vec<Pattern>) -> Vec<Pattern> {
+    elements
+        .into_iter()
+        .flat_map(|p| match p {
+            Pattern::Tuple(_, pattern) => pattern.elements,
+            atom => vec![atom],
+        })
+        .collect()
 }
 
 impl TypeExpression {

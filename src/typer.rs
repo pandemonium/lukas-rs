@@ -38,6 +38,7 @@ pub type MatchClause = ast::pattern::MatchClause<TypeInfo, namer::Identifier>;
 pub type Pattern = ast::pattern::Pattern<TypeInfo, namer::Identifier>;
 pub type ConstructorPattern = ast::pattern::ConstructorPattern<TypeInfo, namer::Identifier>;
 pub type StructPattern = ast::pattern::StructPattern<TypeInfo, namer::Identifier>;
+pub type TuplePattern = ast::pattern::TuplePattern<TypeInfo, namer::Identifier>;
 
 pub type RecordSymbol = namer::RecordSymbol<namer::QualifiedName>;
 pub type CoproductSymbol = namer::CoproductSymbol<namer::QualifiedName>;
@@ -201,7 +202,7 @@ where
 
 #[derive(Debug)]
 pub enum TypeError {
-    Unification {
+    UnificationImpossible {
         lhs: Type,
         rhs: Type,
     },
@@ -523,7 +524,7 @@ impl Type {
 
                 (lhs, rhs) if lhs == rhs => Ok(Substitutions::default()),
 
-                otherwise => panic!("{otherwise:?}"),
+                (lhs, rhs) => Err(TypeError::UnificationImpossible { lhs: lhs.clone(), rhs: rhs.clone() }),
             }
     }
 
@@ -1472,23 +1473,38 @@ impl TypingContext {
                 }
             }
 
-            (namer::Pattern::Tuple(_pi, _pattern), _ty) => {
-                todo!()
+            (namer::Pattern::Tuple(pi, pattern), Type::Tuple(tuple))
+                if pattern.elements.len() == tuple.arity() =>
+            {
+                let mut elements = Vec::with_capacity(tuple.arity());
+                let mut substitutions = Substitutions::default();
+
+                for (pattern, scrutinee) in pattern.elements.iter().zip(tuple.elements()) {
+                    let (subs, element) = self.infer_pattern(pattern, bindings, scrutinee)?;
+                    elements.push(element);
+                    substitutions = substitutions.compose(&subs);
+                }
+
+                Ok((
+                    substitutions,
+                    Pattern::Tuple(
+                        TypeInfo {
+                            parse_info: *pi,
+                            inferred_type: scrutinee.clone(),
+                        },
+                        TuplePattern { elements },
+                    ),
+                ))
             }
 
             (namer::Pattern::Struct(pi, pattern), Type::Record(record))
                 if pattern.fields.len() == record.arity() =>
             {
-                let mut pattern = pattern.fields.iter().cloned().collect::<Vec<_>>();
-                //                pattern.sort_by(|t, u| t.0.cmp(&u.0));
-
-                println!("infer_pattern: {:?}", pattern);
-
                 let mut arguments = Vec::with_capacity(record.arity());
                 let mut substitutions = Substitutions::default();
 
                 for ((pattern_field, pattern), (scrutinee_field, scrutinee)) in
-                    pattern.iter().zip(record.fields().iter())
+                    (&pattern.fields).iter().zip(record.fields().iter())
                 {
                     if pattern_field != scrutinee_field {
                         Err(TypeError::BadRecordPatternField {
@@ -1545,7 +1561,7 @@ impl TypingContext {
                 ))
             }
 
-            (_pattern, _ty) => panic!("Type error. Illegal pattern."),
+            (pattern, ty) => panic!("Type error. Illegal pattern. {pattern:?} {ty}"),
         }
     }
 

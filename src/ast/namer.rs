@@ -112,7 +112,7 @@ impl<A> ast::Expr<A, Identifier> {
                 }
             }
 
-            otherwise => (),
+            _otherwise => (),
         }
     }
 }
@@ -981,7 +981,7 @@ impl parser::Expr {
                         .match_clauses
                         .iter()
                         .map(|clause| parser::MatchClause {
-                            pattern: clause.pattern.clone(),
+                            pattern: clause.pattern.normalize(),
                             consequent: map_lower_tuples(clause.consequent.clone()),
                         })
                         .collect(),
@@ -1038,6 +1038,7 @@ fn unspine_tuple(
     elements
         .into_iter()
         .flat_map(|e| match (*e).clone() {
+            // This is probably not correct - it flattens too much
             parser::Expr::Tuple(_, tuple) => unspine_tuple(tuple.elements.to_vec()),
             atom => vec![atom.into()],
         })
