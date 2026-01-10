@@ -10,7 +10,7 @@ use std::{
 use crate::{
     ast::{
         self, ApplyTypeExpr, ArrowTypeExpr, CompilationUnit, Declaration, ProductElement, Tree,
-        TupleTypeExpr, TypeSignature,
+        TupleTypeExpr,
         pattern::{StructPattern, TuplePattern},
     },
     parser::{self, IdentifierPath, ParseInfo},
@@ -32,6 +32,7 @@ pub type MatchClause = ast::pattern::MatchClause<ParseInfo, Identifier>;
 pub type Pattern = ast::pattern::Pattern<ParseInfo, Identifier>;
 pub type ConstructorPattern = ast::pattern::ConstructorPattern<ParseInfo, Identifier>;
 pub type TypeExpression = ast::TypeExpression<ParseInfo, QualifiedName>;
+pub type TypeSignature = ast::TypeSignature<ParseInfo, QualifiedName>;
 
 type ParserTermId = SymbolName<parser::IdentifierPath, parser::IdentifierPath>;
 type ParserCompilationContext =
@@ -464,8 +465,9 @@ impl ParserCompilationContext {
 
                             collect_coproduct_constructors(
                                 symbols,
-                                pi,
+                                *pi,
                                 type_parameters,
+                                &name,
                                 &constructors,
                             );
 
@@ -490,12 +492,13 @@ impl ParserCompilationContext {
 
 fn collect_coproduct_constructors(
     symbols: &mut HashMap<SymbolName<parser::IdentifierPath, parser::IdentifierPath>, ParserSymbol>,
-    pi: &ParseInfo,
+    pi: ParseInfo,
     type_parameters: &Vec<parser::Identifier>,
+    type_constructor_name: &parser::IdentifierPath,
     constructors: &Vec<ConstructorSymbol<parser::IdentifierPath>>,
 ) {
     for constructor in constructors {
-        let symbol = constructor.make_constructor_term(pi, type_parameters);
+        let symbol = constructor.make_constructor_term(pi, type_parameters, type_constructor_name);
         symbols.insert(
             SymbolName::Term(constructor.name.clone()),
             Symbol::Term(symbol),
@@ -637,31 +640,72 @@ pub struct CoproductSymbol<GlobalName> {
 pub struct ConstructorSymbol<GlobalName> {
     pub name: GlobalName,
     pub signature: Vec<ast::TypeExpression<ParseInfo, GlobalName>>,
-    //    pub phase: PhantomData<LocalId>,
 }
 
 impl ConstructorSymbol<parser::IdentifierPath> {
+    fn make_applied_type_constructor(
+        &self,
+        pi: ParseInfo,
+        type_parameters: &[parser::Identifier],
+        type_constructor_name: &parser::IdentifierPath,
+    ) -> parser::TypeExpression {
+        type_parameters.iter().cloned().fold(
+            parser::TypeExpression::Constructor(pi, type_constructor_name.clone()),
+            |function, argument| {
+                parser::TypeExpression::Apply(
+                    pi,
+                    ApplyTypeExpr {
+                        function: function.into(),
+                        argument: parser::TypeExpression::Parameter(pi, argument).into(),
+                        phase: PhantomData,
+                    },
+                )
+            },
+        )
+    }
+
     fn make_constructor_term(
         &self,
-        pi: &ParseInfo,
-        type_parameters: &Vec<parser::Identifier>,
+        pi: ParseInfo,
+        type_parameters: &[parser::Identifier],
+        type_constructor_name: &parser::IdentifierPath,
     ) -> TermSymbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath> {
         println!("make_constructor_term: name {}", self.name);
         TermSymbol {
             name: self.name.clone(),
-            type_signature: Some(TypeSignature {
-                universal_quantifiers: type_parameters.clone(),
-                body: parser::TypeExpression::Tuple(*pi, TupleTypeExpr(self.signature.clone())),
-                phase: PhantomData,
-            }),
-            body: self.make_curried_argument_lambda(*pi).into(),
+            type_signature: self
+                .make_type_signature(pi, type_parameters, type_constructor_name)
+                .into(),
+            body: self.make_curried_constructor_term(pi).into(),
+        }
+    }
+
+    fn make_type_signature(
+        &self,
+        pi: ParseInfo,
+        type_parameters: &[parser::Identifier],
+        type_constructor_name: &parser::IdentifierPath,
+    ) -> parser::TypeSignature {
+        parser::TypeSignature {
+            universal_quantifiers: type_parameters.to_vec(),
+            body: self.signature.iter().cloned().rfold(
+                self.make_applied_type_constructor(pi, type_parameters, type_constructor_name),
+                |rhs, lhs| {
+                    parser::TypeExpression::Arrow(
+                        pi,
+                        ArrowTypeExpr {
+                            domain: lhs.into(),
+                            codomain: rhs.into(),
+                        },
+                    )
+                },
+            ),
+            phase: PhantomData,
         }
     }
 
     // How is this to work?
-    // Surely this has to happen before De Bruijn
-    // Does it have to be a lambda spine?
-    pub fn make_curried_argument_lambda(&self, pi: ParseInfo) -> parser::Expr {
+    pub fn make_curried_constructor_term(&self, pi: ParseInfo) -> parser::Expr {
         let terms = (0..self.signature.len()).into_iter();
         let construct = parser::Expr::Construct(
             pi,
@@ -687,74 +731,12 @@ impl ConstructorSymbol<parser::IdentifierPath> {
             )
         })
     }
-
-    pub fn make_tuple_argument_lambda(&self, pi: ParseInfo) -> parser::Expr {
-        let construct = self.make_construct_tree(
-            pi,
-            if self.signature.len() > 1 {
-                self.make_tuple_projections(pi)
-            } else {
-                self.make_single(pi)
-            },
-        );
-
-        // if the signature is empty, i.e.: Nothing :: Maybe a.la
-        // Haskell, then we need to figure out how to not be
-        // forced to provide a unit () to it upon construction
-        if self.signature.is_empty() {
-            self.make_construct_tree(pi, vec![])
-        } else {
-            parser::Expr::Lambda(
-                pi,
-                parser::Lambda {
-                    parameter: parser::IdentifierPath::new("x"),
-                    body: construct.into(),
-                },
-            )
-        }
-    }
-
-    fn make_construct_tree(
-        &self,
-        pi: ParseInfo,
-        arguments: Vec<Tree<ParseInfo, parser::IdentifierPath>>,
-    ) -> parser::Expr {
-        parser::Expr::Construct(
-            pi,
-            parser::Construct {
-                constructor: self.name.clone(),
-                arguments,
-            },
-        )
-    }
-
-    fn make_single(&self, pi: ParseInfo) -> Vec<ast::Tree<ParseInfo, parser::IdentifierPath>> {
-        vec![parser::Expr::Variable(pi, parser::IdentifierPath::new("x")).into()]
-    }
-
-    fn make_tuple_projections(
-        &self,
-        pi: ParseInfo,
-    ) -> Vec<ast::Tree<ParseInfo, parser::IdentifierPath>> {
-        (0..self.signature.len())
-            .map(|i| {
-                parser::Expr::Project(
-                    pi,
-                    parser::Projection {
-                        base: parser::Expr::Variable(pi, parser::IdentifierPath::new("x")).into(),
-                        select: ast::ProductElement::Ordinal(i),
-                    },
-                )
-                .into()
-            })
-            .collect()
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct TermSymbol<A, GlobalName, LocalId> {
     pub name: GlobalName,
-    pub type_signature: Option<TypeSignature<ParseInfo, GlobalName>>,
+    pub type_signature: Option<ast::TypeSignature<ParseInfo, GlobalName>>,
     pub body: Option<ast::Expr<A, LocalId>>,
 }
 
@@ -1066,8 +1048,8 @@ impl parser::SelfReferential {
         symbols: &ParserCompilationContext,
     ) -> SelfReferential {
         if let Some(own_name) = self.own_name.try_as_simple() {
-            names.bind_and_then(own_name, |names, name| SelfReferential {
-                own_name: name,
+            names.bind_and_then(own_name.clone(), |names, own_name| SelfReferential {
+                own_name,
                 lambda: self.lambda.resolve(names, symbols),
             })
         } else {

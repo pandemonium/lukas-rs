@@ -111,6 +111,21 @@ where
     }
 }
 
+impl namer::TypeSignature {
+    pub fn scheme(&self, ctx: &TypingContext) -> Typing<TypeScheme> {
+        let type_params = self
+            .universal_quantifiers
+            .iter()
+            .map(|id| (id.clone(), TypeParameter::fresh()))
+            .collect::<HashMap<_, _>>();
+
+        Ok(TypeScheme {
+            quantifiers: type_params.values().cloned().collect(),
+            underlying: self.body.synthesize_type(&type_params, ctx)?,
+        })
+    }
+}
+
 impl namer::NamedCompilationContext {
     pub fn compute_types(
         self,
@@ -119,6 +134,7 @@ impl namer::NamedCompilationContext {
         let mut ctx = TypingContext::default();
         let mut symbols = HashMap::with_capacity(self.symbols.len());
 
+        // Enter types
         for symbol in self.symbols.iter().filter_map(|(_, sym)| match sym {
             Symbol::Type(symbol) => Some(symbol),
             _ => None,
@@ -131,6 +147,7 @@ impl namer::NamedCompilationContext {
 
         ctx.elaborate_type_constructors()?;
 
+        // Enter terms
         for (id, symbol) in evaluation_order
             .map(|&id| {
                 self.symbols
@@ -159,17 +176,30 @@ impl namer::NamedCompilationContext {
         symbol: &TermSymbol<ParseInfo, namer::QualifiedName, Identifier>,
         ctx: &mut TypingContext,
     ) -> Typing<TypedSymbol> {
-        let (subs, body) = ctx.infer_expr(&symbol.body())?;
+        let body = if let Some(type_signature) = &symbol.type_signature {
+            let (_, body) = ctx.infer_expr(symbol.body())?;
 
-        let qualified_name = &symbol.name;
-        let inferred_type = &body.type_info().inferred_type;
+            let inferred_type = body.type_info().inferred_type.clone();
 
-        println!("{qualified_name} => {inferred_type}");
+            inferred_type.check_instance_of(&type_signature.scheme(ctx)?)?;
 
-        ctx.bind_free_term(
-            qualified_name.clone(),
-            inferred_type.generalize(&ctx.with_substitutions(&subs)),
-        );
+            let inferred_scheme = TypeScheme::from_constant(inferred_type);
+
+            let qualified_name = symbol.name.clone();
+            println!("compute_term_symbol: {qualified_name} => {inferred_scheme}");
+
+            ctx.bind_free_term(qualified_name, inferred_scheme);
+            body
+        } else {
+            let (_, body) = ctx.infer_expr(&symbol.body())?;
+
+            let qualified_name = symbol.name.clone();
+            let scheme = TypeScheme::from_constant(body.type_info().inferred_type.clone());
+            println!("compute_term_symbol: {qualified_name} => {scheme}");
+
+            ctx.bind_free_term(qualified_name, scheme);
+            body
+        };
 
         Ok(namer::Symbol::Term(TermSymbol {
             name: symbol.name.clone(),
@@ -355,6 +385,15 @@ impl Type {
         Self::Variable(TypeParameter::fresh())
     }
 
+    pub fn check_instance_of(&self, scheme: &TypeScheme) -> Typing<()> {
+        let instantiated_signature = scheme.instantiate();
+
+        let subs = instantiated_signature.unified_with(self)?;
+        println!("check_instance_of: scheme {instantiated_signature}, self {self}, subs {subs}");
+
+        Ok(())
+    }
+
     pub fn is_base(&self) -> bool {
         matches!(self, Type::Base(..))
     }
@@ -402,7 +441,16 @@ impl Type {
         match self {
             p @ Self::Variable(param) => subs
                 .substitution(param)
-                .map_or_else(|| p.clone(), |t| t.with_substitutions(subs))
+                .map_or_else(
+                    || p.clone(),
+                    |t| {
+                        if !matches!(t, Type::Variable(p2) if p2 == param) {
+                            t.with_substitutions(subs)
+                        } else {
+                            t.clone()
+                        }
+                    },
+                )
                 .clone(),
 
             Self::Base(b) => Self::Base(*b),
@@ -438,94 +486,101 @@ impl Type {
         }
     }
 
-    pub fn unifed_with(&self, rhs: &Self) -> Typing<Substitutions> {
+    pub fn unified_with(&self, rhs: &Self) -> Typing<Substitutions> {
         match (self, rhs) {
-                (Self::Variable(p), ty) | (ty, Self::Variable(p)) => {
-                    if ty.variables().contains(p) {
-                        Err(TypeError::InfiniteType {
-                            param: *p,
-                            ty: ty.clone(),
-                        })
-                    } else {
-                        Ok(vec![(*p, ty.clone())].into())
-                    }
+            (lhs, rhs) if lhs == rhs => Ok(Substitutions::default()),
+
+            (Self::Variable(p), ty) | (ty, Self::Variable(p)) => {
+
+                if matches!(ty, Type::Variable(q) if q == p) {
+                    Ok(Substitutions::default())
+                } else if ty.variables().contains(p) {
+                    Err(TypeError::InfiniteType {
+                        param: *p,
+                        ty: ty.clone(),
+                    })
+                } else {
+                    Ok(vec![(*p, ty.clone())].into())
                 }
-
-                (
-                    Self::Arrow {
-                        domain: lhs_dom,
-                        codomain: lhs_codom,
-                    },
-                    Self::Arrow {
-                        domain: rhs_dom,
-                        codomain: rhs_codom,
-                    },
-                ) => {
-                    let domain = lhs_dom.unifed_with(rhs_dom)?;
-                    let codomain = lhs_codom.unifed_with(rhs_codom)?;
-                    Ok(domain.compose(&codomain))
-                }
-
-                (Self::Tuple(lhs), Self::Tuple(rhs)) if lhs.arity() == rhs.arity() => {
-                    let mut subs = Substitutions::default();
-
-                    println!("unifed_with: {} ~ {}", display_list("; ", lhs.elements()), display_list("; ", rhs.elements()));
-
-                    for (lhs, rhs) in lhs.elements().iter().zip(rhs.elements()) {
-                        // compose_mut
-                        subs = subs.compose(&lhs.unifed_with(rhs)?);
-                    }
-
-                    println!("unified_with: substitutions {subs}");
-
-                    Ok(subs)
-                }
-
-                (Self::Record(lhs), Self::Record(rhs)) if lhs.0.len() == rhs.0.len() => {
-                    let mut subs = Substitutions::default();
-
-                    println!("unify_with: {lhs:?} {rhs:?}");
-                    // Sort first?
-                    for ((lhs_label, lhs), (rhs_label, rhs)) in lhs.0.iter().zip(&rhs.0) {
-                        if lhs_label != rhs_label {
-                            panic!("{lhs_label} != {rhs_label}");
-                        }
-
-                        // compose_mut
-                        subs = subs.compose(&lhs.unifed_with(rhs)?);
-                    }
-
-                    Ok(subs)
-                }
-
-                (Self::Coproduct(lhs), Self::Coproduct(rhs))
-                    if lhs.cardinality() == rhs.cardinality() /*&& {
-                        let rhs_names = rhs.constructor_names().collect::<HashSet<_>>();
-                        lhs.constructor_names().all(|lhs| rhs_names.contains(lhs))
-                    }*/ =>
-                {
-                    todo!()
-                }
-
-                (
-                    Self::Apply {
-                        constructor: lhs_con,
-                        argument: lhs_arg,
-                    },
-                    Self::Apply {
-                        constructor: rhs_con,
-                        argument: rhs_arg,
-                    },
-                ) => {
-                    let constructor = lhs_con.unifed_with(rhs_con)?;
-                    let argument = lhs_arg.unifed_with(rhs_arg)?;
-                    Ok(constructor.compose(&argument))
-                }
-
-                (lhs, rhs) if lhs == rhs => Ok(Substitutions::default()),
-
-                (lhs, rhs) => Err(TypeError::UnificationImpossible { lhs: lhs.clone(), rhs: rhs.clone() }),
             }
+
+            (
+                Self::Arrow {
+                    domain: lhs_dom,
+                    codomain: lhs_codom,
+                },
+                Self::Arrow {
+                    domain: rhs_dom,
+                    codomain: rhs_codom,
+                },
+            ) => {
+                let domain = lhs_dom.unified_with(rhs_dom)?;
+                let codomain = lhs_codom
+                    .with_substitutions(&domain)
+                    .unified_with(
+                        &rhs_codom.with_substitutions(&domain)
+                    )?;
+                Ok(domain.compose(&codomain))
+            }
+
+            (Self::Tuple(lhs), Self::Tuple(rhs)) if lhs.arity() == rhs.arity() => {
+                let mut subs = Substitutions::default();
+
+                println!("unifed_with: {} ~ {}", display_list("; ", lhs.elements()), display_list("; ", rhs.elements()));
+
+                for (lhs, rhs) in lhs.elements().iter().zip(rhs.elements()) {
+                    // compose_mut
+                    subs = subs.compose(&lhs.with_substitutions(&subs).unified_with(&rhs.with_substitutions(&subs))?);
+                }
+
+                println!("unified_with: substitutions {subs}");
+
+                Ok(subs)
+            }
+
+            (Self::Record(lhs), Self::Record(rhs)) if lhs.0.len() == rhs.0.len() => {
+                let mut subs = Substitutions::default();
+
+                println!("unify_with: {lhs:?} {rhs:?}");
+                // Sort first?
+                for ((lhs_label, lhs), (rhs_label, rhs)) in lhs.0.iter().zip(&rhs.0) {
+                    if lhs_label != rhs_label {
+                        panic!("{lhs_label} != {rhs_label}");
+                    }
+
+                    // compose_mut
+                    subs = subs.compose(&lhs.with_substitutions(&subs).unified_with(&rhs.with_substitutions(&subs))?);
+                }
+
+                Ok(subs)
+            }
+
+            (Self::Coproduct(lhs), Self::Coproduct(rhs))
+                if lhs.cardinality() == rhs.cardinality() /*&& {
+                    let rhs_names = rhs.constructor_names().collect::<HashSet<_>>();
+                    lhs.constructor_names().all(|lhs| rhs_names.contains(lhs))
+                }*/ =>
+            {
+                todo!()
+            }
+
+            (
+                Self::Apply {
+                    constructor: lhs_con,
+                    argument: lhs_arg,
+                },
+                Self::Apply {
+                    constructor: rhs_con,
+                    argument: rhs_arg,
+                },
+            ) => {
+                let constructor = lhs_con.unified_with(rhs_con)?;
+                let argument = lhs_arg.with_substitutions(&constructor).unified_with(&rhs_arg.with_substitutions(&constructor))?;
+                Ok(constructor.compose(&argument))
+            }
+
+            (lhs, rhs) => Err(TypeError::UnificationImpossible { lhs: lhs.clone(), rhs: rhs.clone() }),
+        }
     }
 
     pub fn generalize(&self, ctx: &TypingContext) -> TypeScheme {
@@ -892,14 +947,17 @@ impl Substitutions {
     }
 
     fn compose(&self, rhs: &Self) -> Self {
-        let mut composed = self
-            .iter()
-            .map(|(param, ty)| (*param, ty.with_substitutions(rhs)))
-            .collect::<Vec<_>>();
+        let mut out = Vec::new();
 
-        composed.extend(rhs.iter().map(|(param, ty)| (*param, ty.clone())));
+        for (param, ty) in rhs.iter() {
+            out.push((*param, ty.with_substitutions(self)));
+        }
 
-        Substitutions(composed)
+        for (param, ty) in self.iter() {
+            out.push((*param, ty.clone()));
+        }
+
+        Substitutions(out)
     }
 
     fn remove(&mut self, param: TypeParameter) {
@@ -1154,6 +1212,7 @@ impl TypingContext {
         }
     }
 
+    // Why isn't this fucker &mut self?
     pub fn with_substitutions(&self, subs: &Substitutions) -> Self {
         Self {
             types: self.types.with_substitutions(subs),
@@ -1162,6 +1221,11 @@ impl TypingContext {
                 free: Self::substitute_free(&self.terms.free, subs),
             },
         }
+    }
+
+    fn substitute_mut(&mut self, subs: &Substitutions) {
+        let new_self = self.with_substitutions(&subs);
+        *self = new_self;
     }
 
     fn substitute_bound(terms: &[TypeScheme], subs: &Substitutions) -> Vec<TypeScheme> {
@@ -1254,10 +1318,17 @@ impl TypingContext {
     where
         F: FnOnce(&mut TypingContext) -> A,
     {
+        for x in &self.terms.bound {
+            println!("bind_term_and_then: {x}");
+        }
+
         match name {
             namer::Identifier::Bound(ix) => {
                 if self.terms.bound.len() != ix {
-                    panic!("Bad medicine")
+                    panic!(
+                        "bind_term_and_then: de Bruijn index missmatch; bound {ix}, len {}",
+                        self.terms.bound.len()
+                    );
                 }
                 self.terms.bound.push(scheme);
                 let v = block(self);
@@ -1278,23 +1349,61 @@ impl TypingContext {
         }
     }
 
-    //    pub fn check_expr(&mut self, expected_type: TypeScheme, expr: &UntypedExpr) -> Typing<()> {
-    //        match expr {
-    //            UntypedExpr::Variable(_, _) => todo!(),
-    //            UntypedExpr::Constant(_, literal) => todo!(),
-    //            UntypedExpr::RecursiveLambda(_, self_referential) => todo!(),
-    //            UntypedExpr::Lambda(_, lambda) => {
-    //                let expected_type = expected_type.instantiate();
-    //                todo!()
-    //            }
-    //            UntypedExpr::Apply(_, apply) => todo!(),
-    //            UntypedExpr::Let(_, binding) => todo!(),
-    //            UntypedExpr::Tuple(_, tuple) => todo!(),
-    //            UntypedExpr::Record(_, record) => todo!(),
-    //            UntypedExpr::Project(_, projection) => todo!(),
-    //            UntypedExpr::Sequence(_, sequence) => todo!(),
-    //        }
-    //    }
+    fn check_expr(&mut self, expected_type: &Type, expr: &UntypedExpr) -> Typing<Expr> {
+        println!("check_expr: expected {expected_type} for {expr}");
+
+        match expr {
+            UntypedExpr::Lambda(pi, lambda) => {
+                let normalized_type = self.normalize_type_application(expected_type)?;
+                if let Type::Arrow { domain, codomain } = normalized_type {
+                    self.bind_term_and_then(
+                        lambda.parameter.clone(),
+                        TypeScheme::from_constant(*domain.clone()),
+                        |ctx| {
+                            let body = ctx.check_expr(&codomain, &lambda.body)?;
+
+                            let inferred_type = Type::Arrow {
+                                domain: domain.into(),
+                                codomain: codomain.into(),
+                            };
+
+                            Ok(Expr::Lambda(
+                                TypeInfo {
+                                    parse_info: *pi,
+                                    inferred_type: inferred_type,
+                                },
+                                Lambda {
+                                    parameter: lambda.parameter.clone(),
+                                    body: body.into(),
+                                },
+                            ))
+                        },
+                    )
+                } else {
+                    Err(TypeError::UnificationImpossible {
+                        lhs: normalized_type.clone(),
+                        rhs: Type::fresh(),
+                    })?
+                }
+            }
+
+            _otherwise => {
+                println!("check_expr: infer {expr}");
+                let (subs1, expr) = self.infer_expr(expr)?;
+
+                let lhs = expr.type_info().inferred_type.with_substitutions(&subs1);
+                let rhs = expected_type.with_substitutions(&subs1);
+
+                let subs2 = lhs.unified_with(&rhs)?;
+
+                let subs = subs1.compose(&subs2);
+
+                self.substitute_mut(&subs);
+
+                Ok(expr.with_substitutions(&subs))
+            }
+        }
+    }
 
     pub fn infer_expr(&mut self, expr: &UntypedExpr) -> Typing {
         //        println!("infer_expr: {expr}");
@@ -1394,6 +1503,7 @@ impl TypingContext {
             for clause in match_clauses {
                 let mut clause_ctx = self.clone();
                 let mut bindings = Vec::default();
+                let scrutinee_type = &scrutinee_type.with_substitutions(&substitutions);
                 let (subs1, pattern) =
                     clause_ctx.infer_pattern(&clause.pattern, &mut bindings, scrutinee_type)?;
                 let mut clause_ctx = clause_ctx.with_substitutions(&subs1);
@@ -1406,7 +1516,7 @@ impl TypingContext {
                     .type_info()
                     .inferred_type
                     .with_substitutions(&substitutions)
-                    .unifed_with(&consequent_type)?;
+                    .unified_with(&consequent_type)?;
                 consequent_type = consequent_type.with_substitutions(&subs);
                 typed_match_clauses.push(MatchClause {
                     pattern,
@@ -1441,6 +1551,29 @@ impl TypingContext {
         let normalized_scrutinee = self.normalize_type_application(&scrutinee)?;
 
         match (pattern, &normalized_scrutinee) {
+            (namer::Pattern::Coproduct(_, coproduct_pattern), Type::Variable(p)) => {
+                if let namer::Identifier::Free(constructor) = &coproduct_pattern.constructor {
+                    let inferred = self
+                        .types
+                        .query_coproduct_type_constructors(&constructor)?
+                        .first()
+                        .ok_or_else(|| TypeError::NoSuchCoproductConstructor(constructor.clone()))?
+                        .instantiate(&self)?
+                        .make_spine();
+
+                    let substitutions = Substitutions::from(vec![(*p, inferred.clone())]);
+                    println!("infer_pattern: subs {substitutions}");
+
+                    self.substitute_mut(&substitutions);
+
+                    println!("infer_pattern: calling with resolved {p} into {inferred}");
+                    let (subs, pattern) = self.infer_pattern(pattern, bindings, &inferred)?;
+                    Ok((subs.compose(&substitutions), pattern))
+                } else {
+                    todo!()
+                }
+            }
+
             (namer::Pattern::Coproduct(pi, pattern), Type::Coproduct(coproduct)) => {
                 if let namer::Identifier::Free(constructor) = &pattern.constructor
                     && let Some(signature) = coproduct.signature(constructor)
@@ -1533,7 +1666,7 @@ impl TypingContext {
             // Check pattern at ty
             (namer::Pattern::Literally(pi, pattern), ..) => {
                 let inferred = pattern.synthesize_type();
-                let subs = inferred.unifed_with(&scrutinee)?;
+                let subs = inferred.unified_with(&scrutinee)?;
 
                 Ok((
                     subs,
@@ -1561,7 +1694,7 @@ impl TypingContext {
                 ))
             }
 
-            (pattern, ty) => panic!("Type error. Illegal pattern. {pattern:?} {ty}"),
+            (pattern, ty) => panic!("Type error. Illegal pattern. `{pattern}` `{ty}`"),
         }
     }
 
@@ -1615,7 +1748,7 @@ impl TypingContext {
                 .signature(constructor_name)
                 .ok_or_else(|| TypeError::NoSuchCoproductConstructor(constructor_name.clone()))?;
             Type::Tuple(TupleType::from_signature(signature))
-                .unifed_with(&Type::Tuple(TupleType::from_signature(&argument_types)))?
+                .unified_with(&Type::Tuple(TupleType::from_signature(&argument_types)))?
         } else {
             Err(TypeError::InternalAssertion(format!("Expected ")))?
         };
@@ -1685,7 +1818,7 @@ impl TypingContext {
 
         let subs = type_constructor
             .structure()?
-            .unifed_with(&Type::Record(record_type))?;
+            .unified_with(&Type::Record(record_type))?;
 
         Ok((
             substitutions.compose(&subs),
@@ -1772,7 +1905,7 @@ impl TypingContext {
                         elems.push(Type::fresh());
                     }
                     let tuple_ty = Type::Tuple(TupleType::from_signature(&elems));
-                    let subs = base_type.unifed_with(&tuple_ty)?;
+                    let subs = base_type.unified_with(&tuple_ty)?;
                     let projected_ty = match tuple_ty.with_substitutions(&subs) {
                         Type::Tuple(tuple) => tuple.elements()[*ordinal].clone(),
                         _ => unreachable!(),
@@ -1827,7 +1960,7 @@ impl TypingContext {
             typed_elements.push(element);
             // compose_mut?
             substitutions = substitutions.compose(&subs);
-            *self = self.with_substitutions(&substitutions);
+            //            *self = self.with_substitutions(&substitutions);
         }
 
         let typed_elements = typed_elements
@@ -1845,40 +1978,40 @@ impl TypingContext {
 
     fn infer_recursive_lambda(
         &mut self,
-        parse_info: &ParseInfo,
+        pi: &ParseInfo,
         rec_lambda: &namer::SelfReferential,
     ) -> Typing {
-        let own_ty = Type::fresh();
+        let domain = Type::fresh();
+        let codomain = Type::fresh();
+        let own_ty = Type::Arrow {
+            domain: domain.clone().into(),
+            codomain: codomain.clone().into(),
+        };
         self.bind_term_and_then(
             rec_lambda.own_name.clone(),
             TypeScheme::from_constant(own_ty.clone()),
             |ctx| {
                 ctx.bind_term_and_then(
                     rec_lambda.lambda.parameter.clone(),
-                    TypeScheme::from_constant(Type::fresh()),
+                    TypeScheme::from_constant(domain),
                     |ctx| {
-                        let (substitutions, type_info, lambda) =
-                            ctx.infer_lambda(parse_info, &rec_lambda.lambda)?;
+                        let (substitutions, body) = ctx.infer_expr(&rec_lambda.lambda.body)?;
+                        let subs2 = body.type_info().inferred_type.unified_with(&codomain)?;
+                        let substitutions = substitutions.compose(&subs2);
 
-                        let own_ty = own_ty.with_substitutions(&substitutions);
-                        let substitutions = type_info
-                            .inferred_type
-                            .unifed_with(&own_ty)?
-                            .compose(&substitutions);
-
-                        let underlying = lambda.with_substitutions(&substitutions);
-
-                        let typing_info = TypeInfo {
-                            inferred_type: own_ty.with_substitutions(&substitutions),
-                            ..type_info
-                        };
                         Ok((
-                            substitutions,
+                            substitutions.clone(),
                             Expr::RecursiveLambda(
-                                typing_info,
+                                TypeInfo {
+                                    parse_info: *pi,
+                                    inferred_type: own_ty.with_substitutions(&substitutions),
+                                },
                                 SelfReferential {
                                     own_name: rec_lambda.own_name.clone(),
-                                    lambda: underlying,
+                                    lambda: Lambda {
+                                        parameter: rec_lambda.lambda.parameter.clone(),
+                                        body: body.into(),
+                                    },
                                 },
                             ),
                         ))
@@ -1909,7 +2042,7 @@ impl TypingContext {
 
         let substitutions = expected_ty
             .with_substitutions(&substitutions)
-            .unifed_with(&function.type_info().inferred_type)?
+            .unified_with(&function.type_info().inferred_type)?
             .compose(&substitutions);
 
         let apply = Apply {

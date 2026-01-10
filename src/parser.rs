@@ -6,7 +6,7 @@ use crate::{
     ast::{
         self, ApplyTypeExpr, ArrowTypeExpr, CompilationUnit, CoproductConstructor,
         CoproductDeclarator, Declaration, FieldDeclarator, RecordDeclarator, Tree, TypeDeclaration,
-        TypeDeclarator, TypeSignature, ValueDeclaration, ValueDeclarator,
+        TypeDeclarator, ValueDeclaration, ValueDeclarator,
     },
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
 };
@@ -28,6 +28,7 @@ pub type ConstructorPattern = ast::pattern::ConstructorPattern<ParseInfo, Identi
 pub type TuplePattern = ast::pattern::TuplePattern<ParseInfo, IdentifierPath>;
 pub type StructPattern = ast::pattern::StructPattern<ParseInfo, IdentifierPath>;
 pub type TypeExpression = ast::TypeExpression<ParseInfo, IdentifierPath>;
+pub type TypeSignature = ast::TypeSignature<ParseInfo, IdentifierPath>;
 
 impl Expr {
     pub fn parse_info(&self) -> &ParseInfo {
@@ -367,11 +368,13 @@ impl<'a> Parser<'a> {
                 // <id> <:=>
                 self.advance(2);
 
+                let own_name = IdentifierPath::new(name);
+
                 Ok(Declaration::Value(
                     ParseInfo::from_position(*position),
                     ValueDeclaration {
                         name: Identifier::from_str(name),
-                        declarator: self.parse_value_declarator(None)?,
+                        declarator: self.parse_value_declarator(None, own_name)?,
                     },
                 ))
             }
@@ -392,16 +395,16 @@ impl<'a> Parser<'a> {
 
                 let type_signature = self.parse_type_signature().map(Some)?;
 
-                //                println!("parse_declaration: {}", self.peek()?.kind);
-
                 // <:=>
                 self.advance(1);
+
+                let own_name = IdentifierPath::new(name);
 
                 Ok(Declaration::Value(
                     ParseInfo::from_position(*position),
                     ValueDeclaration {
                         name: Identifier::from_str(name),
-                        declarator: self.parse_value_declarator(type_signature)?,
+                        declarator: self.parse_value_declarator(type_signature, own_name)?,
                     },
                 ))
             }
@@ -464,13 +467,28 @@ impl<'a> Parser<'a> {
 
     fn parse_value_declarator(
         &mut self,
-        type_signature: Option<TypeSignature<ParseInfo, IdentifierPath>>,
+        type_signature: Option<TypeSignature>,
+        own_name: IdentifierPath,
     ) -> Result<ValueDeclarator<ParseInfo>> {
         let _t = self.trace();
 
         Ok(ValueDeclarator {
             type_signature,
-            body: self.parse_block(|parser| parser.parse_expression(0))?,
+            body: self
+                .parse_block(|parser| parser.parse_expression(0))
+                .map(|lambda| {
+                    if let Expr::Lambda(pi, lambda) = lambda {
+                        Expr::RecursiveLambda(
+                            pi,
+                            SelfReferential {
+                                own_name,
+                                lambda: lambda.into(),
+                            },
+                        )
+                    } else {
+                        lambda
+                    }
+                })?,
         })
     }
 
@@ -581,7 +599,9 @@ impl<'a> Parser<'a> {
                 ..,
             ] => {
                 self.advance(1);
-                self.parse_type_expression()
+                let prefix = self.parse_type_expression();
+                self.expect(TokenKind::RightParen)?;
+                prefix
             }
 
             // parens
@@ -590,10 +610,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_simple_type_expr_term(
-        &self,
+        &mut self,
         id: &String,
         position: &SourceLocation,
     ) -> ast::TypeExpression<ParseInfo, IdentifierPath> {
+        let _t = self.trace();
+
         let parse_info = ParseInfo::from_position(*position);
         if is_lowercase(id) {
             TypeExpression::Parameter(parse_info, Identifier::from_str(id))
@@ -965,7 +987,7 @@ impl<'a> Parser<'a> {
             // f x
             [t, u, ..]
                 if Self::is_expr_prefix(&t.kind)
-                    && u.kind != TokenKind::Assign
+                    && !matches!(u.kind, TokenKind::Assign | TokenKind::TypeAscribe)
                     && Operator::Juxtaposition.precedence() > context_precedence =>
             {
                 println!("Calling parse_juxtaposed(2) with u {u:?}");
@@ -1155,7 +1177,7 @@ impl<'a> Parser<'a> {
         )
     }
 
-    fn parse_type_signature(&mut self) -> Result<TypeSignature<ParseInfo, IdentifierPath>> {
+    fn parse_type_signature(&mut self) -> Result<TypeSignature> {
         let _t = self.trace();
 
         let quantifiers = self.parse_forall_clause()?;
@@ -1203,7 +1225,6 @@ impl<'a> Parser<'a> {
                 });
             } else {
                 signature.push(self.parse_type_expression()?);
-                self.expect(TokenKind::RightParen)?;
             }
         }
 
@@ -1359,8 +1380,9 @@ impl<'a> Parser<'a> {
     fn parse_constructor_pattern(&mut self) -> Result<Pattern> {
         let _t = self.trace();
 
+        // There are nullary constructors
         let (pos, id) = self.identifier()?;
-        let mut arguments = vec![self.parse_pattern_prefix()?];
+        let mut arguments = vec![];
 
         while !matches!(
             self.peek()?.kind,
