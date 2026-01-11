@@ -18,7 +18,6 @@ use crate::{
             SymbolName, TermSymbol, TypeDefinition, TypeExpression, TypeSymbol,
         },
     },
-    bridge::Bridge,
     parser::{self, ParseInfo},
 };
 
@@ -605,6 +604,7 @@ const BUILTIN_BASE_TYPE_NAMES: [&str; 2] =
 pub enum BaseType {
     Int,
     Text,
+    Bool,
 }
 
 impl BaseType {
@@ -616,6 +616,7 @@ impl BaseType {
         match self {
             Self::Int => "Int",
             Self::Text => "Text",
+            Self::Bool => "Bool",
         }
     }
 
@@ -623,6 +624,7 @@ impl BaseType {
         match self {
             Self::Int => namer::QualifiedName::builtin("Int"),
             Self::Text => namer::QualifiedName::builtin("Text"),
+            Self::Bool => namer::QualifiedName::builtin("Bool"),
         }
     }
 }
@@ -2222,6 +2224,7 @@ impl fmt::Display for BaseType {
         match self {
             Self::Int => write!(f, "Int"),
             Self::Text => write!(f, "Text"),
+            Self::Bool => write!(f, "Bool"),
         }
     }
 }
