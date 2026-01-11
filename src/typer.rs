@@ -166,7 +166,7 @@ impl namer::NamedCompilationContext {
         }
 
         Ok(CompilationContext {
-            modules: self.modules,
+            module_members: self.module_members,
             symbols,
             phase: PhantomData,
         })
@@ -183,7 +183,8 @@ impl namer::NamedCompilationContext {
 
             inferred_type.check_instance_of(&type_signature.scheme(ctx)?)?;
 
-            let inferred_scheme = TypeScheme::from_constant(inferred_type);
+            //            let inferred_scheme = TypeScheme::from_constant(inferred_type);
+            let inferred_scheme = inferred_type.generalize(ctx);
 
             let qualified_name = symbol.name.clone();
             println!("compute_term_symbol: {qualified_name} => {inferred_scheme}");
@@ -194,7 +195,8 @@ impl namer::NamedCompilationContext {
             let (_, body) = ctx.infer_expr(&symbol.body())?;
 
             let qualified_name = symbol.name.clone();
-            let scheme = TypeScheme::from_constant(body.type_info().inferred_type.clone());
+            let inferred_type = &body.type_info().inferred_type;
+            let scheme = inferred_type.generalize(&ctx);
             println!("compute_term_symbol: {qualified_name} => {scheme}");
 
             ctx.bind_free_term(qualified_name, scheme);

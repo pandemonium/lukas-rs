@@ -323,7 +323,7 @@ pub enum SymbolName<TypeId, ValueId> {
 // "Modules do not exist" - they should get their own table.
 #[derive(Debug, Clone)]
 pub struct CompilationContext<A, GlobalName, LocalId> {
-    pub modules: HashSet<parser::IdentifierPath>,
+    pub module_members: HashSet<parser::IdentifierPath>,
     pub symbols: HashMap<SymbolName<GlobalName, LocalId>, Symbol<A, GlobalName, LocalId>>,
     pub phase: PhantomData<(A, GlobalName, LocalId)>,
 }
@@ -331,7 +331,7 @@ pub struct CompilationContext<A, GlobalName, LocalId> {
 impl<A, TypeId, ValueId> Default for CompilationContext<A, TypeId, ValueId> {
     fn default() -> Self {
         Self {
-            modules: HashSet::default(),
+            module_members: HashSet::default(),
             symbols: HashMap::default(),
             phase: PhantomData,
         }
@@ -352,7 +352,7 @@ impl ParserCompilationContext {
                 module_path.push(segment);
                 let identifier_path = parser::IdentifierPath::try_from_components(&module_path)?;
 
-                if !self.modules.contains(&identifier_path) {
+                if !self.module_members.contains(&identifier_path) {
                     module_path.pop();
                     in_module_prefix = false;
                     member.push(segment);
@@ -405,7 +405,7 @@ impl ParserCompilationContext {
         );
 
         Self {
-            modules,
+            module_members: modules,
             symbols,
             phase: PhantomData,
         }
@@ -1265,7 +1265,7 @@ impl ParserCompilationContext {
     // modules are known
     pub fn rename_symbols(self) -> NamedCompilationContext {
         CompilationContext {
-            modules: self.modules.clone(),
+            module_members: self.module_members.clone(),
             symbols: self
                 .symbols
                 .iter()

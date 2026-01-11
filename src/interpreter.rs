@@ -28,7 +28,7 @@ impl Expr<(), namer::Identifier> {
 
             Self::RecursiveLambda(_, the) => {
                 let closure = Closure::capture(env, &the.lambda.body);
-                closure.borrow_mut().capture.put(Value::SelfReferential {
+                closure.borrow_mut().capture.put(Value::RecursiveClosure {
                     name: the.own_name.clone(),
                     inner: Rc::downgrade(&closure),
                 });
@@ -38,10 +38,16 @@ impl Expr<(), namer::Identifier> {
             Self::Lambda(_, the) => Ok(Value::Closure(Closure::capture(env, &the.body))),
 
             Self::Apply(_, the) => {
-                if let Value::Closure(closure) = the.function.reduce(env)? {
-                    apply_closure(closure, the.argument.reduce(env)?)
-                } else {
-                    Err(RuntimeError::ExpectedClosure(the.function.reduce(env)?))
+                let value = the.function.reduce(env)?;
+                match value {
+                    Value::Closure(closure) => apply_closure(closure, the.argument.reduce(env)?),
+                    Value::RecursiveClosure { name, inner } => {
+                        let closure = inner.upgrade().ok_or_else(|| {
+                            RuntimeError::ExpiredSelfReferential(format!("{name}"))
+                        })?;
+                        apply_closure(closure, the.argument.reduce(env)?)
+                    }
+                    otherwise => Err(RuntimeError::ExpectedClosure(otherwise)),
                 }
             }
 
@@ -178,6 +184,7 @@ pub enum RuntimeError {
     NoSuchSymbol(Identifier),
     ExpectedClosure(Value),
     ExpectedMatch,
+    ExpiredSelfReferential(String),
 }
 
 pub type Interpretation<A = Value> = Result<A, RuntimeError>;
@@ -196,13 +203,24 @@ struct EnvironmentInner {
 }
 
 impl Environment {
-    pub fn call(&self, symbol: &namer::QualifiedName, argument: ast::Literal) -> Value {
-        let symbol = self.get_global(symbol);
-        if let Some(Value::Closure(closure)) = symbol {
-            apply_closure(closure, Value::Constant(argument.into())).unwrap()
-        } else {
-            // It did not find Root/start
-            panic!("{symbol:?}")
+    pub fn call(
+        &self,
+        symbol_name: &namer::QualifiedName,
+        argument: ast::Literal,
+    ) -> Interpretation {
+        let symbol = self
+            .get_global(symbol_name)
+            .ok_or_else(|| RuntimeError::NoSuchSymbol(Identifier::Free(symbol_name.clone())))?;
+
+        match symbol {
+            Value::Closure(closure) => apply_closure(closure, Value::Constant(argument.into())),
+            Value::RecursiveClosure { inner, .. } => {
+                let closure = inner.upgrade().ok_or_else(|| {
+                    RuntimeError::ExpiredSelfReferential(format!("{symbol_name}"))
+                })?;
+                apply_closure(closure, Value::Constant(argument.into()))
+            }
+            otherwise => Err(RuntimeError::ExpectedClosure(otherwise)),
         }
     }
 
@@ -304,7 +322,7 @@ pub enum Value {
     // have this structure
     Closure(Rc<RefCell<Closure>>),
 
-    SelfReferential {
+    RecursiveClosure {
         name: namer::Identifier,
         inner: Weak<RefCell<Closure>>,
     },
@@ -403,7 +421,7 @@ impl fmt::Display for Value {
 
             Self::Closure(x) => write!(f, "`{}`", x.borrow()),
 
-            Self::SelfReferential { name, inner } => {
+            Self::RecursiveClosure { name, inner } => {
                 if let Some(inner) = inner.upgrade() {
                     write!(f, "/{name}/ {}", inner.borrow())
                 } else {
