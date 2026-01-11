@@ -868,7 +868,9 @@ fn map_lower_tuples(body: Tree<ParseInfo, IdentifierPath>) -> Tree<ParseInfo, Id
 impl parser::Expr {
     pub fn lower_tuples(self) -> parser::Expr {
         match self {
-            parser::Expr::Variable(..) | parser::Expr::Constant(..) => self,
+            parser::Expr::Variable(..)
+            | parser::Expr::Constant(..)
+            | parser::Expr::InvokeBridge(..) => self,
 
             parser::Expr::RecursiveLambda(a, self_referential) => parser::Expr::RecursiveLambda(
                 a,
@@ -997,18 +999,31 @@ impl parser::Expr {
                     panic!("Unresolved symbol {}", identifier_path)
                 }
             }
+
+            Self::InvokeBridge(a, bridge) => Expr::InvokeBridge(*a, bridge.clone()),
+
             Self::Constant(a, literal) => Expr::Constant(*a, literal.clone()),
+
             Self::RecursiveLambda(a, node) => {
                 Expr::RecursiveLambda(*a, node.resolve(names, symbols))
             }
+
             Self::Lambda(a, node) => Expr::Lambda(*a, node.resolve(names, symbols)),
+
             Self::Apply(a, node) => Expr::Apply(*a, node.resolve(names, symbols)),
+
             Self::Let(a, node) => Expr::Let(*a, node.resolve(names, symbols)),
+
             Self::Record(a, node) => Expr::Record(*a, node.resolve(names, symbols)),
+
             Self::Tuple(a, node) => Expr::Tuple(*a, node.resolve(names, symbols)),
+
             Self::Construct(a, node) => Expr::Construct(*a, node.resolve(names, symbols)),
+
             Self::Project(a, node) => Expr::Project(*a, node.resolve(names, symbols)),
+
             Self::Sequence(a, node) => Expr::Sequence(*a, node.resolve(names, symbols)),
+
             Self::Deconstruct(a, node) => Expr::Deconstruct(*a, node.resolve(names, symbols)),
         }
     }

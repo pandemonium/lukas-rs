@@ -24,6 +24,12 @@ impl Expr<(), namer::Identifier> {
                 .get(the)
                 .ok_or_else(|| RuntimeError::NoSuchSymbol(the.clone())),
 
+            Self::InvokeBridge(_, bridge) => {
+                let stack = &env.inner.borrow().locals;
+                let arguments = &stack[(stack.len() - bridge.external.arity())..];
+                bridge.external.invoke(arguments)
+            }
+
             Self::Constant(_, the) => Ok(Value::Constant(the.clone().into())),
 
             Self::RecursiveLambda(_, the) => {
@@ -41,12 +47,14 @@ impl Expr<(), namer::Identifier> {
                 let value = the.function.reduce(env)?;
                 match value {
                     Value::Closure(closure) => apply_closure(closure, the.argument.reduce(env)?),
+
                     Value::RecursiveClosure { name, inner } => {
                         let closure = inner.upgrade().ok_or_else(|| {
                             RuntimeError::ExpiredSelfReferential(format!("{name}"))
                         })?;
                         apply_closure(closure, the.argument.reduce(env)?)
                     }
+
                     otherwise => Err(RuntimeError::ExpectedClosure(otherwise)),
                 }
             }
@@ -185,6 +193,7 @@ pub enum RuntimeError {
     ExpectedClosure(Value),
     ExpectedMatch,
     ExpiredSelfReferential(String),
+    NotApplicable2 { a: Value, b: Value },
 }
 
 pub type Interpretation<A = Value> = Result<A, RuntimeError>;
@@ -266,7 +275,7 @@ impl Environment {
         self.inner.borrow_mut().locals.push(v);
     }
 
-    fn get(&self, id: &Identifier) -> Option<Value> {
+    pub fn get(&self, id: &Identifier) -> Option<Value> {
         match id {
             Identifier::Bound(ix) => self.inner.borrow().locals.get(*ix).cloned(),
             Identifier::Free(id) => self.inner.borrow().globals.get(id).cloned(),

@@ -2,6 +2,7 @@ use std::{fmt, marker::PhantomData, rc::Rc};
 
 use crate::{
     ast::{self, annotation::Annotated},
+    bridge::Bridge,
     parser::{self, Identifier},
 };
 
@@ -100,14 +101,28 @@ pub struct TypeSignature<A, TypeId> {
     pub phase: PhantomData<A>,
 }
 
-impl<A, TypeId1> TypeSignature<A, TypeId1> {
+impl<A, TypeId> TypeSignature<A, TypeId> {
     pub fn map<F, B, TypeId2>(self, f: F) -> TypeSignature<B, TypeId2>
     where
-        F: FnOnce(TypeExpression<A, TypeId1>) -> TypeExpression<B, TypeId2>,
+        F: FnOnce(TypeExpression<A, TypeId>) -> TypeExpression<B, TypeId2>,
     {
         TypeSignature {
             universal_quantifiers: self.universal_quantifiers,
             body: f(self.body),
+            phase: PhantomData,
+        }
+    }
+
+    // Is this really a workable thing?
+    pub fn ultimate(&self) -> Self
+    where
+        A: Clone,
+        TypeId: Clone,
+    {
+        let ultimate = self.body.ultimate();
+        Self {
+            universal_quantifiers: self.universal_quantifiers.clone(),
+            body: ultimate.clone(),
             phase: PhantomData,
         }
     }
@@ -116,10 +131,19 @@ impl<A, TypeId1> TypeSignature<A, TypeId1> {
 #[derive(Debug, Clone)]
 pub enum TypeExpression<A, TypeId> {
     Constructor(A, TypeId),
-    Parameter(A, Identifier),
+    Parameter(A, parser::Identifier),
     Apply(A, ApplyTypeExpr<A, TypeId>),
     Arrow(A, ArrowTypeExpr<A, TypeId>),
     Tuple(A, TupleTypeExpr<A, TypeId>),
+}
+
+impl<A, TypeId> TypeExpression<A, TypeId> {
+    fn ultimate(&self) -> &Self {
+        match self {
+            Self::Constructor(..) | Self::Parameter(..) | Self::Apply(..) | Self::Tuple(..) => self,
+            Self::Arrow(_, ArrowTypeExpr { codomain, .. }) => codomain.ultimate(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +167,7 @@ pub type Tree<A, Id> = Rc<Expr<A, Id>>;
 #[derive(Debug, Clone)]
 pub enum Expr<A, Id> {
     Variable(A, Id),
+    InvokeBridge(A, Bridge),
     Constant(A, Literal),
     RecursiveLambda(A, SelfReferential<A, Id>),
     Lambda(A, Lambda<A, Id>),
@@ -160,6 +185,7 @@ impl<A, Id> Expr<A, Id> {
     pub fn annotation(&self) -> &A {
         match self {
             Expr::Variable(a, ..)
+            | Expr::InvokeBridge(a, ..)
             | Expr::Constant(a, ..)
             | Expr::RecursiveLambda(a, ..)
             | Expr::Lambda(a, ..)
@@ -282,6 +308,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Variable(_, x) => write!(f, "{x}"),
+            Self::InvokeBridge(_, x) => write!(f, "bridge_{}", x),
             Self::Constant(_, x) => write!(f, "{x}"),
             Self::RecursiveLambda(_, x) => write!(f, "{} := {}", x.own_name, x.lambda),
             Self::Lambda(_, x) => write!(f, "{}", x),

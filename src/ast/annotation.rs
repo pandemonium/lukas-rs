@@ -27,6 +27,7 @@ where
         {
             match node {
                 Expr::Variable(a, node) => Expr::Variable(f(a), node.clone()),
+                Expr::InvokeBridge(a, node) => Expr::InvokeBridge(f(a), node.clone()),
                 Expr::Constant(a, node) => Expr::Constant(f(a), node.clone()),
                 Expr::RecursiveLambda(a, node) => {
                     Expr::RecursiveLambda(f(a), node.map_annotation(&f))

@@ -18,6 +18,7 @@ use crate::{
             SymbolName, TermSymbol, TypeDefinition, TypeExpression, TypeSymbol,
         },
     },
+    bridge::Bridge,
     parser::{self, ParseInfo},
 };
 
@@ -910,7 +911,7 @@ impl TypeScheme {
         self.underlying.with_substitutions(&substitutions)
     }
 
-    fn from_constant(ty: Type) -> TypeScheme {
+    pub fn from_constant(ty: Type) -> TypeScheme {
         Self {
             quantifiers: vec![],
             underlying: ty,
@@ -1300,13 +1301,7 @@ impl TypingContext {
             // How in the f is this supposed to work?
             // Just push and hope they get the correct DeBruijn index?
             // Assertion here that  self.terms.bound.len() == id?
-            Identifier::Bound(id) => {
-                println!(
-                    "bind_term: {id} -> {scheme}, pushed at {}",
-                    self.terms.bound.len()
-                );
-                self.terms.bound.push(scheme)
-            }
+            Identifier::Bound(..) => self.terms.bound.push(scheme),
             Identifier::Free(name) => self.bind_free_term(name, scheme),
         }
     }
@@ -1320,10 +1315,6 @@ impl TypingContext {
     where
         F: FnOnce(&mut TypingContext) -> A,
     {
-        for x in &self.terms.bound {
-            println!("bind_term_and_then: {x}");
-        }
-
         match name {
             namer::Identifier::Bound(ix) => {
                 if self.terms.bound.len() != ix {
@@ -1408,8 +1399,6 @@ impl TypingContext {
     }
 
     pub fn infer_expr(&mut self, expr: &UntypedExpr) -> Typing {
-        //        println!("infer_expr: {expr}");
-
         match expr {
             UntypedExpr::Variable(pi, name) => Ok((
                 Substitutions::default(),
@@ -1428,6 +1417,27 @@ impl TypingContext {
                     name.clone(),
                 ),
             )),
+
+            UntypedExpr::InvokeBridge(pi, bridge) => {
+                let qualified_name = bridge.qualified_name();
+                Ok((
+                    Substitutions::default(),
+                    Expr::InvokeBridge(
+                        TypeInfo {
+                            parse_info: *pi,
+                            inferred_type: self
+                                .terms
+                                .lookup_free(&qualified_name)
+                                .ok_or_else(|| TypeError::UndefinedName {
+                                    parse_info: *pi,
+                                    name: Identifier::Free(qualified_name.clone()),
+                                })?
+                                .instantiate(),
+                        },
+                        bridge.clone(),
+                    ),
+                ))
+            }
 
             UntypedExpr::Constant(pi, literal) => Ok((
                 Substitutions::default(),
