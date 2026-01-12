@@ -444,6 +444,10 @@ impl ParserCompilationContext {
                 arity: 0,
             }),
         );
+        modules
+            .entry(builtins.clone())
+            .or_default()
+            .push(parser::Identifier::from_str("Int"));
 
         symbols.insert(
             SymbolName::Type(QualifiedName::builtin("Text")),
@@ -453,6 +457,10 @@ impl ParserCompilationContext {
                 arity: 0,
             }),
         );
+        modules
+            .entry(builtins.clone())
+            .or_default()
+            .push(parser::Identifier::from_str("Text"));
 
         symbols.insert(
             SymbolName::Type(QualifiedName::builtin("Bool")),
@@ -462,6 +470,10 @@ impl ParserCompilationContext {
                 arity: 0,
             }),
         );
+        modules
+            .entry(builtins.clone())
+            .or_default()
+            .push(parser::Identifier::from_str("Bool"));
 
         symbols.insert(
             SymbolName::Type(QualifiedName::builtin("Unit")),
@@ -471,6 +483,10 @@ impl ParserCompilationContext {
                 arity: 0,
             }),
         );
+        modules
+            .entry(builtins.clone())
+            .or_default()
+            .push(parser::Identifier::from_str("Unit"));
 
         Self::collect_symbols(
             parser::IdentifierPath::new(program.root.name.as_str()),
@@ -913,17 +929,7 @@ impl parser::TypeExpression {
             Self::Constructor(a, name) => {
                 // TODO: Is this where this happens? What exactly is _this_?
                 // Resolve local name against _import prefixes_?
-                let new_name = if name.tail.is_empty() {
-                    if BaseType::is_name(&name.head) {
-                        name.as_builtin_module_member()
-                    } else {
-                        name.as_root_module_member()
-                    }
-                } else {
-                    name.clone()
-                };
-
-                TypeExpression::Constructor(*a, symbols.resolve_member_path(&new_name))
+                TypeExpression::Constructor(*a, symbols.resolve_member_path(&name))
             }
 
             Self::Parameter(a, name) => TypeExpression::Parameter(*a, name.clone()),

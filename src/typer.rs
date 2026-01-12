@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     ast::{
-        self, Literal, ProductElement, Tree, TupleTypeExpr,
+        self, ApplyTypeExpr, ArrowTypeExpr, Literal, ProductElement, Tree, TupleTypeExpr,
         annotation::Annotated,
         namer::{
             self, CompilationContext, DependencyMatrix, Identifier, QualifiedName, Symbol,
@@ -180,15 +180,17 @@ impl namer::NamedCompilationContext {
 
             let inferred_type = body.type_info().inferred_type.clone();
 
-            inferred_type.check_instance_of(&type_signature.scheme(ctx)?)?;
+            let type_scheme = type_signature.scheme(ctx)?;
+            inferred_type.check_instance_of(&type_scheme)?;
 
-            //            let inferred_scheme = TypeScheme::from_constant(inferred_type);
             let inferred_scheme = inferred_type.generalize(ctx);
 
             let qualified_name = symbol.name.clone();
-            println!("compute_term_symbol: {qualified_name} => {inferred_scheme}");
+            println!(
+                "compute_term_symbol: {qualified_name} => {inferred_scheme}, <== {type_scheme}"
+            );
 
-            ctx.bind_free_term(qualified_name, inferred_scheme);
+            ctx.bind_free_term(qualified_name, type_scheme);
             body
         } else {
             let (_, body) = ctx.infer_expr(&symbol.body())?;
@@ -382,6 +384,56 @@ pub enum Type {
 }
 
 impl Type {
+    pub fn reify(&self) -> parser::TypeExpression {
+        let pi = ParseInfo::default();
+
+        let reified_name = |qn: &QualifiedName| {
+            parser::IdentifierPath::new(&qn.clone().into_identifier_path().tail[0])
+        };
+
+        match self {
+            Self::Variable(TypeParameter(p)) => {
+                parser::TypeExpression::Parameter(pi, parser::Identifier::from_str(&format!("{p}")))
+            }
+            Self::Base(BaseType::Int) => {
+                parser::TypeExpression::Constructor(pi, parser::IdentifierPath::new("Int"))
+            }
+            Self::Base(BaseType::Text) => {
+                parser::TypeExpression::Constructor(pi, parser::IdentifierPath::new("Text"))
+            }
+            Self::Base(BaseType::Bool) => {
+                parser::TypeExpression::Constructor(pi, parser::IdentifierPath::new("Bool"))
+            }
+            Self::Base(BaseType::Unit) => {
+                parser::TypeExpression::Constructor(pi, parser::IdentifierPath::new("Unit"))
+            }
+            Self::Arrow { domain, codomain } => parser::TypeExpression::Arrow(
+                pi,
+                ArrowTypeExpr {
+                    domain: domain.reify().into(),
+                    codomain: codomain.reify().into(),
+                },
+            ),
+            Self::Tuple(..) => todo!(),
+            Self::Record(..) => todo!(),
+            Self::Coproduct(..) => todo!(),
+            Self::Constructor(qualified_name) => {
+                parser::TypeExpression::Constructor(pi, reified_name(qualified_name))
+            }
+            Self::Apply {
+                constructor,
+                argument,
+            } => parser::TypeExpression::Apply(
+                pi,
+                ApplyTypeExpr {
+                    function: constructor.reify().into(),
+                    argument: argument.reify().into(),
+                    phase: PhantomData,
+                },
+            ),
+        }
+    }
+
     pub fn fresh() -> Self {
         Self::Variable(TypeParameter::fresh())
     }
