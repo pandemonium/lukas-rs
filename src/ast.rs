@@ -237,6 +237,8 @@ pub struct Tuple<A, Id> {
 pub enum Literal {
     Int(i64),
     Text(String),
+    Bool(bool),
+    Unit,
 }
 
 #[derive(Debug, Clone)]
@@ -406,6 +408,8 @@ impl fmt::Display for Literal {
         match self {
             Self::Int(x) => write!(f, "{x}"),
             Self::Text(x) => write!(f, "{x}"),
+            Self::Bool(x) => write!(f, "{x}"),
+            Self::Unit => write!(f, "()"),
         }
     }
 }

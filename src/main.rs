@@ -10,7 +10,7 @@ fn main() {
     let _ctx = TypingContext::default();
 
     let mut lexer = LexicalAnalyzer::default();
-    let input = include_str!("../examples/5.txt");
+    let input = include_str!("../examples/10.txt");
 
     let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
 
@@ -23,12 +23,14 @@ fn main() {
 
     println!("Program: {program}");
 
-    let env = Environment::typecheck_and_initialize(program).expect("initialized");
+    let env = Environment::typecheck_and_initialize(program).expect("TypeChecked and initialized");
 
-    let return_value = env.call(
-        &namer::QualifiedName::from_root_symbol(Identifier::from_str("start")),
-        ast::Literal::Int(27),
-    );
+    let return_value = env
+        .call(
+            &namer::QualifiedName::from_root_symbol(Identifier::from_str("start")),
+            ast::Literal::Int(427),
+        )
+        .expect("Expected a return value");
 
     println!("main: return value: {return_value}");
 }

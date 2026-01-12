@@ -194,6 +194,7 @@ pub enum RuntimeError {
     ExpectedMatch,
     ExpiredSelfReferential(String),
     NotApplicable2 { a: Value, b: Value },
+    ExpectedType(typer::Type),
 }
 
 pub type Interpretation<A = Value> = Result<A, RuntimeError>;
@@ -351,6 +352,8 @@ pub enum Value {
 pub enum Literal {
     Int(i64),
     Text(String),
+    Bool(bool),
+    Unit,
 }
 
 impl From<ast::Literal> for Literal {
@@ -358,6 +361,8 @@ impl From<ast::Literal> for Literal {
         match value {
             ast::Literal::Int(x) => Self::Int(x),
             ast::Literal::Text(x) => Self::Text(x),
+            ast::Literal::Bool(x) => Self::Bool(x),
+            ast::Literal::Unit => Self::Unit,
         }
     }
 }
@@ -382,6 +387,8 @@ impl fmt::Display for Literal {
         match self {
             Self::Int(x) => write!(f, "{x}"),
             Self::Text(x) => write!(f, "{x}"),
+            Self::Bool(x) => write!(f, "{x}"),
+            Self::Unit => write!(f, "()"),
         }
     }
 }

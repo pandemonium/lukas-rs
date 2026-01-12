@@ -63,7 +63,7 @@ where
 {
     pub fn terms(
         &self,
-        order: Iter<&namer::TermName>,
+        order: Iter<&SymbolName>,
     ) -> Vec<&TermSymbol<A, namer::QualifiedName, namer::Identifier>> {
         self.extract_symbols(order, |sym| {
             if let namer::Symbol::Term(sym) = sym {
@@ -76,7 +76,7 @@ where
 
     pub fn type_symbols(
         &self,
-        order: Iter<&namer::TermName>,
+        order: Iter<&SymbolName>,
     ) -> Vec<&namer::TypeSymbol<namer::QualifiedName>> {
         self.extract_symbols(order, |sym| {
             if let namer::Symbol::Type(sym) = sym {
@@ -87,7 +87,7 @@ where
         })
     }
 
-    fn extract_symbols<F, Sym>(&self, terms: Iter<&namer::TermName>, select: F) -> Vec<&Sym>
+    fn extract_symbols<F, Sym>(&self, terms: Iter<&SymbolName>, select: F) -> Vec<&Sym>
     where
         F: Fn(&namer::Symbol<A, namer::QualifiedName, namer::Identifier>) -> Option<&Sym>,
     {
@@ -97,9 +97,7 @@ where
             .collect()
     }
 
-    pub fn dependency_matrix(
-        &self,
-    ) -> DependencyMatrix<SymbolName<namer::QualifiedName, namer::Identifier>> {
+    pub fn dependency_matrix(&self) -> DependencyMatrix<SymbolName> {
         let mut matrix = DependencyMatrix::default();
 
         // This function is incredibly inefficient.
@@ -129,7 +127,7 @@ impl namer::TypeSignature {
 impl namer::NamedCompilationContext {
     pub fn compute_types(
         self,
-        evaluation_order: Iter<&namer::TermName>,
+        evaluation_order: Iter<&SymbolName>,
     ) -> Typing<TypedCompilationContext> {
         let mut ctx = TypingContext::default();
         let mut symbols = HashMap::with_capacity(self.symbols.len());
@@ -167,6 +165,7 @@ impl namer::NamedCompilationContext {
 
         Ok(CompilationContext {
             module_members: self.module_members,
+            member_module: self.member_module,
             symbols,
             phase: PhantomData,
         })
@@ -251,7 +250,7 @@ pub enum TypeError {
         name: Identifier,
     },
     UndefinedType(namer::QualifiedName),
-    UndefinedTerm(SymbolName<namer::QualifiedName, namer::Identifier>),
+    UndefinedTerm(SymbolName),
     NoSuchRecordType(RecordType),
     UnquantifiedTypeParameter(parser::Identifier),
     WrongArity {
@@ -605,6 +604,7 @@ pub enum BaseType {
     Int,
     Text,
     Bool,
+    Unit,
 }
 
 impl BaseType {
@@ -617,6 +617,7 @@ impl BaseType {
             Self::Int => "Int",
             Self::Text => "Text",
             Self::Bool => "Bool",
+            Self::Unit => "Unit",
         }
     }
 
@@ -625,6 +626,7 @@ impl BaseType {
             Self::Int => namer::QualifiedName::builtin("Int"),
             Self::Text => namer::QualifiedName::builtin("Text"),
             Self::Bool => namer::QualifiedName::builtin("Bool"),
+            Self::Unit => namer::QualifiedName::builtin("Unit"),
         }
     }
 }
@@ -1001,8 +1003,6 @@ impl Deref for Substitutions {
         &self.0
     }
 }
-
-pub type Term = namer::SymbolName<namer::QualifiedName, namer::Identifier>;
 
 #[derive(Debug, Clone, Default)]
 pub struct TermEnvironment {
@@ -1420,26 +1420,16 @@ impl TypingContext {
                 ),
             )),
 
-            UntypedExpr::InvokeBridge(pi, bridge) => {
-                let qualified_name = bridge.qualified_name();
-                Ok((
-                    Substitutions::default(),
-                    Expr::InvokeBridge(
-                        TypeInfo {
-                            parse_info: *pi,
-                            inferred_type: self
-                                .terms
-                                .lookup_free(&qualified_name)
-                                .ok_or_else(|| TypeError::UndefinedName {
-                                    parse_info: *pi,
-                                    name: Identifier::Free(qualified_name.clone()),
-                                })?
-                                .instantiate(),
-                        },
-                        bridge.clone(),
-                    ),
-                ))
-            }
+            UntypedExpr::InvokeBridge(pi, bridge) => Ok((
+                Substitutions::default(),
+                Expr::InvokeBridge(
+                    TypeInfo {
+                        parse_info: *pi,
+                        inferred_type: bridge.return_type.clone(),
+                    },
+                    bridge.clone(),
+                ),
+            )),
 
             UntypedExpr::Constant(pi, literal) => Ok((
                 Substitutions::default(),
@@ -1755,9 +1745,6 @@ impl TypingContext {
         let type_constructor = type_constructor.instantiate(self)?;
 
         let subs = if let Type::Coproduct(coproduct) = type_constructor.structure()? {
-            println!(
-                "infer_coproduct_construct: coproduct {coproduct:?}, argument typrs {argument_types:?}"
-            );
             let signature = coproduct
                 .signature(constructor_name)
                 .ok_or_else(|| TypeError::NoSuchCoproductConstructor(constructor_name.clone()))?;
@@ -2160,6 +2147,8 @@ impl Literal {
         Type::Base(match self {
             ast::Literal::Int(..) => BaseType::Int,
             ast::Literal::Text(..) => BaseType::Text,
+            ast::Literal::Bool(..) => BaseType::Bool,
+            ast::Literal::Unit => BaseType::Unit,
         })
     }
 }
@@ -2225,6 +2214,7 @@ impl fmt::Display for BaseType {
             Self::Int => write!(f, "Int"),
             Self::Text => write!(f, "Text"),
             Self::Bool => write!(f, "Bool"),
+            Self::Unit => write!(f, "Unit"),
         }
     }
 }

@@ -88,6 +88,19 @@ impl IdentifierPath {
             .prefigure(head, tail, ast::BUILTIN_MODULE_NAME.to_owned())
     }
 
+    pub fn in_module(&self, module: &IdentifierPath) -> Self {
+        IdentifierPath {
+            head: module.head.clone(),
+            tail: {
+                let mut new_tail = module.tail.to_vec();
+                new_tail.push(self.head.clone());
+                new_tail.extend_from_slice(&self.tail);
+
+                new_tail
+            },
+        }
+    }
+
     fn prefigure(self, head: &str, tail: &Vec<String>, head1: String) -> IdentifierPath {
         Self {
             head: head1,
@@ -1527,7 +1540,7 @@ impl From<Literal> for ast::Literal {
         match value {
             Literal::Integer(x) => ast::Literal::Int(x),
             Literal::Text(x) => ast::Literal::Text(x),
-            Literal::Bool(..) => todo!(),
+            Literal::Bool(x) => ast::Literal::Bool(x),
         }
     }
 }
