@@ -2188,9 +2188,21 @@ impl TypingContext {
     }
 
     fn infer_sequence(&mut self, sequence: &namer::Sequence) -> Typing {
-        // Is it this simple?
-        self.infer_expr(&sequence.this)?;
-        self.infer_expr(&sequence.and_then)
+        let (subs1, this) = self.infer_expr(&sequence.this)?;
+        self.substitute_mut(&subs1);
+        let (subs2, and_then) = self.infer_expr(&sequence.and_then)?;
+        let substitutions = subs1.compose(&subs2);
+
+        Ok((
+            substitutions,
+            Expr::Sequence(
+                and_then.type_info().clone(),
+                Sequence {
+                    this: this.into(),
+                    and_then: and_then.into(),
+                },
+            ),
+        ))
     }
 
     fn free_variables(&self) -> HashSet<TypeParameter> {

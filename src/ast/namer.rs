@@ -116,6 +116,11 @@ impl<A> ast::Expr<A, Identifier> {
                 }
             }
 
+            Self::Sequence(_, ast::Sequence { this, and_then }) => {
+                this.gather_free_variables(free);
+                and_then.gather_free_variables(free);
+            }
+
             _otherwise => (),
         }
     }

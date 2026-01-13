@@ -43,21 +43,18 @@ impl Expr<(), namer::Identifier> {
 
             Self::Lambda(_, the) => Ok(Value::Closure(Closure::capture(env, &the.body))),
 
-            Self::Apply(_, the) => {
-                let value = the.function.reduce(env)?;
-                match value {
-                    Value::Closure(closure) => apply_closure(closure, the.argument.reduce(env)?),
+            Self::Apply(_, the) => match the.function.reduce(env)? {
+                Value::Closure(closure) => apply_closure(closure, the.argument.reduce(env)?),
 
-                    Value::RecursiveClosure { name, inner } => {
-                        let closure = inner.upgrade().ok_or_else(|| {
-                            RuntimeError::ExpiredSelfReferential(format!("{name}"))
-                        })?;
-                        apply_closure(closure, the.argument.reduce(env)?)
-                    }
-
-                    otherwise => Err(RuntimeError::ExpectedClosure(otherwise)),
+                Value::RecursiveClosure { name, inner } => {
+                    let closure = inner
+                        .upgrade()
+                        .ok_or_else(|| RuntimeError::ExpiredSelfReferential(format!("{name}")))?;
+                    apply_closure(closure, the.argument.reduce(env)?)
                 }
-            }
+
+                otherwise => Err(RuntimeError::ExpectedClosure(otherwise)),
+            },
 
             Self::Let(_, the) => {
                 env.bind_and_then(the.bound.reduce(env)?, |env| the.body.reduce(env))
@@ -95,7 +92,8 @@ impl Expr<(), namer::Identifier> {
             },
 
             Self::Sequence(_, the) => {
-                env.bind_and_then(the.this.reduce(env)?, |env| the.and_then.reduce(env))
+                the.this.reduce(env)?;
+                the.and_then.reduce(env)
             }
 
             Self::Deconstruct(_, the) => {
@@ -182,9 +180,8 @@ impl Pattern<(), namer::Identifier> {
 
 fn apply_closure(closure: Rc<RefCell<Closure>>, argument: Value) -> Interpretation {
     let closure = closure.borrow();
-    closure
-        .capture
-        .bind_and_then(argument, |env| closure.body.reduce(env))
+    let env = closure.capture.clone();
+    env.bind_and_then(argument, |env| closure.body.reduce(env))
 }
 
 #[derive(Debug)]

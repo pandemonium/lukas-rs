@@ -1,2 +1,13 @@
+factorial :: Int -> Int :=
+  lambda n.
+    deconstruct n into
+      0 -> 1
+    | x ->
+        let arg = x - 1
+        in
+            x * factorial arg
+
 start := lambda x.
-  print_endline (show ((1 + 3) % 2))
+  print_endline "starting"
+  let ans = factorial 20
+  in print_endline (show ans)

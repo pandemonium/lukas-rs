@@ -244,7 +244,7 @@ impl<'a> Parser<'a> {
                     .collect::<Vec<_>>()
                     .join(" "),
                 indent = depth * 2,
-                pad = 90 - (depth * 2 + e.step.len())
+                pad = 100 - (depth * 2 + e.step.len())
             );
         } else {
             println!("Unknown caller.")
@@ -794,7 +794,7 @@ impl<'a> Parser<'a> {
 
         self.expect(TokenKind::Period)?;
 
-        let body = self.parse_block(|parser| parser.parse_expression(0))?;
+        let body = self.parse_block(|parser| parser.parse_sequence())?;
 
         let lambda = params.into_iter().rfold(body, |body, (pos, param)| {
             Expr::Lambda(
@@ -1311,7 +1311,7 @@ impl<'a> Parser<'a> {
         let pattern = self.parse_pattern()?;
 
         self.expect(TokenKind::Arrow)?;
-        let consequent = self.parse_expression(0)?;
+        let consequent = self.parse_block(|parser| parser.parse_sequence())?;
         Ok(MatchClause {
             pattern,
             consequent: consequent.into(),
