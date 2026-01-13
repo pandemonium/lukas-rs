@@ -222,7 +222,7 @@ pub struct QualifiedName {
 }
 
 impl QualifiedName {
-    fn new(module: parser::IdentifierPath, member: &str) -> QualifiedName {
+    pub fn new(module: parser::IdentifierPath, member: &str) -> QualifiedName {
         Self {
             module,
             member: parser::Identifier::from_str(member),
@@ -422,15 +422,13 @@ impl ParserCompilationContext {
         let builtins = parser::IdentifierPath::new(ast::BUILTIN_MODULE_NAME);
 
         modules.insert(parser::IdentifierPath::new(ast::ROOT_MODULE_NAME), vec![]);
+        modules.insert(parser::IdentifierPath::new(ast::STDLIB_MODULE_NAME), vec![]);
         modules.insert(builtins.clone(), vec![]);
-
-        // builtin::import?
-        // stdlib::import?
 
         for symbol in stdlib::import() {
             println!("from: {symbol:?}");
             modules
-                .entry(builtins.clone())
+                .entry(symbol.name.module.clone())
                 .or_default()
                 .push(symbol.name.member.clone());
             symbols.insert(SymbolName::Term(symbol.name.clone()), Symbol::Term(symbol));
@@ -1079,24 +1077,19 @@ impl parser::Expr {
     fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Expr {
         match self {
             Self::Variable(a, identifier_path) => {
-                println!("resolve: {identifier_path}");
+                println!("resolve(x): {identifier_path}");
 
                 if let Some(bound) =
                     names.try_resolve_bound(&parser::Identifier::from_str(&identifier_path.head))
                 {
                     println!("resolve(1): {identifier_path}");
                     into_projection(a, bound, identifier_path)
-                }
-                /*  else if let Some(name) = identifier_path.try_as_simple() {
-                    println!("resolve(2): {identifier_path}");
-                    Expr::Variable(*a, names.resolve(&name))
-                }*/
-                else if let Some(path) =
+                } else if let Some(path) =
                     // I guess this would have to resolve the this name against every
                     // imported namespace
                     symbols.resolve_module_path_expr(&identifier_path)
                 {
-                    println!("resolve(3): {identifier_path}");
+                    println!("resolve(3): {identifier_path} -> {path}");
                     path.into_projection(*a)
                 } else {
                     panic!("Unresolved symbol {}", identifier_path)

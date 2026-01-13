@@ -43,12 +43,12 @@ pub struct PartialRawLambda2<F> {
 }
 
 impl Bridge {
-    pub fn for_external<E>(external: E) -> Self
+    pub fn for_external<E>(external: E, module: &parser::IdentifierPath) -> Self
     where
         E: External + 'static,
     {
         let return_type = external.return_type();
-        let qualified_name = QualifiedName::builtin(external.name());
+        let qualified_name = QualifiedName::new(module.clone(), external.name());
         Bridge {
             external: Rc::new(external),
             return_type,
@@ -72,12 +72,12 @@ pub trait External {
 
     fn return_type(&self) -> Type;
 
-    fn into_curried_lambda_tree(self) -> parser::Expr
+    fn into_curried_lambda_tree(self, module: &parser::IdentifierPath) -> parser::Expr
     where
         Self: Sized + 'static,
     {
         (0..self.arity()).rfold(
-            parser::Expr::InvokeBridge(ParseInfo::default(), Bridge::for_external(self)),
+            parser::Expr::InvokeBridge(ParseInfo::default(), Bridge::for_external(self, module)),
             |body, index| {
                 parser::Expr::Lambda(
                     ParseInfo::default(),
@@ -90,14 +90,17 @@ pub trait External {
         )
     }
 
-    fn into_symbol(self) -> TermSymbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>
+    fn into_symbol(
+        self,
+        module: &parser::IdentifierPath,
+    ) -> TermSymbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>
     where
         Self: Sized + 'static,
     {
         TermSymbol {
-            name: QualifiedName::builtin(self.name()),
+            name: QualifiedName::new(module.clone(), self.name()),
             type_signature: Some(self.type_signature()),
-            body: self.into_curried_lambda_tree().into(),
+            body: self.into_curried_lambda_tree(module).into(),
         }
     }
 }

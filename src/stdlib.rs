@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use crate::{
-    ast::{TypeSignature, namer::TermSymbol},
+    ast::{BUILTIN_MODULE_NAME, STDLIB_MODULE_NAME, TypeSignature, namer::TermSymbol},
     bridge::{External, Lambda1, Lambda2, PartialRawLambda2, RawLambda1},
     interpreter::{Literal, Value},
     lambda1, lambda2,
@@ -10,16 +10,6 @@ use crate::{
     rawlambda1,
     typer::{BaseType, Type, TypeParameter},
 };
-
-impl Value {
-    fn try_into_constant(self) -> Option<Literal> {
-        if let Value::Constant(literal) = self {
-            Some(literal)
-        } else {
-            None
-        }
-    }
-}
 
 fn comparison_signature() -> TypeSignature<ParseInfo, parser::IdentifierPath> {
     let a = parser::Identifier::from_str("a");
@@ -86,6 +76,9 @@ fn mk_artithmetic_op(
 }
 
 pub fn import() -> Vec<TermSymbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>> {
+    let builtins = parser::IdentifierPath::new(BUILTIN_MODULE_NAME);
+    let stdlib = parser::IdentifierPath::new(STDLIB_MODULE_NAME);
+
     let eq = PartialRawLambda2 {
         name: Operator::Equals.name(),
         apply: |p, q| equals(p, q).map(|r| Value::Constant(Literal::Bool(r))),
@@ -147,21 +140,21 @@ pub fn import() -> Vec<TermSymbol<ParseInfo, parser::IdentifierPath, parser::Ide
     };
 
     vec![
-        rawlambda1!(show).into_symbol(),
-        lambda1!(print_endline).into_symbol(),
-        eq.into_symbol(),
-        gte.into_symbol(),
-        lte.into_symbol(),
-        gt.into_symbol(),
-        lt.into_symbol(),
-        lambda2!(and).into_symbol(),
-        lambda2!(or).into_symbol(),
-        lambda2!(xor).into_symbol(),
-        plus.into_symbol(),
-        minus.into_symbol(),
-        times.into_symbol(),
-        divided.into_symbol(),
-        modulo.into_symbol(),
+        rawlambda1!(show).into_symbol(&stdlib),
+        lambda1!(print_endline).into_symbol(&stdlib),
+        eq.into_symbol(&builtins),
+        gte.into_symbol(&builtins),
+        lte.into_symbol(&builtins),
+        gt.into_symbol(&builtins),
+        lt.into_symbol(&builtins),
+        lambda2!(and).into_symbol(&builtins),
+        lambda2!(or).into_symbol(&builtins),
+        lambda2!(xor).into_symbol(&builtins),
+        plus.into_symbol(&builtins),
+        minus.into_symbol(&builtins),
+        times.into_symbol(&builtins),
+        divided.into_symbol(&builtins),
+        modulo.into_symbol(&builtins),
     ]
 }
 
