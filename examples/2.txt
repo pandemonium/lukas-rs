@@ -1,0 +1,24 @@
+if <expr> then <consequent expr> else <alternate expr>
+
+if <expr> then <consequent expr>
+else <alternate expr>
+
+if <expr> then
+    <consequent expr>
+else
+    <alternate expr>
+
+if <expr>
+then <consequent expr>
+else <alternate expr>
+
+if
+    <expr>
+then
+    <consequent expr>
+else
+    <alternate expr>
+
+if <expr>
+    then <consequent expr>
+    else <alternate expr>

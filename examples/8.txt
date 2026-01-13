@@ -1,0 +1,33 @@
+Perhaps ::= forall a. Indeed a | Missed
+
+map :: forall a b. (a -> b) -> Perhaps a -> Perhaps b :=
+  lambda f xs.
+    deconstruct xs into
+      Indeed a -> Indeed (f a)
+    | Missed   -> Missed
+
+Record ::=
+  { Name :: Text
+    Age  :: Perhaps Int
+  }
+
+record_matching :=
+  deconstruct
+    { Name: "Patrik Andersson"
+      Age: Indeed 47
+    }
+  into
+    { Name: name; Age: Indeed age } -> age
+  | { Name: name; Age: age }        -> 427
+
+start  := lambda x.
+  foo "Hej"
+
+tuple_matching :=
+  deconstruct
+    1, "två"
+  into
+    t, u -> u, t, 1
+
+foo :: Text -> Perhaps Int := lambda x.
+  map (lambda y. y) (Indeed x)

@@ -1,0 +1,15 @@
+Foo ::= forall a.
+  { Name :: a
+    Age  :: Int
+  }
+
+mk_foo := lambda a. { Age: 47; Name: a }
+
+text_foo := mk_foo "Patrik Andersson"
+
+int_foo := mk_foo 427
+
+start2 := lambda x. int_foo.Name
+
+start := lambda x.
+  ((lambda a. a) text_foo).Age

@@ -1,0 +1,21 @@
+List ::= forall a. Nil | Cons a (List a)
+
+map_list :: forall a b. (a -> b) -> List a -> List b :=
+  lambda f xs.
+    deconstruct xs into
+      Cons head tail -> Cons (f head) (map_list f tail)
+    | Nil            -> Nil
+
+Perhaps ::= forall a. Indeed a | Missed
+
+map_perhaps :: forall a b. (a -> b) -> Perhaps a -> Perhaps b :=
+  lambda f xs.
+    deconstruct xs into
+      Indeed a -> Indeed (f a)
+    | Missed   -> Missed
+
+start := lambda x.
+  map_list (lambda x. "ett") (Cons 1 (Cons 2 Nil))
+
+foo :: Int -> Perhaps Int := lambda x.
+  map_perhaps (lambda y. y) (Indeed x)

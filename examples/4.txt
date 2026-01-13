@@ -1,0 +1,34 @@
+Blow ::= forall a.
+  { Name :: a
+    Id   :: Int
+  }
+
+mk_blow := lambda a. { Name: a; Id: 10 }
+
+mk_text_blow := mk_blow "Sune Sundgren"
+
+mk_int_blow := mk_blow 427
+
+Perhaps ::= This Text | Nope
+
+Expr ::= forall a. Var Text | Lambda Text (Expr a)
+
+start :=
+  lambda x.
+    (foo 1 x).Name.Id
+
+foo :=
+  lambda x y.
+    rec
+
+rec :=
+    { Name: { Name: "Patrik Andersson" ; Id: 13 }
+      Age: 47
+      Length: 9000
+    }
+
+Yo ::=
+  { Name   :: Blow Text
+    Age    :: Int
+    Length :: Int
+  }

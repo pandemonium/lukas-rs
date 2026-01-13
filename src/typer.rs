@@ -384,7 +384,7 @@ pub enum Type {
 }
 
 impl Type {
-    pub fn reify(&self) -> parser::TypeExpression {
+    pub fn reify(&self, type_param_map: &[parser::Identifier]) -> parser::TypeExpression {
         let pi = ParseInfo::default();
 
         let reified_name = |qn: &QualifiedName| {
@@ -393,7 +393,7 @@ impl Type {
 
         match self {
             Self::Variable(TypeParameter(p)) => {
-                parser::TypeExpression::Parameter(pi, parser::Identifier::from_str(&format!("{p}")))
+                parser::TypeExpression::Parameter(pi, type_param_map[*p as usize].clone())
             }
             Self::Base(BaseType::Int) => {
                 parser::TypeExpression::Constructor(pi, parser::IdentifierPath::new("Int"))
@@ -410,8 +410,8 @@ impl Type {
             Self::Arrow { domain, codomain } => parser::TypeExpression::Arrow(
                 pi,
                 ArrowTypeExpr {
-                    domain: domain.reify().into(),
-                    codomain: codomain.reify().into(),
+                    domain: domain.reify(type_param_map).into(),
+                    codomain: codomain.reify(type_param_map).into(),
                 },
             ),
             Self::Tuple(..) => todo!(),
@@ -426,8 +426,8 @@ impl Type {
             } => parser::TypeExpression::Apply(
                 pi,
                 ApplyTypeExpr {
-                    function: constructor.reify().into(),
-                    argument: argument.reify().into(),
+                    function: constructor.reify(type_param_map).into(),
+                    argument: argument.reify(type_param_map).into(),
                     phase: PhantomData,
                 },
             ),
@@ -989,8 +989,12 @@ pub struct TypeParameter(u32);
 static FRESH_TYPE_ID: AtomicU32 = AtomicU32::new(0);
 
 impl TypeParameter {
-    fn fresh() -> Self {
+    pub fn fresh() -> Self {
         Self(FRESH_TYPE_ID.fetch_add(1, Ordering::SeqCst))
+    }
+
+    pub fn new(p: u32) -> Self {
+        Self(p)
     }
 }
 

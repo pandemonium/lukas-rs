@@ -1,0 +1,11 @@
+Perhaps ::= forall a. This a | Nope
+
+List ::= forall a. Nil | Cons a (List a)
+
+mk_tup := lambda a b c. a, b, c
+
+int_list := Cons (mk_tup 7 "Sju" 0) (Cons (mk_tup 1 "ett" 1) (Cons (mk_tup 427 "fyrahundratjugosju" 2) Nil))
+
+tup_five := lambda x. 0, x, 2, 3, 4
+
+start := lambda x. (tup_five "427").1

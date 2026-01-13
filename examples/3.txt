@@ -1,0 +1,6 @@
+let frobnicator = 27
+in
+    print_endline "Hi, mom" 1 2 3 ; print_endline
+                                        "Hello, world"
+let quux = 10 in
+foo
