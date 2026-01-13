@@ -29,6 +29,7 @@ pub type Projection = ast::Projection<ParseInfo, Identifier>;
 pub type Construct = ast::Construct<ParseInfo, Identifier>;
 pub type Sequence = ast::Sequence<ParseInfo, Identifier>;
 pub type Deconstruct = ast::Deconstruct<ParseInfo, Identifier>;
+pub type IfThenElse = ast::IfThenElse<ParseInfo, Identifier>;
 pub type MatchClause = ast::pattern::MatchClause<ParseInfo, Identifier>;
 pub type Pattern = ast::pattern::Pattern<ParseInfo, Identifier>;
 pub type ConstructorPattern = ast::pattern::ConstructorPattern<ParseInfo, Identifier>;
@@ -119,6 +120,12 @@ impl<A> ast::Expr<A, Identifier> {
             Self::Sequence(_, ast::Sequence { this, and_then }) => {
                 this.gather_free_variables(free);
                 and_then.gather_free_variables(free);
+            }
+
+            Self::If(_, the) => {
+                the.predicate.gather_free_variables(free);
+                the.consequent.gather_free_variables(free);
+                the.alternate.gather_free_variables(free);
             }
 
             _otherwise => (),
@@ -973,44 +980,44 @@ impl parser::Expr {
             | parser::Expr::Constant(..)
             | parser::Expr::InvokeBridge(..) => self,
 
-            parser::Expr::RecursiveLambda(a, self_referential) => parser::Expr::RecursiveLambda(
+            parser::Expr::RecursiveLambda(a, the) => parser::Expr::RecursiveLambda(
                 a,
                 parser::SelfReferential {
-                    own_name: self_referential.own_name,
+                    own_name: the.own_name,
                     lambda: parser::Lambda {
-                        parameter: self_referential.lambda.parameter,
-                        body: map_lower_tuples(self_referential.lambda.body),
+                        parameter: the.lambda.parameter,
+                        body: map_lower_tuples(the.lambda.body),
                     },
                 },
             ),
 
-            parser::Expr::Lambda(a, lambda) => parser::Expr::Lambda(
+            parser::Expr::Lambda(a, the) => parser::Expr::Lambda(
                 a,
                 parser::Lambda {
-                    parameter: lambda.parameter,
-                    body: map_lower_tuples(lambda.body),
+                    parameter: the.parameter,
+                    body: map_lower_tuples(the.body),
                 },
             ),
 
-            parser::Expr::Apply(a, apply) => parser::Expr::Apply(
+            parser::Expr::Apply(a, the) => parser::Expr::Apply(
                 a,
                 parser::Apply {
-                    function: map_lower_tuples(apply.function),
-                    argument: map_lower_tuples(apply.argument),
+                    function: map_lower_tuples(the.function),
+                    argument: map_lower_tuples(the.argument),
                 },
             ),
 
-            parser::Expr::Let(a, binding) => parser::Expr::Let(
+            parser::Expr::Let(a, the) => parser::Expr::Let(
                 a,
                 parser::Binding {
-                    binder: binding.binder,
-                    bound: map_lower_tuples(binding.bound),
-                    body: map_lower_tuples(binding.body),
+                    binder: the.binder,
+                    bound: map_lower_tuples(the.bound),
+                    body: map_lower_tuples(the.body),
                 },
             ),
 
-            parser::Expr::Tuple(a, tuple) => {
-                let elements = tuple.elements;
+            parser::Expr::Tuple(a, the) => {
+                let elements = the.elements;
                 parser::Expr::Tuple(
                     a,
                     parser::Tuple {
@@ -1019,10 +1026,10 @@ impl parser::Expr {
                 )
             }
 
-            parser::Expr::Record(a, record) => parser::Expr::Record(
+            parser::Expr::Record(a, the) => parser::Expr::Record(
                 a,
                 parser::Record {
-                    fields: record
+                    fields: the
                         .fields
                         .into_iter()
                         .map(|(label, e)| (label, map_lower_tuples(e)))
@@ -1030,11 +1037,11 @@ impl parser::Expr {
                 },
             ),
 
-            parser::Expr::Construct(a, construct) => parser::Expr::Construct(
+            parser::Expr::Construct(a, the) => parser::Expr::Construct(
                 a,
                 parser::Construct {
-                    constructor: construct.constructor,
-                    arguments: construct
+                    constructor: the.constructor,
+                    arguments: the
                         .arguments
                         .into_iter()
                         .map(|e| map_lower_tuples(e))
@@ -1042,27 +1049,27 @@ impl parser::Expr {
                 },
             ),
 
-            parser::Expr::Project(a, projection) => parser::Expr::Project(
+            parser::Expr::Project(a, the) => parser::Expr::Project(
                 a,
                 parser::Projection {
-                    base: map_lower_tuples(projection.base),
-                    select: projection.select,
+                    base: map_lower_tuples(the.base),
+                    select: the.select,
                 },
             ),
 
-            parser::Expr::Sequence(a, sequence) => parser::Expr::Sequence(
+            parser::Expr::Sequence(a, the) => parser::Expr::Sequence(
                 a,
                 parser::Sequence {
-                    this: map_lower_tuples(sequence.this),
-                    and_then: map_lower_tuples(sequence.and_then),
+                    this: map_lower_tuples(the.this),
+                    and_then: map_lower_tuples(the.and_then),
                 },
             ),
 
-            parser::Expr::Deconstruct(a, deconstruct) => parser::Expr::Deconstruct(
+            parser::Expr::Deconstruct(a, the) => parser::Expr::Deconstruct(
                 a,
                 parser::Deconstruct {
-                    scrutinee: map_lower_tuples(deconstruct.scrutinee),
-                    match_clauses: deconstruct
+                    scrutinee: map_lower_tuples(the.scrutinee),
+                    match_clauses: the
                         .match_clauses
                         .iter()
                         .map(|clause| parser::MatchClause {
@@ -1070,6 +1077,15 @@ impl parser::Expr {
                             consequent: map_lower_tuples(clause.consequent.clone()),
                         })
                         .collect(),
+                },
+            ),
+
+            parser::Expr::If(a, the) => parser::Expr::If(
+                a,
+                parser::IfThenElse {
+                    predicate: map_lower_tuples(the.predicate),
+                    consequent: map_lower_tuples(the.consequent),
+                    alternate: map_lower_tuples(the.alternate),
                 },
             ),
         }
@@ -1126,6 +1142,8 @@ impl parser::Expr {
             Self::Sequence(a, node) => Expr::Sequence(*a, node.resolve(names, symbols)),
 
             Self::Deconstruct(a, node) => Expr::Deconstruct(*a, node.resolve(names, symbols)),
+
+            Self::If(a, node) => Expr::If(*a, node.resolve(names, symbols)),
         }
     }
 }
@@ -1279,6 +1297,16 @@ impl parser::Deconstruct {
                 .iter()
                 .map(|clause| clause.resolve(names, symbols))
                 .collect(),
+        }
+    }
+}
+
+impl parser::IfThenElse {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> IfThenElse {
+        IfThenElse {
+            predicate: self.predicate.resolve(names, symbols).into(),
+            consequent: self.consequent.resolve(names, symbols).into(),
+            alternate: self.alternate.resolve(names, symbols).into(),
         }
     }
 }

@@ -34,6 +34,7 @@ pub type Record = ast::Record<TypeInfo, namer::Identifier>;
 pub type Projection = ast::Projection<TypeInfo, namer::Identifier>;
 pub type Sequence = ast::Sequence<TypeInfo, namer::Identifier>;
 pub type Deconstruct = ast::Deconstruct<TypeInfo, namer::Identifier>;
+pub type IfThenElse = ast::IfThenElse<TypeInfo, namer::Identifier>;
 pub type MatchClause = ast::pattern::MatchClause<TypeInfo, namer::Identifier>;
 pub type Pattern = ast::pattern::Pattern<TypeInfo, namer::Identifier>;
 pub type ConstructorPattern = ast::pattern::ConstructorPattern<TypeInfo, namer::Identifier>;
@@ -1528,6 +1529,8 @@ impl TypingContext {
             UntypedExpr::Deconstruct(pi, deconstruct) => {
                 self.infer_deconstruction(*pi, deconstruct)
             }
+
+            UntypedExpr::If(pi, if_then_else) => self.infer_if_then_else(*pi, if_then_else),
         }
     }
 
@@ -1990,14 +1993,14 @@ impl TypingContext {
         }
     }
 
-    fn infer_tuple(&mut self, parse_info: &ParseInfo, tuple: &namer::Tuple) -> Typing {
+    fn infer_tuple(&mut self, pi: &ParseInfo, tuple: &namer::Tuple) -> Typing {
         let (substitutions, elements, element_types) = self.infer_several(&tuple.elements)?;
 
         Ok((
             substitutions,
             Expr::Tuple(
                 TypeInfo {
-                    parse_info: *parse_info,
+                    parse_info: *pi,
                     inferred_type: Type::Tuple(TupleType::from_signature(&element_types)),
                 },
                 Tuple { elements },
@@ -2080,7 +2083,7 @@ impl TypingContext {
 
     fn infer_apply(
         &mut self,
-        parse_info: &ParseInfo,
+        pi: &ParseInfo,
         function: &namer::Expr,
         argument: &namer::Expr,
     ) -> Typing {
@@ -2113,7 +2116,7 @@ impl TypingContext {
             substitutions,
             Expr::Apply(
                 TypeInfo {
-                    parse_info: *parse_info,
+                    parse_info: *pi,
                     inferred_type,
                 },
                 apply,
@@ -2123,7 +2126,7 @@ impl TypingContext {
 
     fn infer_lambda(
         &mut self,
-        parse_info: &ParseInfo,
+        pi: &ParseInfo,
         lambda: &namer::Lambda,
     ) -> Typing<(Substitutions, TypeInfo, Lambda)> {
         let domain = Type::fresh();
@@ -2144,7 +2147,7 @@ impl TypingContext {
                 Ok((
                     substitutions,
                     TypeInfo {
-                        parse_info: *parse_info,
+                        parse_info: *pi,
                         inferred_type,
                     },
                     Lambda {
@@ -2156,7 +2159,7 @@ impl TypingContext {
         )
     }
 
-    fn infer_binding(&mut self, parse_info: &ParseInfo, binding: &namer::Binding) -> Typing {
+    fn infer_binding(&mut self, pi: &ParseInfo, binding: &namer::Binding) -> Typing {
         let (bound_subs, bound) = self.infer_expr(&binding.bound)?;
         let bound_type = bound
             .type_info()
@@ -2174,7 +2177,7 @@ impl TypingContext {
                 substitutions,
                 Expr::Let(
                     TypeInfo {
-                        parse_info: *parse_info,
+                        parse_info: *pi,
                         inferred_type: body.type_info().inferred_type.clone(),
                     },
                     Binding {
@@ -2200,6 +2203,56 @@ impl TypingContext {
                 Sequence {
                     this: this.into(),
                     and_then: and_then.into(),
+                },
+            ),
+        ))
+    }
+
+    fn infer_if_then_else(&mut self, pi: ParseInfo, if_then_else: &namer::IfThenElse) -> Typing {
+        let (p_subs, predicate) = self.infer_expr(&if_then_else.predicate)?;
+        let subs = predicate
+            .type_info()
+            .inferred_type
+            .unified_with(&Type::Base(BaseType::Bool))?;
+        let p_subs = p_subs.compose(&subs);
+
+        self.substitute_mut(&p_subs);
+        let (c_subs, consequent) = self.infer_expr(&if_then_else.consequent)?;
+        self.substitute_mut(&c_subs);
+        let (a_subs, alternate) = self.infer_expr(&if_then_else.alternate)?;
+
+        let subs = p_subs.compose(&c_subs).compose(&a_subs);
+
+        let consequent_type = consequent
+            .with_substitutions(&subs)
+            .type_info()
+            .inferred_type
+            .clone();
+
+        let substitutions = consequent_type.unified_with(
+            &alternate
+                .with_substitutions(&subs)
+                .type_info()
+                .inferred_type,
+        )?;
+
+        let substitutions = subs.compose(&substitutions);
+
+        let predicate = predicate.with_substitutions(&substitutions);
+        let consequent = consequent.with_substitutions(&substitutions);
+        let alternate = alternate.with_substitutions(&substitutions);
+
+        Ok((
+            substitutions,
+            Expr::If(
+                TypeInfo {
+                    parse_info: pi,
+                    inferred_type: consequent_type.into(),
+                },
+                IfThenElse {
+                    predicate: predicate.into(),
+                    consequent: consequent.into(),
+                    alternate: alternate.into(),
                 },
             ),
         ))

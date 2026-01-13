@@ -41,6 +41,7 @@ where
                 Expr::Project(a, node) => Expr::Project(f(a), node.map_annotation(&f)),
                 Expr::Sequence(a, node) => Expr::Sequence(f(a), node.map_annotation(&f)),
                 Expr::Deconstruct(a, node) => Expr::Deconstruct(f(a), node.map_annotation(&f)),
+                Expr::If(a, node) => Expr::If(f(a), node.map_annotation(&f)),
             }
         }
 
@@ -256,6 +257,24 @@ where
                     consequent: clause.consequent.map_annotation(f).into(),
                 })
                 .collect(),
+        }
+    }
+}
+
+impl<A, B, Id> Annotated<A, B, Id> for IfThenElse<A, Id>
+where
+    Id: Clone,
+{
+    type Output = IfThenElse<B, Id>;
+
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
+    where
+        F: Fn(&A) -> B,
+    {
+        IfThenElse {
+            predicate: self.predicate.map_annotation(f),
+            consequent: self.consequent.map_annotation(f),
+            alternate: self.alternate.map_annotation(f),
         }
     }
 }

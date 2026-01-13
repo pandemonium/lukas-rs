@@ -22,6 +22,7 @@ pub type Projection = ast::Projection<ParseInfo, IdentifierPath>;
 pub type Construct = ast::Construct<ParseInfo, IdentifierPath>;
 pub type Sequence = ast::Sequence<ParseInfo, IdentifierPath>;
 pub type Deconstruct = ast::Deconstruct<ParseInfo, IdentifierPath>;
+pub type IfThenElse = ast::IfThenElse<ParseInfo, IdentifierPath>;
 pub type Pattern = ast::pattern::Pattern<ParseInfo, IdentifierPath>;
 pub type MatchClause = ast::pattern::MatchClause<ParseInfo, IdentifierPath>;
 pub type ConstructorPattern = ast::pattern::ConstructorPattern<ParseInfo, IdentifierPath>;
@@ -911,6 +912,8 @@ impl<'a> Parser<'a> {
 
             [t, ..] if t.is_keyword(Keyword::Deconstruct) => self.parse_deconstruct_into(),
 
+            [t, ..] if t.is_keyword(Keyword::If) => self.parse_if_then_else(),
+
             [
                 Token {
                     kind: TokenKind::LeftParen,
@@ -940,6 +943,7 @@ impl<'a> Parser<'a> {
                     Keyword::And
                         | Keyword::Or
                         | Keyword::Xor
+                        | Keyword::Then
                         | Keyword::Else
                         | Keyword::Into
                         | Keyword::In
@@ -960,6 +964,8 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Let),
             TokenKind::Keyword(Keyword::In),
             TokenKind::Keyword(Keyword::Into),
+            TokenKind::Keyword(Keyword::Then),
+            TokenKind::Keyword(Keyword::Else),
             TokenKind::End,
         ];
 
@@ -1469,6 +1475,40 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Colon)?;
         let pattern = self.parse_pattern()?;
         Ok((Identifier::from_str(&label), pattern))
+    }
+
+    fn parse_if_then_else(&mut self) -> Result<Expr> {
+        let _t = self.trace();
+
+        let position = self.expect(TokenKind::Keyword(Keyword::If))?.position;
+
+        let predicate = self.parse_block(|parser| parser.parse_sequence())?;
+
+        self.parse_block(|parser| {
+            if parser.peek()?.is_newline() {
+                parser.advance(1);
+            }
+            parser.expect(TokenKind::Keyword(Keyword::Then))?;
+
+            let consequent = parser.parse_block(|parser| parser.parse_sequence())?;
+
+            if parser.peek()?.is_newline() {
+                parser.advance(1);
+            }
+
+            parser.expect(TokenKind::Keyword(Keyword::Else))?;
+
+            let alternate = parser.parse_block(|parser| parser.parse_sequence())?;
+
+            Ok(Expr::If(
+                ParseInfo::from_position(position),
+                IfThenElse {
+                    predicate: predicate.into(),
+                    consequent: consequent.into(),
+                    alternate: alternate.into(),
+                },
+            ))
+        })
     }
 }
 

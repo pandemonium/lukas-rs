@@ -180,6 +180,7 @@ pub enum Expr<A, Id> {
     Project(A, Projection<A, Id>),
     Sequence(A, Sequence<A, Id>),
     Deconstruct(A, Deconstruct<A, Id>),
+    If(A, IfThenElse<A, Id>),
 }
 
 impl<A, Id> Expr<A, Id> {
@@ -197,7 +198,8 @@ impl<A, Id> Expr<A, Id> {
             | Expr::Construct(a, ..)
             | Expr::Project(a, ..)
             | Expr::Sequence(a, ..)
-            | Expr::Deconstruct(a, ..) => a,
+            | Expr::Deconstruct(a, ..)
+            | Expr::If(a, ..) => a,
         }
     }
 
@@ -213,6 +215,13 @@ impl<A, Id> Expr<A, Id> {
 pub struct Deconstruct<A, Id> {
     pub scrutinee: Tree<A, Id>,
     pub match_clauses: Vec<pattern::MatchClause<A, Id>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IfThenElse<A, Id> {
+    pub predicate: Tree<A, Id>,
+    pub consequent: Tree<A, Id>,
+    pub alternate: Tree<A, Id>,
 }
 
 #[derive(Debug, Clone)]
@@ -332,6 +341,7 @@ where
             Self::Project(_, x) => write!(f, "{}.{}", x.base, x.select),
             Self::Sequence(_, x) => write!(f, "{}; {}", x.this, x.and_then),
             Self::Deconstruct(_, x) => write!(f, "{x}"),
+            Self::If(_, x) => write!(f, "{x}"),
         }
     }
 }
@@ -352,6 +362,20 @@ where
         }
 
         Ok(())
+    }
+}
+
+impl<A, Id> fmt::Display for IfThenElse<A, Id>
+where
+    Id: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            predicate,
+            consequent,
+            alternate,
+        } = self;
+        write!(f, "if {predicate} then {consequent} else {alternate}")
     }
 }
 

@@ -7,6 +7,22 @@ factorial :: Int -> Int :=
         in
             x * factorial arg
 
+fibonacci :: Int -> Int := lambda n.
+  deconstruct
+    n
+  into
+    0 -> 1
+  | 1 -> 1
+  | x -> fibonacci (n - 1) + fibonacci (n - 2)
+
+ifonacci :: Int -> Int := lambda n.
+  if n = 0
+  then 1
+  else
+    if n = 1
+    then 1
+    else fibonacci (n - 1) + fibonacci (n - 2)
+
 start := lambda x.
   print_endline "starting"
   let ans = factorial 20

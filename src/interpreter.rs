@@ -112,6 +112,22 @@ impl Expr<(), namer::Identifier> {
                     consequent.reduce(env)
                 })
             }
+
+            Self::If(_, the) => {
+                let predicate = the.predicate.reduce(env)?;
+
+                if let Value::Constant(Literal::Bool(predicate)) = predicate {
+                    if predicate {
+                        the.consequent.reduce(env)
+                    } else {
+                        the.alternate.reduce(env)
+                    }
+                } else {
+                    Err(RuntimeError::ExpectedType(typer::Type::Base(
+                        typer::BaseType::Bool,
+                    )))
+                }
+            }
         }
     }
 }
