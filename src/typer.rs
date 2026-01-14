@@ -154,7 +154,8 @@ impl namer::NamedCompilationContext {
                 self.symbols
                     .get(id)
                     .map(|symbol| (id, symbol))
-                    .ok_or_else(|| TypeError::UndefinedSymbol(id.clone()))
+                    // This is really an internal error
+                    .ok_or_else(|| TypeError::UndefinedSymbol(id.clone()).at(ParseInfo::default()))
             })
             .collect::<Typing<Vec<_>>>()?
         {
@@ -184,7 +185,7 @@ impl namer::NamedCompilationContext {
             let inferred_type = body.type_info().inferred_type.clone();
 
             let type_scheme = type_signature.scheme(ctx)?;
-            inferred_type.check_instance_of(&type_scheme)?;
+            inferred_type.check_instance_of(body.type_info().parse_info, &type_scheme)?;
 
             let inferred_scheme = inferred_type.generalize(ctx);
 
@@ -238,7 +239,7 @@ where
 
 #[derive(Debug, Error)]
 pub enum TypeError {
-    #[error("Type error: cannot unify\nleft:  {lhs}\nright: {rhs}")]
+    #[error("Type error: cannot unify\n       left:  {lhs}\n       right: {rhs}")]
     UnificationImpossible { lhs: Type, rhs: Type },
 
     #[error("Type error: infinite type\ntype variable: {param}\noccurs in: {ty}")]
@@ -301,7 +302,21 @@ pub enum TypeError {
     },
 }
 
-pub type Typing<A = (Substitutions, Expr)> = Result<A, TypeError>;
+impl TypeError {
+    pub fn at(self, pi: ParseInfo) -> Located<Self> {
+        Located {
+            parse_info: pi,
+            error: self,
+        }
+    }
+}
+
+pub type Typing<A = (Substitutions, Expr)> = Result<A, Located<TypeError>>;
+
+pub struct Located<E> {
+    pub parse_info: ParseInfo,
+    pub error: E,
+}
 
 #[derive(Debug, Clone)]
 pub struct TypeInfo {
@@ -465,10 +480,13 @@ impl Type {
         Self::Variable(TypeParameter::fresh())
     }
 
-    pub fn check_instance_of(&self, scheme: &TypeScheme) -> Typing<()> {
+    pub fn check_instance_of(&self, pi: ParseInfo, scheme: &TypeScheme) -> Typing<()> {
         let instantiated_signature = scheme.instantiate();
 
-        let subs = instantiated_signature.unified_with(self)?;
+        let subs = instantiated_signature
+            .unified_with(self)
+            .map_err(|e| e.at(pi))?;
+
         println!("check_instance_of: scheme {instantiated_signature}, self {self}, subs {subs}");
 
         Ok(())
@@ -566,7 +584,7 @@ impl Type {
         }
     }
 
-    pub fn unified_with(&self, rhs: &Self) -> Typing<Substitutions> {
+    pub fn unified_with(&self, rhs: &Self) -> Result<Substitutions, TypeError> {
         match (self, rhs) {
             (lhs, rhs) if lhs == rhs => Ok(Substitutions::default()),
 
@@ -701,12 +719,7 @@ impl BaseType {
     }
 
     pub fn qualified_name(&self) -> namer::QualifiedName {
-        match self {
-            Self::Int => namer::QualifiedName::builtin("Int"),
-            Self::Text => namer::QualifiedName::builtin("Text"),
-            Self::Bool => namer::QualifiedName::builtin("Bool"),
-            Self::Unit => namer::QualifiedName::builtin("Unit"),
-        }
+        namer::QualifiedName::builtin(self.local_name())
     }
 }
 
@@ -777,11 +790,11 @@ impl TypeExpression {
         ctx: &TypingContext,
     ) -> Typing<Type> {
         match self {
-            Self::Constructor(_, name) => {
+            Self::Constructor(pi, name) => {
                 let constructor = ctx
                     .types
                     .lookup(name)
-                    .ok_or_else(|| TypeError::UndefinedType(name.clone()))?;
+                    .ok_or_else(|| TypeError::UndefinedType(name.clone()).at(*pi))?;
 
                 Ok(constructor
                     .definition()
@@ -789,11 +802,11 @@ impl TypeExpression {
                     .unwrap_or_else(|| constructor.definition().head()))
             }
 
-            Self::Parameter(_, p) => type_params
+            Self::Parameter(pi, p) => type_params
                 .get(p)
                 .copied()
                 .map(Type::Variable)
-                .ok_or_else(|| TypeError::UnquantifiedTypeParameter(p.clone())),
+                .ok_or_else(|| TypeError::UnquantifiedTypeParameter(p.clone()).at(*pi)),
 
             Self::Apply(
                 _,
@@ -923,7 +936,7 @@ impl TypeConstructor {
         }
     }
 
-    fn structure(&self) -> Typing<&Type> {
+    fn structure(&self) -> Result<&Type, TypeError> {
         if let Self::Elaborated(c) = self {
             Ok(&c.structure)
         } else {
@@ -1236,9 +1249,9 @@ pub struct TypingContext {
 }
 
 impl TypingContext {
-    pub fn normalize_type_application(&self, ty: &Type) -> Typing<Type> {
+    pub fn normalize_type_application(&self, pi: ParseInfo, ty: &Type) -> Typing<Type> {
         if let Type::Constructor(..) | Type::Apply { .. } = ty {
-            self.reduce_applied_constructor(ty, &mut vec![])
+            self.reduce_applied_constructor(pi, ty, &mut vec![])
         } else {
             Ok(ty.clone())
         }
@@ -1246,6 +1259,7 @@ impl TypingContext {
 
     fn reduce_applied_constructor(
         &self,
+        pi: ParseInfo,
         applied: &Type,
         arguments: &mut Vec<Type>,
     ) -> Typing<Type> {
@@ -1254,14 +1268,15 @@ impl TypingContext {
                 let constructor = self
                     .types
                     .lookup(name)
-                    .ok_or_else(|| TypeError::UndefinedType(name.clone()))?;
+                    .ok_or_else(|| TypeError::UndefinedType(name.clone()).at(pi))?;
 
                 if constructor.arity() != arguments.len() {
                     Err(TypeError::WrongArity {
                         constructor: constructor.definition().name.clone(),
                         was: arguments.clone(),
                         expected: constructor.arity(),
-                    })?;
+                    }
+                    .at(pi))?;
                 }
 
                 // Given (((f a) b) c), the recursion sees the outer
@@ -1285,7 +1300,10 @@ impl TypingContext {
                         .collect::<Vec<_>>(),
                 );
 
-                Ok(constructor.structure()?.with_substitutions(&subs))
+                Ok(constructor
+                    .structure()
+                    .map_err(|e| e.at(pi))?
+                    .with_substitutions(&subs))
             }
 
             Type::Apply {
@@ -1293,7 +1311,7 @@ impl TypingContext {
                 argument,
             } => {
                 arguments.push(*argument.clone());
-                self.reduce_applied_constructor(constructor, arguments)
+                self.reduce_applied_constructor(pi, constructor, arguments)
             }
 
             _ => Ok(applied.clone()),
@@ -1432,7 +1450,7 @@ impl TypingContext {
 
         match expr {
             UntypedExpr::Lambda(pi, lambda) => {
-                let normalized_type = self.normalize_type_application(expected_type)?;
+                let normalized_type = self.normalize_type_application(*pi, expected_type)?;
                 if let Type::Arrow { domain, codomain } = normalized_type {
                     self.bind_term_and_then(
                         lambda.parameter.clone(),
@@ -1461,18 +1479,21 @@ impl TypingContext {
                     Err(TypeError::UnificationImpossible {
                         lhs: normalized_type.clone(),
                         rhs: Type::fresh(),
-                    })?
+                    }
+                    .at(*pi))?
                 }
             }
 
-            _otherwise => {
+            otherwise => {
                 println!("check_expr: infer {expr}");
                 let (subs1, expr) = self.infer_expr(expr)?;
 
                 let lhs = expr.type_info().inferred_type.with_substitutions(&subs1);
                 let rhs = expected_type.with_substitutions(&subs1);
 
-                let subs2 = lhs.unified_with(&rhs)?;
+                let subs2 = lhs
+                    .unified_with(&rhs)
+                    .map_err(|e| e.at(*otherwise.annotation()))?;
 
                 let subs = subs1.compose(&subs2);
 
@@ -1493,9 +1514,12 @@ impl TypingContext {
                         inferred_type: self
                             .terms
                             .lookup(name)
-                            .ok_or_else(|| TypeError::UndefinedName {
-                                parse_info: *pi,
-                                name: name.clone(),
+                            .ok_or_else(|| {
+                                TypeError::UndefinedName {
+                                    parse_info: *pi,
+                                    name: name.clone(),
+                                }
+                                .at(*pi)
                             })?
                             .instantiate(),
                     },
@@ -1526,7 +1550,7 @@ impl TypingContext {
             )),
 
             UntypedExpr::RecursiveLambda(pi, rec_lambda) => {
-                self.infer_recursive_lambda(pi, rec_lambda)
+                self.infer_recursive_lambda(*pi, rec_lambda)
             }
 
             UntypedExpr::Lambda(pi, lambda) => {
@@ -1535,20 +1559,20 @@ impl TypingContext {
             }
 
             UntypedExpr::Apply(pi, ast::Apply { function, argument }) => {
-                self.infer_apply(pi, function, argument)
+                self.infer_apply(*pi, function, argument)
             }
 
             UntypedExpr::Let(pi, binding) => self.infer_binding(pi, binding),
 
-            UntypedExpr::Record(pi, record) => self.infer_record(pi, record),
+            UntypedExpr::Record(pi, record) => self.infer_record(*pi, record),
 
             UntypedExpr::Tuple(pi, tuple) => self.infer_tuple(pi, tuple),
 
             UntypedExpr::Construct(pi, constructor) => {
-                self.infer_coproduct_construct(pi, constructor)
+                self.infer_coproduct_construct(*pi, constructor)
             }
 
-            UntypedExpr::Project(pi, projection) => self.infer_projection(pi, projection),
+            UntypedExpr::Project(pi, projection) => self.infer_projection(*pi, projection),
 
             UntypedExpr::Sequence(_pi, sequence) => self.infer_sequence(sequence),
 
@@ -1605,7 +1629,8 @@ impl TypingContext {
                     .type_info()
                     .inferred_type
                     .with_substitutions(&substitutions)
-                    .unified_with(&consequent_type)?;
+                    .unified_with(&consequent_type)
+                    .map_err(|e| e.at(*&expr.annotation().parse_info))?;
                 consequent_type = consequent_type.with_substitutions(&subs);
                 typed_match_clauses.push(MatchClause {
                     pattern,
@@ -1637,7 +1662,8 @@ impl TypingContext {
         bindings: &mut Vec<(namer::Identifier, Type)>,
         scrutinee: &Type,
     ) -> Typing<(Substitutions, Pattern)> {
-        let normalized_scrutinee = self.normalize_type_application(&scrutinee)?;
+        let pi = *pattern.annotation();
+        let normalized_scrutinee = self.normalize_type_application(pi, &scrutinee)?;
 
         match (pattern, &normalized_scrutinee) {
             (namer::Pattern::Coproduct(_, coproduct_pattern), Type::Variable(p)) => {
@@ -1646,7 +1672,9 @@ impl TypingContext {
                         .types
                         .query_coproduct_type_constructors(&constructor)?
                         .first()
-                        .ok_or_else(|| TypeError::NoSuchCoproductConstructor(constructor.clone()))?
+                        .ok_or_else(|| {
+                            TypeError::NoSuchCoproductConstructor(constructor.clone()).at(pi)
+                        })?
                         .instantiate(&self)?
                         .make_spine();
 
@@ -1732,7 +1760,8 @@ impl TypingContext {
                         Err(TypeError::BadRecordPatternField {
                             record_type: scrutinee.clone(),
                             field: pattern_field.clone(),
-                        })?;
+                        }
+                        .at(*pi))?;
                     }
 
                     let (subs, pattern) = self.infer_pattern(pattern, bindings, scrutinee)?;
@@ -1755,7 +1784,7 @@ impl TypingContext {
             // Check pattern at ty
             (namer::Pattern::Literally(pi, pattern), ..) => {
                 let inferred = pattern.synthesize_type();
-                let subs = inferred.unified_with(&scrutinee)?;
+                let subs = inferred.unified_with(&scrutinee).map_err(|e| e.at(*pi))?;
 
                 Ok((
                     subs,
@@ -1787,32 +1816,16 @@ impl TypingContext {
         }
     }
 
-    fn infer_coproduct_construct(
-        &mut self,
-        pi: &ParseInfo,
-        construct: &namer::Construct,
-    ) -> Typing {
+    fn infer_coproduct_construct(&mut self, pi: ParseInfo, construct: &namer::Construct) -> Typing {
         let (substitutions, typed_arguments, argument_types) =
             self.infer_several(&construct.arguments)?;
-
-        //        for ty in &typed_arguments {
-        //            println!("infer_coproduct_construct: typed argument {}", ty);
-        //        }
-        //
-        //        for x in &argument_types {
-        //            println!("infer_coproduct_construct: argument type {}", x);
-        //        }
-
-        // Does it try more than one alternative if there are more? Pick the one
-        // with the best type? I could encode the name of the type constructor
-        // as a type of prefix to the constructor
-
         // TODO: namer::Identifier is a shit type for this purpose
         let constructor_name = construct.constructor.try_as_free().ok_or_else(|| {
             TypeError::InternalAssertion(format!(
                 "expected Identifier::Free, was: {}",
                 construct.constructor
             ))
+            .at(pi)
         })?;
 
         let candidates = self
@@ -1825,18 +1838,23 @@ impl TypingContext {
             // the user to qualify the name with a <Coproduct name>.<Constructor name>
             // type of deal
             .first()
-            .ok_or_else(|| TypeError::NoSuchCoproductConstructor(constructor_name.clone()))?;
+            .ok_or_else(|| {
+                TypeError::NoSuchCoproductConstructor(constructor_name.clone()).at(pi)
+            })?;
 
         let type_constructor = type_constructor.instantiate(self)?;
 
-        let subs = if let Type::Coproduct(coproduct) = type_constructor.structure()? {
-            let signature = coproduct
-                .signature(constructor_name)
-                .ok_or_else(|| TypeError::NoSuchCoproductConstructor(constructor_name.clone()))?;
+        let subs = if let Type::Coproduct(coproduct) =
+            type_constructor.structure().map_err(|e| e.at(pi))?
+        {
+            let signature = coproduct.signature(constructor_name).ok_or_else(|| {
+                TypeError::NoSuchCoproductConstructor(constructor_name.clone()).at(pi)
+            })?;
             Type::Tuple(TupleType::from_signature(signature))
-                .unified_with(&Type::Tuple(TupleType::from_signature(&argument_types)))?
+                .unified_with(&Type::Tuple(TupleType::from_signature(&argument_types)))
+                .map_err(|e| e.at(pi))?
         } else {
-            Err(TypeError::InternalAssertion(format!("Expected ")))?
+            Err(TypeError::InternalAssertion(format!("Expected ")).at(pi))?
         };
 
         Ok((
@@ -1844,7 +1862,7 @@ impl TypingContext {
             Expr::Construct(
                 // ParseInfo::with_inferred_type(self, ...) in typer.rs
                 TypeInfo {
-                    parse_info: *pi,
+                    parse_info: pi,
                     // I think this is incorrect - this must become
                     // a TypeScheme with the correct quantification
                     inferred_type: type_constructor.make_spine().with_substitutions(&subs),
@@ -1860,7 +1878,7 @@ impl TypingContext {
         ))
     }
 
-    fn infer_record(&mut self, pi: &ParseInfo, record: &namer::Record) -> Typing {
+    fn infer_record(&mut self, pi: ParseInfo, record: &namer::Record) -> Typing {
         let mut substitutions = Substitutions::default();
         let mut fields = Vec::with_capacity(record.fields.len());
 
@@ -1897,20 +1915,22 @@ impl TypingContext {
 
         let type_constructor = type_constructors
             .first()
-            .ok_or_else(|| TypeError::NoSuchRecordType(record_type.clone()))?;
+            .ok_or_else(|| TypeError::NoSuchRecordType(record_type.clone()).at(pi))?;
 
         // This is needed for coproducts too
         let type_constructor = type_constructor.instantiate(self)?;
 
         let subs = type_constructor
-            .structure()?
-            .unified_with(&Type::Record(record_type))?;
+            .structure()
+            .map_err(|e| e.at(pi))?
+            .unified_with(&Type::Record(record_type))
+            .map_err(|e| e.at(pi))?;
 
         Ok((
             substitutions.compose(&subs),
             Expr::Record(
                 TypeInfo {
-                    parse_info: *pi,
+                    parse_info: pi,
                     // I think this is incorrect - this must become
                     // a TypeScheme with the correct quantification
                     inferred_type: type_constructor.make_spine().with_substitutions(&subs),
@@ -1920,10 +1940,10 @@ impl TypingContext {
         ))
     }
 
-    fn infer_projection(&mut self, pi: &ParseInfo, projection: &namer::Projection) -> Typing {
+    fn infer_projection(&mut self, pi: ParseInfo, projection: &namer::Projection) -> Typing {
         let (substitutions, base) = self.infer_expr(&projection.base)?;
         let base_type = &base.type_info().inferred_type;
-        let normalized_base_type = self.normalize_type_application(base_type)?;
+        let normalized_base_type = self.normalize_type_application(pi, base_type)?;
 
         println!("infer_projection: {normalized_base_type}");
 
@@ -1940,7 +1960,7 @@ impl TypingContext {
                             substitutions,
                             Expr::Project(
                                 TypeInfo {
-                                    parse_info: *pi,
+                                    parse_info: pi,
                                     inferred_type: field_type.clone(),
                                 },
                                 Projection {
@@ -1953,7 +1973,8 @@ impl TypingContext {
                         Err(TypeError::BadProjection {
                             projection: projection.clone(),
                             inferred_type: base_type.clone(),
-                        })
+                        }
+                        .at(pi))
                     }
                 } else {
                     panic!("{base_type}")
@@ -1967,7 +1988,7 @@ impl TypingContext {
                             substitutions,
                             Expr::Project(
                                 TypeInfo {
-                                    parse_info: *pi,
+                                    parse_info: pi,
                                     inferred_type: element.clone(),
                                 },
                                 Projection {
@@ -1980,7 +2001,8 @@ impl TypingContext {
                         Err(TypeError::TupleOrdinalOutOfBounds {
                             base: (*projection.base).clone(),
                             select: projection.select.clone(),
-                        })?
+                        }
+                        .at(pi))?
                     }
                 }
 
@@ -1991,7 +2013,7 @@ impl TypingContext {
                         elems.push(Type::fresh());
                     }
                     let tuple_ty = Type::Tuple(TupleType::from_signature(&elems));
-                    let subs = base_type.unified_with(&tuple_ty)?;
+                    let subs = base_type.unified_with(&tuple_ty).map_err(|e| e.at(pi))?;
                     let projected_ty = match tuple_ty.with_substitutions(&subs) {
                         Type::Tuple(tuple) => tuple.elements()[*ordinal].clone(),
                         _ => unreachable!(),
@@ -2000,7 +2022,7 @@ impl TypingContext {
                         substitutions.compose(&subs),
                         Expr::Project(
                             TypeInfo {
-                                parse_info: *pi,
+                                parse_info: pi,
                                 inferred_type: projected_ty,
                             },
                             Projection {
@@ -2014,7 +2036,8 @@ impl TypingContext {
                 _ => Err(TypeError::BadProjection {
                     projection: projection.clone(),
                     inferred_type: base.type_info().inferred_type.clone(),
-                }),
+                }
+                .at(pi)),
             },
         }
     }
@@ -2064,7 +2087,7 @@ impl TypingContext {
 
     fn infer_recursive_lambda(
         &mut self,
-        pi: &ParseInfo,
+        pi: ParseInfo,
         rec_lambda: &namer::SelfReferential,
     ) -> Typing {
         let domain = Type::fresh();
@@ -2082,14 +2105,18 @@ impl TypingContext {
                     TypeScheme::from_constant(domain),
                     |ctx| {
                         let (substitutions, body) = ctx.infer_expr(&rec_lambda.lambda.body)?;
-                        let subs2 = body.type_info().inferred_type.unified_with(&codomain)?;
+                        let subs2 = body
+                            .type_info()
+                            .inferred_type
+                            .unified_with(&codomain)
+                            .map_err(|e| e.at(pi))?;
                         let substitutions = substitutions.compose(&subs2);
 
                         Ok((
                             substitutions.clone(),
                             Expr::RecursiveLambda(
                                 TypeInfo {
-                                    parse_info: *pi,
+                                    parse_info: pi,
                                     inferred_type: own_ty.with_substitutions(&substitutions),
                                 },
                                 SelfReferential {
@@ -2109,7 +2136,7 @@ impl TypingContext {
 
     fn infer_apply(
         &mut self,
-        pi: &ParseInfo,
+        pi: ParseInfo,
         function: &namer::Expr,
         argument: &namer::Expr,
     ) -> Typing {
@@ -2128,7 +2155,8 @@ impl TypingContext {
 
         let substitutions = expected_ty
             .with_substitutions(&substitutions)
-            .unified_with(&function.type_info().inferred_type)?
+            .unified_with(&function.type_info().inferred_type)
+            .map_err(|e| e.at(pi))?
             .compose(&substitutions);
 
         let apply = Apply {
@@ -2142,7 +2170,7 @@ impl TypingContext {
             substitutions,
             Expr::Apply(
                 TypeInfo {
-                    parse_info: *pi,
+                    parse_info: pi,
                     inferred_type,
                 },
                 apply,
@@ -2239,7 +2267,8 @@ impl TypingContext {
         let subs = predicate
             .type_info()
             .inferred_type
-            .unified_with(&Type::Base(BaseType::Bool))?;
+            .unified_with(&Type::Base(BaseType::Bool))
+            .map_err(|e| e.at(pi))?;
         let p_subs = p_subs.compose(&subs);
 
         self.substitute_mut(&p_subs);
@@ -2255,12 +2284,14 @@ impl TypingContext {
             .inferred_type
             .clone();
 
-        let substitutions = consequent_type.unified_with(
-            &alternate
-                .with_substitutions(&subs)
-                .type_info()
-                .inferred_type,
-        )?;
+        let substitutions = consequent_type
+            .unified_with(
+                &alternate
+                    .with_substitutions(&subs)
+                    .type_info()
+                    .inferred_type,
+            )
+            .map_err(|e| e.at(pi))?;
 
         let substitutions = subs.compose(&substitutions);
 
@@ -2297,6 +2328,16 @@ impl Literal {
             ast::Literal::Bool(..) => BaseType::Bool,
             ast::Literal::Unit => BaseType::Unit,
         })
+    }
+}
+
+impl<E> fmt::Display for Located<E>
+where
+    E: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { parse_info, error } = self;
+        write!(f, "{parse_info}: {error}")
     }
 }
 

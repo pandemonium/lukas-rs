@@ -676,7 +676,7 @@ impl fmt::Display for TokenKind {
 impl fmt::Display for SourceLocation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { row, column } = self;
-        write!(f, "{row},{column}")
+        write!(f, "{row}:{column}")
     }
 }
 

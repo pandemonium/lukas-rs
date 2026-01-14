@@ -1,6 +1,7 @@
 use std::{cell::Cell, fmt, iter, marker::PhantomData, result, vec};
 
 use backtrace::Backtrace;
+use thiserror::Error;
 
 use crate::{
     ast::{
@@ -150,17 +151,28 @@ impl Identifier {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum Fault {
+    #[error("Parse error: unexpected overflow")]
     UnexpectedOverflow,
+
+    #[error("Parse error: unexpected underflow")]
     UnexpectedUnderflow,
+
+    #[error("Parse error: {position}: expected {expected}\nfound: {found}")]
     Expected {
         expected: TokenKind,
         found: TokenKind,
         position: SourceLocation,
     },
+
+    #[error("Parse error: expected a parameter list")]
     ExpectedParameterList,
+
+    #[error("Parse error: expected an identifier\nfound: {0}")]
     ExpectedIdentifier(Token),
+
+    #[error("Parse error: expected a type constructor (Capitalized name.)")]
     ExpectedTypeConstructor,
 }
 
@@ -1606,7 +1618,7 @@ impl fmt::Display for IdentifierPath {
 impl fmt::Display for ParseInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { location } = self;
-        write!(f, "[{location}]")
+        write!(f, "{location}")
     }
 }
 

@@ -139,6 +139,16 @@ pub enum TypeExpression<A, TypeId> {
 }
 
 impl<A, TypeId> TypeExpression<A, TypeId> {
+    fn annotation(&self) -> &A {
+        match self {
+            Self::Constructor(a, _)
+            | Self::Parameter(a, _)
+            | Self::Apply(a, _)
+            | Self::Arrow(a, _)
+            | Self::Tuple(a, _) => a,
+        }
+    }
+
     fn ultimate(&self) -> &Self {
         match self {
             Self::Constructor(..) | Self::Parameter(..) | Self::Apply(..) | Self::Tuple(..) => self,
