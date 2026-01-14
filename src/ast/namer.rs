@@ -381,15 +381,16 @@ impl ParserCompilationContext {
         &self,
         path: &parser::IdentifierPath,
     ) -> Option<parser::IdentifierPath> {
-        println!(
-            "resolve_module_membership: {}",
+        if !self
+            .module_members
+            .contains_key(&IdentifierPath::new(path.head.as_str()))
+        {
             self.member_module
-                .contains_key(&parser::Identifier::from_str(&path.head))
-        );
-
-        self.member_module
-            .get(&parser::Identifier::from_str(&path.head))
-            .map(|module| path.in_module(module))
+                .get(&parser::Identifier::from_str(&path.head))
+                .map(|module| path.in_module(module))
+        } else {
+            Some(path.clone())
+        }
     }
 
     pub fn resolve_module_path_expr(
@@ -563,6 +564,12 @@ impl ParserCompilationContext {
                         declarator,
                     },
                 ) => {
+                    println!("collect_symbols: add {name} to {module_path}");
+                    module_members
+                        .entry(module_path.clone())
+                        .or_default()
+                        .push(name.clone());
+
                     let name = QualifiedName::new(module_path.clone(), name.as_str());
                     let symbol = match declarator {
                         ast::TypeDeclarator::Record(_, record) => {
@@ -582,6 +589,7 @@ impl ParserCompilationContext {
                                 })
                                 .collect::<Vec<_>>();
 
+                            println!("collect_symbols: module {module_path}");
                             collect_coproduct_constructors(
                                 *pi,
                                 symbols,
@@ -937,8 +945,6 @@ impl parser::TypeExpression {
     pub fn resolve_names(&self, symbols: &ParserCompilationContext) -> TypeExpression {
         match self {
             Self::Constructor(a, name) => {
-                // TODO: Is this where this happens? What exactly is _this_?
-                // Resolve local name against _import prefixes_?
                 TypeExpression::Constructor(*a, symbols.resolve_member_path(&name))
             }
 
@@ -1341,7 +1347,7 @@ impl parser::Pattern {
                 ConstructorPattern {
                     constructor: Identifier::Free(
                         // Resolve this against imported namespaces
-                        symbols.resolve_member_path(&pattern.constructor.as_root_module_member()),
+                        symbols.resolve_member_path(&pattern.constructor),
                     ),
                     arguments: pattern
                         .arguments
