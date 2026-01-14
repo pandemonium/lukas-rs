@@ -1,3 +1,5 @@
+use std::process::exit;
+
 use lukas::{
     ast::{self, namer},
     interpreter::Environment,
@@ -10,7 +12,7 @@ fn main() {
     let _ctx = TypingContext::default();
 
     let mut lexer = LexicalAnalyzer::default();
-    let input = include_str!("../examples/10.txt");
+    let input = include_str!("../examples/8.txt");
 
     let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
 
@@ -23,7 +25,13 @@ fn main() {
 
     println!("Program: {program}");
 
-    let env = Environment::typecheck_and_initialize(program).expect("TypeChecked and initialized");
+    let env = match Environment::typecheck_and_initialize(program) {
+        Ok(env) => env,
+        Err(error) => {
+            eprintln!("{error}");
+            exit(1);
+        }
+    };
 
     let return_value = env
         .call(

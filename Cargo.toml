@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 backtrace = "0.3.76"
+thiserror = "2.0.17"

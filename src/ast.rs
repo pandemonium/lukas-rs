@@ -346,6 +346,16 @@ where
     }
 }
 
+impl<A, Id> fmt::Display for Projection<A, Id>
+where
+    Id: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { base, select } = self;
+        write!(f, "{base}.{select}")
+    }
+}
+
 impl<A, Id> fmt::Display for Deconstruct<A, Id>
 where
     Id: fmt::Display,

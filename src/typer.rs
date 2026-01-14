@@ -9,6 +9,8 @@ use std::{
     vec,
 };
 
+use thiserror::Error;
+
 use crate::{
     ast::{
         self, ApplyTypeExpr, ArrowTypeExpr, Literal, ProductElement, Tree, TupleTypeExpr,
@@ -152,7 +154,7 @@ impl namer::NamedCompilationContext {
                 self.symbols
                     .get(id)
                     .map(|symbol| (id, symbol))
-                    .ok_or_else(|| TypeError::UndefinedTerm(id.clone()))
+                    .ok_or_else(|| TypeError::UndefinedSymbol(id.clone()))
             })
             .collect::<Typing<Vec<_>>>()?
         {
@@ -234,41 +236,65 @@ where
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum TypeError {
-    UnificationImpossible {
-        lhs: Type,
-        rhs: Type,
-    },
-    InfiniteType {
-        param: TypeParameter,
-        ty: Type,
-    },
+    #[error("Type error: cannot unify\nleft:  {lhs}\nright: {rhs}")]
+    UnificationImpossible { lhs: Type, rhs: Type },
+
+    #[error("Type error: infinite type\ntype variable: {param}\noccurs in: {ty}")]
+    InfiniteType { param: TypeParameter, ty: Type },
+
+    #[error(
+        "Type error: bad projection\nfrom type: {projection}\nit does not have a member: {inferred_type}"
+    )]
     BadProjection {
         projection: namer::Projection,
         inferred_type: Type,
     },
+
+    #[error("Type error: undefined name {name}\nat: {parse_info}")]
     UndefinedName {
         parse_info: ParseInfo,
         name: Identifier,
     },
+
+    #[error("Type error: undefined type {0}")]
     UndefinedType(namer::QualifiedName),
-    UndefinedTerm(SymbolName),
+
+    #[error("Type error: undefined symbol {0}")]
+    UndefinedSymbol(SymbolName),
+
+    #[error("Type error: {0} does not match a known record type")]
     NoSuchRecordType(RecordType),
+
+    #[error("Type error: unknown type parameter {0} in type expression")]
     UnquantifiedTypeParameter(parser::Identifier),
+
+    #[error(
+        "Type error: type constructor {constructor} expects {expected} arguments\nwas given: {was:?}"
+    )]
     WrongArity {
         constructor: namer::QualifiedName,
         was: Vec<Type>,
         expected: usize,
     },
+
+    #[error("Type error: type constructor {0} accessed in non-elaborated state")]
     UnelaboratedConstructor(namer::QualifiedName),
+
+    #[error("Type error: {0}")]
     InternalAssertion(String),
+
+    #[error("Type error: {0} is not a known coproduct constructor")]
     NoSuchCoproductConstructor(namer::QualifiedName),
-    ExpectedTuple,
+
+    #[error("Type error: tuple expression {base} does not have element {select}")]
     TupleOrdinalOutOfBounds {
         base: ast::Expr<ParseInfo, Identifier>,
         select: ProductElement,
     },
+
+    #[error("Type error: no such field {field} in {record_type}")]
     BadRecordPatternField {
         record_type: Type,
         field: parser::Identifier,

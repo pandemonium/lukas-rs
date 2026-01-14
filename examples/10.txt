@@ -23,6 +23,11 @@ ifonacci :: Int -> Int := lambda n.
     then 1
     else fibonacci (n - 1) + fibonacci (n - 2)
 
+bastard_if :=
+  if true
+    then "Hej"
+    else "1"
+
 start := lambda x.
   print_endline "starting"
   let ans = factorial 20

@@ -1603,6 +1603,13 @@ impl fmt::Display for IdentifierPath {
     }
 }
 
+impl fmt::Display for ParseInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { location } = self;
+        write!(f, "[{location}]")
+    }
+}
+
 //impl<'a> fmt::Display for TraceLogEntry<'a> {
 //    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 //        let Self { step, remains } = self;
