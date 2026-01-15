@@ -501,9 +501,9 @@ impl<'a> Parser<'a> {
         Ok(ValueDeclarator {
             type_signature,
             body: self
-                .parse_block(|parser| parser.parse_expression(0))
-                .map(|lambda| {
-                    if let Expr::Lambda(pi, lambda) = lambda {
+                .parse_block(|parser| parser.parse_sequence())
+                .map(|body| {
+                    if let Expr::Lambda(pi, lambda) = body {
                         Expr::RecursiveLambda(
                             pi,
                             SelfReferential {
@@ -512,7 +512,7 @@ impl<'a> Parser<'a> {
                             },
                         )
                     } else {
-                        lambda
+                        body
                     }
                 })?,
         })
@@ -697,6 +697,27 @@ impl<'a> Parser<'a> {
 
             [
                 Token {
+                    kind: TokenKind::LeftParen,
+                    position,
+                },
+                ..,
+            ] => {
+                self.advance(1);
+                let rhs = self.parse_type_expression()?;
+                self.expect(TokenKind::RightParen)?;
+
+                self.parse_type_expr_infix(TypeExpression::Apply(
+                    ParseInfo::from_position(*position),
+                    ApplyTypeExpr {
+                        function: lhs.into(),
+                        argument: rhs.into(),
+                        phase: PhantomData,
+                    },
+                ))
+            }
+
+            [
+                Token {
                     kind: TokenKind::RightParen,
                     ..
                 },
@@ -734,8 +755,20 @@ impl<'a> Parser<'a> {
 
         let location = *self.expect(TokenKind::Keyword(Keyword::Let))?.location();
         let (.., binder) = self.identifier()?;
+        let binder = IdentifierPath::new(&binder);
         self.expect(TokenKind::Equals)?;
         let bound = self.parse_block(|parser| parser.parse_sequence())?;
+        let bound = if let Expr::Lambda(pi, lambda) = bound {
+            Expr::RecursiveLambda(
+                pi,
+                SelfReferential {
+                    own_name: binder.clone(),
+                    lambda,
+                },
+            )
+        } else {
+            bound
+        };
         if self.peek()?.is_newline() {
             self.consume()?;
         }
@@ -744,11 +777,10 @@ impl<'a> Parser<'a> {
             self.consume()?;
         }
         let body = self.parse_block(|parser| parser.parse_sequence())?;
-        println!("parse_let: body `{body}`");
         Ok(Expr::Let(
             ParseInfo { location },
             Binding {
-                binder: IdentifierPath::new(&binder),
+                binder,
                 bound: bound.into(),
                 body: body.into(),
             },
@@ -827,13 +859,12 @@ impl<'a> Parser<'a> {
 
         let prefix = self.parse_expression(0)?;
 
-        println!(
-            "parse_sequence: prefix `{prefix}` at {}",
-            prefix.parse_info().location
-        );
-
         match self.remains() {
-            [t, u, ..] if t.is_sequence_separator() && Self::is_expr_prefix(&u.kind) => {
+            [t, u, v, ..]
+                if t.is_sequence_separator()
+                    && Self::is_expr_prefix(&u.kind)
+                    && Self::is_expr_prefix(&v.kind) =>
+            {
                 self.consume()?;
                 self.parse_subsequent(prefix)
             }
@@ -856,10 +887,7 @@ impl<'a> Parser<'a> {
                 self.parse_subsequent(prefix)
             }
 
-            _ => {
-                println!("parse_sequence: sequence concluded with prefix `{prefix}`");
-                Ok(prefix)
-            }
+            _ => Ok(prefix),
         }
     }
 
@@ -948,6 +976,7 @@ impl<'a> Parser<'a> {
         !matches!(
             kind,
             TokenKind::Layout(Layout::Dedent | Layout::Indent | Layout::Newline)
+                | TokenKind::Assign
                 | TokenKind::RightBrace
                 | TokenKind::Pipe
                 | TokenKind::End
@@ -1021,7 +1050,6 @@ impl<'a> Parser<'a> {
                     && !matches!(u.kind, TokenKind::Assign | TokenKind::TypeAscribe)
                     && Operator::Juxtaposition.precedence() > context_precedence =>
             {
-                println!("Calling parse_juxtaposed(2) with u {u:?}");
                 self.parse_juxtaposed(lhs, context_precedence)
             }
 

@@ -11,6 +11,7 @@ use crate::{
         namer::{self, CompilationContext, Identifier},
         pattern::Pattern,
     },
+    bridge::Bridge,
     parser::ParseInfo,
     typer,
 };
@@ -24,11 +25,10 @@ impl Expr<(), namer::Identifier> {
                 .get(the)
                 .ok_or_else(|| RuntimeError::NoSuchSymbol(the.clone())),
 
-            Self::InvokeBridge(_, bridge) => {
-                let stack = &env.inner.borrow().locals;
-                let arguments = &stack[(stack.len() - bridge.external.arity())..];
-                bridge.external.invoke(arguments)
-            }
+            Self::InvokeBridge(_, bridge) => Ok(Value::PartiallyAppliedBridge {
+                bridge: bridge.clone(),
+                arguments: vec![],
+            }),
 
             Self::Constant(_, the) => Ok(Value::Constant(the.clone().into())),
 
@@ -51,6 +51,19 @@ impl Expr<(), namer::Identifier> {
                         .upgrade()
                         .ok_or_else(|| RuntimeError::ExpiredSelfReferential(format!("{name}")))?;
                     apply_closure(closure, the.argument.reduce(env)?)
+                }
+
+                Value::PartiallyAppliedBridge {
+                    bridge,
+                    mut arguments,
+                } => {
+                    arguments.push(the.argument.reduce(env)?);
+
+                    if arguments.len() < bridge.external.arity() {
+                        Ok(Value::PartiallyAppliedBridge { bridge, arguments })
+                    } else {
+                        Ok(bridge.external.invoke(&arguments)?)
+                    }
                 }
 
                 otherwise => Err(RuntimeError::ExpectedClosure(otherwise)),
@@ -350,6 +363,11 @@ pub enum Value {
         inner: Weak<RefCell<Closure>>,
     },
 
+    PartiallyAppliedBridge {
+        bridge: Bridge,
+        arguments: Vec<Value>,
+    },
+
     // Is this problem free?
     Product(Vec<Value>),
 
@@ -458,6 +476,10 @@ impl fmt::Display for Value {
                 }
             }
 
+            Self::PartiallyAppliedBridge { bridge, arguments } => {
+                write!(f, "{} {:?}", bridge.qualified_name(), arguments)
+            }
+
             Self::Product(elements) => {
                 let elements = elements
                     .iter()
@@ -468,18 +490,18 @@ impl fmt::Display for Value {
             }
 
             Self::Variant {
-                coproduct,
                 constructor,
                 arguments,
+                ..
             } => {
                 write!(
                     f,
-                    "{coproduct}.{constructor} {}",
+                    "({constructor}{})",
                     arguments
                         .iter()
-                        .map(|v| v.to_string())
+                        .map(|v| format!(" {v}"))
                         .collect::<Vec<_>>()
-                        .join(",")
+                        .join("")
                 )
             }
         }

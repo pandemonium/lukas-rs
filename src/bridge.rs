@@ -1,19 +1,15 @@
-use std::{fmt, marker::PhantomData, rc::Rc};
+use std::{fmt, rc::Rc};
 
 use crate::{
-    ast::{
-        self, ArrowTypeExpr,
-        namer::{self, QualifiedName, TermSymbol},
-    },
+    ast::namer::{self, QualifiedName, TermSymbol},
     interpreter::{Interpretation, Literal, RuntimeError, Value},
-    parser::{self, ParseInfo, TypeSignature},
-    typer::{BaseType, Type},
+    parser::{self, ParseInfo},
+    typer::{BaseType, Type, TypeParameter, TypeScheme},
 };
 
 #[derive(Clone)]
 pub struct Bridge {
     pub external: Rc<dyn External + 'static>,
-    pub return_type: Type,
     pub qualified_name: QualifiedName,
 }
 
@@ -39,7 +35,7 @@ pub struct RawLambda1<R> {
 pub struct PartialRawLambda2<F> {
     pub name: &'static str,
     pub apply: F,
-    pub signature: TypeSignature,
+    pub type_scheme: TypeScheme,
 }
 
 impl Bridge {
@@ -47,17 +43,19 @@ impl Bridge {
     where
         E: External + 'static,
     {
-        let return_type = external.return_type();
         let qualified_name = QualifiedName::new(module.clone(), external.name());
         Bridge {
             external: Rc::new(external),
-            return_type,
             qualified_name,
         }
     }
 
     pub fn qualified_name(&self) -> &namer::QualifiedName {
         &self.qualified_name
+    }
+
+    pub fn type_scheme(&self) -> TypeScheme {
+        self.external.type_scheme()
     }
 }
 
@@ -68,27 +66,7 @@ pub trait External {
 
     fn invoke(&self, arguments: &[Value]) -> Interpretation;
 
-    fn type_signature(&self) -> ast::TypeSignature<ParseInfo, parser::IdentifierPath>;
-
-    fn return_type(&self) -> Type;
-
-    fn into_curried_lambda_tree(self, module: &parser::IdentifierPath) -> parser::Expr
-    where
-        Self: Sized + 'static,
-    {
-        (0..self.arity()).rfold(
-            parser::Expr::InvokeBridge(ParseInfo::default(), Bridge::for_external(self, module)),
-            |body, index| {
-                parser::Expr::Lambda(
-                    ParseInfo::default(),
-                    parser::Lambda {
-                        parameter: parser::IdentifierPath::new(&format!("p{index}")),
-                        body: body.into(),
-                    },
-                )
-            },
-        )
-    }
+    fn type_scheme(&self) -> TypeScheme;
 
     fn into_symbol(
         self,
@@ -99,8 +77,12 @@ pub trait External {
     {
         TermSymbol {
             name: QualifiedName::new(module.clone(), self.name()),
-            type_signature: Some(self.type_signature()),
-            body: self.into_curried_lambda_tree(module).into(),
+            type_signature: None, // Some(self.type_signature()), (reify the type_scheme!)
+            body: parser::Expr::InvokeBridge(
+                ParseInfo::default(),
+                Bridge::for_external(self, module),
+            )
+            .into(),
         }
     }
 }
@@ -181,21 +163,11 @@ where
         Ok(apply(arguments[0].clone().try_into()?).into())
     }
 
-    fn type_signature(&self) -> TypeSignature {
-        let body_type = Type::Arrow {
+    fn type_scheme(&self) -> TypeScheme {
+        TypeScheme::from_constant(Type::Arrow {
             domain: A::TYPE.into(),
             codomain: R::TYPE.into(),
-        };
-
-        TypeSignature {
-            universal_quantifiers: vec![],
-            body: body_type.reify(&vec![]),
-            phase: PhantomData,
-        }
-    }
-
-    fn return_type(&self) -> Type {
-        R::TYPE
+        })
     }
 }
 
@@ -222,25 +194,15 @@ where
         .into())
     }
 
-    fn type_signature(&self) -> TypeSignature {
-        let body_type = Type::Arrow {
+    fn type_scheme(&self) -> TypeScheme {
+        TypeScheme::from_constant(Type::Arrow {
             domain: A::TYPE.into(),
             codomain: Type::Arrow {
                 domain: B::TYPE.into(),
                 codomain: R::TYPE.into(),
             }
             .into(),
-        };
-
-        TypeSignature {
-            universal_quantifiers: vec![],
-            body: body_type.reify(&vec![]),
-            phase: PhantomData,
-        }
-    }
-
-    fn return_type(&self) -> Type {
-        R::TYPE
+        })
     }
 }
 
@@ -261,24 +223,15 @@ where
         Ok(apply(arguments[0].clone()).into())
     }
 
-    fn type_signature(&self) -> ast::TypeSignature<ParseInfo, parser::IdentifierPath> {
-        let pi = ParseInfo::default();
-        let a = parser::Identifier::from_str("a");
-        ast::TypeSignature {
-            universal_quantifiers: vec![a.clone()],
-            body: parser::TypeExpression::Arrow(
-                pi,
-                ArrowTypeExpr {
-                    domain: parser::TypeExpression::Parameter(pi, a).into(),
-                    codomain: R::TYPE.reify(&vec![]).into(),
-                },
-            ),
-            phase: PhantomData,
+    fn type_scheme(&self) -> TypeScheme {
+        let tp = TypeParameter::fresh();
+        TypeScheme {
+            quantifiers: vec![tp],
+            underlying: Type::Arrow {
+                domain: Type::Variable(tp).into(),
+                codomain: R::TYPE.into(),
+            },
         }
-    }
-
-    fn return_type(&self) -> Type {
-        R::TYPE
     }
 }
 
@@ -305,13 +258,8 @@ where
         })
     }
 
-    fn type_signature(&self) -> ast::TypeSignature<ParseInfo, parser::IdentifierPath> {
-        self.signature.clone()
-    }
-
-    fn return_type(&self) -> Type {
-        // Otherwise, synthesize_type from self.type_signature, which is a pain
-        Type::fresh()
+    fn type_scheme(&self) -> TypeScheme {
+        self.type_scheme.clone()
     }
 }
 
@@ -394,7 +342,7 @@ impl fmt::Display for Bridge {
             f,
             "Bridge {} :: {}",
             external.name(),
-            external.type_signature()
+            external.type_scheme()
         )
     }
 }
@@ -403,7 +351,7 @@ impl fmt::Debug for Bridge {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Bridge")
             .field(&self.external.name())
-            .field(&self.external.type_signature())
+            .field(&self.external.type_scheme())
             .finish()
     }
 }

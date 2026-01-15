@@ -1,0 +1,61 @@
+List ::= ∀α. Nil | Cons α (List α)
+
+fold_right :: ∀z α. (α -> z -> z) -> z -> List α -> z :=
+  λf z xs.
+    deconstruct xs into
+      Cons a tail -> f a (fold_right f z tail)
+    | Nil         -> z
+
+fold_left :: ∀z α. (z -> α -> z) -> z -> List α -> z :=
+  λf z xs.
+    deconstruct xs into
+      Cons a tail -> fold_left f (f z a) tail
+    | Nil         -> z
+
+map :: ∀α β. (α -> β) -> List α -> List β :=
+  λf. fold_right (λa. Cons (f a)) Nil
+
+bind :: ∀α β. (α -> List β) -> List α -> List β :=
+  λf. fold_right (λx. append (f x)) Nil
+
+append :: ∀α. List α -> List α -> List α :=
+  λxs ys. fold_right Cons ys xs
+
+reverse :: ∀α. List α -> List α :=
+  fold_left (λz a. Cons a z) Nil
+
+length :: ∀α. List α -> Int :=
+  fold_right (λa z. 1 + z) 0
+
+count :: ∀α. (α -> Bool) -> List α -> Int :=
+  λp. fold_left (λz x. if p x then 1 + z else z) 0
+
+filter :: ∀α. (α -> Bool) -> List α -> List α :=
+  λp. bind (λx. if p x then Cons x Nil else Nil)
+
+flatten :: ∀α. List (List α) -> List α :=
+  bind id
+
+tabulate :: ∀α. Int -> (Int -> α) -> List α :=
+  λc f.
+    let loop = λi xs.
+      if i < c
+        then loop (1 + i) (Cons (f i) xs)
+        else xs
+    in loop 0 Nil
+
+id :: ∀α. α -> α :=
+  λx. x
+
+flip :: ∀α β r. (α -> β -> r) -> β -> α -> r :=
+  λf b a. f a b
+
+compose :: ∀α β γ. (β -> γ) -> (α -> β) -> α -> γ :=
+  λg f a. g (f a)
+
+long_list := tabulate 120 id
+
+start := λx.
+  let xs = long_list in
+  let ys = map (λx. Cons x Nil) xs in
+  count (λx. x > 1) (flatten ys)

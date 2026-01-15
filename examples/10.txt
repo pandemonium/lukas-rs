@@ -30,5 +30,5 @@ bastard_if :=
 
 start := lambda x.
   print_endline "starting"
-  let ans = factorial 20
+  let ans = factorial "20"
   in print_endline (show ans)

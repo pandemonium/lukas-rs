@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::{
-    ast::{Literal, Tree},
+    ast::{self, Literal, Tree, namer},
     parser,
 };
 
@@ -20,9 +20,21 @@ pub enum Pattern<A, Id> {
     Bind(A, Id),
 }
 
+impl<A, Id> Pattern<A, Id> {
+    pub fn annotation(&self) -> &A {
+        match self {
+            Self::Coproduct(a, _)
+            | Self::Tuple(a, _)
+            | Self::Struct(a, _)
+            | Self::Literally(a, _)
+            | Self::Bind(a, _) => a,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ConstructorPattern<A, Id> {
-    pub constructor: Id,
+    pub constructor: Id, // Ought to be QualifiedName!
     pub arguments: Vec<Pattern<A, Id>>,
 }
 
@@ -34,6 +46,19 @@ pub struct TuplePattern<A, Id> {
 #[derive(Debug, Clone)]
 pub struct StructPattern<A, Id> {
     pub fields: Vec<(parser::Identifier, Pattern<A, Id>)>,
+}
+
+pub enum DomainExpression {
+    Nothing,
+    This(Object),
+    Everything,
+}
+
+pub enum Object {
+    Literal(ast::Literal),
+    Coproduct(Vec<(namer::QualifiedName, Vec<DomainExpression>)>),
+    Struct(Vec<(parser::Identifier, DomainExpression)>),
+    Tuple(Vec<DomainExpression>),
 }
 
 impl<A, Id> fmt::Display for Pattern<A, Id>

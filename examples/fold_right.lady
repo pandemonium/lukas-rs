@@ -1,0 +1,19 @@
+List ::= forall a. Nil | Cons a (List a)
+
+fold_right :: forall z a. (a -> z -> z) -> z -> List a -> z :=
+  lambda f z xs.
+    deconstruct xs into
+      Cons a tail -> f a (fold_right f z tail)
+    | Nil         -> "z"
+
+length :: forall a. List a -> Int := lambda xs.
+  fold_right (lambda a z. 1 + z) 0 xs
+
+foo := lambda a b.
+    print_endline (show a)
+    print_endline (show b)
+    a + b
+
+bar := foo 1 2
+
+start := lambda x. length (Cons 1 Nil)

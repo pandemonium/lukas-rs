@@ -1,55 +1,41 @@
-use std::marker::PhantomData;
-
 use crate::{
-    ast::{BUILTIN_MODULE_NAME, STDLIB_MODULE_NAME, TypeSignature, namer::TermSymbol},
+    ast::{BUILTIN_MODULE_NAME, STDLIB_MODULE_NAME, namer::TermSymbol},
     bridge::{External, Lambda1, Lambda2, PartialRawLambda2, RawLambda1},
     interpreter::{Literal, Value},
     lambda1, lambda2,
     lexer::Operator,
     parser::{self, ParseInfo},
     rawlambda1,
-    typer::{BaseType, Type, TypeParameter},
+    typer::{BaseType, Type, TypeParameter, TypeScheme},
 };
 
-fn comparison_signature() -> TypeSignature<ParseInfo, parser::IdentifierPath> {
-    let a = parser::Identifier::from_str("a");
-    // Is this dangerous?
-    let tp = TypeParameter::new(0);
-    let body = {
-        Type::Arrow {
+fn comparison_signature() -> TypeScheme {
+    let tp = TypeParameter::fresh();
+    TypeScheme {
+        quantifiers: vec![tp],
+        underlying: Type::Arrow {
             domain: Type::Variable(tp).into(),
             codomain: Type::Arrow {
                 domain: Type::Variable(tp).into(),
                 codomain: Type::Base(BaseType::Bool).into(),
             }
             .into(),
-        }
-    };
-    TypeSignature {
-        universal_quantifiers: vec![a.clone()],
-        body: body.reify(&vec![a]),
-        phase: PhantomData,
+        },
     }
 }
 
-fn artithmetic_signature() -> TypeSignature<ParseInfo, parser::IdentifierPath> {
-    let a = parser::Identifier::from_str("a");
-    // Is this dangerous?
-    let tp = TypeParameter::new(0);
-    let body = {
-        Type::Arrow {
+fn artithmetic_signature() -> TypeScheme {
+    let tp = TypeParameter::fresh();
+    TypeScheme {
+        quantifiers: vec![tp],
+        underlying: Type::Arrow {
             domain: Type::Variable(tp).into(),
             codomain: Type::Arrow {
                 domain: Type::Variable(tp).into(),
                 codomain: Type::Variable(tp).into(),
             }
             .into(),
-        }
-    };
-    TypeSignature {
-        universal_quantifiers: vec![a.clone()],
-        body: body.reify(&vec![a]),
-        phase: PhantomData,
+        },
     }
 }
 
@@ -82,61 +68,61 @@ pub fn import() -> Vec<TermSymbol<ParseInfo, parser::IdentifierPath, parser::Ide
     let eq = PartialRawLambda2 {
         name: Operator::Equals.name(),
         apply: |p, q| equals(p, q).map(|r| Value::Constant(Literal::Bool(r))),
-        signature: comparison_signature(),
+        type_scheme: comparison_signature(),
     };
 
     let gte = PartialRawLambda2 {
         name: Operator::Gte.name(),
         apply: mk_comparison_op(gte),
-        signature: comparison_signature(),
+        type_scheme: comparison_signature(),
     };
 
     let lte = PartialRawLambda2 {
         name: Operator::Lte.name(),
         apply: mk_comparison_op(lte),
-        signature: comparison_signature(),
+        type_scheme: comparison_signature(),
     };
 
     let gt = PartialRawLambda2 {
         name: Operator::Gt.name(),
         apply: mk_comparison_op(gt),
-        signature: comparison_signature(),
+        type_scheme: comparison_signature(),
     };
 
     let lt = PartialRawLambda2 {
         name: Operator::Lt.name(),
         apply: mk_comparison_op(lt),
-        signature: comparison_signature(),
+        type_scheme: comparison_signature(),
     };
 
     let plus = PartialRawLambda2 {
         name: Operator::Plus.name(),
         apply: mk_artithmetic_op(plus),
-        signature: artithmetic_signature(),
+        type_scheme: artithmetic_signature(),
     };
 
     let minus = PartialRawLambda2 {
         name: Operator::Minus.name(),
         apply: mk_artithmetic_op(minus),
-        signature: artithmetic_signature(),
+        type_scheme: artithmetic_signature(),
     };
 
     let times = PartialRawLambda2 {
         name: Operator::Times.name(),
         apply: mk_artithmetic_op(times),
-        signature: artithmetic_signature(),
+        type_scheme: artithmetic_signature(),
     };
 
     let divided = PartialRawLambda2 {
         name: Operator::Division.name(),
         apply: mk_artithmetic_op(divided),
-        signature: artithmetic_signature(),
+        type_scheme: artithmetic_signature(),
     };
 
     let modulo = PartialRawLambda2 {
         name: Operator::Modulo.name(),
         apply: mk_artithmetic_op(modulo),
-        signature: artithmetic_signature(),
+        type_scheme: artithmetic_signature(),
     };
 
     vec![

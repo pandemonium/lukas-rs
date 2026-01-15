@@ -397,8 +397,6 @@ impl ParserCompilationContext {
         &self,
         path: &parser::IdentifierPath,
     ) -> Option<QualifiedNameExpr> {
-        println!("resolve_module_path_expr: {path}");
-
         let path = self.resolve_module_membership(path)?;
 
         let mut module_path = vec![];
@@ -1104,19 +1102,15 @@ impl parser::Expr {
     fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Expr {
         match self {
             Self::Variable(a, identifier_path) => {
-                println!("resolve(x): {identifier_path}");
-
                 if let Some(bound) =
                     names.try_resolve_bound(&parser::Identifier::from_str(&identifier_path.head))
                 {
-                    println!("resolve(1): {identifier_path}");
                     into_projection(a, bound, identifier_path)
                 } else if let Some(path) =
                     // I guess this would have to resolve the this name against every
                     // imported namespace
                     symbols.resolve_module_path_expr(&identifier_path)
                 {
-                    println!("resolve(3): {identifier_path} -> {path}");
                     path.into_projection(*a)
                 } else {
                     panic!("Unresolved symbol {}", identifier_path)
