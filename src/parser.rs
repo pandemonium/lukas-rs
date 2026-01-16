@@ -6,8 +6,8 @@ use thiserror::Error;
 use crate::{
     ast::{
         self, ApplyTypeExpr, ArrowTypeExpr, CompilationUnit, CoproductConstructor,
-        CoproductDeclarator, Declaration, FieldDeclarator, RecordDeclarator, Tree, TypeDeclaration,
-        TypeDeclarator, ValueDeclaration, ValueDeclarator,
+        CoproductDeclarator, Declaration, FieldDeclarator, ModuleDeclaration, ModuleDeclarator,
+        RecordDeclarator, Tree, TypeDeclaration, TypeDeclarator, ValueDeclaration, ValueDeclarator,
     },
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
 };
@@ -67,6 +67,11 @@ impl IdentifierPath {
         }
     }
 
+    pub fn last(&self) -> &str {
+        println!("last: {} {:?}", self.head, self.tail);
+        self.tail.last().unwrap_or_else(|| &self.head)
+    }
+
     pub fn try_from_components(components: &[&str]) -> Option<Self> {
         if let [head, tail @ ..] = components {
             Some(Self {
@@ -78,28 +83,21 @@ impl IdentifierPath {
         }
     }
 
-    pub fn as_root_module_member(&self) -> Self {
-        let Self { head, tail } = self;
-        self.clone()
-            .prefigure(head, tail, ast::ROOT_MODULE_NAME.to_owned())
-    }
-
-    pub fn as_builtin_module_member(&self) -> Self {
-        let Self { head, tail } = self;
-        self.clone()
-            .prefigure(head, tail, ast::BUILTIN_MODULE_NAME.to_owned())
-    }
-
     pub fn in_module(&self, module: &IdentifierPath) -> Self {
-        IdentifierPath {
-            head: module.head.clone(),
-            tail: {
-                let mut new_tail = module.tail.to_vec();
-                new_tail.push(self.head.clone());
-                new_tail.extend_from_slice(&self.tail);
+        println!("in_module: {} {}", self, module);
+        if self.head != module.head {
+            IdentifierPath {
+                head: module.head.clone(),
+                tail: {
+                    let mut new_tail = module.tail.to_vec();
+                    new_tail.push(self.head.clone());
+                    new_tail.extend_from_slice(&self.tail);
 
-                new_tail
-            },
+                    new_tail
+                },
+            }
+        } else {
+            self.clone()
         }
     }
 
@@ -257,7 +255,7 @@ impl<'a> Parser<'a> {
                     .collect::<Vec<_>>()
                     .join(" "),
                 indent = depth * 2,
-                pad = 100 - (depth * 2 + e.step.len())
+                pad = 120 - (depth * 2 + e.step.len())
             );
         } else {
             println!("Unknown caller.")
@@ -335,8 +333,15 @@ impl<'a> Parser<'a> {
     pub fn parse_compilation_unit(&mut self) -> Result<CompilationUnit<ParseInfo>> {
         let _t = self.trace();
 
-        let mut decls = vec![self.parse_declaration()?];
+        let decls = self.parse_declaration_list()?;
 
+        Ok(CompilationUnit::from_declarations(decls))
+    }
+
+    fn parse_declaration_list(&mut self) -> Result<Vec<Declaration<ParseInfo>>> {
+        let _t = self.trace();
+
+        let mut decls = vec![self.parse_declaration()?];
         while self.has_declaration_prefix() {
             if self.peek()?.is_newline() {
                 self.advance(1);
@@ -349,8 +354,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-
-        Ok(CompilationUnit::from_declarations(decls))
+        Ok(decls)
     }
 
     fn has_declaration_prefix(&self) -> bool {
@@ -362,7 +366,10 @@ impl<'a> Parser<'a> {
                     ..
                 },
                 Token {
-                    kind: TokenKind::Assign | TokenKind::TypeAssign | TokenKind::TypeAscribe,
+                    kind: TokenKind::Assign         // Function or value
+                        | TokenKind::TypeAssign     // Type
+                        | TokenKind::TypeAscribe    // Type signature
+                        | TokenKind::Colon, // Module
                     ..
                 },
                 ..
@@ -460,8 +467,39 @@ impl<'a> Parser<'a> {
                 ))
             }
 
+            [
+                Token {
+                    kind: TokenKind::Identifier(name),
+                    position,
+                },
+                Token {
+                    kind: TokenKind::Colon,
+                    ..
+                },
+                ..,
+            ] => {
+                // <id> <:>
+                self.advance(2);
+
+                Ok(Declaration::Module(
+                    ParseInfo::from_position(*position),
+                    ModuleDeclaration {
+                        name: Identifier::from_str(name),
+                        declarator: self.parse_block(|parser| parser.parse_module_declarator())?,
+                    },
+                ))
+            }
+
             otherwise => panic!("{otherwise:?}"),
         }
+    }
+
+    fn parse_module_declarator(&mut self) -> Result<ModuleDeclarator<ParseInfo>> {
+        let _t = self.trace();
+
+        Ok(ModuleDeclarator {
+            members: self.parse_declaration_list()?,
+        })
     }
 
     // preceed with parse_block, but it has to lookahead to see
@@ -865,6 +903,7 @@ impl<'a> Parser<'a> {
                     && Self::is_expr_prefix(&u.kind)
                     && Self::is_expr_prefix(&v.kind) =>
             {
+                println!("parse_sequence(1)");
                 self.consume()?;
                 self.parse_subsequent(prefix)
             }
@@ -875,6 +914,7 @@ impl<'a> Parser<'a> {
                     && Self::is_expr_prefix(&u.kind)
                     && u.location().is_same_block(&prefix.parse_info().location) =>
             {
+                println!("parse_sequence(2)");
                 self.consume()?;
                 self.parse_subsequent(prefix)
             }
@@ -884,6 +924,7 @@ impl<'a> Parser<'a> {
                     && t.location().is_same_block(&prefix.parse_info().location)
                     && u.kind != TokenKind::End =>
             {
+                println!("parse_sequence(3)");
                 self.parse_subsequent(prefix)
             }
 
@@ -975,8 +1016,9 @@ impl<'a> Parser<'a> {
     fn is_expr_prefix(kind: &TokenKind) -> bool {
         !matches!(
             kind,
-            TokenKind::Layout(Layout::Dedent | Layout::Indent | Layout::Newline)
+            TokenKind::Layout(..)
                 | TokenKind::Assign
+                | TokenKind::Colon
                 | TokenKind::RightBrace
                 | TokenKind::Pipe
                 | TokenKind::End
@@ -1059,8 +1101,7 @@ impl<'a> Parser<'a> {
 
     fn parse_juxtaposed(&mut self, lhs: Expr, context_precedence: usize) -> Result<Expr> {
         let _t = self.trace();
-
-        let rhs = self.parse_expr_prefix()?;
+        let rhs = self.parse_expression(Operator::Juxtaposition.precedence())?;
         self.parse_expr_infix(
             Expr::Apply(
                 *lhs.parse_info(),
@@ -1071,6 +1112,17 @@ impl<'a> Parser<'a> {
             ),
             context_precedence,
         )
+        //        let rhs = self.parse_expr_prefix()?;
+        //        self.parse_expr_infix(
+        //            Expr::Apply(
+        //                *lhs.parse_info(),
+        //                ast::Apply {
+        //                    function: lhs.into(),
+        //                    argument: rhs.into(),
+        //                },
+        //            ),
+        //            context_precedence,
+        //        )
     }
 
     fn parse_literal(&mut self, literal: &Literal, position: &SourceLocation) -> Result<Expr> {
@@ -1149,6 +1201,10 @@ impl<'a> Parser<'a> {
 
     fn parse_select_operator(&mut self, lhs: Expr) -> Result<Expr> {
         let _t = self.trace();
+
+        let sneak = &self.peek()?.kind;
+
+        println!("parse_select_operator: {sneak:?}, lhs: {lhs}");
 
         if let Expr::Variable(pi, id) = &lhs
             && !matches!(self.peek()?.kind, TokenKind::Literal(..))

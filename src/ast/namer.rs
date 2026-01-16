@@ -193,20 +193,20 @@ impl Identifier {
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct QualifiedNameExpr {
+pub struct NameExpr {
     module_prefix: parser::IdentifierPath,
     member: String,
-    member_suffix: Vec<String>,
+    projections: Vec<String>,
 }
 
-impl QualifiedNameExpr {
+impl NameExpr {
     fn into_projection(self, pi: ParseInfo) -> Expr {
         let path = QualifiedName {
             module: self.module_prefix,
             member: parser::Identifier::from_str(&self.member),
         };
 
-        self.member_suffix
+        self.projections
             .iter()
             .fold(Expr::Variable(pi, Identifier::Free(path)), |base, field| {
                 ast::Expr::Project(
@@ -219,7 +219,7 @@ impl QualifiedNameExpr {
             })
     }
 
-    pub fn into_member_path(self) -> QualifiedName {
+    pub fn into_qualified_name(self) -> QualifiedName {
         QualifiedName {
             module: self.module_prefix,
             member: parser::Identifier::from_str(&self.member),
@@ -354,11 +354,32 @@ pub enum SymbolName {
     Term(QualifiedName),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ModuleMember {
+    Type(parser::Identifier),
+    Term(parser::Identifier),
+}
+
+impl parser::IdentifierPath {
+    pub fn try_into_qualified_name(self) -> Option<QualifiedName> {
+        println!("try_into_qualified_name: {}", self);
+        let Self { head, mut tail } = self;
+
+        let member = tail.pop();
+        println!("try_into_qualified_name: member {member:?}");
+
+        member.map(|member| QualifiedName {
+            module: parser::IdentifierPath { head, tail },
+            member: parser::Identifier::from_str(&member),
+        })
+    }
+}
+
 // "Modules do not exist" - they should get their own table.
 #[derive(Debug, Clone)]
 pub struct CompilationContext<A, GlobalName, LocalId> {
-    pub module_members: HashMap<parser::IdentifierPath, Vec<parser::Identifier>>,
-    pub member_module: HashMap<parser::Identifier, parser::IdentifierPath>,
+    pub module_members: HashMap<parser::IdentifierPath, Vec<ModuleMember>>,
+    pub member_module: HashMap<ModuleMember, parser::IdentifierPath>,
     pub symbols: HashMap<SymbolName, Symbol<A, GlobalName, LocalId>>,
     pub phase: PhantomData<(A, GlobalName, LocalId)>,
 }
@@ -375,29 +396,30 @@ impl<A, TypeId, ValueId> Default for CompilationContext<A, TypeId, ValueId> {
 }
 
 impl ParserCompilationContext {
-    // Mod2.member.field1.field2
-    // where Mod2 could be in Root
-    fn resolve_module_membership(
-        &self,
-        path: &parser::IdentifierPath,
-    ) -> Option<parser::IdentifierPath> {
-        if !self
-            .module_members
-            .contains_key(&IdentifierPath::new(path.head.as_str()))
-        {
-            self.member_module
-                .get(&parser::Identifier::from_str(&path.head))
-                .map(|module| path.in_module(module))
-        } else {
-            Some(path.clone())
-        }
+    fn resolve_as_term_member(&self, path: &parser::IdentifierPath) -> parser::IdentifierPath {
+        println!("resolve_as_term_member: {path}");
+        self.member_module
+            .get(&ModuleMember::Term(parser::Identifier::from_str(
+                path.head.as_str(),
+            )))
+            .map(|module| path.in_module(module))
+            .unwrap_or_else(|| path.clone())
     }
 
-    pub fn resolve_module_path_expr(
-        &self,
-        path: &parser::IdentifierPath,
-    ) -> Option<QualifiedNameExpr> {
-        let path = self.resolve_module_membership(path)?;
+    // This ought to return QualifiedName
+    fn resolve_as_type_member(&self, path: &parser::IdentifierPath) -> Option<QualifiedName> {
+        println!("resolve_as_type_member: {path}");
+
+        self.member_module
+            .get(&ModuleMember::Type(parser::Identifier::from_str(
+                path.last(),
+            )))
+            .inspect(|x| println!("resolve_as_type_member: x {path} -- {x}"))
+            .and_then(|module| path.in_module(module).try_into_qualified_name())
+    }
+
+    pub fn resolve_module_path_expr(&self, path: &parser::IdentifierPath) -> Option<NameExpr> {
+        println!("resolve_module_path_expr: {path}");
 
         let mut module_path = vec![];
         let mut member = vec![];
@@ -419,10 +441,10 @@ impl ParserCompilationContext {
         }
 
         let mut members = member.iter().map(|&s| s.to_owned());
-        Some(QualifiedNameExpr {
+        Some(NameExpr {
             module_prefix: parser::IdentifierPath::try_from_components(&module_path)?,
             member: members.next()?,
-            member_suffix: members.collect(),
+            projections: members.collect(),
         })
     }
 
@@ -436,12 +458,13 @@ impl ParserCompilationContext {
         modules.insert(parser::IdentifierPath::new(ast::STDLIB_MODULE_NAME), vec![]);
         modules.insert(builtins.clone(), vec![]);
 
+        // Change when I move the base types into a module proper
         for symbol in stdlib::import() {
             println!("from: {symbol:?}");
             modules
                 .entry(symbol.name.module.clone())
                 .or_default()
-                .push(symbol.name.member.clone());
+                .push(ModuleMember::Term(symbol.name.member.clone()));
             symbols.insert(SymbolName::Term(symbol.name.clone()), Symbol::Term(symbol));
         }
 
@@ -456,7 +479,7 @@ impl ParserCompilationContext {
         modules
             .entry(builtins.clone())
             .or_default()
-            .push(parser::Identifier::from_str("Int"));
+            .push(ModuleMember::Type(parser::Identifier::from_str("Int")));
 
         symbols.insert(
             SymbolName::Type(QualifiedName::builtin("Text")),
@@ -469,7 +492,7 @@ impl ParserCompilationContext {
         modules
             .entry(builtins.clone())
             .or_default()
-            .push(parser::Identifier::from_str("Text"));
+            .push(ModuleMember::Type(parser::Identifier::from_str("Text")));
 
         symbols.insert(
             SymbolName::Type(QualifiedName::builtin("Bool")),
@@ -482,7 +505,7 @@ impl ParserCompilationContext {
         modules
             .entry(builtins.clone())
             .or_default()
-            .push(parser::Identifier::from_str("Bool"));
+            .push(ModuleMember::Type(parser::Identifier::from_str("Bool")));
 
         symbols.insert(
             SymbolName::Type(QualifiedName::builtin("Unit")),
@@ -495,7 +518,7 @@ impl ParserCompilationContext {
         modules
             .entry(builtins.clone())
             .or_default()
-            .push(parser::Identifier::from_str("Unit"));
+            .push(ModuleMember::Type(parser::Identifier::from_str("Unit")));
 
         Self::collect_symbols(
             parser::IdentifierPath::new(program.root.name.as_str()),
@@ -527,7 +550,7 @@ impl ParserCompilationContext {
     pub fn collect_symbols(
         module_path: parser::IdentifierPath,
         declarations: &[Declaration<ParseInfo>],
-        module_members: &mut HashMap<parser::IdentifierPath, Vec<parser::Identifier>>,
+        module_members: &mut HashMap<parser::IdentifierPath, Vec<ModuleMember>>,
         symbols: &mut HashMap<SymbolName, ParserSymbol>,
     ) {
         for decl in declarations {
@@ -537,7 +560,7 @@ impl ParserCompilationContext {
                     module_members
                         .entry(module_path.clone())
                         .or_default()
-                        .push(name.clone());
+                        .push(ModuleMember::Term(name.clone()));
 
                     let name = QualifiedName::new(module_path.clone(), name.as_str());
                     let symbol = TermSymbol {
@@ -550,8 +573,19 @@ impl ParserCompilationContext {
                 }
 
                 ast::Declaration::Module(_, decl) => {
-                    module_members
-                        .insert(module_path.clone().with_suffix(decl.name.as_str()), vec![]);
+                    module_members.entry(module_path.clone()).or_default().push(
+                        // Think about this. Do modules and terms share namespace?
+                        ModuleMember::Term(parser::Identifier::from_str(decl.name.as_str())),
+                    );
+                    let module_path = module_path.clone().with_suffix(decl.name.as_str());
+                    module_members.insert(module_path.clone(), vec![]);
+
+                    Self::collect_symbols(
+                        module_path,
+                        &decl.declarator.members,
+                        module_members,
+                        symbols,
+                    );
                 }
 
                 ast::Declaration::Type(
@@ -562,11 +596,11 @@ impl ParserCompilationContext {
                         declarator,
                     },
                 ) => {
-                    println!("collect_symbols: add {name} to {module_path}");
+                    println!("collect_symbols: add type {name} to {module_path}");
                     module_members
                         .entry(module_path.clone())
                         .or_default()
-                        .push(name.clone());
+                        .push(ModuleMember::Type(name.clone()));
 
                     let name = QualifiedName::new(module_path.clone(), name.as_str());
                     let symbol = match declarator {
@@ -622,12 +656,12 @@ fn collect_coproduct_constructors(
     type_parameters: &Vec<parser::Identifier>,
     type_constructor_name: &QualifiedName,
     constructors: &Vec<ConstructorSymbol<parser::IdentifierPath>>,
-    module_members: &mut Vec<parser::Identifier>,
+    module_members: &mut Vec<ModuleMember>,
 ) {
     for constructor in constructors {
-        module_members.push(parser::Identifier::from_str(
+        module_members.push(ModuleMember::Term(parser::Identifier::from_str(
             &constructor.name.member.as_str().to_owned(),
-        ));
+        )));
         let symbol = constructor.make_constructor_term(pi, type_parameters, type_constructor_name);
         symbols.insert(
             SymbolName::Term(constructor.name.clone()),
@@ -942,9 +976,12 @@ impl DeBruijnIndex {
 impl parser::TypeExpression {
     pub fn resolve_names(&self, symbols: &ParserCompilationContext) -> TypeExpression {
         match self {
-            Self::Constructor(a, name) => {
-                TypeExpression::Constructor(*a, symbols.resolve_member_path(&name))
-            }
+            Self::Constructor(a, name) => TypeExpression::Constructor(
+                *a,
+                symbols
+                    .resolve_as_type_member(&name)
+                    .expect("Resolvable type name"),
+            ),
 
             Self::Parameter(a, name) => TypeExpression::Parameter(*a, name.clone()),
 
@@ -1102,6 +1139,7 @@ impl parser::Expr {
     fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Expr {
         match self {
             Self::Variable(a, identifier_path) => {
+                println!("resolve: {identifier_path}");
                 if let Some(bound) =
                     names.try_resolve_bound(&parser::Identifier::from_str(&identifier_path.head))
                 {
@@ -1109,7 +1147,9 @@ impl parser::Expr {
                 } else if let Some(path) =
                     // I guess this would have to resolve the this name against every
                     // imported namespace
-                    symbols.resolve_module_path_expr(&identifier_path)
+                    symbols.resolve_module_path_expr(
+                        &symbols.resolve_as_term_member(&identifier_path),
+                    )
                 {
                     path.into_projection(*a)
                 } else {
@@ -1256,7 +1296,9 @@ impl parser::Tuple {
 impl parser::Construct {
     fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Construct {
         Construct {
-            constructor: Identifier::Free(symbols.resolve_member_path(&self.constructor)),
+            constructor: Identifier::Free(
+                symbols.resolve_qualified(&symbols.resolve_as_term_member(&self.constructor)),
+            ),
             arguments: self
                 .arguments
                 .iter()
@@ -1341,7 +1383,9 @@ impl parser::Pattern {
                 ConstructorPattern {
                     constructor: Identifier::Free(
                         // Resolve this against imported namespaces
-                        symbols.resolve_member_path(&pattern.constructor),
+                        symbols.resolve_qualified(
+                            &symbols.resolve_as_term_member(&pattern.constructor),
+                        ),
                     ),
                     arguments: pattern
                         .arguments
@@ -1422,10 +1466,10 @@ impl ParserCompilationContext {
         }
     }
 
-    pub fn resolve_member_path(&self, id: &parser::IdentifierPath) -> QualifiedName {
+    pub fn resolve_qualified(&self, id: &parser::IdentifierPath) -> QualifiedName {
         self.resolve_module_path_expr(id)
             .expect(&format!("a valid type identifier path: {id}"))
-            .into_member_path()
+            .into_qualified_name()
     }
 
     // Own and move instead?
@@ -1498,14 +1542,14 @@ impl fmt::Display for Identifier {
     }
 }
 
-impl fmt::Display for QualifiedNameExpr {
+impl fmt::Display for NameExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{}::{}.{}",
             self.module_prefix,
             self.member,
-            self.member_suffix.join("."),
+            self.projections.join("."),
         )
     }
 }

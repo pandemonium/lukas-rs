@@ -1,0 +1,7 @@
+Perhaps:
+  T ::= ∀α. Nope | This α
+
+foo :: Perhaps.T Int := Perhaps.This 1
+
+start := λx.
+  print_endline (show Perhaps.Nope)
