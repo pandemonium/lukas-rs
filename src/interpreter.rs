@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     ast::{
-        self, CompilationUnit, Expr, ProductElement, Tree,
+        self, CompilationUnit, Expr, Interpolate, ProductElement, Tree,
         namer::{self, CompilationContext, Identifier},
         pattern::Pattern,
     },
@@ -140,6 +140,26 @@ impl Expr<(), namer::Identifier> {
                         typer::BaseType::Bool,
                     )))
                 }
+            }
+
+            Self::Interpolate(_, the) => {
+                use std::fmt::Write as _;
+                let Interpolate(segments) = the;
+                let mut rendering = String::new();
+
+                for segment in segments {
+                    match segment {
+                        ast::Segment::Literal(_, literal) => {
+                            let _ = write!(rendering, "{literal}");
+                        }
+                        ast::Segment::Expression(expr) => {
+                            let value = expr.reduce(env)?;
+                            let _ = write!(rendering, "{value}");
+                        }
+                    }
+                }
+
+                Ok(Value::Constant(Literal::Text(rendering)))
             }
         }
     }

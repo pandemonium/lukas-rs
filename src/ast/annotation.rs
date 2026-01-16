@@ -42,6 +42,7 @@ where
                 Expr::Sequence(a, node) => Expr::Sequence(f(a), node.map_annotation(&f)),
                 Expr::Deconstruct(a, node) => Expr::Deconstruct(f(a), node.map_annotation(&f)),
                 Expr::If(a, node) => Expr::If(f(a), node.map_annotation(&f)),
+                Expr::Interpolate(a, node) => Expr::Interpolate(f(a), node.map_annotation(&f)),
             }
         }
 
@@ -276,6 +277,29 @@ where
             consequent: self.consequent.map_annotation(f),
             alternate: self.alternate.map_annotation(f),
         }
+    }
+}
+
+impl<A, B, Id> Annotated<A, B, Id> for Interpolate<A, Id>
+where
+    Id: Clone,
+{
+    type Output = Interpolate<B, Id>;
+
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
+    where
+        F: Fn(&A) -> B,
+    {
+        let Self(segments) = self;
+        Interpolate(
+            segments
+                .into_iter()
+                .map(|s| match s {
+                    Segment::Literal(a, literal) => Segment::Literal(f(a), literal.clone()),
+                    Segment::Expression(expr) => Segment::Expression(expr.map_annotation(f)),
+                })
+                .collect(),
+        )
     }
 }
 

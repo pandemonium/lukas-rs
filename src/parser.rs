@@ -24,6 +24,8 @@ pub type Construct = ast::Construct<ParseInfo, IdentifierPath>;
 pub type Sequence = ast::Sequence<ParseInfo, IdentifierPath>;
 pub type Deconstruct = ast::Deconstruct<ParseInfo, IdentifierPath>;
 pub type IfThenElse = ast::IfThenElse<ParseInfo, IdentifierPath>;
+pub type Interpolate = ast::Interpolate<ParseInfo, IdentifierPath>;
+pub type Segment = ast::Sequence<ParseInfo, IdentifierPath>;
 pub type Pattern = ast::pattern::Pattern<ParseInfo, IdentifierPath>;
 pub type MatchClause = ast::pattern::MatchClause<ParseInfo, IdentifierPath>;
 pub type ConstructorPattern = ast::pattern::ConstructorPattern<ParseInfo, IdentifierPath>;
@@ -205,6 +207,20 @@ fn stack_depth() -> usize {
     STACK_DEPTH.with(|d| d.get())
 }
 
+impl Interpolate {
+    pub fn begin(pi: ParseInfo, prelude: Literal) -> Self {
+        Self(vec![ast::Segment::Literal(pi, prelude.into())])
+    }
+
+    pub fn expression(&mut self, expr: Expr) {
+        self.0.push(ast::Segment::Expression(expr.into()));
+    }
+
+    pub fn literal(&mut self, pi: ParseInfo, literal: Literal) {
+        self.0.push(ast::Segment::Literal(pi, literal.into()));
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Parser<'a> {
     remains: &'a [Token],
@@ -255,7 +271,7 @@ impl<'a> Parser<'a> {
                     .collect::<Vec<_>>()
                     .join(" "),
                 indent = depth * 2,
-                pad = 120 - (depth * 2 + e.step.len())
+                pad = 400 - (depth * 2 + e.step.len())
             );
         } else {
             println!("Unknown caller.")
@@ -997,6 +1013,14 @@ impl<'a> Parser<'a> {
 
             [
                 Token {
+                    kind: TokenKind::Interpolate(Interpolation::Interlude(prelude)),
+                    position,
+                },
+                ..,
+            ] => self.parse_interpolated_text(*position, prelude.clone()),
+
+            [
+                Token {
                     kind: TokenKind::LeftParen,
                     ..
                 },
@@ -1096,6 +1120,40 @@ impl<'a> Parser<'a> {
             }
 
             _ => Ok(lhs),
+        }
+    }
+
+    fn parse_interpolated_text(
+        &mut self,
+        position: SourceLocation,
+        prelude: Literal,
+    ) -> Result<Expr> {
+        let pi = ParseInfo::from_position(position);
+        let mut interpolator = Interpolate::begin(pi, prelude.into());
+        self.advance(1);
+
+        loop {
+            interpolator.expression(self.parse_expression(0)?);
+            // The backtick?
+            self.advance(1);
+            match self.consume()? {
+                Token {
+                    kind: TokenKind::Interpolate(Interpolation::Interlude(literal)),
+                    position,
+                } => interpolator
+                    .literal(ParseInfo::from_position(*position), literal.clone().into()),
+
+                Token {
+                    kind: TokenKind::Interpolate(Interpolation::Epilogue(literal)),
+                    position,
+                } => {
+                    let pi = ParseInfo::from_position(*position);
+                    interpolator.literal(pi, literal.clone().into());
+                    break Ok(Expr::Interpolate(pi, interpolator));
+                }
+
+                unexpected => panic!("{unexpected:?}"),
+            }
         }
     }
 

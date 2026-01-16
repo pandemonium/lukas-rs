@@ -191,6 +191,7 @@ pub enum Expr<A, Id> {
     Sequence(A, Sequence<A, Id>),
     Deconstruct(A, Deconstruct<A, Id>),
     If(A, IfThenElse<A, Id>),
+    Interpolate(A, Interpolate<A, Id>),
 }
 
 impl<A, Id> Expr<A, Id> {
@@ -209,7 +210,8 @@ impl<A, Id> Expr<A, Id> {
             | Expr::Project(a, ..)
             | Expr::Sequence(a, ..)
             | Expr::Deconstruct(a, ..)
-            | Expr::If(a, ..) => a,
+            | Expr::If(a, ..)
+            | Expr::Interpolate(a, ..) => a,
         }
     }
 
@@ -219,6 +221,15 @@ impl<A, Id> Expr<A, Id> {
     {
         self.map_annotation(&|_| ())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct Interpolate<A, Id>(pub Vec<Segment<A, Id>>);
+
+#[derive(Debug, Clone)]
+pub enum Segment<A, Id> {
+    Literal(A, Literal),
+    Expression(Tree<A, Id>),
 }
 
 #[derive(Debug, Clone)]
@@ -352,6 +363,34 @@ where
             Self::Sequence(_, x) => write!(f, "{}; {}", x.this, x.and_then),
             Self::Deconstruct(_, x) => write!(f, "{x}"),
             Self::If(_, x) => write!(f, "{x}"),
+            Self::Interpolate(_, x) => write!(f, "{x}"),
+        }
+    }
+}
+
+impl<A, Id> fmt::Display for Interpolate<A, Id>
+where
+    Id: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(segments) = self;
+        let segments = segments
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+
+        write!(f, "{}", segments.join(" "))
+    }
+}
+
+impl<A, Id> fmt::Display for Segment<A, Id>
+where
+    Id: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Segment::Literal(_, literal) => write!(f, "<{literal}>"),
+            Segment::Expression(expr) => write!(f, "<{expr}>"),
         }
     }
 }

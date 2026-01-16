@@ -1,6 +1,12 @@
 List ::= ∀α. Nil | Cons α (List α)
 
 List:
+  head :: ∀α. List α -> Perhaps α :=
+    λxs. deconstruct xs into Cons a tail -> This a | otherwise -> Nope
+
+  tail :: ∀α. List α -> List α :=
+    λxs. deconstruct xs into Cons a tail -> tail | tail -> tail
+
   fold_right :: ∀z α. (α -> z -> z) -> z -> List α -> z :=
     λf z xs.
       deconstruct xs into
@@ -32,10 +38,10 @@ List:
     λp. fold_left (λz x. if p x then 1 + z else z) 0
 
   filter :: ∀α. (α -> Bool) -> List α -> List α :=
-    λp. bind (λx. if p x then Cons x Nil else Nil)
+    λp. List.bind (λx. if p x then Cons x Nil else Nil)
 
   flatten :: ∀α. List (List α) -> List α :=
-    bind id
+    List.bind id
 
   tabulate :: ∀α. Int -> (Int -> α) -> List α :=
     λc f.
@@ -45,10 +51,32 @@ List:
           else xs
       in loop 0 Nil
 
+
 Perhaps ::= ∀α. Nope | This α
 
 Perhaps:
-  perhaps := 1
+  perhaps :: ∀α z. z -> (α -> z) -> Perhaps α -> z :=
+    λz f xa. deconstruct xa into This x -> f x | otherwise -> z
+
+  map :: ∀α β. (α -> β) -> Perhaps α -> Perhaps β :=
+    λf. perhaps Nope (compose This f)
+
+  bind :: ∀α β. (α -> Perhaps β) -> Perhaps α -> Perhaps β :=
+    λf. perhaps Nope f
+
+
+Result ::= ∀α e. Fault e | Return α
+
+Result:
+  result :: ∀α e z. (e -> z) -> (α -> z) -> Result α e -> z :=
+    λfault return ra.
+      deconstruct ra into
+        Fault e  -> fault e
+      | Return a -> return a
+
+  map :: ∀α β e. (α -> β) -> Result α e -> Result β e :=
+    λf ra. result Fault (compose Return f) ra
+
 
 id :: ∀α. α -> α :=
   λx. x
@@ -62,6 +90,14 @@ compose :: ∀α β γ. (β -> γ) -> (α -> β) -> α -> γ :=
 long_list := tabulate 100 id
 
 start := λx.
+  print_endline (show (true and false or true))
+
+  let p = This 1 in
+  let q = Perhaps.map (λx. 10 * x) p in
+  print_endline (show q)
+
+  print_endline "Hej `1`"
+
   let xs = Root.long_list in
   let ys = List.map (λx. Cons x Nil) xs in
   List.count (λx. x > 1) (List.flatten ys)

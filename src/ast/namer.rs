@@ -30,6 +30,8 @@ pub type Construct = ast::Construct<ParseInfo, Identifier>;
 pub type Sequence = ast::Sequence<ParseInfo, Identifier>;
 pub type Deconstruct = ast::Deconstruct<ParseInfo, Identifier>;
 pub type IfThenElse = ast::IfThenElse<ParseInfo, Identifier>;
+pub type Interpolate = ast::Interpolate<ParseInfo, Identifier>;
+pub type Segment = ast::Segment<ParseInfo, Identifier>;
 pub type MatchClause = ast::pattern::MatchClause<ParseInfo, Identifier>;
 pub type Pattern = ast::pattern::Pattern<ParseInfo, Identifier>;
 pub type ConstructorPattern = ast::pattern::ConstructorPattern<ParseInfo, Identifier>;
@@ -1129,6 +1131,20 @@ impl parser::Expr {
                     alternate: map_lower_tuples(the.alternate),
                 },
             ),
+
+            parser::Expr::Interpolate(a, ast::Interpolate(the)) => parser::Expr::Interpolate(
+                a,
+                ast::Interpolate(
+                    the.into_iter()
+                        .map(|s| match s {
+                            ast::Segment::Literal(a, literal) => ast::Segment::Literal(a, literal),
+                            ast::Segment::Expression(expr) => {
+                                ast::Segment::Expression(map_lower_tuples(expr))
+                            }
+                        })
+                        .collect(),
+                ),
+            ),
         }
     }
 
@@ -1184,6 +1200,8 @@ impl parser::Expr {
             Self::Deconstruct(a, node) => Expr::Deconstruct(*a, node.resolve(names, symbols)),
 
             Self::If(a, node) => Expr::If(*a, node.resolve(names, symbols)),
+
+            Self::Interpolate(a, node) => Expr::Interpolate(*a, node.resolve(names, symbols)),
         }
     }
 }
@@ -1350,6 +1368,27 @@ impl parser::IfThenElse {
             consequent: self.consequent.resolve(names, symbols).into(),
             alternate: self.alternate.resolve(names, symbols).into(),
         }
+    }
+}
+
+impl parser::Interpolate {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &ParserCompilationContext,
+    ) -> Interpolate {
+        let Self(segments) = self;
+        ast::Interpolate(
+            segments
+                .into_iter()
+                .map(|s| match s {
+                    ast::Segment::Literal(a, literal) => ast::Segment::Literal(*a, literal.clone()),
+                    ast::Segment::Expression(expr) => {
+                        ast::Segment::Expression(expr.resolve(names, symbols).into())
+                    }
+                })
+                .collect(),
+        )
     }
 }
 

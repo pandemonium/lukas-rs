@@ -38,6 +38,8 @@ pub type Projection = ast::Projection<TypeInfo, namer::Identifier>;
 pub type Sequence = ast::Sequence<TypeInfo, namer::Identifier>;
 pub type Deconstruct = ast::Deconstruct<TypeInfo, namer::Identifier>;
 pub type IfThenElse = ast::IfThenElse<TypeInfo, namer::Identifier>;
+pub type Interpolate = ast::Interpolate<TypeInfo, namer::Identifier>;
+pub type Segment = ast::Segment<TypeInfo, namer::Identifier>;
 pub type MatchClause = ast::pattern::MatchClause<TypeInfo, namer::Identifier>;
 pub type Pattern = ast::pattern::Pattern<TypeInfo, namer::Identifier>;
 pub type ConstructorPattern = ast::pattern::ConstructorPattern<TypeInfo, namer::Identifier>;
@@ -1591,7 +1593,55 @@ impl TypingContext {
             }
 
             UntypedExpr::If(pi, if_then_else) => self.infer_if_then_else(*pi, if_then_else),
+
+            UntypedExpr::Interpolate(pi, ast::Interpolate(segments)) => {
+                self.infer_interpolation(*pi, &segments)
+            }
         }
+    }
+
+    #[instrument]
+    fn infer_interpolation(&mut self, pi: ParseInfo, segments: &[namer::Segment]) -> Typing {
+        let mut segs = vec![];
+        let mut substitutions = Substitutions::default();
+
+        for segment in segments {
+            match segment {
+                ast::Segment::Literal(pi, literal) => segs.push(Segment::Literal(
+                    TypeInfo {
+                        parse_info: *pi,
+                        inferred_type: literal.synthesize_type(),
+                    },
+                    literal.clone(),
+                )),
+                ast::Segment::Expression(expr) => {
+                    let (subs, expr) = self.infer_expr(&expr)?;
+                    segs.push(ast::Segment::Expression(expr.into()));
+                    substitutions = substitutions.compose(&subs);
+                }
+            }
+        }
+
+        let segs = segs
+            .into_iter()
+            .map(|s| match s {
+                Segment::Expression(expr) => {
+                    Segment::Expression(expr.with_substitutions(&substitutions))
+                }
+                lit => lit,
+            })
+            .collect();
+
+        Ok((
+            substitutions,
+            Expr::Interpolate(
+                TypeInfo {
+                    parse_info: pi,
+                    inferred_type: Type::Base(BaseType::Text),
+                },
+                ast::Interpolate(segs),
+            ),
+        ))
     }
 
     #[instrument]
