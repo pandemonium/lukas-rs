@@ -9,10 +9,11 @@ use std::{
 
 use crate::{
     ast::{
-        self, ApplyTypeExpr, ArrowTypeExpr, CompilationUnit, Declaration, ProductElement, Tree,
-        TupleTypeExpr,
+        self, ApplyTypeExpr, ArrowTypeExpr, CompilationUnit, Declaration, ModuleDeclarator,
+        ProductElement, Tree, TupleTypeExpr,
         pattern::{StructPattern, TuplePattern},
     },
+    compiler::{Bootstrap, Compilation},
     parser::{self, IdentifierPath, ParseInfo},
     stdlib,
     typer::BaseType,
@@ -400,6 +401,7 @@ impl<A, TypeId, ValueId> Default for CompilationContext<A, TypeId, ValueId> {
 impl ParserCompilationContext {
     fn resolve_as_term_member(&self, path: &parser::IdentifierPath) -> parser::IdentifierPath {
         println!("resolve_as_term_member: {path}");
+
         self.member_module
             .get(&ModuleMember::Term(parser::Identifier::from_str(
                 path.head.as_str(),
@@ -450,15 +452,11 @@ impl ParserCompilationContext {
         })
     }
 
-    pub fn from(program: &CompilationUnit<ParseInfo>) -> Self {
+    pub fn from(program: CompilationUnit<ParseInfo>) -> Self {
         let mut symbols = HashMap::default();
-        let mut modules = HashMap::default();
+        let mut modules = HashMap::<IdentifierPath, Vec<ModuleMember>>::default();
 
         let builtins = parser::IdentifierPath::new(ast::BUILTIN_MODULE_NAME);
-
-        modules.insert(parser::IdentifierPath::new(ast::ROOT_MODULE_NAME), vec![]);
-        modules.insert(parser::IdentifierPath::new(ast::STDLIB_MODULE_NAME), vec![]);
-        modules.insert(builtins.clone(), vec![]);
 
         // Change when I move the base types into a module proper
         for symbol in stdlib::import() {
@@ -522,9 +520,13 @@ impl ParserCompilationContext {
             .or_default()
             .push(ModuleMember::Type(parser::Identifier::from_str("Unit")));
 
+        let declarations =
+            Self::module_declarations(program.bootstrap.clone(), program.root_module.declarator)
+                .unwrap();
         Self::collect_symbols(
-            parser::IdentifierPath::new(program.root.name.as_str()),
-            &program.root.declarator.members,
+            program.bootstrap.clone(),
+            parser::IdentifierPath::new(program.root_module.name.as_str()),
+            declarations,
             &mut modules,
             &mut symbols,
         );
@@ -550,8 +552,9 @@ impl ParserCompilationContext {
     // This could just as well keep a running module_path of varified
     // modules. Shouldn't I just rewrite this sucker?
     pub fn collect_symbols(
+        bootstrap: Bootstrap,
         module_path: parser::IdentifierPath,
-        declarations: &[Declaration<ParseInfo>],
+        declarations: Vec<Declaration<ParseInfo>>,
         module_members: &mut HashMap<parser::IdentifierPath, Vec<ModuleMember>>,
         symbols: &mut HashMap<SymbolName, ParserSymbol>,
     ) {
@@ -583,8 +586,9 @@ impl ParserCompilationContext {
                     module_members.insert(module_path.clone(), vec![]);
 
                     Self::collect_symbols(
+                        bootstrap.clone(),
                         module_path,
-                        &decl.declarator.members,
+                        Self::module_declarations(bootstrap.clone(), decl.declarator).unwrap(),
                         module_members,
                         symbols,
                     );
@@ -607,7 +611,7 @@ impl ParserCompilationContext {
                     let name = QualifiedName::new(module_path.clone(), name.as_str());
                     let symbol = match declarator {
                         ast::TypeDeclarator::Record(_, record) => {
-                            make_record_type_symbol(type_parameters, &name, record)
+                            make_record_type_symbol(&type_parameters, &name, &record)
                         }
 
                         ast::TypeDeclarator::Coproduct(_, coproduct) => {
@@ -625,9 +629,9 @@ impl ParserCompilationContext {
 
                             println!("collect_symbols: module {module_path}");
                             collect_coproduct_constructors(
-                                *pi,
+                                pi,
                                 symbols,
-                                type_parameters,
+                                &type_parameters,
                                 &name,
                                 &constructors,
                                 module_members.entry(module_path.clone()).or_default(),
@@ -648,6 +652,18 @@ impl ParserCompilationContext {
                     symbols.insert(SymbolName::Type(name), Symbol::Type(symbol));
                 }
             };
+        }
+    }
+
+    fn module_declarations(
+        loader: Bootstrap,
+        module: ModuleDeclarator<ParseInfo>,
+    ) -> Compilation<Vec<Declaration<ParseInfo>>> {
+        match module {
+            ModuleDeclarator::Inline(declarations) => Ok(declarations),
+            ModuleDeclarator::External(module_name) => {
+                Ok(loader.load_module_declarations(&module_name)?)
+            }
         }
     }
 }
@@ -752,6 +768,14 @@ pub enum TypeDefinition<GlobalName> {
 impl<GlobalName> TypeDefinition<GlobalName> {
     pub fn is_base_type(&self) -> bool {
         matches!(self, Self::Builtin(..))
+    }
+
+    pub fn qualified_name(&self) -> QualifiedName {
+        match self {
+            Self::Record(the) => the.name.clone(),
+            Self::Coproduct(the) => the.name.clone(),
+            Self::Builtin(the) => the.qualified_name(),
+        }
     }
 }
 
@@ -1155,7 +1179,6 @@ impl parser::Expr {
     fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Expr {
         match self {
             Self::Variable(a, identifier_path) => {
-                println!("resolve: {identifier_path}");
                 if let Some(bound) =
                     names.try_resolve_bound(&parser::Identifier::from_str(&identifier_path.head))
                 {

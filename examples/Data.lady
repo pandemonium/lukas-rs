@@ -1,0 +1,11 @@
+Result ::= ∀α e. Fault e | Return α
+
+module Result:
+  result :: ∀α e z. (e -> z) -> (α -> z) -> Result α e -> z :=
+    λfault return ra.
+      deconstruct ra into
+        Fault e  -> fault e
+      | Return a -> return a
+
+  map :: ∀α β e. (α -> β) -> Result α e -> Result β e :=
+    λf ra. result Fault (compose Return f) ra

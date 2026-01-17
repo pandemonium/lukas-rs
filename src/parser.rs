@@ -5,9 +5,9 @@ use thiserror::Error;
 
 use crate::{
     ast::{
-        self, ApplyTypeExpr, ArrowTypeExpr, CompilationUnit, CoproductConstructor,
-        CoproductDeclarator, Declaration, FieldDeclarator, ModuleDeclaration, ModuleDeclarator,
-        RecordDeclarator, Tree, TypeDeclaration, TypeDeclarator, ValueDeclaration, ValueDeclarator,
+        self, ApplyTypeExpr, ArrowTypeExpr, CoproductConstructor, CoproductDeclarator, Declaration,
+        FieldDeclarator, ModuleDeclaration, ModuleDeclarator, RecordDeclarator, Tree,
+        TypeDeclaration, TypeDeclarator, ValueDeclaration, ValueDeclarator,
     },
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
 };
@@ -100,18 +100,6 @@ impl IdentifierPath {
             }
         } else {
             self.clone()
-        }
-    }
-
-    fn prefigure(self, head: &str, tail: &Vec<String>, head1: String) -> IdentifierPath {
-        Self {
-            head: head1,
-            tail: {
-                let mut new_tail = Vec::with_capacity(1 + tail.capacity());
-                new_tail.push(head.to_owned());
-                new_tail.extend_from_slice(tail);
-                new_tail
-            },
         }
     }
 
@@ -241,6 +229,8 @@ impl<'a> Parser<'a> {
     }
 
     fn trace(&mut self) -> TraceGuard {
+        const REMAINS_COL: usize = 120;
+
         let depth = stack_depth();
 
         let backtrace = Backtrace::new();
@@ -253,28 +243,39 @@ impl<'a> Parser<'a> {
 
         if let Some(caller) = calling_symbol {
             let caller_name = caller.to_string();
-            let caller = caller_name.split("::").collect::<Vec<_>>();
-            let caller = caller.get(caller.len() - 2);
-            let e = TraceLogEntry {
-                step: caller.unwrap_or(&caller_name.as_str()).to_string(),
-                remains: self.remains(),
+            let parts = caller_name.split("::").collect::<Vec<_>>();
+            let step = parts
+                .get(parts.len().saturating_sub(2))
+                .unwrap_or(&caller_name.as_str())
+                .to_string();
+
+            let remains = self
+                .remains()
+                .iter()
+                .take(8)
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            let remains = remains.chars().collect::<Vec<_>>();
+
+            let remains = if remains.len() > REMAINS_COL {
+                &remains[..REMAINS_COL]
+            } else {
+                &remains
             };
+
+            let indent = depth * 2;
+
             println!(
-                "{:indent$}{}{:<pad$}{}",
-                "",
-                e.step,
-                "",
-                self.remains()
-                    .iter()
-                    .map(|t| t.to_string())
-                    .take(8)
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                indent = depth * 2,
-                pad = 400 - (depth * 2 + e.step.len())
+                "{:<width$}{}{}",
+                remains.into_iter().collect::<String>(),
+                " ".repeat(indent),
+                step,
+                width = REMAINS_COL
             );
         } else {
-            println!("Unknown caller.")
+            println!("Unknown caller.");
         }
 
         TraceGuard::enter()
@@ -346,15 +347,15 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub fn parse_compilation_unit(&mut self) -> Result<CompilationUnit<ParseInfo>> {
-        let _t = self.trace();
+    //    pub fn parse_compilation_unit(&mut self) -> Result<CompilationUnit<ParseInfo>> {
+    //        let _t = self.trace();
+    //
+    //        let decls = self.parse_declaration_list()?;
+    //
+    //        Ok(CompilationUnit::from_declarations(decls))
+    //    }
 
-        let decls = self.parse_declaration_list()?;
-
-        Ok(CompilationUnit::from_declarations(decls))
-    }
-
-    fn parse_declaration_list(&mut self) -> Result<Vec<Declaration<ParseInfo>>> {
+    pub fn parse_declaration_list(&mut self) -> Result<Vec<Declaration<ParseInfo>>> {
         let _t = self.trace();
 
         let mut decls = vec![self.parse_declaration()?];
@@ -370,6 +371,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+
         Ok(decls)
     }
 
@@ -392,6 +394,12 @@ impl<'a> Parser<'a> {
             ] | [
                 Token {
                     kind: TokenKind::Layout(Layout::Newline),
+                    ..
+                },
+                ..
+            ] | [
+                Token {
+                    kind: TokenKind::Keyword(Keyword::Module),
                     ..
                 },
                 ..
@@ -485,6 +493,10 @@ impl<'a> Parser<'a> {
 
             [
                 Token {
+                    kind: TokenKind::Keyword(Keyword::Module),
+                    ..
+                },
+                Token {
                     kind: TokenKind::Identifier(name),
                     position,
                 },
@@ -494,14 +506,42 @@ impl<'a> Parser<'a> {
                 },
                 ..,
             ] => {
-                // <id> <:>
-                self.advance(2);
+                // <module> <id> <:>
+                self.advance(3);
 
                 Ok(Declaration::Module(
                     ParseInfo::from_position(*position),
                     ModuleDeclaration {
                         name: Identifier::from_str(name),
                         declarator: self.parse_block(|parser| parser.parse_module_declarator())?,
+                    },
+                ))
+            }
+
+            [
+                Token {
+                    kind: TokenKind::Keyword(Keyword::Module),
+                    ..
+                },
+                Token {
+                    kind: TokenKind::Identifier(name),
+                    position,
+                },
+                Token {
+                    kind: TokenKind::Period,
+                    ..
+                },
+                ..,
+            ] => {
+                // <module> <id> <.>
+                self.advance(3);
+
+                let name = Identifier::from_str(name);
+                Ok(Declaration::Module(
+                    ParseInfo::from_position(*position),
+                    ModuleDeclaration {
+                        name: name.clone(),
+                        declarator: ast::ModuleDeclarator::External(name),
                     },
                 ))
             }
@@ -513,9 +553,7 @@ impl<'a> Parser<'a> {
     fn parse_module_declarator(&mut self) -> Result<ModuleDeclarator<ParseInfo>> {
         let _t = self.trace();
 
-        Ok(ModuleDeclarator {
-            members: self.parse_declaration_list()?,
-        })
+        Ok(ModuleDeclarator::Inline(self.parse_declaration_list()?))
     }
 
     // preceed with parse_block, but it has to lookahead to see
@@ -1814,7 +1852,7 @@ mod tests {
         }
 
         let mut p = Parser::from_tokens(tokens);
-        let x = p.parse_compilation_unit().unwrap();
-        println!("{x}")
+        let x = p.parse_declaration_list().unwrap();
+        println!("{x:?}")
     }
 }

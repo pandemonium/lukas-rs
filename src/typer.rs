@@ -324,7 +324,11 @@ impl TypeError {
 
 pub type Typing<A = (Substitutions, Expr)> = Result<A, Located<TypeError>>;
 
-pub struct Located<E> {
+#[derive(Debug, Error)]
+pub struct Located<E>
+where
+    E: fmt::Debug,
+{
     pub parse_info: ParseInfo,
     pub error: E,
 }
@@ -2434,7 +2438,7 @@ impl Literal {
 
 impl<E> fmt::Display for Located<E>
 where
-    E: fmt::Display,
+    E: fmt::Display + fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { parse_info, error } = self;

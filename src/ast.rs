@@ -3,7 +3,7 @@ use std::{fmt, marker::PhantomData, rc::Rc};
 use crate::{
     ast::{self, annotation::Annotated},
     bridge::Bridge,
-    parser::{self, Identifier},
+    compiler, parser,
 };
 
 pub mod annotation;
@@ -16,18 +16,8 @@ pub const STDLIB_MODULE_NAME: &str = "Stdlib";
 
 #[derive(Debug)]
 pub struct CompilationUnit<A> {
-    pub root: ModuleDeclaration<A>,
-}
-
-impl<A> CompilationUnit<A> {
-    pub fn from_declarations(decls: Vec<Declaration<A>>) -> Self {
-        Self {
-            root: ModuleDeclaration {
-                name: Identifier::from_str(ROOT_MODULE_NAME),
-                declarator: ModuleDeclarator { members: decls },
-            },
-        }
-    }
+    pub root_module: ModuleDeclaration<A>,
+    pub bootstrap: compiler::Bootstrap,
 }
 
 #[derive(Debug)]
@@ -56,8 +46,9 @@ pub struct ModuleDeclaration<A> {
 }
 
 #[derive(Debug)]
-pub struct ModuleDeclarator<A> {
-    pub members: Vec<Declaration<A>>,
+pub enum ModuleDeclarator<A> {
+    Inline(Vec<Declaration<A>>),
+    External(parser::Identifier),
 }
 
 #[derive(Debug)]
@@ -139,7 +130,7 @@ pub enum TypeExpression<A, TypeId> {
 }
 
 impl<A, TypeId> TypeExpression<A, TypeId> {
-    fn annotation(&self) -> &A {
+    pub fn annotation(&self) -> &A {
         match self {
             Self::Constructor(a, _)
             | Self::Parameter(a, _)
@@ -500,7 +491,7 @@ impl fmt::Display for Literal {
 
 impl<A> fmt::Display for CompilationUnit<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.root)
+        write!(f, "{}", self.root_module)
     }
 }
 
@@ -546,9 +537,16 @@ impl<A> fmt::Display for ModuleDeclaration<A> {
 
 impl<A> fmt::Display for ModuleDeclarator<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for m in &self.members {
-            writeln!(f, "{m}")?;
-        }
+        match self {
+            Self::Inline(declarations) => {
+                for m in declarations {
+                    writeln!(f, "{m}")?
+                }
+            }
+
+            Self::External(identifier) => write!(f, "external module {identifier}")?,
+        };
+
         Ok(())
     }
 }

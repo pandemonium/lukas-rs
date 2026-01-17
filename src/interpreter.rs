@@ -340,7 +340,7 @@ impl Environment {
     // Ought to be Interpretation
     pub fn typecheck_and_initialize(program: CompilationUnit<ParseInfo>) -> typer::Typing<Self> {
         let mut environment = Self::default();
-        let mut compilation = CompilationContext::from(&program);
+        let mut compilation = CompilationContext::from(program);
         compilation.lower_tuples();
 
         let compilation = compilation.rename_symbols();

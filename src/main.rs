@@ -1,16 +1,17 @@
 use std::process::exit;
 
+use clap::Parser;
 use lukas::{
-    ast::{self, namer},
+    ast::{self, ROOT_MODULE_NAME, namer},
+    compiler,
     interpreter::Environment,
-    lexer::LexicalAnalyzer,
-    parser::{Identifier, Parser},
-    typer::TypingContext,
+    parser::{self},
 };
 
 use tracing::{
     Subscriber,
     field::{Field, Visit},
+    info,
 };
 use tracing_subscriber::{
     Registry,
@@ -71,20 +72,10 @@ where
 
 fn main() {
     Registry::default().with(TreeLayer).init();
+    info!("Marmelade Compiler v420");
 
-    let _ctx = TypingContext::default();
-
-    let mut lexer = LexicalAnalyzer::default();
-    let input = include_str!("../examples/List.lady");
-
-    let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
-
-    //    for t in tokens {
-    //        println!("{t}")
-    //    }
-
-    let mut parser = Parser::from_tokens(tokens);
-    let program = parser.parse_compilation_unit().unwrap();
+    let params = compiler::Bootstrap::parse();
+    let program = params.parse_compilation_unit().unwrap();
 
     println!("Program: {program}");
 
@@ -98,7 +89,7 @@ fn main() {
 
     let return_value = env
         .call(
-            &namer::QualifiedName::from_root_symbol(Identifier::from_str("start")),
+            &namer::QualifiedName::new(parser::IdentifierPath::new(&ROOT_MODULE_NAME), "start"),
             ast::Literal::Int(427),
         )
         .expect("Expected a return value");

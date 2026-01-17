@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 backtrace = "0.3.76"
+clap = { version = "4.5.54", features = ["derive"] }
 thiserror = "2.0.17"
 tracing = { version = "0.1.44", features = ["attributes"] }
 tracing-subscriber = { version = "0.3.22", features = ["fmt", "std"] }
