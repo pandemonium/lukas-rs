@@ -5,14 +5,15 @@ use std::{
     rc::{Rc, Weak},
 };
 
+use thiserror::Error;
+
 use crate::{
     ast::{
-        self, CompilationUnit, Expr, Interpolate, ProductElement, Tree,
-        namer::{self, CompilationContext, Identifier},
+        self, Expr, Interpolate, ProductElement, Tree,
+        namer::{self, Identifier},
         pattern::Pattern,
     },
     bridge::Bridge,
-    parser::ParseInfo,
     typer,
 };
 
@@ -233,13 +234,24 @@ fn apply_closure(closure: Rc<RefCell<Closure>>, argument: Value) -> Interpretati
     env.bind_and_then(argument, |env| closure.body.reduce(env))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum RuntimeError {
+    #[error("no such symbol: {0}")]
     NoSuchSymbol(Identifier),
+
+    #[error("expected closure, found: {0}")]
     ExpectedClosure(Value),
+
+    #[error("expected at least one match")]
     ExpectedMatch,
+
+    #[error("expired self referential: {0}")]
     ExpiredSelfReferential(String),
+
+    #[error("function not applicable to {a} {b}")]
     NotApplicable2 { a: Value, b: Value },
+
+    #[error("expected type {0}")]
     ExpectedType(typer::Type),
 }
 
@@ -333,40 +345,8 @@ impl Environment {
         self.inner.borrow().globals.get(id).cloned()
     }
 
-    fn define_global(&mut self, id: &namer::QualifiedName, value: Value) {
+    pub fn define_global(&mut self, id: &namer::QualifiedName, value: Value) {
         self.inner.borrow_mut().globals.insert(id.clone(), value);
-    }
-
-    // Ought to be Interpretation
-    pub fn typecheck_and_initialize(program: CompilationUnit<ParseInfo>) -> typer::Typing<Self> {
-        let mut environment = Self::default();
-        let mut compilation = CompilationContext::from(program);
-        compilation.lower_tuples();
-
-        let compilation = compilation.rename_symbols();
-
-        for (name, sym) in &compilation.symbols {
-            println!("typecheck_and_initialize: {name} -> {sym:?}");
-        }
-
-        let dependencies = compilation.dependency_matrix();
-        let evaluation_order = dependencies.in_resolvable_order();
-
-        if dependencies.are_sound() {
-            for symbol in compilation
-                .compute_types(evaluation_order.iter())?
-                .terms(evaluation_order.iter())
-            {
-                let value = Rc::new(symbol.body().erase_annotation())
-                    .reduce(&environment)
-                    .expect("successful static init");
-                environment.define_global(&symbol.name, value);
-            }
-        } else {
-            panic!("Bad dependencies")
-        }
-
-        Ok(environment)
     }
 }
 

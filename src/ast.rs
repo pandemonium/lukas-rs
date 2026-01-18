@@ -12,12 +12,12 @@ pub mod pattern;
 
 pub const ROOT_MODULE_NAME: &str = "Root"; // This should be the main source file name
 pub const BUILTIN_MODULE_NAME: &str = "__builtin__";
-pub const STDLIB_MODULE_NAME: &str = "Stdlib";
+pub const STDLIB_MODULE_NAME: &str = "stdlib";
 
 #[derive(Debug)]
 pub struct CompilationUnit<A> {
     pub root_module: ModuleDeclaration<A>,
-    pub bootstrap: compiler::Bootstrap,
+    pub compiler: compiler::Compiler,
 }
 
 #[derive(Debug)]

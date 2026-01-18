@@ -174,7 +174,6 @@ impl namer::NamedCompilationContext {
             module_members: self.module_members,
             member_module: self.member_module,
             symbols,
-            phase: PhantomData,
         })
     }
 
@@ -184,10 +183,6 @@ impl namer::NamedCompilationContext {
     ) -> Typing<TypedSymbol> {
         let body = if let Some(type_signature) = &symbol.type_signature {
             let (subs, body) = ctx.infer_expr(symbol.body())?;
-            println!(
-                "compute_term_symbol: body {} subs {subs}",
-                body.type_info().inferred_type
-            );
 
             ctx.substitute_mut(&subs);
 
@@ -201,9 +196,7 @@ impl namer::NamedCompilationContext {
                 .check_instance_of(body.type_info().parse_info, &inferred_scheme)?;
 
             let qualified_name = symbol.name.clone();
-            println!(
-                "compute_term_symbol: {qualified_name} => {inferred_scheme}, <== {type_scheme}"
-            );
+            println!("typer: {qualified_name} => {inferred_scheme}, <== {type_scheme}");
 
             ctx.bind_free_term(qualified_name, type_scheme);
             body
@@ -213,7 +206,7 @@ impl namer::NamedCompilationContext {
             let qualified_name = symbol.name.clone();
             let inferred_type = &body.type_info().inferred_type;
             let scheme = inferred_type.generalize(&ctx);
-            println!("compute_term_symbol: {qualified_name} => {scheme}");
+            println!("typer: {qualified_name} => {scheme}");
 
             ctx.bind_free_term(qualified_name, scheme);
             body
@@ -250,63 +243,59 @@ where
 
 #[derive(Debug, Error)]
 pub enum TypeError {
-    #[error("Type error: cannot unify\n       left:  {lhs}\n       right: {rhs}")]
+    #[error("cannot unify\n       left:  {lhs}\n       right: {rhs}")]
     UnificationImpossible { lhs: Type, rhs: Type },
 
-    #[error("Type error: infinite type\ntype variable: {param}\noccurs in: {ty}")]
+    #[error("infinite type\ntype variable: {param}\noccurs in: {ty}")]
     InfiniteType { param: TypeParameter, ty: Type },
 
-    #[error(
-        "Type error: bad projection\nfrom type: {projection}\nit does not have a member: {inferred_type}"
-    )]
+    #[error("bad projection\nfrom type: {projection}\nit does not have a member: {inferred_type}")]
     BadProjection {
         projection: namer::Projection,
         inferred_type: Type,
     },
 
-    #[error("Type error: undefined name {name}\nat: {parse_info}")]
+    #[error("undefined name {name}\nat: {parse_info}")]
     UndefinedName {
         parse_info: ParseInfo,
         name: Identifier,
     },
 
-    #[error("Type error: undefined type {0}")]
+    #[error("undefined type {0}")]
     UndefinedType(namer::QualifiedName),
 
-    #[error("Type error: undefined symbol {0}")]
+    #[error("undefined symbol {0}")]
     UndefinedSymbol(SymbolName),
 
-    #[error("Type error: {0} does not match a known record type")]
+    #[error("{0} does not match a known record type")]
     NoSuchRecordType(RecordType),
 
-    #[error("Type error: unknown type parameter {0} in type expression")]
+    #[error("unknown type parameter {0} in type expression")]
     UnquantifiedTypeParameter(parser::Identifier),
 
-    #[error(
-        "Type error: type constructor {constructor} expects {expected} arguments\nwas given: {was:?}"
-    )]
+    #[error("type constructor {constructor} expects {expected} arguments\nwas given: {was:?}")]
     WrongArity {
         constructor: namer::QualifiedName,
         was: Vec<Type>,
         expected: usize,
     },
 
-    #[error("Type error: type constructor {0} accessed in non-elaborated state")]
+    #[error("type constructor {0} accessed in non-elaborated state")]
     UnelaboratedConstructor(namer::QualifiedName),
 
-    #[error("Type error: {0}")]
+    #[error("{0}")]
     InternalAssertion(String),
 
-    #[error("Type error: {0} is not a known coproduct constructor")]
+    #[error("{0} is not a known coproduct constructor")]
     NoSuchCoproductConstructor(namer::QualifiedName),
 
-    #[error("Type error: tuple expression {base} does not have element {select}")]
+    #[error("tuple expression {base} does not have element {select}")]
     TupleOrdinalOutOfBounds {
         base: ast::Expr<ParseInfo, Identifier>,
         select: ProductElement,
     },
 
-    #[error("Type error: no such field {field} in {record_type}")]
+    #[error("no such field {field} in {record_type}")]
     BadRecordPatternField {
         record_type: Type,
         field: parser::Identifier,

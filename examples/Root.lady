@@ -1,3 +1,12 @@
+Token_Type ::=
+    Type_Assign
+  | Arrow
+  | Identifier Text
+  | Keyword    Keyword
+  | Star | Gte | Plus
+
+Keyword ::= Module | If
+
 List ::= ∀α. Nil | Cons α (List α)
 
 module List:
@@ -6,6 +15,11 @@ module List:
 
   tail :: ∀α. List α -> List α :=
     λxs. deconstruct xs into Cons a tail -> tail | tail -> tail
+
+  fmap :: ∀α β. (α -> β) -> List α -> List β := λf xs.
+    deconstruct xs into
+      Cons x xs -> Cons (f x) (fmap f xs)
+    | Nil -> Nil
 
   fold_right :: ∀z α. (α -> z -> z) -> z -> List α -> z :=
     λf z xs.
@@ -20,7 +34,7 @@ module List:
       | Nil         -> z
 
   map :: ∀α β. (α -> β) -> List α -> List β :=
-    λf. fold_right (λa. Cons (f a)) Nil
+    λf. fold_right (compose Cons f) Nil
 
   bind :: ∀α β. (α -> List β) -> List α -> List β :=
     λf. fold_right (λx. append (f x)) Nil
@@ -77,8 +91,81 @@ compose :: ∀α β γ. (β -> γ) -> (α -> β) -> α -> γ :=
 
 long_list := tabulate 100 id
 
+fibonacci :: Int -> Int := λn.
+  if n = 0 or n = 1 then 1
+  else fibonacci (n - 1) + fibonacci (n - 2)
+
+clamp := lambda from to.
+  fibonacci from, fibonacci to
+
+frobnication :=
+  deconstruct clamp 3 5 into
+    p, q -> p * q
+
+
+say_name := lambda name.
+  "My name is; my name is: `name`, ..."
+
+also_say_name :=
+  say_name
+
+say_it :=
+  also_say_name
+
+say_real_name := lambda fake real.
+  print_endline "Formerly known as `say_it fake` but akshually `say_it real`"
+
+any_expression := 420
+
+and_function := λn. n * any_expression
+
+order_number := This 66
+order_number :: Perhaps Int := This 66
+
+switch := lambda x.
+  deconstruct
+    x
+  into
+    1         -> "Eins"
+  | 2         -> "Zwei"
+  | otherwise -> "Polizei"
+
+
+Dollars ::=
+  { The_Good :: Int
+    The_Bad  :: Text
+    The_Ugly :: Perhaps Int
+  }
+
+make_one := lambda good bad.
+  { The_Good: good; The_Bad: bad; The_Ugly: Nope }
+
+dollars :: Text :=
+  deconstruct
+    make_one 1 "Sylvester"
+  into
+    { The_Good: good; The_Bad: bad; The_Ugly: This ugly } ->
+        "`good`, `bad`, `ugly`"
+  | { The_Good: good; The_Bad: bad; The_Ugly: Nope }       ->
+        "`good`, `bad`"
+
+
 start := λx.
+  let x = (λf. (f 1, f "hi"))
+  in print_endline "hmm: `x id`"
+
+  let thang =
+    1, 2, "and to the 4"
+  in print_endline "`thang.0`, `thang.1`, `thang.0 + thang.1` `thang.2`"
+
+  print_endline "frobnication: `frobnication`"
+
   print_endline "`true and false or true`"
+
+  let render = λx. "I, `x`, can be anything `and_function any_expression / 69`." in
+  print_endline "... when I say the name, Biggus: `render "Optim¢us Prime"`?"
+
+  say_real_name "Slim Shady" "Marshall Mathers"
 
   let x = Data.Fault 1 in
   print_endline (show x)

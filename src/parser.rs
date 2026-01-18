@@ -1079,6 +1079,8 @@ impl<'a> Parser<'a> {
         !matches!(
             kind,
             TokenKind::Layout(..)
+                | TokenKind::TypeAscribe
+                | TokenKind::TypeAssign
                 | TokenKind::Assign
                 | TokenKind::Colon
                 | TokenKind::RightBrace
@@ -1105,6 +1107,9 @@ impl<'a> Parser<'a> {
             TokenKind::RightParen,
             TokenKind::Semicolon,
             TokenKind::Pipe,
+            TokenKind::Assign,
+            TokenKind::TypeAscribe,
+            TokenKind::TypeAssign,
             TokenKind::Layout(Layout::Dedent),
             TokenKind::Keyword(Keyword::Let),
             TokenKind::Keyword(Keyword::In),
@@ -1140,10 +1145,6 @@ impl<'a> Parser<'a> {
                     && Operator::Juxtaposition.precedence() > context_precedence
                     && u.location().is_descendant_of(lhs.position()) =>
             {
-                //                println!(
-                //                    "Calling parse_juxtaposed(1); lhs pos {}",
-                //                    lhs.parse_info().location
-                //                );
                 self.advance(1); //the indent
                 self.parse_juxtaposed(lhs, context_precedence)
             }
@@ -1151,7 +1152,10 @@ impl<'a> Parser<'a> {
             // f x
             [t, u, ..]
                 if Self::is_expr_prefix(&t.kind)
-                    && !matches!(u.kind, TokenKind::Assign | TokenKind::TypeAscribe)
+                    && !matches!(
+                        u.kind,
+                        TokenKind::Assign | TokenKind::TypeAscribe | TokenKind::TypeAssign
+                    )
                     && Operator::Juxtaposition.precedence() > context_precedence =>
             {
                 self.parse_juxtaposed(lhs, context_precedence)
@@ -1197,7 +1201,10 @@ impl<'a> Parser<'a> {
 
     fn parse_juxtaposed(&mut self, lhs: Expr, context_precedence: usize) -> Result<Expr> {
         let _t = self.trace();
+
+        println!("parse_juxtaposed: about take rhs");
         let rhs = self.parse_expression(Operator::Juxtaposition.precedence())?;
+
         self.parse_expr_infix(
             Expr::Apply(
                 *lhs.parse_info(),
@@ -1406,9 +1413,34 @@ impl<'a> Parser<'a> {
 
         let mut constructors = vec![self.parse_coproduct_constructor()?];
 
-        while self.peek()?.kind == TokenKind::Pipe {
+        if self.peek()?.is_dedent() {
+            self.consume()?;
+        }
+
+        let is_constructor_separator = |remains: &[Token]| match remains {
+            [
+                Token {
+                    kind: TokenKind::Pipe,
+                    ..
+                },
+                ..,
+            ] => Some(1),
+
+            [
+                t,
+                Token {
+                    kind: TokenKind::Pipe,
+                    ..
+                },
+                ..,
+            ] if t.is_layout() => Some(2),
+
+            _ => None,
+        };
+
+        while let Some(separator) = is_constructor_separator(self.remains()) {
             // |
-            self.advance(1);
+            self.advance(separator);
             constructors.push(self.parse_coproduct_constructor()?);
         }
 
@@ -1460,7 +1492,6 @@ impl<'a> Parser<'a> {
         }
 
         let mut match_clauses = vec![self.parse_match_clause()?];
-        println!("parse_deconstruct_into: parsed match clause");
 
         // Annoying
         if self.peek()?.is_dedent() {

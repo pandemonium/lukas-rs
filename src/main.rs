@@ -74,25 +74,22 @@ fn main() {
     Registry::default().with(TreeLayer).init();
     info!("Marmelade Compiler v420");
 
-    let params = compiler::Bootstrap::parse();
-    let program = params.parse_compilation_unit().unwrap();
+    let compiler = compiler::Compiler::parse();
+    match compiler.compile_and_initialize() {
+        Ok(program) => {
+            let return_value = program
+                .call(
+                    &namer::QualifiedName::new(
+                        parser::IdentifierPath::new(&ROOT_MODULE_NAME),
+                        "start",
+                    ),
+                    ast::Literal::Int(427),
+                )
+                .expect("Expected a return value");
 
-    println!("Program: {program}");
-
-    let env = match Environment::typecheck_and_initialize(program) {
-        Ok(env) => env,
-        Err(error) => {
-            eprintln!("{error}");
-            exit(1);
+            println!("#### {return_value}");
         }
-    };
 
-    let return_value = env
-        .call(
-            &namer::QualifiedName::new(parser::IdentifierPath::new(&ROOT_MODULE_NAME), "start"),
-            ast::Literal::Int(427),
-        )
-        .expect("Expected a return value");
-
-    println!("main: return value: {return_value}");
+        Err(fault) => println!("$$$$ {fault}"),
+    }
 }

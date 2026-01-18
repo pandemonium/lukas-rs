@@ -1,5 +1,8 @@
 use crate::{
-    ast::{BUILTIN_MODULE_NAME, STDLIB_MODULE_NAME, namer::TermSymbol},
+    ast::{
+        BUILTIN_MODULE_NAME, STDLIB_MODULE_NAME,
+        namer::{Symbol, TypeDefinition, TypeOrigin, TypeSymbol},
+    },
     bridge::{External, Lambda1, Lambda2, PartialRawLambda2, RawLambda1},
     interpreter::{Literal, Value},
     lambda1, lambda2,
@@ -61,7 +64,7 @@ fn mk_artithmetic_op(
     }
 }
 
-pub fn import() -> Vec<TermSymbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>> {
+pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>> {
     let builtins = parser::IdentifierPath::new(BUILTIN_MODULE_NAME);
     let stdlib = parser::IdentifierPath::new(STDLIB_MODULE_NAME);
 
@@ -125,7 +128,7 @@ pub fn import() -> Vec<TermSymbol<ParseInfo, parser::IdentifierPath, parser::Ide
         type_scheme: artithmetic_signature(),
     };
 
-    vec![
+    let terms = vec![
         rawlambda1!(show).into_symbol(&stdlib),
         lambda1!(print_endline).into_symbol(&stdlib),
         eq.into_symbol(&builtins),
@@ -141,7 +144,36 @@ pub fn import() -> Vec<TermSymbol<ParseInfo, parser::IdentifierPath, parser::Ide
         times.into_symbol(&builtins),
         divided.into_symbol(&builtins),
         modulo.into_symbol(&builtins),
-    ]
+    ];
+
+    let types = vec![
+        TypeSymbol {
+            definition: TypeDefinition::Builtin(BaseType::Int),
+            origin: TypeOrigin::Builtin,
+            arity: 0,
+        },
+        TypeSymbol {
+            definition: TypeDefinition::Builtin(BaseType::Text),
+            origin: TypeOrigin::Builtin,
+            arity: 0,
+        },
+        TypeSymbol {
+            definition: TypeDefinition::Builtin(BaseType::Bool),
+            origin: TypeOrigin::Builtin,
+            arity: 0,
+        },
+        TypeSymbol {
+            definition: TypeDefinition::Builtin(BaseType::Unit),
+            origin: TypeOrigin::Builtin,
+            arity: 0,
+        },
+    ];
+
+    terms
+        .into_iter()
+        .map(Symbol::Term)
+        .chain(types.into_iter().map(Symbol::Type))
+        .collect()
 }
 
 pub fn show(x: Value) -> String {

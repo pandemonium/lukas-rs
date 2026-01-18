@@ -13,9 +13,9 @@ use crate::{
         ProductElement, Tree, TupleTypeExpr,
         pattern::{StructPattern, TuplePattern},
     },
-    compiler::{Bootstrap, Compilation},
+    builtin,
+    compiler::{Compilation, Compiler},
     parser::{self, IdentifierPath, ParseInfo},
-    stdlib,
     typer::BaseType,
 };
 
@@ -89,6 +89,15 @@ impl<A> ast::Expr<A, Identifier> {
             Self::Record(_, record) => {
                 for (_, init) in &record.fields {
                     init.gather_free_variables(free)
+                }
+            }
+
+            Self::Interpolate(_, ast::Interpolate(segments)) => {
+                for s in segments {
+                    match s {
+                        ast::Segment::Expression(expr) => expr.gather_free_variables(free),
+                        _ => (),
+                    }
                 }
             }
 
@@ -269,6 +278,10 @@ impl QualifiedName {
             },
         }
     }
+
+    pub fn module(&self) -> &parser::IdentifierPath {
+        &self.module
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -378,13 +391,12 @@ impl parser::IdentifierPath {
     }
 }
 
-// "Modules do not exist" - they should get their own table.
+// Rename to Symbols? SymbolContext?
 #[derive(Debug, Clone)]
 pub struct CompilationContext<A, GlobalName, LocalId> {
     pub module_members: HashMap<parser::IdentifierPath, Vec<ModuleMember>>,
     pub member_module: HashMap<ModuleMember, parser::IdentifierPath>,
     pub symbols: HashMap<SymbolName, Symbol<A, GlobalName, LocalId>>,
-    pub phase: PhantomData<(A, GlobalName, LocalId)>,
 }
 
 impl<A, TypeId, ValueId> Default for CompilationContext<A, TypeId, ValueId> {
@@ -393,7 +405,6 @@ impl<A, TypeId, ValueId> Default for CompilationContext<A, TypeId, ValueId> {
             module_members: HashMap::default(),
             member_module: HashMap::default(),
             symbols: HashMap::default(),
-            phase: PhantomData,
         }
     }
 }
@@ -452,79 +463,44 @@ impl ParserCompilationContext {
         })
     }
 
-    pub fn from(program: CompilationUnit<ParseInfo>) -> Self {
+    pub fn from(program: CompilationUnit<ParseInfo>) -> Compilation<Self> {
         let mut symbols = HashMap::default();
         let mut modules = HashMap::<IdentifierPath, Vec<ModuleMember>>::default();
 
-        let builtins = parser::IdentifierPath::new(ast::BUILTIN_MODULE_NAME);
+        for symbol in builtin::import() {
+            println!("from: builtin {symbol:?}");
 
-        // Change when I move the base types into a module proper
-        for symbol in stdlib::import() {
-            println!("from: {symbol:?}");
-            modules
-                .entry(symbol.name.module.clone())
-                .or_default()
-                .push(ModuleMember::Term(symbol.name.member.clone()));
-            symbols.insert(SymbolName::Term(symbol.name.clone()), Symbol::Term(symbol));
+            match symbol {
+                Symbol::Term(symbol) => {
+                    modules
+                        .entry(symbol.name.module().clone())
+                        .or_default()
+                        .push(ModuleMember::Term(symbol.name.member.clone()));
+
+                    symbols.insert(SymbolName::Term(symbol.name.clone()), Symbol::Term(symbol));
+                }
+
+                Symbol::Type(symbol) => {
+                    let qualified_name = symbol.definition.qualified_name();
+
+                    modules
+                        .entry(qualified_name.module().clone())
+                        .or_default()
+                        .push(ModuleMember::Type(qualified_name.member.clone()));
+
+                    symbols.insert(
+                        SymbolName::Type(qualified_name.clone()),
+                        Symbol::Type(symbol),
+                    );
+                }
+            }
         }
 
-        symbols.insert(
-            SymbolName::Type(QualifiedName::builtin("Int")),
-            Symbol::Type(TypeSymbol {
-                definition: TypeDefinition::Builtin(BaseType::Int),
-                origin: TypeOrigin::Builtin,
-                arity: 0,
-            }),
-        );
-        modules
-            .entry(builtins.clone())
-            .or_default()
-            .push(ModuleMember::Type(parser::Identifier::from_str("Int")));
-
-        symbols.insert(
-            SymbolName::Type(QualifiedName::builtin("Text")),
-            Symbol::Type(TypeSymbol {
-                definition: TypeDefinition::Builtin(BaseType::Text),
-                origin: TypeOrigin::Builtin,
-                arity: 0,
-            }),
-        );
-        modules
-            .entry(builtins.clone())
-            .or_default()
-            .push(ModuleMember::Type(parser::Identifier::from_str("Text")));
-
-        symbols.insert(
-            SymbolName::Type(QualifiedName::builtin("Bool")),
-            Symbol::Type(TypeSymbol {
-                definition: TypeDefinition::Builtin(BaseType::Bool),
-                origin: TypeOrigin::Builtin,
-                arity: 0,
-            }),
-        );
-        modules
-            .entry(builtins.clone())
-            .or_default()
-            .push(ModuleMember::Type(parser::Identifier::from_str("Bool")));
-
-        symbols.insert(
-            SymbolName::Type(QualifiedName::builtin("Unit")),
-            Symbol::Type(TypeSymbol {
-                definition: TypeDefinition::Builtin(BaseType::Unit),
-                origin: TypeOrigin::Builtin,
-                arity: 0,
-            }),
-        );
-        modules
-            .entry(builtins.clone())
-            .or_default()
-            .push(ModuleMember::Type(parser::Identifier::from_str("Unit")));
-
         let declarations =
-            Self::module_declarations(program.bootstrap.clone(), program.root_module.declarator)
+            Self::module_declarations(program.compiler.clone(), program.root_module.declarator)
                 .unwrap();
         Self::collect_symbols(
-            program.bootstrap.clone(),
+            program.compiler.clone(),
             parser::IdentifierPath::new(program.root_module.name.as_str()),
             declarations,
             &mut modules,
@@ -541,18 +517,17 @@ impl ParserCompilationContext {
             })
             .collect();
 
-        Self {
+        Ok(Self {
             module_members: modules,
             member_module,
             symbols,
-            phase: PhantomData,
-        }
+        })
     }
 
     // This could just as well keep a running module_path of varified
     // modules. Shouldn't I just rewrite this sucker?
     pub fn collect_symbols(
-        bootstrap: Bootstrap,
+        compiler: Compiler,
         module_path: parser::IdentifierPath,
         declarations: Vec<Declaration<ParseInfo>>,
         module_members: &mut HashMap<parser::IdentifierPath, Vec<ModuleMember>>,
@@ -586,9 +561,9 @@ impl ParserCompilationContext {
                     module_members.insert(module_path.clone(), vec![]);
 
                     Self::collect_symbols(
-                        bootstrap.clone(),
+                        compiler.clone(),
                         module_path,
-                        Self::module_declarations(bootstrap.clone(), decl.declarator).unwrap(),
+                        Self::module_declarations(compiler.clone(), decl.declarator).unwrap(),
                         module_members,
                         symbols,
                     );
@@ -656,7 +631,7 @@ impl ParserCompilationContext {
     }
 
     fn module_declarations(
-        loader: Bootstrap,
+        loader: Compiler,
         module: ModuleDeclarator<ParseInfo>,
     ) -> Compilation<Vec<Declaration<ParseInfo>>> {
         match module {
@@ -1524,7 +1499,6 @@ impl ParserCompilationContext {
                 .iter()
                 .map(|(id, symbol)| (id.clone(), self.rename_symbol(symbol)))
                 .collect(),
-            phase: PhantomData,
         }
     }
 
