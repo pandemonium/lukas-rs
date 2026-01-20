@@ -14,6 +14,8 @@ Now living the Curry Howard-fantancy of types as proofs.
 
 1. Curiosity, Rust and ¬impossible.
 
+I could just as well be someone that can do it.
+
 Unbounded curiousity, and for the longest time, I really wanted to learn and become really good at Rust. The one way I know that makes these kinds of things happen is by trying something that is difficult, but not impossible.
 
 I wanted to implement a type checker, which seemed too hard, and a pattern matcher because that clearly functions through arcane magic, and I wanted a language with currying and functions as values.
@@ -38,14 +40,13 @@ https://github.com/pandemonium/lukas_rs
 Writing programs offers few surprises. We even spell Hello, World the same way.
 
 start := lambda x.
-  print_endline "Hello, world"
+print_endline "Hello, world"
 
 start :: Int -> ... := lambda x.
-  print_endline "Hello, world"
+print_endline "Hello, world"
 
 start :: Int -> exists a. a := lambda x.
-  print_endline "Hello, world"
-
+print_endline "Hello, world"
 
 No type annotations are needed, they are inferred.
 
@@ -58,32 +59,34 @@ text :: Text
 show :: ∀α. α -> Text
 print_endline :: Text -> Unit
 
-
 Functions, mildly inspired by The Lambda Calculus
 
-print_scientific_fact := lambda x.
-  let the_thing = (x + 67) * 840 / x in
-  let text =
-    show the_thing
-  in print_endline text
+print_scientific_fact := lambda icewalls.
+  print_endline if icewalls
+    then "Earth has an interesting shape"
+    else "Our princess is in another castle"
 
-compute_and_print := λfactor.
-  print_scientific_fact factor
+compute_earthiness := λr.
+  let π = 3 in
+  4/3 * π * r * r * r
 
+einstein := lambda m c.
+  let square = λc. c * c
+  in m * square c
 
 Top-level values can be annotated with a type signature
 
-computation :: Int -> Int :=
-  λfactor.
-    let the_thing = (factor + 68)
-    in
-        840 / (1 + factor)
+puts := Text -> Unit := λs. print_endline s
 
-core_business_logic :: Int -> Int -> Int := lambda p q.
-  let the_thing = (1 + p)
-  in
-    Logger.info "Doing logics with `p` and `q`"
-    q / 2
+einstein :: Int -> Int -> Int := lambda m c.
+  let square = λc. c * c
+  in m * square c
+
+whence :: forall a. Bool -> (Unit -> a) -> Unit -> a) -> a :=
+  lambda predicate consequent alternate.
+    if predicate then consequent () else alternate ()
+
+whence false (λ_. print_endline "for it is true") (λ_. print_endline "unless false")
 
 
 If expressions ought to be sufficient for everyone
@@ -101,29 +104,33 @@ fibonacci :: Int -> Int := λn.
 Algebraic data types -- tuples
 
 let thang =
-  1, 2, "and to the 4"
+1, 2, "and to the 4"
 in print_endline "`thang.0`, `thang.1`, `thang.0 + thang.1` `thang.2`"
 
 clamp := lambda from to.
-  fibonacci from, fibonacci to
+fibonacci from, fibonacci to
 
 frobnication :=
-  deconstruct clamp 3 5 into
-    p, q -> p * q
-
+deconstruct clamp 3 5 into
+p, q -> p \* q
 
 Algebraic data types -- A fistful of Co-products
 
-Perhaps ::= forall a. This a | Nah
+Perhaps ::= forall α. This α | Nada
 
-order_number := This 66
+Expr ::=
+    Var    Text
+  | Lambda Text Expr
+  | Apply  Expr Expr
+  | IntLit Int
+
+order_number := This "sextiosex"
 order_number :: Perhaps Int := This 66
 
-divide :: Int -> Int -> Perhaps Int :=
-  lambda dividend divisor.
-    if divisor = 0
-    then Nah
-    else This (dividend / divisor)
+divide :: Int -> Int -> Perhaps Int := lambda dividend divisor.
+  if divisor = 0
+  then Nada
+  else This (dividend / divisor)
 
 
 ADTs -- For a few Co-products more
@@ -143,7 +150,6 @@ divide :: Int -> Int -> Result Int Artithemtic_Error :=
     if divisor = 0
     then Fault Division_by_Zero
     else Return (dividend / divisor)
-
 
 ADTs -- Look ma, we have records
 
@@ -179,10 +185,39 @@ sovereign_citizen := lambda x.
   | "2"       -> "Am I free to go?"
   | otherwise -> "Polizei"
 
-$$$$ type error: 138:5: cannot unify
-       left:  Text
-       right: Int
+$$$ type error: 138:5: cannot unify
+       left  : Text
+       right : Int
 
+
+Patterns all the way down
+
+Movie ::=
+  { Title       :: Text
+    Acting_Lead :: Actor
+    Side_Kick   :: Perhaps Actor
+  }
+
+Actor ::=
+  { Name           :: Text
+    Alias          :: Text
+    Also_Known_For :: Perhaps Movie
+  }
+
+deconstruct mk_randomized_movie into
+  { Title: title; Acting_lead: _;
+    Side_Kick:
+      { Name: "Tuco Benedicto Pacifico Juan Maria Ramirez"
+        Alias: "The Ugly"
+        Also_Known_For:
+          This
+            { Title: other_movie
+              Acting_Lead: acting_lead
+              Side_Kick: _
+            }
+      }
+  } -> print_endline "When you have to Shoot, Shoot don't talk"
+| _ -> print_endline "AEAEAaaa!"
 
 Algebraic data types -- pattern matching
 
@@ -212,20 +247,10 @@ dollars :=
     otherwise -> 10
   | { The_Good: good; The_Bad: bad; The_Ugly: This ugly } -> ugly
 
-$$$$ type error: 97:5: case { { The_Good: good; The_Bad: bad; The_Ugly: Nope } } is not useful for Root::make_one 1 Sylvester.
+$$$$ type error: 97:5: case { { The_Good: good; The_Bad: bad; The_Ugly: This ugly } } is not useful for Root::make_one 1 Sylvester.
 
 
 Curry! Curry! Curry!
-
-compute_and_print := λfactor.
-  print_scientific_fact factor
-
-compute_and_print :=
-  print_scientific_fact
-
-print_scientific_fact :: Int -> Unit := ...
-
-compute_and_print :: Int -> Unit := print_scientific_fact
 
 map :: ∀a b. (a -> b) -> Perhaps a -> Perhaps b
 
@@ -257,12 +282,13 @@ say_real_name := lambda fake real.
 
 I accidentally a text interpolator
 
-any_expression := 420
+say_name := lambda name.
+  "My name is; my name is: `name`, ..."
 
-and_function := λn. n * any_expression + 1
-
-let render = λx. "I, `x`, can be anything `and_function any_expression / 69`." in
-print_endline "... when I say the name, Biggus: `render "Optimus Prime"`?"
+let service_announcement =
+    λuse_real_name.
+      "My name is: `say_name if use_real_name then "Marshal Mathers" else "Slim S."`"
+in print_endline "AB testing, A: `service_annoucement true`, and B: `service_annoucement false`"
 
 
 Let's make a list, shall we?
@@ -515,3 +541,4 @@ Body :: Expression
 ## Type expressions
 
 ## Check types
+$$

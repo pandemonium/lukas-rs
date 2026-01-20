@@ -89,7 +89,7 @@ flip :: ∀α β r. (α -> β -> r) -> β -> α -> r :=
 compose :: ∀α β γ. (β -> γ) -> (α -> β) -> α -> γ :=
   λg f a. g (f a)
 
-long_list := tabulate 100 id
+long_list := tabulate 50 id
 
 fibonacci :: Int -> Int := λn.
   if n = 0 or n = 1 then 1
@@ -149,8 +149,41 @@ dollars :: Text :=
   | { The_Good: good; The_Bad: bad; The_Ugly: Nope }       ->
         "`good`, `bad`"
 
+einstein := lambda m c.
+  let square = lambda c. c * c
+  in m * square c
+
+print_scientific_fact := lambda icewalls.
+  print_endline if icewalls
+    then "Earth has an interesting shape"
+    else "Our princess is in another castle"
+
+compute_earthiness := λr.
+  let π = 3 in
+  4/3 * π * r * r * r
+
+whence :: forall a. Bool -> (Unit -> a) -> (Unit -> a) -> a :=
+  lambda predicate consequent alternate.
+    if predicate then consequent () else alternate ()
+
+Expr ::= ∀α id.
+    Var    α id
+  | Lambda α id (Expr α id)
+  | Apply  α (Expr α id) (Expr α id)
+  | IntLit α Int
 
 start := λx.
+  print_scientific_fact false
+
+  let round = true in
+  let real = true in
+  let flat = false in
+  let surrounded_by_ice = true in
+  let earth = round and real xor flat and surrounded_by_ice
+  in print_endline "Earth is `earth`"
+
+  whence false (λ_. print_endline "for it is true") (λ_. print_endline "unless false")
+
   let x = (λf. (f 1, f "hi"))
   in print_endline "hmm: `x id`"
 

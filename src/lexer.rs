@@ -37,6 +37,9 @@ impl LexicalAnalyzer {
 
                 ['=', remains @ ..] => self.emit(1, TokenKind::Equals, remains),
                 [',', remains @ ..] => self.emit(1, TokenKind::Comma, remains),
+                ['(', ')', remains @ ..] => {
+                    self.emit(2, TokenKind::Literal(Literal::Unit), remains)
+                }
                 ['(', remains @ ..] => self.emit(1, TokenKind::LeftParen, remains),
                 [')', remains @ ..] => self.emit(1, TokenKind::RightParen, remains),
                 ['{', remains @ ..] => self.emit(1, TokenKind::LeftBrace, remains),
@@ -121,6 +124,12 @@ impl LexicalAnalyzer {
             )
         } else {
             loop {
+                if remains.is_empty() {
+                    break remains;
+                } else {
+                    println!("scan_text_literal: {:?}", &remains[..4]);
+                }
+
                 remains = self.emit(
                     length,
                     TokenKind::Interpolate(Interpolation::Interlude(Literal::Text(image))),
@@ -565,6 +574,7 @@ pub enum Literal {
     Integer(i64),
     Text(String),
     Bool(bool),
+    Unit,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -686,6 +696,7 @@ impl fmt::Display for Literal {
             Self::Integer(x) => write!(f, "{x}"),
             Self::Text(x) => write!(f, "{x}"),
             Self::Bool(x) => write!(f, "{x}"),
+            Self::Unit => write!(f, "()"),
         }
     }
 }

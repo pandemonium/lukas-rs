@@ -141,26 +141,26 @@ impl Identifier {
 
 #[derive(Debug, Error)]
 pub enum Fault {
-    #[error("Parse error: unexpected overflow")]
+    #[error("unexpected overflow")]
     UnexpectedOverflow,
 
-    #[error("Parse error: unexpected underflow")]
+    #[error("unexpected underflow")]
     UnexpectedUnderflow,
 
-    #[error("Parse error: {position}: expected {expected}\nfound: {found}")]
+    #[error("{position}: expected {expected}\nfound: {found}")]
     Expected {
         expected: TokenKind,
         found: TokenKind,
         position: SourceLocation,
     },
 
-    #[error("Parse error: expected a parameter list")]
+    #[error("expected a parameter list")]
     ExpectedParameterList,
 
-    #[error("Parse error: expected an identifier\nfound: {0}")]
+    #[error("expected an identifier\nfound: {0}")]
     ExpectedIdentifier(Token),
 
-    #[error("Parse error: expected a type constructor (Capitalized name.)")]
+    #[error("expected a type constructor (Capitalized name.)")]
     ExpectedTypeConstructor,
 }
 
@@ -1215,17 +1215,6 @@ impl<'a> Parser<'a> {
             ),
             context_precedence,
         )
-        //        let rhs = self.parse_expr_prefix()?;
-        //        self.parse_expr_infix(
-        //            Expr::Apply(
-        //                *lhs.parse_info(),
-        //                ast::Apply {
-        //                    function: lhs.into(),
-        //                    argument: rhs.into(),
-        //                },
-        //            ),
-        //            context_precedence,
-        //        )
     }
 
     fn parse_literal(&mut self, literal: &Literal, position: &SourceLocation) -> Result<Expr> {
@@ -1804,6 +1793,7 @@ impl From<Literal> for ast::Literal {
             Literal::Integer(x) => ast::Literal::Int(x),
             Literal::Text(x) => ast::Literal::Text(x),
             Literal::Bool(x) => ast::Literal::Bool(x),
+            Literal::Unit => ast::Literal::Unit,
         }
     }
 }
