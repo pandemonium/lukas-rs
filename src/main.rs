@@ -1,10 +1,7 @@
-use std::process::exit;
-
 use clap::Parser;
 use lukas::{
     ast::{self, ROOT_MODULE_NAME, namer},
     compiler,
-    interpreter::Environment,
     parser::{self},
 };
 

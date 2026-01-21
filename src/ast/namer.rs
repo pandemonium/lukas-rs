@@ -463,175 +463,217 @@ impl ParserCompilationContext {
         })
     }
 
-    pub fn from(program: CompilationUnit<ParseInfo>) -> Compilation<Self> {
-        let mut symbols = HashMap::default();
-        let mut modules = HashMap::<IdentifierPath, Vec<ModuleMember>>::default();
+    pub fn add_term_symbol(
+        &mut self,
+        name: QualifiedName,
+        symbol: TermSymbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>,
+    ) {
+        self.symbols
+            .insert(SymbolName::Term(name), Symbol::Term(symbol));
+    }
+
+    pub fn add_type_symbol(
+        &mut self,
+        name: QualifiedName,
+        symbol: TypeSymbol<parser::IdentifierPath>,
+    ) {
+        self.symbols
+            .insert(SymbolName::Type(name), Symbol::Type(symbol));
+    }
+
+    pub fn add_module_term_member(
+        &mut self,
+        module_path: parser::IdentifierPath,
+        member: parser::Identifier,
+    ) {
+        self.add_module_member(module_path, ModuleMember::Term(member));
+    }
+
+    pub fn add_module_type_member(
+        &mut self,
+        module_path: parser::IdentifierPath,
+        member: parser::Identifier,
+    ) {
+        self.add_module_member(module_path, ModuleMember::Type(member));
+    }
+
+    pub fn add_module_member(&mut self, module_path: parser::IdentifierPath, member: ModuleMember) {
+        println!("from: add {member:?} to {module_path}");
+        self.module_members
+            .entry(module_path.clone())
+            .or_default()
+            .push(member.clone());
+
+        self.member_module.insert(member, module_path);
+    }
+
+    pub fn add_type_declaration(
+        &mut self,
+        module_path: &parser::IdentifierPath,
+        ast::TypeDeclaration {
+            name,
+            type_parameters,
+            declarator,
+        }: ast::TypeDeclaration<ParseInfo>,
+    ) {
+        {
+            self.add_module_type_member(module_path.clone(), name.clone());
+
+            let name = QualifiedName::new(module_path.clone(), name.as_str());
+            match declarator {
+                ast::TypeDeclarator::Record(_, record) => {
+                    self.add_type_symbol(
+                        name.clone(),
+                        TypeSymbol {
+                            definition: TypeDefinition::Record(RecordSymbol {
+                                name: name,
+                                type_parameters: type_parameters.clone(),
+                                fields: record
+                                    .fields
+                                    .iter()
+                                    .map(|decl| FieldSymbol {
+                                        name: decl.name.clone(),
+                                        type_signature: decl.type_signature.clone(),
+                                    })
+                                    .collect(),
+                            }),
+                            origin: TypeOrigin::UserDefined,
+                            arity: type_parameters.len(),
+                        },
+                    );
+                }
+
+                ast::TypeDeclarator::Coproduct(pi, coproduct) => {
+                    let constructors = coproduct
+                        .constructors
+                        .iter()
+                        .map(|decl| ConstructorSymbol {
+                            name: QualifiedName::new(module_path.clone(), decl.name.as_str()),
+                            signature: decl.signature.clone(),
+                        })
+                        .collect::<Vec<_>>();
+
+                    for constructor in &constructors {
+                        self.add_module_term_member(
+                            module_path.clone(),
+                            parser::Identifier::from_str(constructor.name.member.as_str()),
+                        );
+                        self.add_term_symbol(
+                            constructor.name.clone(),
+                            constructor.make_constructor_term(pi, &type_parameters, &name),
+                        );
+                    }
+
+                    self.add_type_symbol(
+                        name.clone(),
+                        TypeSymbol {
+                            definition: TypeDefinition::Coproduct(CoproductSymbol {
+                                name: name,
+                                type_parameters: type_parameters.clone(),
+                                constructors,
+                            }),
+                            origin: TypeOrigin::UserDefined,
+                            arity: type_parameters.len(),
+                        },
+                    );
+                }
+            };
+        }
+    }
+
+    pub fn add_value_declaration(
+        &mut self,
+        module_path: &parser::IdentifierPath,
+        ast::ValueDeclaration { name, declarator }: ast::ValueDeclaration<ParseInfo>,
+    ) {
+        self.add_module_term_member(module_path.clone(), name.clone());
+        let name = QualifiedName::new(module_path.clone(), name.as_str());
+        self.add_term_symbol(
+            name.clone(),
+            TermSymbol {
+                name: name,
+                type_signature: declarator.type_signature.clone(),
+                body: declarator.body.clone().into(),
+            },
+        );
+    }
+
+    pub fn add_module_declaration(
+        &mut self,
+        module_path: &parser::IdentifierPath,
+        decl: ast::ModuleDeclaration<ParseInfo>,
+        compiler: &Compiler,
+    ) -> Compilation<()> {
+        // Modules compete in the term namespace
+        self.add_module_term_member(
+            module_path.clone(),
+            parser::Identifier::from_str(decl.name.as_str()),
+        );
+
+        let module_path = module_path.clone().with_suffix(decl.name.as_str());
+        self.add_module_contents(
+            compiler,
+            module_path,
+            Self::module_declarations(compiler, decl.declarator)?,
+        )
+    }
+
+    fn add_module_contents(
+        &mut self,
+        compiler: &Compiler,
+        module_path: IdentifierPath,
+        declarations: Vec<Declaration<ParseInfo>>,
+    ) -> Compilation<()> {
+        for decl in declarations {
+            match decl {
+                Declaration::Value(_, decl) => self.add_value_declaration(&module_path, decl),
+                Declaration::Module(_, decl) => {
+                    self.add_module_declaration(&module_path, decl, compiler)?
+                }
+                Declaration::Type(_, decl) => self.add_type_declaration(&module_path, decl),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn import_compilation_unit(program: CompilationUnit<ParseInfo>) -> Compilation<Self> {
+        let mut ctx = Self::default();
 
         for symbol in builtin::import() {
             println!("from: builtin {symbol:?}");
 
             match symbol {
                 Symbol::Term(symbol) => {
-                    modules
-                        .entry(symbol.name.module().clone())
-                        .or_default()
-                        .push(ModuleMember::Term(symbol.name.member.clone()));
-
-                    symbols.insert(SymbolName::Term(symbol.name.clone()), Symbol::Term(symbol));
+                    let qualified_name = &symbol.name;
+                    ctx.add_module_term_member(
+                        qualified_name.module().clone(),
+                        qualified_name.member.clone(),
+                    );
+                    ctx.add_term_symbol(qualified_name.clone(), symbol);
                 }
 
                 Symbol::Type(symbol) => {
                     let qualified_name = symbol.definition.qualified_name();
-
-                    modules
-                        .entry(qualified_name.module().clone())
-                        .or_default()
-                        .push(ModuleMember::Type(qualified_name.member.clone()));
-
-                    symbols.insert(
-                        SymbolName::Type(qualified_name.clone()),
-                        Symbol::Type(symbol),
+                    ctx.add_module_type_member(
+                        qualified_name.module().clone(),
+                        qualified_name.member.clone(),
                     );
+                    ctx.add_type_symbol(qualified_name, symbol);
                 }
             }
         }
 
-        let declarations =
-            Self::module_declarations(program.compiler.clone(), program.root_module.declarator)
-                .unwrap();
-        Self::collect_symbols(
-            program.compiler.clone(),
+        ctx.add_module_contents(
+            &program.compiler,
             parser::IdentifierPath::new(program.root_module.name.as_str()),
-            declarations,
-            &mut modules,
-            &mut symbols,
-        );
+            Self::module_declarations(&program.compiler, program.root_module.declarator)?,
+        )?;
 
-        let member_module = modules
-            .iter()
-            .flat_map(|(module, members)| {
-                members
-                    .iter()
-                    .cloned()
-                    .map(|member| (member, module.clone()))
-            })
-            .collect();
-
-        Ok(Self {
-            module_members: modules,
-            member_module,
-            symbols,
-        })
-    }
-
-    // This could just as well keep a running module_path of varified
-    // modules. Shouldn't I just rewrite this sucker?
-    pub fn collect_symbols(
-        compiler: Compiler,
-        module_path: parser::IdentifierPath,
-        declarations: Vec<Declaration<ParseInfo>>,
-        module_members: &mut HashMap<parser::IdentifierPath, Vec<ModuleMember>>,
-        symbols: &mut HashMap<SymbolName, ParserSymbol>,
-    ) {
-        for decl in declarations {
-            match decl {
-                ast::Declaration::Value(_, ast::ValueDeclaration { name, declarator }) => {
-                    println!("from: add {name} to {module_path}");
-                    module_members
-                        .entry(module_path.clone())
-                        .or_default()
-                        .push(ModuleMember::Term(name.clone()));
-
-                    let name = QualifiedName::new(module_path.clone(), name.as_str());
-                    let symbol = TermSymbol {
-                        name: name.clone(),
-                        type_signature: declarator.type_signature.clone(),
-                        body: declarator.body.clone().into(),
-                    };
-
-                    symbols.insert(SymbolName::Term(name), Symbol::Term(symbol));
-                }
-
-                ast::Declaration::Module(_, decl) => {
-                    module_members.entry(module_path.clone()).or_default().push(
-                        // Think about this. Do modules and terms share namespace?
-                        ModuleMember::Term(parser::Identifier::from_str(decl.name.as_str())),
-                    );
-                    let module_path = module_path.clone().with_suffix(decl.name.as_str());
-                    module_members.insert(module_path.clone(), vec![]);
-
-                    Self::collect_symbols(
-                        compiler.clone(),
-                        module_path,
-                        Self::module_declarations(compiler.clone(), decl.declarator).unwrap(),
-                        module_members,
-                        symbols,
-                    );
-                }
-
-                ast::Declaration::Type(
-                    pi,
-                    ast::TypeDeclaration {
-                        name,
-                        type_parameters,
-                        declarator,
-                    },
-                ) => {
-                    println!("collect_symbols: add type {name} to {module_path}");
-                    module_members
-                        .entry(module_path.clone())
-                        .or_default()
-                        .push(ModuleMember::Type(name.clone()));
-
-                    let name = QualifiedName::new(module_path.clone(), name.as_str());
-                    let symbol = match declarator {
-                        ast::TypeDeclarator::Record(_, record) => {
-                            make_record_type_symbol(&type_parameters, &name, &record)
-                        }
-
-                        ast::TypeDeclarator::Coproduct(_, coproduct) => {
-                            let constructors = coproduct
-                                .constructors
-                                .iter()
-                                .map(|decl| ConstructorSymbol {
-                                    name: QualifiedName::new(
-                                        module_path.clone(),
-                                        decl.name.as_str(),
-                                    ),
-                                    signature: decl.signature.clone(),
-                                })
-                                .collect::<Vec<_>>();
-
-                            println!("collect_symbols: module {module_path}");
-                            collect_coproduct_constructors(
-                                pi,
-                                symbols,
-                                &type_parameters,
-                                &name,
-                                &constructors,
-                                module_members.entry(module_path.clone()).or_default(),
-                            );
-
-                            TypeSymbol {
-                                definition: TypeDefinition::Coproduct(CoproductSymbol {
-                                    name: name.clone(),
-                                    type_parameters: type_parameters.clone(),
-                                    constructors,
-                                }),
-                                origin: TypeOrigin::UserDefined,
-                                arity: type_parameters.len(),
-                            }
-                        }
-                    };
-
-                    symbols.insert(SymbolName::Type(name), Symbol::Type(symbol));
-                }
-            };
-        }
+        Ok(ctx)
     }
 
     fn module_declarations(
-        loader: Compiler,
+        loader: &Compiler,
         module: ModuleDeclarator<ParseInfo>,
     ) -> Compilation<Vec<Declaration<ParseInfo>>> {
         match module {
@@ -640,49 +682,6 @@ impl ParserCompilationContext {
                 Ok(loader.load_module_declarations(&module_name)?)
             }
         }
-    }
-}
-
-fn collect_coproduct_constructors(
-    pi: ParseInfo,
-    symbols: &mut HashMap<SymbolName, ParserSymbol>,
-    type_parameters: &Vec<parser::Identifier>,
-    type_constructor_name: &QualifiedName,
-    constructors: &Vec<ConstructorSymbol<parser::IdentifierPath>>,
-    module_members: &mut Vec<ModuleMember>,
-) {
-    for constructor in constructors {
-        module_members.push(ModuleMember::Term(parser::Identifier::from_str(
-            &constructor.name.member.as_str().to_owned(),
-        )));
-        let symbol = constructor.make_constructor_term(pi, type_parameters, type_constructor_name);
-        symbols.insert(
-            SymbolName::Term(constructor.name.clone()),
-            Symbol::Term(symbol),
-        );
-    }
-}
-
-fn make_record_type_symbol(
-    type_parameters: &Vec<parser::Identifier>,
-    symbol_name: &QualifiedName,
-    record: &ast::RecordDeclarator<ParseInfo>,
-) -> TypeSymbol<parser::IdentifierPath> {
-    TypeSymbol {
-        definition: TypeDefinition::Record(RecordSymbol {
-            name: symbol_name.clone(),
-            type_parameters: type_parameters.clone(),
-            fields: record
-                .fields
-                .iter()
-                .map(|decl| FieldSymbol {
-                    name: decl.name.clone(),
-                    type_signature: decl.type_signature.clone(),
-                })
-                .collect(),
-        }),
-        origin: TypeOrigin::UserDefined,
-        arity: type_parameters.len(),
     }
 }
 
@@ -720,6 +719,7 @@ impl<A, GlobalName, LocalId> fmt::Display for Symbol<A, GlobalName, LocalId> {
     }
 }
 
+// Why doesn't this have a ParseInfo in it?
 #[derive(Debug, Clone)]
 pub struct TypeSymbol<GlobalName> {
     pub definition: TypeDefinition<GlobalName>,
