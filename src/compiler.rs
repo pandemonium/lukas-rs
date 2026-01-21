@@ -52,7 +52,7 @@ impl Compiler {
 
     pub fn typecheck_and_initialize(&self, program: CompilationUnit) -> Compilation<Environment> {
         let mut environment = Environment::default();
-        let mut symbols = namer::CompilationContext::import_compilation_unit(program)?;
+        let mut symbols = namer::SymbolTable::import_compilation_unit(program)?;
         symbols.lower_tuples();
 
         let compilation = symbols.rename_symbols();

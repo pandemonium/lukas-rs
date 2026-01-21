@@ -77,7 +77,7 @@ fn main() {
             let return_value = program
                 .call(
                     &namer::QualifiedName::new(
-                        parser::IdentifierPath::new(&ROOT_MODULE_NAME),
+                        parser::IdentifierPath::new(ROOT_MODULE_NAME),
                         "start",
                     ),
                     ast::Literal::Int(427),

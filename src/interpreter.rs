@@ -176,7 +176,7 @@ impl Pattern<(), namer::Identifier> {
                     arguments,
                     ..
                 },
-            ) if &pattern.constructor == constructor
+            ) if &pattern.constructor == &namer::Identifier::Free(constructor.clone())  // W T F,
                 && arguments.len() == pattern.arguments.len() =>
             {
                 let mut bindings = Vec::with_capacity(arguments.len());
@@ -373,8 +373,8 @@ pub enum Value {
 
     Variant {
         // Work out what this ought to be
-        coproduct: namer::Identifier,
-        constructor: namer::Identifier,
+        coproduct: namer::QualifiedName,
+        constructor: namer::QualifiedName,
         arguments: Vec<Value>,
     },
 }

@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
     hash::Hash,
+    iter,
     marker::PhantomData,
     rc::Rc,
     vec,
@@ -9,8 +10,8 @@ use std::{
 
 use crate::{
     ast::{
-        self, ApplyTypeExpr, ArrowTypeExpr, CompilationUnit, Declaration, ModuleDeclarator,
-        ProductElement, Tree, TupleTypeExpr,
+        self, ApplyTypeExpr, ArrowTypeExpr, BUILTIN_MODULE_NAME, CompilationUnit, Declaration,
+        ModuleDeclarator, ProductElement, STDLIB_MODULE_NAME, Tree, TupleTypeExpr,
         pattern::{StructPattern, TuplePattern},
     },
     builtin,
@@ -39,10 +40,9 @@ pub type ConstructorPattern = ast::pattern::ConstructorPattern<ParseInfo, Identi
 pub type TypeExpression = ast::TypeExpression<ParseInfo, QualifiedName>;
 pub type TypeSignature = ast::TypeSignature<ParseInfo, QualifiedName>;
 
-type ParserCompilationContext =
-    CompilationContext<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
+type ParserSymbolTable = SymbolTable<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
 type ParserSymbol = Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
-pub type NamedCompilationContext = CompilationContext<ParseInfo, QualifiedName, Identifier>;
+pub type NamedSymbolTable = SymbolTable<ParseInfo, QualifiedName, Identifier>;
 pub type NamedSymbol = Symbol<ParseInfo, QualifiedName, Identifier>;
 
 impl<A> ast::Expr<A, Identifier> {
@@ -106,11 +106,11 @@ impl<A> ast::Expr<A, Identifier> {
             Self::Construct(
                 _,
                 ast::Construct {
-                    constructor: Identifier::Free(id),
+                    constructor,
                     arguments,
                 },
             ) => {
-                free.insert(id);
+                free.insert(constructor);
                 for arg in arguments {
                     arg.gather_free_variables(free);
                 }
@@ -378,11 +378,9 @@ pub enum ModuleMember {
 
 impl parser::IdentifierPath {
     pub fn try_into_qualified_name(self) -> Option<QualifiedName> {
-        println!("try_into_qualified_name: {}", self);
         let Self { head, mut tail } = self;
 
         let member = tail.pop();
-        println!("try_into_qualified_name: member {member:?}");
 
         member.map(|member| QualifiedName {
             module: parser::IdentifierPath { head, tail },
@@ -393,31 +391,74 @@ impl parser::IdentifierPath {
 
 // Rename to Symbols? SymbolContext?
 #[derive(Debug, Clone)]
-pub struct CompilationContext<A, GlobalName, LocalId> {
+pub struct SymbolTable<A, GlobalName, LocalId> {
     pub module_members: HashMap<parser::IdentifierPath, Vec<ModuleMember>>,
-    pub member_module: HashMap<ModuleMember, parser::IdentifierPath>,
+    pub member_modules: HashMap<ModuleMember, Vec<parser::IdentifierPath>>,
     pub symbols: HashMap<SymbolName, Symbol<A, GlobalName, LocalId>>,
+    pub imports: Vec<parser::IdentifierPath>,
 }
 
-impl<A, TypeId, ValueId> Default for CompilationContext<A, TypeId, ValueId> {
+impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
     fn default() -> Self {
         Self {
             module_members: HashMap::default(),
-            member_module: HashMap::default(),
+            member_modules: HashMap::default(),
             symbols: HashMap::default(),
+            imports: Vec::default(),
         }
     }
 }
 
-impl ParserCompilationContext {
+impl ParserSymbolTable {
+    fn resolve_free_term_name(
+        &self,
+        id: &parser::IdentifierPath,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> Option<NameExpr> {
+        println!("resolve_free_term_name: {id} in {semantic_scope}");
+
+        let search_space = self
+            .member_modules
+            .get(&ModuleMember::Term(parser::Identifier::from_str(&id.head)))?;
+
+        let parents = prefix_chain(semantic_scope);
+
+        let mut search_order = parents.chain(self.imports.iter().rev().cloned());
+
+        let fully_qualified = search_order.find_map(|m| {
+            search_space.contains(&m).then_some(IdentifierPath {
+                head: m.head.clone(),
+                tail: {
+                    let mut new_tail = m.tail.clone();
+                    new_tail.push(id.head.clone());
+                    new_tail.extend_from_slice(&id.tail);
+                    new_tail
+                },
+            })
+        })?;
+
+        prefix_chain(&fully_qualified).find_map(|prefix| {
+            self.module_members
+                .contains_key(&prefix)
+                .then_some(NameExpr {
+                    module_prefix: prefix.clone(),
+                    member: fully_qualified.element(prefix.len())?.to_owned(),
+                    projections: fully_qualified.tail[prefix.len()..]
+                        .iter()
+                        .cloned()
+                        .collect(),
+                })
+        })
+    }
+
     fn resolve_as_term_member(&self, path: &parser::IdentifierPath) -> parser::IdentifierPath {
         println!("resolve_as_term_member: {path}");
 
-        self.member_module
+        self.member_modules
             .get(&ModuleMember::Term(parser::Identifier::from_str(
                 path.head.as_str(),
             )))
-            .map(|module| path.in_module(module))
+            .map(|module| path.in_module(&module[0]))
             .unwrap_or_else(|| path.clone())
     }
 
@@ -425,12 +466,12 @@ impl ParserCompilationContext {
     fn resolve_as_type_member(&self, path: &parser::IdentifierPath) -> Option<QualifiedName> {
         println!("resolve_as_type_member: {path}");
 
-        self.member_module
+        self.member_modules
             .get(&ModuleMember::Type(parser::Identifier::from_str(
                 path.last(),
             )))
-            .inspect(|x| println!("resolve_as_type_member: x {path} -- {x}"))
-            .and_then(|module| path.in_module(module).try_into_qualified_name())
+            .inspect(|x| println!("resolve_as_type_member: x {path} -- {x:?}"))
+            .and_then(|module| path.in_module(&module[0]).try_into_qualified_name())
     }
 
     pub fn resolve_module_path_expr(&self, path: &parser::IdentifierPath) -> Option<NameExpr> {
@@ -504,7 +545,10 @@ impl ParserCompilationContext {
             .or_default()
             .push(member.clone());
 
-        self.member_module.insert(member, module_path);
+        self.member_modules
+            .entry(member)
+            .or_default()
+            .push(module_path);
     }
 
     pub fn add_type_declaration(
@@ -636,8 +680,15 @@ impl ParserCompilationContext {
         Ok(())
     }
 
+    pub fn add_import_prefix(&mut self, prefix: parser::IdentifierPath) {
+        self.imports.push(prefix);
+    }
+
     pub fn import_compilation_unit(program: CompilationUnit<ParseInfo>) -> Compilation<Self> {
         let mut ctx = Self::default();
+
+        ctx.add_import_prefix(IdentifierPath::new(BUILTIN_MODULE_NAME));
+        ctx.add_import_prefix(IdentifierPath::new(STDLIB_MODULE_NAME));
 
         for symbol in builtin::import() {
             println!("from: builtin {symbol:?}");
@@ -683,6 +734,18 @@ impl ParserCompilationContext {
             }
         }
     }
+}
+
+fn prefix_chain(identifier_path: &IdentifierPath) -> impl Iterator<Item = IdentifierPath> {
+    iter::successors(Some(identifier_path.clone()), |path| {
+        if !path.tail.is_empty() {
+            let mut path = path.clone();
+            path.tail.pop();
+            Some(path)
+        } else {
+            None
+        }
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -876,7 +939,7 @@ impl ConstructorSymbol<parser::IdentifierPath> {
         let construct = parser::Expr::Construct(
             pi,
             ast::Construct {
-                constructor: self.name.clone().into_identifier_path(),
+                constructor: self.name.clone(),
                 arguments: terms
                     .clone()
                     .map(|i| {
@@ -975,7 +1038,7 @@ impl DeBruijnIndex {
 }
 
 impl parser::TypeExpression {
-    pub fn resolve_names(&self, symbols: &ParserCompilationContext) -> TypeExpression {
+    pub fn resolve_names(&self, symbols: &ParserSymbolTable) -> TypeExpression {
         match self {
             Self::Constructor(a, name) => TypeExpression::Constructor(
                 *a,
@@ -1147,25 +1210,35 @@ impl parser::Expr {
         }
     }
 
-    pub fn resolve_names(&self, symbols: &ParserCompilationContext) -> Expr {
-        self.resolve(&mut DeBruijnIndex::default(), symbols)
+    pub fn resolve_names(
+        &self,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> Expr {
+        self.resolve(&mut DeBruijnIndex::default(), symbols, semantic_scope)
     }
 
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Expr {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> Expr {
         match self {
-            Self::Variable(a, identifier_path) => {
+            Self::Variable(pi, identifier_path) => {
+                // head is locally bound and tail projects off of it
                 if let Some(bound) =
                     names.try_resolve_bound(&parser::Identifier::from_str(&identifier_path.head))
                 {
-                    into_projection(a, bound, identifier_path)
+                    project_base_through_path(pi, bound, identifier_path)
+
+                // identier_path is a free term
+                // Module1.ModuleN.term.projection1.projectionN
                 } else if let Some(path) =
-                    // I guess this would have to resolve the this name against every
-                    // imported namespace
-                    symbols.resolve_module_path_expr(
-                        &symbols.resolve_as_term_member(&identifier_path),
-                    )
+                    { symbols.resolve_free_term_name(identifier_path, semantic_scope) }
                 {
-                    path.into_projection(*a)
+                    println!("tukan: {identifier_path} in {semantic_scope} -> {path}");
+                    path.into_projection(*pi)
                 } else {
                     panic!("Unresolved symbol {}", identifier_path)
                 }
@@ -1176,30 +1249,40 @@ impl parser::Expr {
             Self::Constant(a, literal) => Expr::Constant(*a, literal.clone()),
 
             Self::RecursiveLambda(a, node) => {
-                Expr::RecursiveLambda(*a, node.resolve(names, symbols))
+                Expr::RecursiveLambda(*a, node.resolve(names, symbols, semantic_scope))
             }
 
-            Self::Lambda(a, node) => Expr::Lambda(*a, node.resolve(names, symbols)),
+            Self::Lambda(a, node) => Expr::Lambda(*a, node.resolve(names, symbols, semantic_scope)),
 
-            Self::Apply(a, node) => Expr::Apply(*a, node.resolve(names, symbols)),
+            Self::Apply(a, node) => Expr::Apply(*a, node.resolve(names, symbols, semantic_scope)),
 
-            Self::Let(a, node) => Expr::Let(*a, node.resolve(names, symbols)),
+            Self::Let(a, node) => Expr::Let(*a, node.resolve(names, symbols, semantic_scope)),
 
-            Self::Record(a, node) => Expr::Record(*a, node.resolve(names, symbols)),
+            Self::Record(a, node) => Expr::Record(*a, node.resolve(names, symbols, semantic_scope)),
 
-            Self::Tuple(a, node) => Expr::Tuple(*a, node.resolve(names, symbols)),
+            Self::Tuple(a, node) => Expr::Tuple(*a, node.resolve(names, symbols, semantic_scope)),
 
-            Self::Construct(a, node) => Expr::Construct(*a, node.resolve(names, symbols)),
+            Self::Construct(a, node) => {
+                Expr::Construct(*a, node.resolve(names, symbols, semantic_scope))
+            }
 
-            Self::Project(a, node) => Expr::Project(*a, node.resolve(names, symbols)),
+            Self::Project(a, node) => {
+                Expr::Project(*a, node.resolve(names, symbols, semantic_scope))
+            }
 
-            Self::Sequence(a, node) => Expr::Sequence(*a, node.resolve(names, symbols)),
+            Self::Sequence(a, node) => {
+                Expr::Sequence(*a, node.resolve(names, symbols, semantic_scope))
+            }
 
-            Self::Deconstruct(a, node) => Expr::Deconstruct(*a, node.resolve(names, symbols)),
+            Self::Deconstruct(a, node) => {
+                Expr::Deconstruct(*a, node.resolve(names, symbols, semantic_scope))
+            }
 
-            Self::If(a, node) => Expr::If(*a, node.resolve(names, symbols)),
+            Self::If(a, node) => Expr::If(*a, node.resolve(names, symbols, semantic_scope)),
 
-            Self::Interpolate(a, node) => Expr::Interpolate(*a, node.resolve(names, symbols)),
+            Self::Interpolate(a, node) => {
+                Expr::Interpolate(*a, node.resolve(names, symbols, semantic_scope))
+            }
         }
     }
 }
@@ -1217,7 +1300,11 @@ fn unspine_tuple(
         .collect()
 }
 
-fn into_projection(pi: &ParseInfo, base: Identifier, path: &parser::IdentifierPath) -> Expr {
+fn project_base_through_path(
+    pi: &ParseInfo,
+    base: Identifier,
+    path: &parser::IdentifierPath,
+) -> Expr {
     path.tail
         .iter()
         .fold(Expr::Variable(*pi, base), |base, member| {
@@ -1235,12 +1322,13 @@ impl parser::SelfReferential {
     fn resolve(
         &self,
         names: &mut DeBruijnIndex,
-        symbols: &ParserCompilationContext,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
     ) -> SelfReferential {
         if let Some(own_name) = self.own_name.try_as_simple() {
             names.bind_and_then(own_name.clone(), |names, own_name| SelfReferential {
                 own_name,
-                lambda: self.lambda.resolve(names, symbols),
+                lambda: self.lambda.resolve(names, symbols, semantic_scope),
             })
         } else {
             panic!("Parser erroneously accepted a pathed identifier for recursive function name")
@@ -1249,11 +1337,16 @@ impl parser::SelfReferential {
 }
 
 impl parser::Lambda {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Lambda {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> Lambda {
         if let Some(parameter) = self.parameter.try_as_simple() {
             names.bind_and_then(parameter, |names, parameter| Lambda {
                 parameter,
-                body: self.body.resolve(names, symbols).into(),
+                body: self.body.resolve(names, symbols, semantic_scope).into(),
             })
         } else {
             panic!("Parser erroneously accepted a pathed identifier for lambda parameter")
@@ -1262,22 +1355,32 @@ impl parser::Lambda {
 }
 
 impl parser::Apply {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Apply {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> Apply {
         Apply {
-            function: self.function.resolve(names, symbols).into(),
-            argument: self.argument.resolve(names, symbols).into(),
+            function: self.function.resolve(names, symbols, semantic_scope).into(),
+            argument: self.argument.resolve(names, symbols, semantic_scope).into(),
         }
     }
 }
 
 impl parser::Binding {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Binding {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> Binding {
         if let Some(binder) = self.binder.try_as_simple() {
-            let bound = Rc::new(self.bound.resolve(names, symbols));
+            let bound = Rc::new(self.bound.resolve(names, symbols, semantic_scope));
             names.bind_and_then(binder, |names, binder| Binding {
                 binder,
                 bound: Rc::clone(&bound),
-                body: self.body.resolve(names, symbols).into(),
+                body: self.body.resolve(names, symbols, semantic_scope).into(),
             })
         } else {
             panic!("Parser erroneously accepted a pathed identifier for binder")
@@ -1286,58 +1389,86 @@ impl parser::Binding {
 }
 
 impl parser::Record {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Record {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> Record {
         Record {
             fields: self
                 .fields
                 .iter()
-                .map(|(label, e)| (label.clone(), e.resolve(names, symbols).into()))
+                .map(|(label, e)| {
+                    (
+                        label.clone(),
+                        e.resolve(names, symbols, semantic_scope).into(),
+                    )
+                })
                 .collect(),
         }
     }
 }
 
 impl parser::Tuple {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Tuple {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> Tuple {
         Tuple {
             elements: self
                 .elements
                 .iter()
-                .map(|e| e.resolve(names, symbols).into())
+                .map(|e| e.resolve(names, symbols, semantic_scope).into())
                 .collect(),
         }
     }
 }
 
 impl parser::Construct {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Construct {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> Construct {
         Construct {
-            constructor: Identifier::Free(
-                symbols.resolve_qualified(&symbols.resolve_as_term_member(&self.constructor)),
-            ),
+            constructor: self.constructor.clone(),
             arguments: self
                 .arguments
                 .iter()
-                .map(|e| e.resolve(names, symbols).into())
+                .map(|e| e.resolve(names, symbols, semantic_scope).into())
                 .collect(),
         }
     }
 }
 
 impl parser::Projection {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Projection {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> Projection {
         Projection {
-            base: self.base.resolve(names, symbols).into(),
+            base: self.base.resolve(names, symbols, semantic_scope).into(),
             select: self.select.clone(),
         }
     }
 }
 
 impl parser::Sequence {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Sequence {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> Sequence {
         Sequence {
-            this: self.this.resolve(names, symbols).into(),
-            and_then: self.and_then.resolve(names, symbols).into(),
+            this: self.this.resolve(names, symbols, semantic_scope).into(),
+            and_then: self.and_then.resolve(names, symbols, semantic_scope).into(),
         }
     }
 }
@@ -1346,25 +1477,43 @@ impl parser::Deconstruct {
     fn resolve(
         &self,
         names: &mut DeBruijnIndex,
-        symbols: &ParserCompilationContext,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
     ) -> Deconstruct {
         Deconstruct {
-            scrutinee: self.scrutinee.resolve(names, symbols).into(),
+            scrutinee: self
+                .scrutinee
+                .resolve(names, symbols, semantic_scope)
+                .into(),
             match_clauses: self
                 .match_clauses
                 .iter()
-                .map(|clause| clause.resolve(names, symbols))
+                .map(|clause| clause.resolve(names, symbols, semantic_scope))
                 .collect(),
         }
     }
 }
 
 impl parser::IfThenElse {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> IfThenElse {
+    fn resolve(
+        &self,
+        names: &mut DeBruijnIndex,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> IfThenElse {
         IfThenElse {
-            predicate: self.predicate.resolve(names, symbols).into(),
-            consequent: self.consequent.resolve(names, symbols).into(),
-            alternate: self.alternate.resolve(names, symbols).into(),
+            predicate: self
+                .predicate
+                .resolve(names, symbols, semantic_scope)
+                .into(),
+            consequent: self
+                .consequent
+                .resolve(names, symbols, semantic_scope)
+                .into(),
+            alternate: self
+                .alternate
+                .resolve(names, symbols, semantic_scope)
+                .into(),
         }
     }
 }
@@ -1373,7 +1522,8 @@ impl parser::Interpolate {
     fn resolve(
         &self,
         names: &mut DeBruijnIndex,
-        symbols: &ParserCompilationContext,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
     ) -> Interpolate {
         let Self(segments) = self;
         ast::Interpolate(
@@ -1381,9 +1531,9 @@ impl parser::Interpolate {
                 .into_iter()
                 .map(|s| match s {
                     ast::Segment::Literal(a, literal) => ast::Segment::Literal(*a, literal.clone()),
-                    ast::Segment::Expression(expr) => {
-                        ast::Segment::Expression(expr.resolve(names, symbols).into())
-                    }
+                    ast::Segment::Expression(expr) => ast::Segment::Expression(
+                        expr.resolve(names, symbols, semantic_scope).into(),
+                    ),
                 })
                 .collect(),
         )
@@ -1394,7 +1544,8 @@ impl parser::MatchClause {
     fn resolve(
         &self,
         names: &mut DeBruijnIndex,
-        symbols: &ParserCompilationContext,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
     ) -> MatchClause {
         let Self {
             pattern,
@@ -1404,7 +1555,7 @@ impl parser::MatchClause {
 
         let clause = MatchClause {
             pattern: pattern.resolve(names, symbols),
-            consequent: consequent.resolve(names, symbols).into(),
+            consequent: consequent.resolve(names, symbols, semantic_scope).into(),
         };
 
         names.restore();
@@ -1413,7 +1564,7 @@ impl parser::MatchClause {
 }
 
 impl parser::Pattern {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserCompilationContext) -> Pattern {
+    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserSymbolTable) -> Pattern {
         match self {
             parser::Pattern::Coproduct(a, pattern) => Pattern::Coproduct(
                 *a,
@@ -1469,7 +1620,7 @@ impl parser::Pattern {
     }
 }
 
-impl ParserCompilationContext {
+impl ParserSymbolTable {
     pub fn lower_tuples(&mut self) {
         for symbol in self.symbols.values_mut() {
             match symbol {
@@ -1488,17 +1639,18 @@ impl ParserCompilationContext {
     // Move to namer.rs
     // This does not need the symbols in any particular order, so long as all
     // modules are known
-    pub fn rename_symbols(self) -> NamedCompilationContext {
-        CompilationContext {
+    pub fn rename_symbols(self) -> NamedSymbolTable {
+        SymbolTable {
             // Any kind of renaming necessary here?
             module_members: self.module_members.clone(),
             // Any kind of renaming necessary here?
-            member_module: self.member_module.clone(),
+            member_modules: self.member_modules.clone(),
             symbols: self
                 .symbols
                 .iter()
                 .map(|(id, symbol)| (id.clone(), self.rename_symbol(symbol)))
                 .collect(),
+            imports: self.imports,
         }
     }
 
@@ -1517,7 +1669,12 @@ impl ParserCompilationContext {
                     .type_signature
                     .clone()
                     .map(|ts| ts.map(|te| te.resolve_names(self))),
-                body: symbol.body().resolve_names(self).into(),
+                body: {
+                    symbol
+                        .body()
+                        .resolve_names(self, &symbol.name.module)
+                        .into()
+                },
             }),
 
             Symbol::Type(symbol) => Symbol::Type(match &symbol.definition {

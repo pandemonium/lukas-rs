@@ -69,8 +69,22 @@ impl IdentifierPath {
         }
     }
 
+    pub fn try_into_tail(&self) -> Option<Self> {
+        Some(Self {
+            head: self.tail.first().cloned()?,
+            tail: self.tail.iter().skip(1).cloned().collect(),
+        })
+    }
+
+    pub fn try_into_parent(mut self) -> Option<Self> {
+        if self.tail.pop().is_some() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
     pub fn last(&self) -> &str {
-        println!("last: {} {:?}", self.head, self.tail);
         self.tail.last().unwrap_or_else(|| &self.head)
     }
 
@@ -122,6 +136,18 @@ impl IdentifierPath {
 
     pub fn iter(&self) -> impl Iterator<Item = &str> {
         iter::once(&self.head).chain(&self.tail).map(|s| s.as_str())
+    }
+
+    pub fn element(&self, ix: usize) -> Option<&str> {
+        if ix == 0 {
+            Some(&self.head)
+        } else {
+            self.tail.get(ix - 1).map(|s| s.as_str())
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.tail.len() + 1
     }
 }
 

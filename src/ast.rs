@@ -1,7 +1,7 @@
 use std::{fmt, marker::PhantomData, rc::Rc};
 
 use crate::{
-    ast::{self, annotation::Annotated},
+    ast::{self, annotation::Annotated, namer::QualifiedName},
     bridge::Bridge,
     compiler, parser,
 };
@@ -315,7 +315,7 @@ pub enum ProductElement {
 // This thing needs to separate the name type for the name and the arguments
 #[derive(Debug, Clone)]
 pub struct Construct<A, Id> {
-    pub constructor: Id,
+    pub constructor: QualifiedName,
     pub arguments: Vec<Tree<A, Id>>,
 }
 

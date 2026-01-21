@@ -52,10 +52,10 @@ module List:
     λp. fold_left (λz x. if p x then 1 + z else z) 0
 
   filter :: ∀α. (α -> Bool) -> List α -> List α :=
-    λp. List.bind (λx. if p x then Cons x Nil else Nil)
+    λp. bind (λx. if p x then Cons x Nil else Nil)
 
   flatten :: ∀α. List (List α) -> List α :=
-    List.bind id
+    bind id
 
   tabulate :: ∀α. Int -> (Int -> α) -> List α :=
     λc f.
@@ -89,7 +89,7 @@ flip :: ∀α β r. (α -> β -> r) -> β -> α -> r :=
 compose :: ∀α β γ. (β -> γ) -> (α -> β) -> α -> γ :=
   λg f a. g (f a)
 
-long_list := tabulate 50 id
+long_list := List.tabulate 50 id
 
 fibonacci :: Int -> Int := λn.
   if n = 0 or n = 1 then 1
@@ -208,6 +208,6 @@ start := λx.
 
   print_endline "Hej `1`"
 
-  let xs = Root.long_list in
+  let xs = long_list in
   let ys = List.map (λx. Cons x Nil) xs in
   List.count (λx. x > 1) (List.flatten ys)

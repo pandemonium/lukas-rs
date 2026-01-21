@@ -17,8 +17,8 @@ use crate::{
         self, ApplyTypeExpr, ArrowTypeExpr, Literal, ProductElement, Tree, TupleTypeExpr,
         annotation::Annotated,
         namer::{
-            self, CompilationContext, DependencyMatrix, Identifier, QualifiedName, Symbol,
-            SymbolName, TermSymbol, TypeDefinition, TypeExpression, TypeSymbol,
+            self, DependencyMatrix, Identifier, QualifiedName, Symbol, SymbolName, SymbolTable,
+            TermSymbol, TypeDefinition, TypeExpression, TypeSymbol,
         },
     },
     parser::{self, ParseInfo},
@@ -50,8 +50,7 @@ pub type RecordSymbol = namer::RecordSymbol<namer::QualifiedName>;
 pub type CoproductSymbol = namer::CoproductSymbol<namer::QualifiedName>;
 
 type TypedSymbol = namer::Symbol<TypeInfo, namer::QualifiedName, namer::Identifier>;
-type TypedCompilationContext =
-    namer::CompilationContext<TypeInfo, namer::QualifiedName, namer::Identifier>;
+type TypedSymbolTable = namer::SymbolTable<TypeInfo, namer::QualifiedName, namer::Identifier>;
 
 fn display_list<A>(sep: &str, xs: &[A]) -> String
 where
@@ -63,7 +62,7 @@ where
         .join(sep)
 }
 
-impl<A> CompilationContext<A, namer::QualifiedName, namer::Identifier>
+impl<A> SymbolTable<A, namer::QualifiedName, namer::Identifier>
 where
     A: fmt::Debug,
 {
@@ -108,6 +107,10 @@ where
 
         // This function is incredibly inefficient.
         for (id, symbol) in &self.symbols {
+            println!(
+                "dependency_matrix: {id} depends on [{:?}]",
+                symbol.dependencies()
+            );
             matrix.add_edge(id.clone(), symbol.dependencies().into_iter().collect());
         }
 
@@ -130,11 +133,8 @@ impl namer::TypeSignature {
     }
 }
 
-impl namer::NamedCompilationContext {
-    pub fn compute_types(
-        self,
-        evaluation_order: Iter<&SymbolName>,
-    ) -> Typing<TypedCompilationContext> {
+impl namer::NamedSymbolTable {
+    pub fn compute_types(self, evaluation_order: Iter<&SymbolName>) -> Typing<TypedSymbolTable> {
         let mut ctx = TypingContext::default();
         let mut symbols = HashMap::with_capacity(self.symbols.len());
 
@@ -170,10 +170,11 @@ impl namer::NamedCompilationContext {
             symbols.insert(id.clone(), symbol);
         }
 
-        Ok(CompilationContext {
+        Ok(SymbolTable {
             module_members: self.module_members,
-            member_module: self.member_module,
+            member_modules: self.member_modules,
             symbols,
+            imports: self.imports,
         })
     }
 
@@ -1879,18 +1880,10 @@ impl TypingContext {
     fn infer_coproduct_construct(&mut self, pi: ParseInfo, construct: &namer::Construct) -> Typing {
         let (substitutions, typed_arguments, argument_types) =
             self.infer_several(&construct.arguments)?;
-        // TODO: namer::Identifier is a shit type for this purpose
-        let constructor_name = construct.constructor.try_as_free().ok_or_else(|| {
-            TypeError::InternalAssertion(format!(
-                "expected Identifier::Free, was: {}",
-                construct.constructor
-            ))
-            .at(pi)
-        })?;
 
         let candidates = self
             .types
-            .query_coproduct_type_constructors(constructor_name)?;
+            .query_coproduct_type_constructors(&construct.constructor)?;
 
         let type_constructor = candidates
             // It could go for the first constructor that unifies
@@ -1899,7 +1892,7 @@ impl TypingContext {
             // type of deal
             .first()
             .ok_or_else(|| {
-                TypeError::NoSuchCoproductConstructor(constructor_name.clone()).at(pi)
+                TypeError::NoSuchCoproductConstructor(construct.constructor.clone()).at(pi)
             })?;
 
         let type_constructor = type_constructor.instantiate(self)?;
@@ -1907,8 +1900,8 @@ impl TypingContext {
         let subs = if let Type::Coproduct(coproduct) =
             type_constructor.structure().map_err(|e| e.at(pi))?
         {
-            let signature = coproduct.signature(constructor_name).ok_or_else(|| {
-                TypeError::NoSuchCoproductConstructor(constructor_name.clone()).at(pi)
+            let signature = coproduct.signature(&construct.constructor).ok_or_else(|| {
+                TypeError::NoSuchCoproductConstructor(construct.constructor.clone()).at(pi)
             })?;
             Type::Tuple(TupleType::from_signature(signature))
                 .unified_with(&Type::Tuple(TupleType::from_signature(&argument_types)))
@@ -2398,7 +2391,7 @@ impl TypingContext {
             Expr::If(
                 TypeInfo {
                     parse_info: pi,
-                    inferred_type: consequent_type.into(),
+                    inferred_type: consequent_type,
                 },
                 IfThenElse {
                     predicate: predicate.into(),
