@@ -21,6 +21,7 @@ use crate::{
             TermSymbol, TypeDefinition, TypeExpression, TypeSymbol,
         },
     },
+    compiler::{Located, LocatedError},
     parser::{self, ParseInfo},
 };
 
@@ -299,25 +300,7 @@ pub enum TypeError {
     },
 }
 
-impl TypeError {
-    pub fn at(self, pi: ParseInfo) -> Located<Self> {
-        Located {
-            parse_info: pi,
-            error: self,
-        }
-    }
-}
-
 pub type Typing<A = (Substitutions, Expr)> = Result<A, Located<TypeError>>;
-
-#[derive(Debug, Error)]
-pub struct Located<E>
-where
-    E: fmt::Debug,
-{
-    pub parse_info: ParseInfo,
-    pub error: E,
-}
 
 #[derive(Debug, Clone)]
 pub struct TypeInfo {

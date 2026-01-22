@@ -165,7 +165,7 @@ impl Identifier {
 }
 
 #[derive(Debug, Error)]
-pub enum Fault {
+pub enum ParseError {
     #[error("unexpected overflow")]
     UnexpectedOverflow,
 
@@ -189,7 +189,7 @@ pub enum Fault {
     ExpectedTypeConstructor,
 }
 
-type Result<A> = result::Result<A, Fault>;
+type Result<A> = result::Result<A, ParseError>;
 
 #[derive(Debug)]
 struct TraceLogEntry<'a> {
@@ -307,7 +307,7 @@ impl<'a> Parser<'a> {
     }
 
     fn peek(&self) -> Result<&Token> {
-        self.remains().first().ok_or(Fault::UnexpectedOverflow)
+        self.remains().first().ok_or(ParseError::UnexpectedOverflow)
     }
 
     fn expect(&mut self, expected: TokenKind) -> Result<&Token> {
@@ -317,13 +317,13 @@ impl<'a> Parser<'a> {
                 Ok(token)
             }
 
-            [token, ..] => Err(Fault::Expected {
+            [token, ..] => Err(ParseError::Expected {
                 expected,
                 found: token.kind.clone(),
                 position: token.position,
             }),
 
-            _ => Err(Fault::UnexpectedUnderflow),
+            _ => Err(ParseError::UnexpectedUnderflow),
         }
     }
 
@@ -338,7 +338,7 @@ impl<'a> Parser<'a> {
             self.consume()?;
             Ok(retval)
         } else {
-            Err(Fault::ExpectedIdentifier(token.clone()))
+            Err(ParseError::ExpectedIdentifier(token.clone()))
         }
     }
 
@@ -347,7 +347,7 @@ impl<'a> Parser<'a> {
             self.advance(1);
             Ok(the)
         } else {
-            Err(Fault::UnexpectedOverflow)
+            Err(ParseError::UnexpectedOverflow)
         }
     }
 
@@ -356,7 +356,7 @@ impl<'a> Parser<'a> {
             self.offset -= 1;
             Ok(())
         } else {
-            Err(Fault::UnexpectedUnderflow)
+            Err(ParseError::UnexpectedUnderflow)
         }
     }
 
@@ -368,7 +368,7 @@ impl<'a> Parser<'a> {
             self.advance(1);
             Ok(the)
         } else {
-            Err(Fault::UnexpectedOverflow)
+            Err(ParseError::UnexpectedOverflow)
         }
     }
 
@@ -597,7 +597,7 @@ impl<'a> Parser<'a> {
             }
 
             if params.is_empty() {
-                Err(Fault::ExpectedIdentifier(self.peek()?.clone()))?;
+                Err(ParseError::ExpectedIdentifier(self.peek()?.clone()))?;
             }
 
             self.expect(TokenKind::Period)?;
@@ -790,7 +790,7 @@ impl<'a> Parser<'a> {
                         },
                     ))
                 } else {
-                    Err(Fault::ExpectedTypeConstructor)
+                    Err(ParseError::ExpectedTypeConstructor)
                 }
             }
 
@@ -951,7 +951,7 @@ impl<'a> Parser<'a> {
         }
 
         if params.is_empty() {
-            Err(Fault::ExpectedIdentifier(self.peek()?.clone()))?;
+            Err(ParseError::ExpectedIdentifier(self.peek()?.clone()))?;
         }
 
         self.expect(TokenKind::Period)?;

@@ -1,14 +1,17 @@
-use std::{fs, io, path::PathBuf, rc::Rc};
+use std::{fmt, fs, io, path::PathBuf, rc::Rc};
 
 use clap::Parser;
 use thiserror::Error;
 
 use crate::{
-    ast::{self, ROOT_MODULE_NAME, namer},
-    interpreter::{self, Environment},
+    ast::{
+        self, ROOT_MODULE_NAME,
+        namer::{self, NameError},
+    },
+    interpreter::{self, Environment, RuntimeError},
     lexer::LexicalAnalyzer,
-    parser::{self, ParseInfo},
-    typer,
+    parser::{self, ParseError, ParseInfo},
+    typer::TypeError,
 };
 
 pub type CompilationUnit = ast::CompilationUnit<ParseInfo>;
@@ -16,17 +19,43 @@ pub type CompilationUnit = ast::CompilationUnit<ParseInfo>;
 #[derive(Debug, Error)]
 pub enum CompilationError {
     #[error("parse error: {0}")]
-    ParseError(#[from] parser::Fault),
+    ParseError(#[from] ParseError),
+
+    #[error("name error: {0}")]
+    NameError(#[from] Located<NameError>),
 
     #[error("type error: {0}")]
-    TypeError(#[from] typer::Located<typer::TypeError>),
+    TypeError(#[from] Located<TypeError>),
 
     #[error("interpretation error: {0}")]
-    InterpretationError(#[from] interpreter::RuntimeError),
+    InterpretationError(#[from] RuntimeError),
 
     #[error("I/O error: {0}")]
     IO(#[from] io::Error),
 }
+
+#[derive(Debug, Error)]
+pub struct Located<E>
+where
+    E: fmt::Debug,
+{
+    pub parse_info: ParseInfo,
+    pub error: E,
+}
+
+pub trait LocatedError
+where
+    Self: Sized + fmt::Debug,
+{
+    fn at(self, pi: ParseInfo) -> Located<Self> {
+        Located {
+            parse_info: pi,
+            error: self,
+        }
+    }
+}
+
+impl<T> LocatedError for T where T: fmt::Debug {}
 
 pub type Compilation<A = CompilationUnit> = Result<A, CompilationError>;
 
@@ -55,7 +84,7 @@ impl Compiler {
         let mut symbols = namer::SymbolTable::import_compilation_unit(program)?;
         symbols.lower_tuples();
 
-        let compilation = symbols.rename_symbols();
+        let compilation = symbols.rename_symbols()?;
 
         //for (name, sym) in &compilation.symbols {
         //    println!("typecheck_and_initialize: {name} -> {sym:?}");

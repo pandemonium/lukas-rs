@@ -8,6 +8,8 @@ use std::{
     vec,
 };
 
+use thiserror::Error;
+
 use crate::{
     ast::{
         self, ApplyTypeExpr, ArrowTypeExpr, BUILTIN_MODULE_NAME, CompilationUnit, Declaration,
@@ -15,7 +17,7 @@ use crate::{
         pattern::{StructPattern, TuplePattern},
     },
     builtin,
-    compiler::{Compilation, Compiler},
+    compiler::{Compilation, Compiler, Located, LocatedError},
     parser::{self, IdentifierPath, ParseInfo},
     typer::BaseType,
 };
@@ -44,6 +46,26 @@ type ParserSymbolTable = SymbolTable<ParseInfo, parser::IdentifierPath, parser::
 type ParserSymbol = Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
 pub type NamedSymbolTable = SymbolTable<ParseInfo, QualifiedName, Identifier>;
 pub type NamedSymbol = Symbol<ParseInfo, QualifiedName, Identifier>;
+
+#[derive(Debug, Error)]
+pub enum NameError {
+    #[error("Unknown name `{0}`")]
+    UnknownName(IdentifierPath),
+
+    #[error("Parser erroneously accepted pathed identifier {0} for recursive function name")]
+    BadOwnName(IdentifierPath),
+
+    #[error("Parser erroneously accepted pathed identifier {0} for lambda parameter")]
+    BadParameterName(IdentifierPath),
+
+    #[error("Parser erroneously accepted pathed identifier {0} for binder")]
+    BadBinderName(IdentifierPath),
+
+    #[error("Unknown module member {0}")]
+    UnknownMember(ModuleMember),
+}
+
+pub type Naming<A> = Result<A, Located<NameError>>;
 
 impl<A> ast::Expr<A, Identifier> {
     pub fn free_variables(&self) -> HashSet<&QualifiedName> {
@@ -179,15 +201,6 @@ impl TypeExpression {
     }
 }
 
-/*
- * module A =
- *   module B =
- *     type Option a = Some of a | None
- *     let map f xs : (a -> b) -> Option a -> Option b = ...
- *
- *
- */
-
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum Identifier {
     Bound(usize),
@@ -273,7 +286,6 @@ impl QualifiedName {
             tail: {
                 let mut tail = self.module.tail;
                 tail.push(self.member.as_str().to_owned());
-
                 tail
             },
         }
@@ -424,6 +436,7 @@ impl ParserSymbolTable {
 
         let mut search_order = parents.chain(self.imports.iter().rev().cloned());
 
+        // Could this call in_module instead?
         let fully_qualified = search_order.find_map(|m| {
             search_space.contains(&m).then_some(IdentifierPath {
                 head: m.head.clone(),
@@ -453,20 +466,22 @@ impl ParserSymbolTable {
     fn resolve_type_name(
         &self,
         id: &parser::IdentifierPath,
+        pi: ParseInfo,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Option<QualifiedName> {
-        let search_space =
-            self.member_modules
-                .get(&ModuleMember::Type(parser::Identifier::from_str(
-                    &id.last(),
-                )))?;
+    ) -> Naming<QualifiedName> {
+        let member = ModuleMember::Type(parser::Identifier::from_str(&id.last()));
+        let search_space = self
+            .member_modules
+            .get(&member)
+            .ok_or_else(|| NameError::UnknownMember(member).at(pi))?;
 
         let mut search_order =
             prefix_chain(semantic_scope).chain(self.imports.iter().rev().cloned());
 
         search_order
-            .find_map(|m| (search_space.contains(&m)).then_some(id.in_module(&m)))?
-            .try_into_qualified_name()
+            .find_map(|m| (search_space.contains(&m)).then_some(id.in_module(&m)))
+            .and_then(|id| id.try_into_qualified_name())
+            .ok_or_else(|| NameError::UnknownName(id.clone()).at(pi))
     }
 
     pub fn add_term_symbol(
@@ -1003,44 +1018,55 @@ impl parser::TypeExpression {
     pub fn resolve_names(
         &self,
         symbols: &ParserSymbolTable,
+        pi: ParseInfo,
         semantic_scope: &parser::IdentifierPath,
-    ) -> TypeExpression {
+    ) -> Naming<TypeExpression> {
         match self {
-            Self::Constructor(a, name) => TypeExpression::Constructor(*a, {
-                symbols
-                    .resolve_type_name(&name, semantic_scope)
-                    .expect("Fan!")
-            }),
+            Self::Constructor(a, name) => Ok(TypeExpression::Constructor(*a, {
+                symbols.resolve_type_name(&name, pi, semantic_scope)?
+            })),
 
-            Self::Parameter(a, name) => TypeExpression::Parameter(*a, name.clone()),
+            Self::Parameter(a, name) => Ok(TypeExpression::Parameter(*a, name.clone())),
 
-            Self::Apply(a, apply) => TypeExpression::Apply(
+            Self::Apply(a, apply) => Ok(TypeExpression::Apply(
                 *a,
                 ApplyTypeExpr {
-                    function: apply.function.resolve_names(symbols, semantic_scope).into(),
-                    argument: apply.argument.resolve_names(symbols, semantic_scope).into(),
+                    function: apply
+                        .function
+                        .resolve_names(symbols, pi, semantic_scope)?
+                        .into(),
+                    argument: apply
+                        .argument
+                        .resolve_names(symbols, pi, semantic_scope)?
+                        .into(),
                     phase: PhantomData,
                 },
-            ),
+            )),
 
-            Self::Arrow(a, arrow) => TypeExpression::Arrow(
+            Self::Arrow(a, arrow) => Ok(TypeExpression::Arrow(
                 *a,
                 ArrowTypeExpr {
-                    domain: arrow.domain.resolve_names(symbols, semantic_scope).into(),
-                    codomain: arrow.codomain.resolve_names(symbols, semantic_scope).into(),
+                    domain: arrow
+                        .domain
+                        .resolve_names(symbols, pi, semantic_scope)?
+                        .into(),
+                    codomain: arrow
+                        .codomain
+                        .resolve_names(symbols, pi, semantic_scope)?
+                        .into(),
                 },
-            ),
+            )),
 
-            Self::Tuple(a, tuple) => TypeExpression::Tuple(
+            Self::Tuple(a, tuple) => Ok(TypeExpression::Tuple(
                 *a,
                 TupleTypeExpr(
                     tuple
                         .0
                         .iter()
-                        .map(|te| te.resolve_names(symbols, semantic_scope))
-                        .collect(),
+                        .map(|te| te.resolve_names(symbols, pi, semantic_scope))
+                        .collect::<Naming<_>>()?,
                 ),
-            ),
+            )),
         }
     }
 }
@@ -1185,7 +1211,7 @@ impl parser::Expr {
         &self,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Expr {
+    ) -> Naming<Expr> {
         self.resolve(&mut DeBruijn::default(), symbols, semantic_scope)
     }
 
@@ -1194,65 +1220,86 @@ impl parser::Expr {
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Expr {
+    ) -> Naming<Expr> {
         match self {
             Self::Variable(pi, identifier_path) => {
                 // head is locally bound and tail projects off of it
                 if let Some(bound) =
                     names.try_resolve_bound(&parser::Identifier::from_str(&identifier_path.head))
                 {
-                    project_base_through_path(pi, bound, identifier_path)
+                    Ok(project_base(pi, bound, &identifier_path.tail))
 
                 // identier_path is a free term
                 // Module1.ModuleN.term.projection1.projectionN
                 } else if let Some(path) =
                     { symbols.resolve_free_term_name(identifier_path, semantic_scope) }
                 {
-                    path.into_projection(*pi)
+                    Ok(path.into_projection(*pi))
                 } else {
-                    panic!("Unresolved symbol {}", identifier_path)
+                    Err(NameError::UnknownName(identifier_path.clone()).at(*pi))
                 }
             }
 
-            Self::InvokeBridge(a, bridge) => Expr::InvokeBridge(*a, bridge.clone()),
+            Self::InvokeBridge(pi, bridge) => Ok(Expr::InvokeBridge(*pi, bridge.clone())),
 
-            Self::Constant(a, literal) => Expr::Constant(*a, literal.clone()),
+            Self::Constant(pi, literal) => Ok(Expr::Constant(*pi, literal.clone())),
 
-            Self::RecursiveLambda(a, node) => {
-                Expr::RecursiveLambda(*a, node.resolve(names, symbols, semantic_scope))
-            }
+            Self::RecursiveLambda(pi, node) => Ok(Expr::RecursiveLambda(
+                *pi,
+                node.resolve(names, symbols, *pi, semantic_scope)?,
+            )),
 
-            Self::Lambda(a, node) => Expr::Lambda(*a, node.resolve(names, symbols, semantic_scope)),
+            Self::Lambda(pi, node) => Ok(Expr::Lambda(
+                *pi,
+                node.resolve(names, symbols, *pi, semantic_scope)?,
+            )),
 
-            Self::Apply(a, node) => Expr::Apply(*a, node.resolve(names, symbols, semantic_scope)),
+            Self::Apply(pi, node) => Ok(Expr::Apply(
+                *pi,
+                node.resolve(names, symbols, semantic_scope)?,
+            )),
 
-            Self::Let(a, node) => Expr::Let(*a, node.resolve(names, symbols, semantic_scope)),
+            Self::Let(pi, node) => Ok(Expr::Let(
+                *pi,
+                node.resolve(names, symbols, *pi, semantic_scope)?,
+            )),
 
-            Self::Record(a, node) => Expr::Record(*a, node.resolve(names, symbols, semantic_scope)),
+            Self::Record(pi, node) => Ok(Expr::Record(
+                *pi,
+                node.resolve(names, symbols, semantic_scope)?,
+            )),
 
-            Self::Tuple(a, node) => Expr::Tuple(*a, node.resolve(names, symbols, semantic_scope)),
+            Self::Tuple(pi, node) => Ok(Expr::Tuple(
+                *pi,
+                node.resolve(names, symbols, semantic_scope)?,
+            )),
 
-            Self::Construct(a, node) => {
-                Expr::Construct(*a, node.resolve(names, symbols, semantic_scope))
-            }
+            Self::Construct(pi, node) => Ok(Expr::Construct(
+                *pi,
+                node.resolve(names, symbols, semantic_scope)?,
+            )),
 
-            Self::Project(a, node) => {
-                Expr::Project(*a, node.resolve(names, symbols, semantic_scope))
-            }
+            Self::Project(pi, node) => Ok(Expr::Project(
+                *pi,
+                node.resolve(names, symbols, semantic_scope)?,
+            )),
 
-            Self::Sequence(a, node) => {
-                Expr::Sequence(*a, node.resolve(names, symbols, semantic_scope))
-            }
+            Self::Sequence(pi, node) => Ok(Expr::Sequence(
+                *pi,
+                node.resolve(names, symbols, semantic_scope)?,
+            )),
 
-            Self::Deconstruct(a, node) => {
-                Expr::Deconstruct(*a, node.resolve(names, symbols, semantic_scope))
-            }
+            Self::Deconstruct(pi, node) => Ok(Expr::Deconstruct(
+                *pi,
+                node.resolve(names, symbols, semantic_scope)?,
+            )),
 
-            Self::If(a, node) => Expr::If(*a, node.resolve(names, symbols, semantic_scope)),
+            Self::If(pi, node) => Ok(Expr::If(*pi, node.resolve(names, symbols, semantic_scope)?)),
 
-            Self::Interpolate(a, node) => {
-                Expr::Interpolate(*a, node.resolve(names, symbols, semantic_scope))
-            }
+            Self::Interpolate(pi, node) => Ok(Expr::Interpolate(
+                *pi,
+                node.resolve(names, symbols, semantic_scope)?,
+            )),
         }
     }
 }
@@ -1270,12 +1317,8 @@ fn unspine_tuple(
         .collect()
 }
 
-fn project_base_through_path(
-    pi: &ParseInfo,
-    base: Identifier,
-    path: &parser::IdentifierPath,
-) -> Expr {
-    path.tail
+fn project_base(pi: &ParseInfo, base: Identifier, projection_path: &[String]) -> Expr {
+    projection_path
         .iter()
         .fold(Expr::Variable(*pi, base), |base, member| {
             Expr::Project(
@@ -1293,15 +1336,18 @@ impl parser::SelfReferential {
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
+        pi: ParseInfo,
         semantic_scope: &parser::IdentifierPath,
-    ) -> SelfReferential {
+    ) -> Naming<SelfReferential> {
         if let Some(own_name) = self.own_name.try_as_simple() {
-            names.bind_and_then(own_name.clone(), |names, own_name| SelfReferential {
-                own_name,
-                lambda: self.lambda.resolve(names, symbols, semantic_scope),
+            names.bind_and_then(own_name.clone(), |names, own_name| {
+                Ok(SelfReferential {
+                    own_name,
+                    lambda: self.lambda.resolve(names, symbols, pi, semantic_scope)?,
+                })
             })
         } else {
-            panic!("Parser erroneously accepted a pathed identifier for recursive function name")
+            Err(NameError::BadOwnName(self.own_name.clone()).at(pi))
         }
     }
 }
@@ -1311,15 +1357,18 @@ impl parser::Lambda {
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
+        pi: ParseInfo,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Lambda {
+    ) -> Naming<Lambda> {
         if let Some(parameter) = self.parameter.try_as_simple() {
-            names.bind_and_then(parameter, |names, parameter| Lambda {
-                parameter,
-                body: self.body.resolve(names, symbols, semantic_scope).into(),
+            names.bind_and_then(parameter, |names, parameter| {
+                Ok(Lambda {
+                    parameter,
+                    body: self.body.resolve(names, symbols, semantic_scope)?.into(),
+                })
             })
         } else {
-            panic!("Parser erroneously accepted a pathed identifier for lambda parameter")
+            Err(NameError::BadParameterName(self.parameter.clone()).at(pi))
         }
     }
 }
@@ -1330,11 +1379,17 @@ impl parser::Apply {
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Apply {
-        Apply {
-            function: self.function.resolve(names, symbols, semantic_scope).into(),
-            argument: self.argument.resolve(names, symbols, semantic_scope).into(),
-        }
+    ) -> Naming<Apply> {
+        Ok(Apply {
+            function: self
+                .function
+                .resolve(names, symbols, semantic_scope)?
+                .into(),
+            argument: self
+                .argument
+                .resolve(names, symbols, semantic_scope)?
+                .into(),
+        })
     }
 }
 
@@ -1343,17 +1398,20 @@ impl parser::Binding {
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
+        pi: ParseInfo,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Binding {
+    ) -> Naming<Binding> {
         if let Some(binder) = self.binder.try_as_simple() {
-            let bound = Rc::new(self.bound.resolve(names, symbols, semantic_scope));
-            names.bind_and_then(binder, |names, binder| Binding {
-                binder,
-                bound: Rc::clone(&bound),
-                body: self.body.resolve(names, symbols, semantic_scope).into(),
+            let bound = Rc::new(self.bound.resolve(names, symbols, semantic_scope)?);
+            names.bind_and_then(binder, |names, binder| {
+                Ok(Binding {
+                    binder,
+                    bound: Rc::clone(&bound),
+                    body: self.body.resolve(names, symbols, semantic_scope)?.into(),
+                })
             })
         } else {
-            panic!("Parser erroneously accepted a pathed identifier for binder")
+            Err(NameError::BadBinderName(self.binder.clone()).at(pi))
         }
     }
 }
@@ -1364,19 +1422,17 @@ impl parser::Record {
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Record {
-        Record {
+    ) -> Naming<Record> {
+        Ok(Record {
             fields: self
                 .fields
                 .iter()
                 .map(|(label, e)| {
-                    (
-                        label.clone(),
-                        e.resolve(names, symbols, semantic_scope).into(),
-                    )
+                    e.resolve(names, symbols, semantic_scope)
+                        .map(|e| (label.clone(), e.into()))
                 })
-                .collect(),
-        }
+                .collect::<Naming<_>>()?,
+        })
     }
 }
 
@@ -1386,14 +1442,14 @@ impl parser::Tuple {
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Tuple {
-        Tuple {
+    ) -> Naming<Tuple> {
+        Ok(Tuple {
             elements: self
                 .elements
                 .iter()
-                .map(|e| e.resolve(names, symbols, semantic_scope).into())
-                .collect(),
-        }
+                .map(|e| e.resolve(names, symbols, semantic_scope).map(|e| e.into()))
+                .collect::<Naming<_>>()?,
+        })
     }
 }
 
@@ -1403,15 +1459,15 @@ impl parser::Construct {
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Construct {
-        Construct {
+    ) -> Naming<Construct> {
+        Ok(Construct {
             constructor: self.constructor.clone(),
             arguments: self
                 .arguments
                 .iter()
-                .map(|e| e.resolve(names, symbols, semantic_scope).into())
-                .collect(),
-        }
+                .map(|e| e.resolve(names, symbols, semantic_scope).map(|e| e.into()))
+                .collect::<Naming<_>>()?,
+        })
     }
 }
 
@@ -1421,11 +1477,14 @@ impl parser::Projection {
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Projection {
-        Projection {
-            base: self.base.resolve(names, symbols, semantic_scope).into(),
+    ) -> Naming<Projection> {
+        Ok(Projection {
+            base: self
+                .base
+                .resolve(names, symbols, semantic_scope)
+                .map(|e| e.into())?,
             select: self.select.clone(),
-        }
+        })
     }
 }
 
@@ -1435,11 +1494,17 @@ impl parser::Sequence {
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Sequence {
-        Sequence {
-            this: self.this.resolve(names, symbols, semantic_scope).into(),
-            and_then: self.and_then.resolve(names, symbols, semantic_scope).into(),
-        }
+    ) -> Naming<Sequence> {
+        Ok(Sequence {
+            this: self
+                .this
+                .resolve(names, symbols, semantic_scope)
+                .map(|e| e.into())?,
+            and_then: self
+                .and_then
+                .resolve(names, symbols, semantic_scope)
+                .map(|e| e.into())?,
+        })
     }
 }
 
@@ -1449,18 +1514,18 @@ impl parser::Deconstruct {
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Deconstruct {
-        Deconstruct {
+    ) -> Naming<Deconstruct> {
+        Ok(Deconstruct {
             scrutinee: self
                 .scrutinee
                 .resolve(names, symbols, semantic_scope)
-                .into(),
+                .map(|e| e.into())?,
             match_clauses: self
                 .match_clauses
                 .iter()
                 .map(|clause| clause.resolve(names, symbols, semantic_scope))
-                .collect(),
-        }
+                .collect::<Naming<_>>()?,
+        })
     }
 }
 
@@ -1470,21 +1535,21 @@ impl parser::IfThenElse {
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> IfThenElse {
-        IfThenElse {
+    ) -> Naming<IfThenElse> {
+        Ok(IfThenElse {
             predicate: self
                 .predicate
                 .resolve(names, symbols, semantic_scope)
-                .into(),
+                .map(|e| e.into())?,
             consequent: self
                 .consequent
                 .resolve(names, symbols, semantic_scope)
-                .into(),
+                .map(|e| e.into())?,
             alternate: self
                 .alternate
                 .resolve(names, symbols, semantic_scope)
-                .into(),
-        }
+                .map(|e| e.into())?,
+        })
     }
 }
 
@@ -1494,19 +1559,22 @@ impl parser::Interpolate {
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Interpolate {
+    ) -> Naming<Interpolate> {
         let Self(segments) = self;
-        ast::Interpolate(
+        Ok(ast::Interpolate(
             segments
                 .into_iter()
                 .map(|s| match s {
-                    ast::Segment::Literal(a, literal) => ast::Segment::Literal(*a, literal.clone()),
-                    ast::Segment::Expression(expr) => ast::Segment::Expression(
-                        expr.resolve(names, symbols, semantic_scope).into(),
-                    ),
+                    ast::Segment::Literal(pi, literal) => {
+                        Ok(ast::Segment::Literal(*pi, literal.clone()))
+                    }
+
+                    ast::Segment::Expression(expr) => expr
+                        .resolve(names, symbols, semantic_scope)
+                        .map(|e| ast::Segment::Expression(e.into())),
                 })
-                .collect(),
-        )
+                .collect::<Naming<_>>()?,
+        ))
     }
 }
 
@@ -1516,7 +1584,7 @@ impl parser::MatchClause {
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> MatchClause {
+    ) -> Naming<MatchClause> {
         let Self {
             pattern,
             consequent,
@@ -1525,11 +1593,11 @@ impl parser::MatchClause {
 
         let clause = MatchClause {
             pattern: pattern.resolve(names, symbols, semantic_scope),
-            consequent: consequent.resolve(names, symbols, semantic_scope).into(),
+            consequent: consequent.resolve(names, symbols, semantic_scope)?.into(),
         };
 
         names.restore();
-        clause
+        Ok(clause)
     }
 }
 
@@ -1619,8 +1687,8 @@ impl ParserSymbolTable {
     // Move to namer.rs
     // This does not need the symbols in any particular order, so long as all
     // modules are known
-    pub fn rename_symbols(self) -> NamedSymbolTable {
-        SymbolTable {
+    pub fn rename_symbols(self) -> Naming<NamedSymbolTable> {
+        Ok(SymbolTable {
             // Any kind of renaming necessary here?
             module_members: self.module_members.clone(),
             // Any kind of renaming necessary here?
@@ -1628,30 +1696,40 @@ impl ParserSymbolTable {
             symbols: self
                 .symbols
                 .iter()
-                .map(|(id, symbol)| (id.clone(), self.rename_symbol(symbol)))
-                .collect(),
+                .map(|(id, symbol)| {
+                    // Bad with ParseInfo::default() but I guess I need location
+                    // per Identifier really.
+                    self.rename_symbol(ParseInfo::default(), symbol)
+                        .map(|symbol| (id.clone(), symbol))
+                })
+                .collect::<Naming<_>>()?,
             imports: self.imports,
-        }
+        })
     }
 
     // Own and move instead?
-    fn rename_symbol(&self, symbol: &ParserSymbol) -> NamedSymbol {
+    fn rename_symbol(&self, pi: ParseInfo, symbol: &ParserSymbol) -> Naming<NamedSymbol> {
         match symbol {
-            Symbol::Term(symbol) => Symbol::Term(TermSymbol {
+            Symbol::Term(symbol) => Ok(Symbol::Term(TermSymbol {
                 name: symbol.name.clone(),
-                type_signature: symbol
-                    .type_signature
-                    .clone()
-                    .map(|ts| ts.map(|te| te.resolve_names(self, &symbol.name.module))),
-                body: {
-                    symbol
-                        .body()
-                        .resolve_names(self, &symbol.name.module)
-                        .into()
-                },
-            }),
+                type_signature: if let Some(ts) = &symbol.type_signature {
+                    let resolved = ts.body.resolve_names(self, pi, &symbol.name.module)?;
 
-            Symbol::Type(symbol) => Symbol::Type({
+                    Some(TypeSignature {
+                        universal_quantifiers: ts.universal_quantifiers.clone(),
+                        body: resolved,
+                        phase: PhantomData,
+                    })
+                } else {
+                    None
+                },
+                body: symbol
+                    .body()
+                    .resolve_names(self, &symbol.name.module)?
+                    .into(),
+            })),
+
+            Symbol::Type(symbol) => Ok(Symbol::Type({
                 let semantic_scope = &symbol.definition.qualified_name().module;
                 match &symbol.definition {
                     TypeDefinition::Record(record) => TypeSymbol {
@@ -1661,13 +1739,16 @@ impl ParserSymbolTable {
                             fields: record
                                 .fields
                                 .iter()
-                                .map(|field| FieldSymbol {
-                                    name: field.name.clone(),
-                                    type_signature: field
+                                .map(|field| {
+                                    field
                                         .type_signature
-                                        .resolve_names(self, semantic_scope),
+                                        .resolve_names(self, pi, semantic_scope)
+                                        .map(|te| FieldSymbol {
+                                            name: field.name.clone(),
+                                            type_signature: te,
+                                        })
                                 })
-                                .collect(),
+                                .collect::<Naming<Vec<_>>>()?,
                         }),
                         origin: symbol.origin,
                         arity: symbol.arity,
@@ -1680,15 +1761,18 @@ impl ParserSymbolTable {
                             constructors: coproduct
                                 .constructors
                                 .iter()
-                                .map(|symbol| ConstructorSymbol {
-                                    name: symbol.name.clone(),
-                                    signature: symbol
+                                .map(|symbol| {
+                                    symbol
                                         .signature
                                         .iter()
-                                        .map(|ty| ty.resolve_names(self, semantic_scope))
-                                        .collect(),
+                                        .map(|ty| ty.resolve_names(self, pi, semantic_scope))
+                                        .collect::<Naming<_>>()
+                                        .map(|signature| ConstructorSymbol {
+                                            name: symbol.name.clone(),
+                                            signature,
+                                        })
                                 })
-                                .collect(),
+                                .collect::<Naming<_>>()?,
                         }),
                         origin: symbol.origin,
                         arity: symbol.arity,
@@ -1700,7 +1784,16 @@ impl ParserSymbolTable {
                         arity: symbol.arity,
                     },
                 }
-            }),
+            })),
+        }
+    }
+}
+
+impl fmt::Display for ModuleMember {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Type(identifier) => write!(f, "type {identifier}"),
+            Self::Term(identifier) => write!(f, "term {identifier}"),
         }
     }
 }
