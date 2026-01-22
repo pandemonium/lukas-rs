@@ -16,11 +16,6 @@ module List:
   tail :: ∀α. List α -> List α :=
     λxs. deconstruct xs into Cons a tail -> tail | tail -> tail
 
-  fmap :: ∀α β. (α -> β) -> List α -> List β := λf xs.
-    deconstruct xs into
-      Cons x xs -> Cons (f x) (fmap f xs)
-    | Nil -> Nil
-
   fold_right :: ∀z α. (α -> z -> z) -> z -> List α -> z :=
     λf z xs.
       deconstruct xs into
@@ -38,6 +33,14 @@ module List:
 
   bind :: ∀α β. (α -> List β) -> List α -> List β :=
     λf. fold_right (λx. append (f x)) Nil
+
+  cartesian :: ∀α β. List α -> List β -> List (α, β) :=
+    λxs ys. bind (λx. map (λy. x, y) ys) xs
+
+  zip :: ∀α β. List α -> List β -> List (α, β) := λxs ys.
+    deconstruct xs, ys into
+      Cons x xs, Cons y ys -> Cons (x, y) (zip xs ys)
+    | otherwise            -> Nil
 
   append :: ∀α. List α -> List α -> List α :=
     λxs ys. fold_right Cons ys xs
@@ -211,3 +214,7 @@ start := λx.
   let xs = long_list in
   let ys = List.map (λx. Cons x Nil) xs in
   List.count (λx. x > 1) (List.flatten ys)
+
+  let ps = Cons 1 (Cons 2 (Cons 3 Nil)) in
+  let qs = Cons "ett" (Cons "två" (Cons "tre" Nil)) in
+  print_endline "zipped: `List.zip ps qs`"

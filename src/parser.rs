@@ -7,7 +7,7 @@ use crate::{
     ast::{
         self, ApplyTypeExpr, ArrowTypeExpr, CoproductConstructor, CoproductDeclarator, Declaration,
         FieldDeclarator, ModuleDeclaration, ModuleDeclarator, RecordDeclarator, Tree,
-        TypeDeclaration, TypeDeclarator, ValueDeclaration, ValueDeclarator,
+        TupleTypeExpr, TypeDeclaration, TypeDeclarator, ValueDeclaration, ValueDeclarator,
     },
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
 };
@@ -231,6 +231,26 @@ impl Interpolate {
 
     pub fn literal(&mut self, pi: ParseInfo, literal: Literal) {
         self.0.push(ast::Segment::Literal(pi, literal.into()));
+    }
+}
+
+enum TypeExprOperator {
+    Apply,
+    Arrow,
+    Tuple,
+}
+
+impl TypeExprOperator {
+    fn precedence(&self) -> usize {
+        match self {
+            Self::Apply => 3,
+            Self::Arrow => 2,
+            Self::Tuple => 1,
+        }
+    }
+
+    fn is_right_associative(&self) -> bool {
+        matches!(self, Self::Arrow)
     }
 }
 
@@ -704,7 +724,7 @@ impl<'a> Parser<'a> {
 
         let (_, label) = self.identifier()?;
         self.expect(TokenKind::TypeAscribe)?;
-        let type_signature = self.parse_type_expression()?;
+        let type_signature = self.parse_type_expression(0)?;
         Ok(FieldDeclarator {
             // It could really keep this Identifier instead of cloning it
             name: Identifier::from_str(&label),
@@ -712,11 +732,11 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_type_expression(&mut self) -> Result<TypeExpression> {
+    fn parse_type_expression(&mut self, precedence: usize) -> Result<TypeExpression> {
         let _t = self.trace();
 
         let prefix = self.parse_type_expr_prefix()?;
-        self.parse_type_expr_infix(prefix)
+        self.parse_type_expr_infix(prefix, precedence)
     }
 
     fn parse_type_expr_prefix(&mut self) -> Result<TypeExpression> {
@@ -742,13 +762,43 @@ impl<'a> Parser<'a> {
                 ..,
             ] => {
                 self.advance(1);
-                let prefix = self.parse_type_expression();
+                let prefix = self.parse_type_expression(0);
                 self.expect(TokenKind::RightParen)?;
                 prefix
             }
 
             // parens
             otherwise => panic!("{otherwise:?}"),
+        }
+    }
+
+    fn peek_type_expr_operator(&self, lhs: &TypeExpression) -> Option<TypeExprOperator> {
+        match self.remains() {
+            [
+                Token {
+                    kind: TokenKind::Identifier(_) | TokenKind::LeftParen,
+                    ..
+                },
+                ..,
+            ] if lhs.is_applicable() => Some(TypeExprOperator::Apply),
+
+            [
+                Token {
+                    kind: TokenKind::Arrow,
+                    ..
+                },
+                ..,
+            ] => Some(TypeExprOperator::Arrow),
+
+            [
+                Token {
+                    kind: TokenKind::Comma,
+                    ..
+                },
+                ..,
+            ] => Some(TypeExprOperator::Tuple),
+
+            _ => None,
         }
     }
 
@@ -767,84 +817,73 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_type_expr_infix(&mut self, lhs: TypeExpression) -> Result<TypeExpression> {
+    fn parse_type_expr_infix(
+        &mut self,
+        lhs: TypeExpression,
+        context_precedence: usize,
+    ) -> Result<TypeExpression> {
         let _t = self.trace();
 
-        match self.remains() {
-            [
-                Token {
-                    kind: TokenKind::Identifier(id),
-                    position,
-                },
-                ..,
-            ] => {
-                if lhs.is_applicable() {
-                    self.advance(1);
-                    let rhs = self.parse_simple_type_expr_term(id, position);
-                    self.parse_type_expr_infix(TypeExpression::Apply(
-                        ParseInfo::from_position(*position),
+        let operator = match self.peek_type_expr_operator(&lhs) {
+            Some(op) if op.precedence() > context_precedence => op,
+            _ => return Ok(lhs),
+        };
+
+        match operator {
+            TypeExprOperator::Apply => {
+                let rhs = self.parse_type_expr_prefix()?;
+                self.parse_type_expr_infix(
+                    TypeExpression::Apply(
+                        ParseInfo::default(),
                         ApplyTypeExpr {
                             function: lhs.into(),
                             argument: rhs.into(),
                             phase: PhantomData,
                         },
-                    ))
+                    ),
+                    context_precedence,
+                )
+            }
+
+            TypeExprOperator::Arrow => {
+                let position = self.consume()?.position;
+                let computed_precedence = if operator.is_right_associative() {
+                    operator.precedence() - 1
                 } else {
-                    Err(ParseError::ExpectedTypeConstructor)
-                }
+                    operator.precedence()
+                };
+
+                let rhs = self.parse_type_expression(computed_precedence)?;
+                self.parse_type_expr_infix(
+                    TypeExpression::Arrow(
+                        ParseInfo::from_position(position),
+                        ArrowTypeExpr {
+                            domain: lhs.into(),
+                            codomain: rhs.into(),
+                        },
+                    ),
+                    context_precedence,
+                )
             }
 
-            [
-                Token {
-                    kind: TokenKind::Arrow,
-                    position,
-                },
-                ..,
-            ] => {
-                self.advance(1);
-                let rhs = self.parse_type_expression()?;
-                self.parse_type_expr_infix(TypeExpression::Arrow(
-                    ParseInfo::from_position(*position),
-                    ArrowTypeExpr {
-                        domain: lhs.into(),
-                        codomain: rhs.into(),
-                    },
-                ))
+            TypeExprOperator::Tuple => {
+                let position = self.consume()?.position;
+                let rhs = self.parse_type_expression(operator.precedence())?;
+
+                let tuple = match lhs {
+                    TypeExpression::Tuple(pi, TupleTypeExpr(mut elements)) => {
+                        elements.push(rhs);
+                        TypeExpression::Tuple(pi, TupleTypeExpr(elements))
+                    }
+
+                    lhs => TypeExpression::Tuple(
+                        ParseInfo::from_position(position),
+                        (TupleTypeExpr(vec![lhs, rhs])),
+                    ),
+                };
+
+                self.parse_type_expr_infix(tuple, context_precedence)
             }
-
-            [
-                Token {
-                    kind: TokenKind::LeftParen,
-                    position,
-                },
-                ..,
-            ] => {
-                self.advance(1);
-                let rhs = self.parse_type_expression()?;
-                self.expect(TokenKind::RightParen)?;
-
-                self.parse_type_expr_infix(TypeExpression::Apply(
-                    ParseInfo::from_position(*position),
-                    ApplyTypeExpr {
-                        function: lhs.into(),
-                        argument: rhs.into(),
-                        phase: PhantomData,
-                    },
-                ))
-            }
-
-            [
-                Token {
-                    kind: TokenKind::RightParen,
-                    ..
-                },
-                ..,
-            ] => {
-                //                self.advance(1);
-                Ok(lhs)
-            }
-
-            _otherwise => Ok(lhs),
         }
     }
 
@@ -1413,7 +1452,7 @@ impl<'a> Parser<'a> {
         let _t = self.trace();
 
         let quantifiers = self.parse_forall_clause()?;
-        let body = self.parse_type_expression()?;
+        let body = self.parse_type_expression(0)?;
 
         Ok(TypeSignature {
             universal_quantifiers: quantifiers,
@@ -1481,7 +1520,7 @@ impl<'a> Parser<'a> {
                     TypeExpression::Constructor(pi, IdentifierPath::new(&id))
                 });
             } else {
-                signature.push(self.parse_type_expression()?);
+                signature.push(self.parse_type_expression(0)?);
             }
         }
 
@@ -1882,7 +1921,7 @@ mod tests {
         }
 
         let mut p = Parser::from_tokens(tokens);
-        let x = p.parse_type_expression().unwrap();
+        let x = p.parse_type_expression(0).unwrap();
         println!("{x}")
     }
 
