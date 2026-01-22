@@ -410,13 +410,12 @@ impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
 }
 
 impl ParserSymbolTable {
+    // This ought to give a Result so that we can know what it failed to do
     fn resolve_free_term_name(
         &self,
         id: &parser::IdentifierPath,
         semantic_scope: &parser::IdentifierPath,
     ) -> Option<NameExpr> {
-        println!("resolve_free_term_name: {id} in {semantic_scope}");
-
         let search_space = self
             .member_modules
             .get(&ModuleMember::Term(parser::Identifier::from_str(&id.head)))?;
@@ -451,57 +450,23 @@ impl ParserSymbolTable {
         })
     }
 
-    fn resolve_as_term_member(&self, path: &parser::IdentifierPath) -> parser::IdentifierPath {
-        println!("resolve_as_term_member: {path}");
+    fn resolve_type_name(
+        &self,
+        id: &parser::IdentifierPath,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> Option<QualifiedName> {
+        let search_space =
+            self.member_modules
+                .get(&ModuleMember::Type(parser::Identifier::from_str(
+                    &id.last(),
+                )))?;
 
-        self.member_modules
-            .get(&ModuleMember::Term(parser::Identifier::from_str(
-                path.head.as_str(),
-            )))
-            .map(|module| path.in_module(&module[0]))
-            .unwrap_or_else(|| path.clone())
-    }
+        let mut search_order =
+            prefix_chain(semantic_scope).chain(self.imports.iter().rev().cloned());
 
-    // This ought to return QualifiedName
-    fn resolve_as_type_member(&self, path: &parser::IdentifierPath) -> Option<QualifiedName> {
-        println!("resolve_as_type_member: {path}");
-
-        self.member_modules
-            .get(&ModuleMember::Type(parser::Identifier::from_str(
-                path.last(),
-            )))
-            .inspect(|x| println!("resolve_as_type_member: x {path} -- {x:?}"))
-            .and_then(|module| path.in_module(&module[0]).try_into_qualified_name())
-    }
-
-    pub fn resolve_module_path_expr(&self, path: &parser::IdentifierPath) -> Option<NameExpr> {
-        println!("resolve_module_path_expr: {path}");
-
-        let mut module_path = vec![];
-        let mut member = vec![];
-        let mut in_module_prefix = true;
-
-        for segment in path.iter() {
-            if in_module_prefix {
-                module_path.push(segment);
-                let identifier_path = parser::IdentifierPath::try_from_components(&module_path)?;
-
-                if !self.module_members.contains_key(&identifier_path) {
-                    module_path.pop();
-                    in_module_prefix = false;
-                    member.push(segment);
-                }
-            } else {
-                member.push(segment);
-            }
-        }
-
-        let mut members = member.iter().map(|&s| s.to_owned());
-        Some(NameExpr {
-            module_prefix: parser::IdentifierPath::try_from_components(&module_path)?,
-            member: members.next()?,
-            projections: members.collect(),
-        })
+        search_order
+            .find_map(|m| (search_space.contains(&m)).then_some(id.in_module(&m)))?
+            .try_into_qualified_name()
     }
 
     pub fn add_term_symbol(
@@ -539,7 +504,6 @@ impl ParserSymbolTable {
     }
 
     pub fn add_module_member(&mut self, module_path: parser::IdentifierPath, member: ModuleMember) {
-        println!("from: add {member:?} to {module_path}");
         self.module_members
             .entry(module_path.clone())
             .or_default()
@@ -691,8 +655,6 @@ impl ParserSymbolTable {
         ctx.add_import_prefix(IdentifierPath::new(STDLIB_MODULE_NAME));
 
         for symbol in builtin::import() {
-            println!("from: builtin {symbol:?}");
-
             match symbol {
                 Symbol::Term(symbol) => {
                     let qualified_name = &symbol.name;
@@ -985,12 +947,12 @@ pub struct ModuleSymbol<A, GlobalName, LocalId> {
 }
 
 #[derive(Debug, Default)]
-struct DeBruijnIndex {
+struct DeBruijn {
     stack: Vec<parser::Identifier>,
     restore_points: Vec<usize>,
 }
 
-impl DeBruijnIndex {
+impl DeBruijn {
     fn mark(&mut self) {
         self.restore_points.push(self.stack.len());
     }
@@ -1021,7 +983,7 @@ impl DeBruijnIndex {
 
     fn bind_and_then<F, A>(&mut self, id: parser::Identifier, mut block: F) -> A
     where
-        F: FnMut(&mut DeBruijnIndex, Identifier) -> A,
+        F: FnMut(&mut DeBruijn, Identifier) -> A,
     {
         let de_bruijn_index = self.stack.len();
         self.stack.push(id);
@@ -1038,22 +1000,25 @@ impl DeBruijnIndex {
 }
 
 impl parser::TypeExpression {
-    pub fn resolve_names(&self, symbols: &ParserSymbolTable) -> TypeExpression {
+    pub fn resolve_names(
+        &self,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> TypeExpression {
         match self {
-            Self::Constructor(a, name) => TypeExpression::Constructor(
-                *a,
+            Self::Constructor(a, name) => TypeExpression::Constructor(*a, {
                 symbols
-                    .resolve_as_type_member(&name)
-                    .expect("Resolvable type name"),
-            ),
+                    .resolve_type_name(&name, semantic_scope)
+                    .expect("Fan!")
+            }),
 
             Self::Parameter(a, name) => TypeExpression::Parameter(*a, name.clone()),
 
             Self::Apply(a, apply) => TypeExpression::Apply(
                 *a,
                 ApplyTypeExpr {
-                    function: apply.function.resolve_names(symbols).into(),
-                    argument: apply.argument.resolve_names(symbols).into(),
+                    function: apply.function.resolve_names(symbols, semantic_scope).into(),
+                    argument: apply.argument.resolve_names(symbols, semantic_scope).into(),
                     phase: PhantomData,
                 },
             ),
@@ -1061,14 +1026,20 @@ impl parser::TypeExpression {
             Self::Arrow(a, arrow) => TypeExpression::Arrow(
                 *a,
                 ArrowTypeExpr {
-                    domain: arrow.domain.resolve_names(symbols).into(),
-                    codomain: arrow.codomain.resolve_names(symbols).into(),
+                    domain: arrow.domain.resolve_names(symbols, semantic_scope).into(),
+                    codomain: arrow.codomain.resolve_names(symbols, semantic_scope).into(),
                 },
             ),
 
             Self::Tuple(a, tuple) => TypeExpression::Tuple(
                 *a,
-                TupleTypeExpr(tuple.0.iter().map(|te| te.resolve_names(symbols)).collect()),
+                TupleTypeExpr(
+                    tuple
+                        .0
+                        .iter()
+                        .map(|te| te.resolve_names(symbols, semantic_scope))
+                        .collect(),
+                ),
             ),
         }
     }
@@ -1215,12 +1186,12 @@ impl parser::Expr {
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
     ) -> Expr {
-        self.resolve(&mut DeBruijnIndex::default(), symbols, semantic_scope)
+        self.resolve(&mut DeBruijn::default(), symbols, semantic_scope)
     }
 
     fn resolve(
         &self,
-        names: &mut DeBruijnIndex,
+        names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
     ) -> Expr {
@@ -1237,7 +1208,6 @@ impl parser::Expr {
                 } else if let Some(path) =
                     { symbols.resolve_free_term_name(identifier_path, semantic_scope) }
                 {
-                    println!("tukan: {identifier_path} in {semantic_scope} -> {path}");
                     path.into_projection(*pi)
                 } else {
                     panic!("Unresolved symbol {}", identifier_path)
@@ -1321,7 +1291,7 @@ fn project_base_through_path(
 impl parser::SelfReferential {
     fn resolve(
         &self,
-        names: &mut DeBruijnIndex,
+        names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
     ) -> SelfReferential {
@@ -1339,7 +1309,7 @@ impl parser::SelfReferential {
 impl parser::Lambda {
     fn resolve(
         &self,
-        names: &mut DeBruijnIndex,
+        names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
     ) -> Lambda {
@@ -1357,7 +1327,7 @@ impl parser::Lambda {
 impl parser::Apply {
     fn resolve(
         &self,
-        names: &mut DeBruijnIndex,
+        names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
     ) -> Apply {
@@ -1371,7 +1341,7 @@ impl parser::Apply {
 impl parser::Binding {
     fn resolve(
         &self,
-        names: &mut DeBruijnIndex,
+        names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
     ) -> Binding {
@@ -1391,7 +1361,7 @@ impl parser::Binding {
 impl parser::Record {
     fn resolve(
         &self,
-        names: &mut DeBruijnIndex,
+        names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
     ) -> Record {
@@ -1413,7 +1383,7 @@ impl parser::Record {
 impl parser::Tuple {
     fn resolve(
         &self,
-        names: &mut DeBruijnIndex,
+        names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
     ) -> Tuple {
@@ -1430,7 +1400,7 @@ impl parser::Tuple {
 impl parser::Construct {
     fn resolve(
         &self,
-        names: &mut DeBruijnIndex,
+        names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
     ) -> Construct {
@@ -1448,7 +1418,7 @@ impl parser::Construct {
 impl parser::Projection {
     fn resolve(
         &self,
-        names: &mut DeBruijnIndex,
+        names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
     ) -> Projection {
@@ -1462,7 +1432,7 @@ impl parser::Projection {
 impl parser::Sequence {
     fn resolve(
         &self,
-        names: &mut DeBruijnIndex,
+        names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
     ) -> Sequence {
@@ -1476,7 +1446,7 @@ impl parser::Sequence {
 impl parser::Deconstruct {
     fn resolve(
         &self,
-        names: &mut DeBruijnIndex,
+        names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
     ) -> Deconstruct {
@@ -1497,7 +1467,7 @@ impl parser::Deconstruct {
 impl parser::IfThenElse {
     fn resolve(
         &self,
-        names: &mut DeBruijnIndex,
+        names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
     ) -> IfThenElse {
@@ -1521,7 +1491,7 @@ impl parser::IfThenElse {
 impl parser::Interpolate {
     fn resolve(
         &self,
-        names: &mut DeBruijnIndex,
+        names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
     ) -> Interpolate {
@@ -1543,7 +1513,7 @@ impl parser::Interpolate {
 impl parser::MatchClause {
     fn resolve(
         &self,
-        names: &mut DeBruijnIndex,
+        names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
     ) -> MatchClause {
@@ -1554,7 +1524,7 @@ impl parser::MatchClause {
         names.mark();
 
         let clause = MatchClause {
-            pattern: pattern.resolve(names, symbols),
+            pattern: pattern.resolve(names, symbols, semantic_scope),
             consequent: consequent.resolve(names, symbols, semantic_scope).into(),
         };
 
@@ -1564,21 +1534,26 @@ impl parser::MatchClause {
 }
 
 impl parser::Pattern {
-    fn resolve(&self, names: &mut DeBruijnIndex, symbols: &ParserSymbolTable) -> Pattern {
+    fn resolve(
+        &self,
+        names: &mut DeBruijn,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> Pattern {
         match self {
             parser::Pattern::Coproduct(a, pattern) => Pattern::Coproduct(
                 *a,
                 ConstructorPattern {
                     constructor: Identifier::Free(
-                        // Resolve this against imported namespaces
-                        symbols.resolve_qualified(
-                            &symbols.resolve_as_term_member(&pattern.constructor),
-                        ),
+                        symbols
+                            .resolve_free_term_name(&pattern.constructor, semantic_scope)
+                            .expect("msg")
+                            .into_qualified_name(),
                     ),
                     arguments: pattern
                         .arguments
                         .iter()
-                        .map(|arg| arg.resolve(names, symbols))
+                        .map(|arg| arg.resolve(names, symbols, semantic_scope))
                         .collect(),
                 },
             ),
@@ -1589,7 +1564,7 @@ impl parser::Pattern {
                     elements: pattern
                         .elements
                         .iter()
-                        .map(|p| p.resolve(names, symbols))
+                        .map(|p| p.resolve(names, symbols, semantic_scope))
                         .collect(),
                 },
             ),
@@ -1600,7 +1575,12 @@ impl parser::Pattern {
                     fields: pattern
                         .fields
                         .iter()
-                        .map(|(field, pattern)| (field.clone(), pattern.resolve(names, symbols)))
+                        .map(|(field, pattern)| {
+                            (
+                                field.clone(),
+                                pattern.resolve(names, symbols, semantic_scope),
+                            )
+                        })
                         .collect(),
                 },
             ),
@@ -1654,12 +1634,6 @@ impl ParserSymbolTable {
         }
     }
 
-    pub fn resolve_qualified(&self, id: &parser::IdentifierPath) -> QualifiedName {
-        self.resolve_module_path_expr(id)
-            .expect(&format!("a valid type identifier path: {id}"))
-            .into_qualified_name()
-    }
-
     // Own and move instead?
     fn rename_symbol(&self, symbol: &ParserSymbol) -> NamedSymbol {
         match symbol {
@@ -1668,7 +1642,7 @@ impl ParserSymbolTable {
                 type_signature: symbol
                     .type_signature
                     .clone()
-                    .map(|ts| ts.map(|te| te.resolve_names(self))),
+                    .map(|ts| ts.map(|te| te.resolve_names(self, &symbol.name.module))),
                 body: {
                     symbol
                         .body()
@@ -1677,50 +1651,55 @@ impl ParserSymbolTable {
                 },
             }),
 
-            Symbol::Type(symbol) => Symbol::Type(match &symbol.definition {
-                TypeDefinition::Record(record) => TypeSymbol {
-                    definition: TypeDefinition::Record(RecordSymbol {
-                        name: record.name.clone(),
-                        type_parameters: record.type_parameters.clone(),
-                        fields: record
-                            .fields
-                            .iter()
-                            .map(|symbol| FieldSymbol {
-                                name: symbol.name.clone(),
-                                type_signature: symbol.type_signature.resolve_names(self),
-                            })
-                            .collect(),
-                    }),
-                    origin: symbol.origin,
-                    arity: symbol.arity,
-                },
+            Symbol::Type(symbol) => Symbol::Type({
+                let semantic_scope = &symbol.definition.qualified_name().module;
+                match &symbol.definition {
+                    TypeDefinition::Record(record) => TypeSymbol {
+                        definition: TypeDefinition::Record(RecordSymbol {
+                            name: record.name.clone(),
+                            type_parameters: record.type_parameters.clone(),
+                            fields: record
+                                .fields
+                                .iter()
+                                .map(|field| FieldSymbol {
+                                    name: field.name.clone(),
+                                    type_signature: field
+                                        .type_signature
+                                        .resolve_names(self, semantic_scope),
+                                })
+                                .collect(),
+                        }),
+                        origin: symbol.origin,
+                        arity: symbol.arity,
+                    },
 
-                TypeDefinition::Coproduct(coproduct) => TypeSymbol {
-                    definition: TypeDefinition::Coproduct(CoproductSymbol {
-                        name: coproduct.name.clone(),
-                        type_parameters: coproduct.type_parameters.clone(),
-                        constructors: coproduct
-                            .constructors
-                            .iter()
-                            .map(|symbol| ConstructorSymbol {
-                                name: symbol.name.clone(),
-                                signature: symbol
-                                    .signature
-                                    .iter()
-                                    .map(|ty| ty.resolve_names(self))
-                                    .collect(),
-                            })
-                            .collect(),
-                    }),
-                    origin: symbol.origin,
-                    arity: symbol.arity,
-                },
+                    TypeDefinition::Coproduct(coproduct) => TypeSymbol {
+                        definition: TypeDefinition::Coproduct(CoproductSymbol {
+                            name: coproduct.name.clone(),
+                            type_parameters: coproduct.type_parameters.clone(),
+                            constructors: coproduct
+                                .constructors
+                                .iter()
+                                .map(|symbol| ConstructorSymbol {
+                                    name: symbol.name.clone(),
+                                    signature: symbol
+                                        .signature
+                                        .iter()
+                                        .map(|ty| ty.resolve_names(self, semantic_scope))
+                                        .collect(),
+                                })
+                                .collect(),
+                        }),
+                        origin: symbol.origin,
+                        arity: symbol.arity,
+                    },
 
-                TypeDefinition::Builtin(base_type) => TypeSymbol {
-                    definition: TypeDefinition::Builtin(*base_type),
-                    origin: symbol.origin.clone(),
-                    arity: symbol.arity,
-                },
+                    TypeDefinition::Builtin(base_type) => TypeSymbol {
+                        definition: TypeDefinition::Builtin(*base_type),
+                        origin: symbol.origin.clone(),
+                        arity: symbol.arity,
+                    },
+                }
             }),
         }
     }

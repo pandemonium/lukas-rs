@@ -57,9 +57,9 @@ impl Compiler {
 
         let compilation = symbols.rename_symbols();
 
-        for (name, sym) in &compilation.symbols {
-            println!("typecheck_and_initialize: {name} -> {sym:?}");
-        }
+        //for (name, sym) in &compilation.symbols {
+        //    println!("typecheck_and_initialize: {name} -> {sym:?}");
+        //}
 
         let dependencies = compilation.dependency_matrix();
         let evaluation_order = dependencies.in_resolvable_order();

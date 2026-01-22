@@ -100,7 +100,6 @@ impl IdentifierPath {
     }
 
     pub fn in_module(&self, module: &IdentifierPath) -> Self {
-        println!("in_module: {} {}", self, module);
         if self.head != module.head {
             IdentifierPath {
                 head: module.head.clone(),

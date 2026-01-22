@@ -107,10 +107,6 @@ where
 
         // This function is incredibly inefficient.
         for (id, symbol) in &self.symbols {
-            println!(
-                "dependency_matrix: {id} depends on [{:?}]",
-                symbol.dependencies()
-            );
             matrix.add_edge(id.clone(), symbol.dependencies().into_iter().collect());
         }
 
@@ -629,14 +625,10 @@ impl Type {
             (Self::Tuple(lhs), Self::Tuple(rhs)) if lhs.arity() == rhs.arity() => {
                 let mut subs = Substitutions::default();
 
-                println!("unifed_with: {} ~ {}", display_list("; ", lhs.elements()), display_list("; ", rhs.elements()));
-
                 for (lhs, rhs) in lhs.elements().iter().zip(rhs.elements()) {
                     // compose_mut
                     subs = subs.compose(&lhs.with_substitutions(&subs).unified_with(&rhs.with_substitutions(&subs))?);
                 }
-
-                println!("unified_with: substitutions {subs}");
 
                 Ok(subs)
             }
@@ -1739,11 +1731,9 @@ impl TypingContext {
                         .make_spine();
 
                     let substitutions = Substitutions::from(vec![(*p, inferred.clone())]);
-                    println!("infer_pattern: subs {substitutions}");
 
                     self.substitute_mut(&substitutions);
 
-                    println!("infer_pattern: calling with resolved {p} into {inferred}");
                     let (subs, pattern) = self.infer_pattern(pattern, bindings, &inferred)?;
                     Ok((subs.compose(&substitutions), pattern))
                 } else {
@@ -2000,8 +1990,6 @@ impl TypingContext {
         let base_type = &base.type_info().inferred_type;
         let normalized_base_type = self.normalize_type_application(pi, base_type)?;
 
-        println!("infer_projection: {normalized_base_type}");
-
         match &projection.select {
             ProductElement::Name(field) => {
                 if let Type::Record(record) = &normalized_base_type {
@@ -2062,7 +2050,6 @@ impl TypingContext {
                 }
 
                 Type::Variable(..) => {
-                    println!("infer_projection: Am i audible?");
                     let mut elems = Vec::with_capacity(ordinal + 1);
                     for _ in 0..=*ordinal {
                         elems.push(Type::fresh());

@@ -312,7 +312,6 @@ pub enum ProductElement {
     Name(parser::Identifier),
 }
 
-// This thing needs to separate the name type for the name and the arguments
 #[derive(Debug, Clone)]
 pub struct Construct<A, Id> {
     pub constructor: QualifiedName,
