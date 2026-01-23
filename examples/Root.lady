@@ -83,6 +83,9 @@ module Perhaps:
 
 module Data.
 
+foo :: ∀α e. Data.Result α e -> Int :=
+  λr. 1
+
 id :: ∀α. α -> α :=
   λx. x
 

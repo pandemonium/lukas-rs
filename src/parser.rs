@@ -749,10 +749,7 @@ impl<'a> Parser<'a> {
                     position,
                 },
                 ..,
-            ] => {
-                self.advance(1);
-                Ok(self.parse_simple_type_expr_term(id, position))
-            }
+            ] => self.parse_simple_type_expr_term(id, position),
 
             [
                 Token {
@@ -802,18 +799,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // This ought to be able to parse identifiers with dots in them
     fn parse_simple_type_expr_term(
         &mut self,
         id: &String,
         position: &SourceLocation,
-    ) -> ast::TypeExpression<ParseInfo, IdentifierPath> {
+    ) -> Result<ast::TypeExpression<ParseInfo, IdentifierPath>> {
         let _t = self.trace();
 
         let parse_info = ParseInfo::from_position(*position);
         if is_lowercase(id) {
-            TypeExpression::Parameter(parse_info, Identifier::from_str(id))
+            self.advance(1);
+            Ok(TypeExpression::Parameter(
+                parse_info,
+                Identifier::from_str(id),
+            ))
         } else {
-            TypeExpression::Constructor(parse_info, IdentifierPath::new(id))
+            let id = self.parse_identifier_path()?;
+            Ok(TypeExpression::Constructor(parse_info, id))
         }
     }
 
@@ -878,7 +881,7 @@ impl<'a> Parser<'a> {
 
                     lhs => TypeExpression::Tuple(
                         ParseInfo::from_position(position),
-                        (TupleTypeExpr(vec![lhs, rhs])),
+                        TupleTypeExpr(vec![lhs, rhs]),
                     ),
                 };
 
@@ -1358,20 +1361,44 @@ impl<'a> Parser<'a> {
     fn parse_select_operator(&mut self, lhs: Expr) -> Result<Expr> {
         let _t = self.trace();
 
-        let sneak = &self.peek()?.kind;
-
-        println!("parse_select_operator: {sneak:?}, lhs: {lhs}");
-
         if let Expr::Variable(pi, id) = &lhs
             && !matches!(self.peek()?.kind, TokenKind::Literal(..))
         {
-            self.parse_identifier_path(*pi, id.clone())
+            self.parse_identifier_path_expr(*pi, id.clone())
         } else {
             self.parse_projection(lhs)
         }
     }
 
-    fn parse_identifier_path(&mut self, pi: ParseInfo, lhs: IdentifierPath) -> Result<Expr> {
+    fn parse_identifier_path(&mut self) -> Result<IdentifierPath> {
+        let _t = self.trace();
+
+        let (_, head) = self.identifier()?;
+        let mut tail = vec![];
+        loop {
+            match self.remains() {
+                [
+                    Token {
+                        kind: TokenKind::Period,
+                        ..
+                    },
+                    Token {
+                        kind: TokenKind::Identifier(id),
+                        ..
+                    },
+                    ..,
+                ] => {
+                    self.advance(2);
+                    tail.push(id.clone())
+                }
+                _ => {
+                    break Ok(IdentifierPath { head, tail });
+                }
+            }
+        }
+    }
+
+    fn parse_identifier_path_expr(&mut self, pi: ParseInfo, lhs: IdentifierPath) -> Result<Expr> {
         let _t = self.trace();
 
         let (_, rhs) = self.identifier()?;

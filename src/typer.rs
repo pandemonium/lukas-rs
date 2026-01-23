@@ -53,7 +53,7 @@ pub type CoproductSymbol = namer::CoproductSymbol<namer::QualifiedName>;
 type TypedSymbol = namer::Symbol<TypeInfo, namer::QualifiedName, namer::Identifier>;
 type TypedSymbolTable = namer::SymbolTable<TypeInfo, namer::QualifiedName, namer::Identifier>;
 
-fn display_list<A>(sep: &str, xs: &[A]) -> String
+pub fn display_list<A>(sep: &str, xs: &[A]) -> String
 where
     A: fmt::Display,
 {

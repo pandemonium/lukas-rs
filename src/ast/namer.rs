@@ -469,7 +469,8 @@ impl ParserSymbolTable {
         pi: ParseInfo,
         semantic_scope: &parser::IdentifierPath,
     ) -> Naming<QualifiedName> {
-        let member = ModuleMember::Type(parser::Identifier::from_str(&id.last()));
+        let type_name = parser::Identifier::from_str(&id.last());
+        let member = ModuleMember::Type(type_name);
         let search_space = self
             .member_modules
             .get(&member)
@@ -479,7 +480,15 @@ impl ParserSymbolTable {
             prefix_chain(semantic_scope).chain(self.imports.iter().rev().cloned());
 
         search_order
-            .find_map(|m| (search_space.contains(&m)).then_some(id.in_module(&m)))
+            .find_map(|m| {
+                let owner = if let Some(parent) = id.clone().try_into_parent() {
+                    parent.in_module(&m)
+                } else {
+                    m.clone()
+                };
+
+                search_space.contains(&owner).then_some(id.in_module(&m))
+            })
             .and_then(|id| id.try_into_qualified_name())
             .ok_or_else(|| NameError::UnknownName(id.clone()).at(pi))
     }
@@ -1023,6 +1032,7 @@ impl parser::TypeExpression {
     ) -> Naming<TypeExpression> {
         match self {
             Self::Constructor(a, name) => Ok(TypeExpression::Constructor(*a, {
+                println!("resolve_names: {name}");
                 symbols.resolve_type_name(&name, pi, semantic_scope)?
             })),
 
