@@ -255,7 +255,7 @@ pub struct Tuple<A, Id> {
     pub elements: Vec<Tree<A, Id>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
 pub enum Literal {
     Int(i64),
     Text(String),

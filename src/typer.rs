@@ -20,6 +20,7 @@ use crate::{
             self, DependencyMatrix, Identifier, QualifiedName, Symbol, SymbolName, SymbolTable,
             TermSymbol, TypeDefinition, TypeExpression, TypeSymbol,
         },
+        pattern::{Denotation, Object},
     },
     compiler::{Located, LocatedError},
     parser::{self, ParseInfo},
@@ -298,6 +299,12 @@ pub enum TypeError {
         record_type: Type,
         field: parser::Identifier,
     },
+
+    #[error("{clause} is not useful")]
+    UselessMatchClause { clause: MatchClause },
+
+    #[error("all of {} is not covered", deconstruct.scrutinee)]
+    MatchNotExhaustive { deconstruct: Deconstruct },
 }
 
 pub type Typing<A = (Substitutions, Expr)> = Result<A, Located<TypeError>>;
@@ -1672,6 +1679,31 @@ impl TypingContext {
 
             trace!("substitutions: {substitutions}");
 
+            let mut match_space =
+                MatchSpace::from_scrutinee(pi, &scrutinee.type_info().inferred_type, &clause_ctx)?;
+            println!("infer_deconstruct: {match_space:?}");
+
+            for clause in &typed_match_clauses {
+                if !match_space.join(&clause.pattern) {
+                    Err(TypeError::UselessMatchClause {
+                        clause: clause.clone(),
+                    }
+                    .at(clause.pattern.annotation().parse_info))?;
+                }
+            }
+
+            let deconstruct = Deconstruct {
+                scrutinee: scrutinee.clone().into(),
+                match_clauses: typed_match_clauses,
+            };
+
+            if !match_space.is_exhaustive() {
+                Err(TypeError::MatchNotExhaustive {
+                    deconstruct: deconstruct.clone(),
+                }
+                .at(pi))?;
+            }
+
             Ok((
                 substitutions,
                 Expr::Deconstruct(
@@ -1679,10 +1711,7 @@ impl TypingContext {
                         parse_info: pi,
                         inferred_type: consequent_type,
                     },
-                    Deconstruct {
-                        scrutinee: scrutinee.clone().into(),
-                        match_clauses: typed_match_clauses,
-                    },
+                    deconstruct,
                 ),
             ))
         } else {
@@ -2385,6 +2414,116 @@ impl Literal {
             ast::Literal::Bool(..) => BaseType::Bool,
             ast::Literal::Unit => BaseType::Unit,
         })
+    }
+}
+
+impl Denotation {
+    fn universe(pi: ParseInfo, scrutinee: &Type, ctx: &TypingContext) -> Typing<Self> {
+        let scrutinee = ctx.normalize_type_application(pi, scrutinee)?;
+
+        let denot = match scrutinee {
+            Type::Coproduct(CoproductType(coproduct)) => Self::Structured(Object::Coproduct(
+                coproduct
+                    .iter()
+                    .map(|(constructor, args)| {
+                        args.iter()
+                            .map(|ty| Self::universe(pi, ty, ctx))
+                            .collect::<Typing<_>>()
+                            .map(|args| (constructor.clone(), args))
+                    })
+                    .collect::<Typing<_>>()?,
+            )),
+
+            Type::Record(RecordType(record)) => Self::Structured(Object::Struct(
+                record
+                    .iter()
+                    .map(|(field, scrutinee)| {
+                        Self::universe(pi, scrutinee, ctx).map(|d| (field.clone(), d))
+                    })
+                    .collect::<Typing<_>>()?,
+            )),
+
+            Type::Tuple(TupleType(tuple)) => Self::Structured(Object::Tuple(
+                tuple
+                    .iter()
+                    .map(|ty| Self::universe(pi, ty, ctx))
+                    .collect::<Typing<_>>()?,
+            )),
+
+            _ => Self::Universal,
+        };
+
+        Ok(denot)
+    }
+}
+
+impl Pattern {
+    fn denotation(&self) -> Denotation {
+        match self {
+            Pattern::Coproduct(_, pattern) => {
+                Denotation::Structured(Object::Coproduct(HashMap::from([(
+                    pattern.constructor.try_as_free().cloned().expect("this is what I get for having constructor be namer::Identifier when it ought to be a QualifiedName"),
+                    pattern.arguments.iter().map(|p| p.denotation()).collect(),
+                )])))
+            }
+
+            Pattern::Tuple(_, pattern) => Denotation::Structured(Object::Tuple(
+                pattern.elements.iter().map(|e| e.denotation()).collect(),
+            )),
+
+            Pattern::Struct(_, pattern) => Denotation::Structured(Object::Struct(
+                pattern
+                    .fields
+                    .iter()
+                    .map(|(field, pattern)| (field.clone(), pattern.denotation()))
+                    .collect(),
+            )),
+
+            Pattern::Literally(_, pattern) => Denotation::Finite(
+                BTreeSet::from([pattern.clone()])
+            ),
+
+            Pattern::Bind(..) => Denotation::Universal,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct MatchSpace {
+    pub universe: Denotation,
+    pub covered: Denotation,
+}
+
+impl MatchSpace {
+    pub fn from_scrutinee(pi: ParseInfo, scrutinee: &Type, ctx: &TypingContext) -> Typing<Self> {
+        let universe = Denotation::universe(pi, scrutinee, ctx)?;
+        let covered = Denotation::default();
+        Ok(Self { universe, covered })
+    }
+
+    // Instead of returning bool
+    // return the remaining set!
+    pub fn is_exhaustive(&self) -> bool {
+        println!(
+            "is_exhaustive: universe {:? }, covered {:?}",
+            self.universe, self.covered
+        );
+
+        self.covered.normalize() == self.universe
+    }
+
+    pub fn join(&mut self, p: &Pattern) -> bool {
+        let new_coverage = p
+            .denotation()
+            .join(&self.covered)
+            .expect("code that typechecks");
+
+        println!("join: new {:?} old {:?}", new_coverage, self.covered);
+
+        let useful = new_coverage != self.covered;
+        self.covered = new_coverage;
+
+        useful
     }
 }
 

@@ -1,0 +1,8 @@
+Perhaps ::= ∀α. Some α | None
+
+start := λ_.
+  deconstruct Some 1 into
+    Some 1 -> print_endline "Ett!"
+  | Some otherwise -> print_endline "Två två!"
+  | Some 2 -> print_endline "Ett!"
+  | None -> print_endline "Två två!"
