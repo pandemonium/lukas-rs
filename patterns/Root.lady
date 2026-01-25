@@ -1,8 +1,9 @@
-Perhaps ::= ∀α. Some α | None
+List ::= ∀α. Cons α (List α) | Nil
+
+map :: ∀α β. (α -> β) -> List α -> List β := λf xs.
+  deconstruct xs into
+    Cons a xs -> Cons (f a) (map f xs)
+  | Nil       -> Nil
 
 start := λ_.
-  deconstruct Some 1 into
-    Some 1 -> print_endline "Ett!"
-  | Some otherwise -> print_endline "Två två!"
-  | Some 2 -> print_endline "Ett!"
-  | None -> print_endline "Två två!"
+  map (λx. 1 + 1) (Cons 1 Nil)

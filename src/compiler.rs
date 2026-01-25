@@ -137,7 +137,7 @@ impl Compiler {
 
     fn get_source_path(&self, module: &parser::Identifier) -> PathBuf {
         self.source_directory
-            .join(PathBuf::from(format!("{}.lady", module)))
+            .join(PathBuf::from(format!("{}.lady", module.as_str())))
     }
 }
 

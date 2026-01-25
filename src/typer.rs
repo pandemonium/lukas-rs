@@ -20,7 +20,7 @@ use crate::{
             self, DependencyMatrix, Identifier, QualifiedName, Symbol, SymbolName, SymbolTable,
             TermSymbol, TypeDefinition, TypeExpression, TypeSymbol,
         },
-        pattern::{Denotation, Object},
+        pattern::{Denotation, Shape},
     },
     compiler::{Located, LocatedError},
     parser::{self, ParseInfo},
@@ -341,11 +341,11 @@ impl RecordType {
         Self(fields)
     }
 
-    fn with_substitutions(self, subs: &Substitutions) -> Self {
+    fn with_substitutions(&self, subs: &Substitutions) -> Self {
         Self(
             self.0
-                .into_iter()
-                .map(|(id, t)| (id, t.with_substitutions(subs)))
+                .iter()
+                .map(|(id, t)| (id.clone(), t.with_substitutions(subs)))
                 .collect(),
         )
     }
@@ -526,7 +526,10 @@ impl Type {
         }
     }
 
+    //    #[instrument]
     pub fn with_substitutions(&self, subs: &Substitutions) -> Self {
+        //trace!("{self} -- subs {subs}");
+
         match self {
             p @ Self::Variable(param) => subs
                 .substitution(param)
@@ -557,11 +560,9 @@ impl Type {
                     .collect::<Vec<_>>(),
             )),
 
-            Self::Record(record) => Self::Record(record.clone().with_substitutions(subs)),
+            Self::Record(record) => Self::Record(record.with_substitutions(subs)),
 
-            Self::Coproduct(coproduct) => {
-                Self::Coproduct(coproduct.clone().with_substitutions(subs))
-            }
+            Self::Coproduct(coproduct) => Self::Coproduct(coproduct.with_substitutions(subs)),
 
             Self::Constructor(..) => self.clone(),
 
@@ -923,13 +924,14 @@ impl TypeConstructor {
         }
     }
 
-    fn structure(&self) -> Result<&Type, TypeError> {
+    fn structure(&self) -> Typing<&Type> {
         if let Self::Elaborated(c) = self {
             Ok(&c.structure)
         } else {
-            Err(TypeError::UnelaboratedConstructor(
-                self.definition().name.clone(),
-            ))
+            Err(
+                TypeError::UnelaboratedConstructor(self.definition().name.clone())
+                    .at(ParseInfo::default()),
+            )
         }
     }
 
@@ -1237,7 +1239,7 @@ pub struct TypingContext {
 
 impl TypingContext {
     pub fn normalize_type_application(&self, pi: ParseInfo, ty: &Type) -> Typing<Type> {
-        if let Type::Constructor(..) | Type::Apply { .. } = ty {
+        if let Type::Constructor { .. } | Type::Apply { .. } = ty {
             self.reduce_applied_constructor(pi, ty, &mut vec![])
         } else {
             Ok(ty.clone())
@@ -1255,7 +1257,8 @@ impl TypingContext {
                 let constructor = self
                     .types
                     .lookup(name)
-                    .ok_or_else(|| TypeError::UndefinedType(name.clone()).at(pi))?;
+                    .ok_or_else(|| TypeError::UndefinedType(name.clone()).at(pi))?
+                    .instantiate(&self)?;
 
                 if constructor.arity() != arguments.len() {
                     Err(TypeError::WrongArity {
@@ -1287,10 +1290,7 @@ impl TypingContext {
                         .collect::<Vec<_>>(),
                 );
 
-                Ok(constructor
-                    .structure()
-                    .map_err(|e| e.at(pi))?
-                    .with_substitutions(&subs))
+                Ok(constructor.structure()?.with_substitutions(&subs))
             }
 
             Type::Apply {
@@ -1627,6 +1627,8 @@ impl TypingContext {
         let mut match_clauses = deconstruct.match_clauses.iter();
         let mut typed_match_clauses = Vec::with_capacity(deconstruct.match_clauses.len());
 
+        let normalized_scrutinee_type = self.normalize_type_application(pi, scrutinee_type)?;
+
         let mut clause_ctx = self.clone();
         if let Some(clause) = match_clauses.next() {
             let mut consequent_type = {
@@ -1677,11 +1679,7 @@ impl TypingContext {
                 });
             }
 
-            trace!("substitutions: {substitutions}");
-
-            let mut match_space =
-                MatchSpace::from_scrutinee(pi, &scrutinee.type_info().inferred_type, &clause_ctx)?;
-            println!("infer_deconstruct: {match_space:?}");
+            let mut match_space = MatchSpace::default();
 
             for clause in &typed_match_clauses {
                 if !match_space.join(&clause.pattern) {
@@ -1697,7 +1695,11 @@ impl TypingContext {
                 match_clauses: typed_match_clauses,
             };
 
-            if !match_space.is_exhaustive() {
+            if !match_space.is_exhaustive(
+                pi,
+                &scrutinee_type.with_substitutions(&substitutions),
+                self,
+            )? {
                 Err(TypeError::MatchNotExhaustive {
                     deconstruct: deconstruct.clone(),
                 }
@@ -1762,8 +1764,13 @@ impl TypingContext {
                     let mut substitutions = Substitutions::default();
 
                     for (scrutinee, pattern) in signature.iter().zip(&pattern.arguments) {
-                        let (subs, argument) = self.infer_pattern(pattern, bindings, scrutinee)?;
-                        arguments.push(argument);
+                        let (subs, argument) = self.infer_pattern(
+                            pattern,
+                            bindings,
+                            &scrutinee.with_substitutions(&substitutions),
+                        )?;
+                        self.substitute_mut(&subs);
+                        arguments.push(argument.with_substitutions(&substitutions));
                         substitutions = substitutions.compose(&subs);
                     }
 
@@ -1782,6 +1789,25 @@ impl TypingContext {
                     ))
                 } else {
                     panic!("Bad coproduct deconstruction")
+                }
+            }
+
+            (namer::Pattern::Coproduct(pi, coproduct_pattern), _ty) => {
+                if let namer::Identifier::Free(constructor) = &coproduct_pattern.constructor {
+                    let inferred = self
+                        .types
+                        .query_coproduct_type_constructors(&constructor)?
+                        .first()
+                        .ok_or_else(|| {
+                            TypeError::NoSuchCoproductConstructor(constructor.clone()).at(*pi)
+                        })?
+                        .instantiate(&self)?
+                        .structure()
+                        .cloned()?;
+
+                    self.infer_pattern(pattern, bindings, &inferred)
+                } else {
+                    todo!()
                 }
             }
 
@@ -1899,9 +1925,7 @@ impl TypingContext {
 
         let type_constructor = type_constructor.instantiate(self)?;
 
-        let subs = if let Type::Coproduct(coproduct) =
-            type_constructor.structure().map_err(|e| e.at(pi))?
-        {
+        let subs = if let Type::Coproduct(coproduct) = type_constructor.structure()? {
             let signature = coproduct.signature(&construct.constructor).ok_or_else(|| {
                 TypeError::NoSuchCoproductConstructor(construct.constructor.clone()).at(pi)
             })?;
@@ -1977,8 +2001,7 @@ impl TypingContext {
         let type_constructor = type_constructor.instantiate(self)?;
 
         let subs = type_constructor
-            .structure()
-            .map_err(|e| e.at(pi))?
+            .structure()?
             .unified_with(&Type::Record(record_type))
             .map_err(|e| e.at(pi))?;
 
@@ -2418,42 +2441,109 @@ impl Literal {
 }
 
 impl Denotation {
-    fn universe(pi: ParseInfo, scrutinee: &Type, ctx: &TypingContext) -> Typing<Self> {
+    //    fn universe(pi: ParseInfo, scrutinee: &Type, ctx: &TypingContext) -> Typing<Self> {
+    //        //let scrutinee = ctx.normalize_type_application(pi, scrutinee)?;
+    //
+    //        let denot = match scrutinee {
+    //            Type::Coproduct(CoproductType(coproduct)) => Self::Structured(Shape::Coproduct(
+    //                coproduct
+    //                    .iter()
+    //                    .map(|(constructor, args)| {
+    //                        args.iter()
+    //                            .map(|ty| Self::universe(pi, ty, ctx))
+    //                            .collect::<Typing<_>>()
+    //                            .map(|args| (constructor.clone(), args))
+    //                    })
+    //                    .collect::<Typing<_>>()?,
+    //            )),
+    //
+    //            Type::Record(RecordType(record)) => Self::Structured(Shape::Struct(
+    //                record
+    //                    .iter()
+    //                    .map(|(field, scrutinee)| {
+    //                        Self::universe(pi, scrutinee, ctx).map(|d| (field.clone(), d))
+    //                    })
+    //                    .collect::<Typing<_>>()?,
+    //            )),
+    //
+    //            Type::Tuple(TupleType(tuple)) => Self::Structured(Shape::Tuple(
+    //                tuple
+    //                    .iter()
+    //                    .map(|ty| Self::universe(pi, ty, ctx))
+    //                    .collect::<Typing<_>>()?,
+    //            )),
+    //
+    //            _ => Self::Universal,
+    //        };
+    //
+    //        Ok(denot)
+    //    }
+
+    // Instead of doing it this way, I could have used a denotation directed
+    // universe creator
+    fn covers(&self, pi: ParseInfo, scrutinee: &Type, ctx: &TypingContext) -> Typing<bool> {
+        match self {
+            Self::Structured(shape) => shape.covers(pi, &scrutinee, ctx),
+
+            Self::Universal => Ok(true),
+
+            Self::Empty | Self::Finite(..) => Ok(false),
+        }
+    }
+}
+
+impl Shape {
+    fn covers(&self, pi: ParseInfo, scrutinee: &Type, ctx: &TypingContext) -> Typing<bool> {
         let scrutinee = ctx.normalize_type_application(pi, scrutinee)?;
+        match (self, scrutinee) {
+            (Self::Coproduct(denotations), Type::Coproduct(CoproductType(constructors))) => {
+                let mut covers = true;
 
-        let denot = match scrutinee {
-            Type::Coproduct(CoproductType(coproduct)) => Self::Structured(Object::Coproduct(
-                coproduct
-                    .iter()
-                    .map(|(constructor, args)| {
-                        args.iter()
-                            .map(|ty| Self::universe(pi, ty, ctx))
-                            .collect::<Typing<_>>()
-                            .map(|args| (constructor.clone(), args))
-                    })
-                    .collect::<Typing<_>>()?,
-            )),
+                'outer: for (constructor, arguments) in constructors {
+                    if !denotations.contains_key(&constructor) {
+                        covers = false;
+                        break;
+                    }
 
-            Type::Record(RecordType(record)) => Self::Structured(Object::Struct(
-                record
-                    .iter()
-                    .map(|(field, scrutinee)| {
-                        Self::universe(pi, scrutinee, ctx).map(|d| (field.clone(), d))
-                    })
-                    .collect::<Typing<_>>()?,
-            )),
+                    for (denotation, scrutinee) in denotations[&constructor].iter().zip(arguments) {
+                        let scrutinee = ctx.normalize_type_application(pi, &scrutinee)?;
+                        covers &= denotation.covers(pi, &scrutinee, ctx)?;
+                        if !covers {
+                            break 'outer;
+                        }
+                    }
+                }
 
-            Type::Tuple(TupleType(tuple)) => Self::Structured(Object::Tuple(
-                tuple
-                    .iter()
-                    .map(|ty| Self::universe(pi, ty, ctx))
-                    .collect::<Typing<_>>()?,
-            )),
+                Ok(covers)
+            }
 
-            _ => Self::Universal,
-        };
+            (Self::Struct(denotations), Type::Record(RecordType(fields))) => {
+                let mut covers = true;
+                for (field, scrutinee) in &fields {
+                    let scrutinee = ctx.normalize_type_application(pi, &scrutinee)?;
+                    covers &= denotations[field].covers(pi, &scrutinee, ctx)?;
+                    if !covers {
+                        break;
+                    }
+                }
 
-        Ok(denot)
+                Ok(covers)
+            }
+
+            (Self::Tuple(denotations), Type::Tuple(TupleType(types))) => {
+                let mut covers = true;
+                for (denotation, scrutinee) in denotations.iter().zip(types) {
+                    let scrutinee = ctx.normalize_type_application(pi, &scrutinee)?;
+                    covers &= denotation.covers(pi, &scrutinee, ctx)?;
+                    if !covers {
+                        break;
+                    }
+                }
+                Ok(covers)
+            }
+
+            otherwise => panic!("Latent type error. {otherwise:?}"),
+        }
     }
 }
 
@@ -2461,17 +2551,17 @@ impl Pattern {
     fn denotation(&self) -> Denotation {
         match self {
             Pattern::Coproduct(_, pattern) => {
-                Denotation::Structured(Object::Coproduct(HashMap::from([(
+                Denotation::Structured(Shape::Coproduct(HashMap::from([(
                     pattern.constructor.try_as_free().cloned().expect("this is what I get for having constructor be namer::Identifier when it ought to be a QualifiedName"),
                     pattern.arguments.iter().map(|p| p.denotation()).collect(),
                 )])))
             }
 
-            Pattern::Tuple(_, pattern) => Denotation::Structured(Object::Tuple(
+            Pattern::Tuple(_, pattern) => Denotation::Structured(Shape::Tuple(
                 pattern.elements.iter().map(|e| e.denotation()).collect(),
             )),
 
-            Pattern::Struct(_, pattern) => Denotation::Structured(Object::Struct(
+            Pattern::Struct(_, pattern) => Denotation::Structured(Shape::Struct(
                 pattern
                     .fields
                     .iter()
@@ -2488,28 +2578,19 @@ impl Pattern {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct MatchSpace {
-    pub universe: Denotation,
     pub covered: Denotation,
 }
 
 impl MatchSpace {
-    pub fn from_scrutinee(pi: ParseInfo, scrutinee: &Type, ctx: &TypingContext) -> Typing<Self> {
-        let universe = Denotation::universe(pi, scrutinee, ctx)?;
-        let covered = Denotation::default();
-        Ok(Self { universe, covered })
-    }
-
-    // Instead of returning bool
-    // return the remaining set!
-    pub fn is_exhaustive(&self) -> bool {
-        println!(
-            "is_exhaustive: universe {:? }, covered {:?}",
-            self.universe, self.covered
-        );
-
-        self.covered.normalize() == self.universe
+    pub fn is_exhaustive(
+        &self,
+        pi: ParseInfo,
+        scrutinee: &Type,
+        ctx: &TypingContext,
+    ) -> Typing<bool> {
+        self.covered.normalize().covers(pi, scrutinee, ctx)
     }
 
     pub fn join(&mut self, p: &Pattern) -> bool {

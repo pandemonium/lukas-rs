@@ -1,4 +1,4 @@
-use std::{cell::Cell, fmt, iter, marker::PhantomData, result, vec};
+use std::{cell::Cell, fmt, marker::PhantomData, result, vec};
 
 use backtrace::Backtrace;
 use thiserror::Error;
@@ -55,6 +55,8 @@ impl ParseInfo {
     }
 }
 
+// Rewrite to be in terms of Identifier instead, that way
+// we get ParseInfo everywhere
 #[derive(Debug, Clone, PartialEq, Hash, Eq, PartialOrd, Ord)]
 pub struct IdentifierPath {
     pub head: String,
@@ -69,13 +71,6 @@ impl IdentifierPath {
         }
     }
 
-    pub fn try_into_tail(&self) -> Option<Self> {
-        Some(Self {
-            head: self.tail.first().cloned()?,
-            tail: self.tail.iter().skip(1).cloned().collect(),
-        })
-    }
-
     pub fn try_into_parent(mut self) -> Option<Self> {
         if self.tail.pop().is_some() {
             Some(self)
@@ -86,17 +81,6 @@ impl IdentifierPath {
 
     pub fn last(&self) -> &str {
         self.tail.last().unwrap_or_else(|| &self.head)
-    }
-
-    pub fn try_from_components(components: &[&str]) -> Option<Self> {
-        if let [head, tail @ ..] = components {
-            Some(Self {
-                head: (*head).to_owned(),
-                tail: tail.iter().map(|&s| s.to_owned()).collect(),
-            })
-        } else {
-            None
-        }
     }
 
     pub fn in_module(&self, module: &IdentifierPath) -> Self {
@@ -127,14 +111,10 @@ impl IdentifierPath {
 
     pub fn try_as_simple(&self) -> Option<Identifier> {
         if self.tail.is_empty() {
-            Some(Identifier(self.head.clone()))
+            Some(Identifier::from_str(&self.head))
         } else {
             None
         }
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &str> {
-        iter::once(&self.head).chain(&self.tail).map(|s| s.as_str())
     }
 
     pub fn element(&self, ix: usize) -> Option<&str> {
@@ -152,15 +132,19 @@ impl IdentifierPath {
 
 // What about ParseInfo?
 #[derive(Debug, Clone, PartialEq, Hash, Eq, PartialOrd, Ord)]
-pub struct Identifier(String);
+pub struct Identifier {
+    image: String,
+}
 
 impl Identifier {
     pub fn from_str(id: &str) -> Self {
-        Self(id.to_owned())
+        Self {
+            image: id.to_owned(),
+        }
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.image
     }
 }
 
@@ -613,7 +597,7 @@ impl<'a> Parser<'a> {
 
             let mut params = vec![];
             while self.peek()?.is_identifier() {
-                params.push(self.identifier().map(|(_, id)| Identifier(id))?);
+                params.push(self.identifier().map(|(_, id)| Identifier { image: id })?);
             }
 
             if params.is_empty() {
@@ -1891,8 +1875,8 @@ impl From<Literal> for ast::Literal {
 
 impl fmt::Display for Identifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self(id) = self;
-        write!(f, "{id}")
+        let Self { image } = self;
+        write!(f, "{image}")
     }
 }
 

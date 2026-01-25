@@ -54,7 +54,7 @@ pub struct StructPattern<A, Id> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Denotation {
     Empty,
-    Structured(Object),
+    Structured(Shape),
     Finite(BTreeSet<ast::Literal>),
     Universal,
 }
@@ -100,13 +100,13 @@ impl Denotation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Object {
+pub enum Shape {
     Coproduct(HashMap<namer::QualifiedName, Vec<Denotation>>),
     Struct(HashMap<parser::Identifier, Denotation>),
     Tuple(Vec<Denotation>),
 }
 
-impl Object {
+impl Shape {
     fn normalize(&self) -> Self {
         match self {
             Self::Coproduct(denots) => Self::Coproduct(
