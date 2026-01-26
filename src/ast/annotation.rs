@@ -43,6 +43,7 @@ where
                 Expr::Deconstruct(a, node) => Expr::Deconstruct(f(a), node.map_annotation(&f)),
                 Expr::If(a, node) => Expr::If(f(a), node.map_annotation(&f)),
                 Expr::Interpolate(a, node) => Expr::Interpolate(f(a), node.map_annotation(&f)),
+                Expr::Annotation(a, node) => Expr::Annotation(f(a), node.map_annotation(&f)),
             }
         }
 
@@ -277,6 +278,110 @@ where
             consequent: self.consequent.map_annotation(f),
             alternate: self.alternate.map_annotation(f),
         }
+    }
+}
+
+impl<A, B, Id> Annotated<A, B, Id> for TypeAscription<A, Id>
+where
+    Id: Clone,
+{
+    type Output = TypeAscription<B, Id>;
+
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
+    where
+        F: Fn(&A) -> B,
+    {
+        TypeAscription {
+            tree: self.tree.map_annotation(f),
+            type_signature: self.type_signature.map_annotation(f),
+        }
+    }
+}
+
+impl<A, B, Id> Annotated<A, B, Id> for TypeSignature<A, Id>
+where
+    Id: Clone,
+{
+    type Output = TypeSignature<B, Id>;
+
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
+    where
+        F: Fn(&A) -> B,
+    {
+        TypeSignature {
+            universal_quantifiers: self.universal_quantifiers.clone(),
+            body: self.body.map_annotation(f),
+            phase: PhantomData,
+        }
+    }
+}
+
+impl<A, B, Id> Annotated<A, B, Id> for TypeExpression<A, Id>
+where
+    Id: Clone,
+{
+    type Output = TypeExpression<B, Id>;
+
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
+    where
+        F: Fn(&A) -> B,
+    {
+        match self {
+            Self::Constructor(a, id) => TypeExpression::Constructor(f(a), id.clone()),
+            Self::Parameter(a, id) => TypeExpression::Parameter(f(a), id.clone()),
+            Self::Apply(a, node) => TypeExpression::Apply(f(a), node.map_annotation(f)),
+            Self::Arrow(a, node) => TypeExpression::Arrow(f(a), node.map_annotation(f)),
+            Self::Tuple(a, node) => TypeExpression::Tuple(f(a), node.map_annotation(f)),
+        }
+    }
+}
+
+impl<A, B, Id> Annotated<A, B, Id> for ApplyTypeExpr<A, Id>
+where
+    Id: Clone,
+{
+    type Output = ApplyTypeExpr<B, Id>;
+
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
+    where
+        F: Fn(&A) -> B,
+    {
+        ApplyTypeExpr {
+            function: self.function.map_annotation(f).into(),
+            argument: self.argument.map_annotation(f).into(),
+            phase: PhantomData,
+        }
+    }
+}
+
+impl<A, B, Id> Annotated<A, B, Id> for ArrowTypeExpr<A, Id>
+where
+    Id: Clone,
+{
+    type Output = ArrowTypeExpr<B, Id>;
+
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
+    where
+        F: Fn(&A) -> B,
+    {
+        ArrowTypeExpr {
+            domain: self.domain.map_annotation(f).into(),
+            codomain: self.codomain.map_annotation(f).into(),
+        }
+    }
+}
+impl<A, B, Id> Annotated<A, B, Id> for TupleTypeExpr<A, Id>
+where
+    Id: Clone,
+{
+    type Output = TupleTypeExpr<B, Id>;
+
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
+    where
+        F: Fn(&A) -> B,
+    {
+        let Self(elements) = self;
+        TupleTypeExpr(elements.iter().map(|e| e.map_annotation(f)).collect())
     }
 }
 

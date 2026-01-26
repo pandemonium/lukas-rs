@@ -25,6 +25,7 @@ pub type Sequence = ast::Sequence<ParseInfo, IdentifierPath>;
 pub type Deconstruct = ast::Deconstruct<ParseInfo, IdentifierPath>;
 pub type IfThenElse = ast::IfThenElse<ParseInfo, IdentifierPath>;
 pub type Interpolate = ast::Interpolate<ParseInfo, IdentifierPath>;
+pub type TypeAscription = ast::TypeAscription<ParseInfo, IdentifierPath>;
 pub type Segment = ast::Sequence<ParseInfo, IdentifierPath>;
 pub type Pattern = ast::pattern::Pattern<ParseInfo, IdentifierPath>;
 pub type MatchClause = ast::pattern::MatchClause<ParseInfo, IdentifierPath>;

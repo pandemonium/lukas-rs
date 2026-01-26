@@ -41,6 +41,7 @@ pub type Pattern = ast::pattern::Pattern<ParseInfo, Identifier>;
 pub type ConstructorPattern = ast::pattern::ConstructorPattern<ParseInfo, Identifier>;
 pub type TypeExpression = ast::TypeExpression<ParseInfo, QualifiedName>;
 pub type TypeSignature = ast::TypeSignature<ParseInfo, QualifiedName>;
+pub type TypeAscription = ast::TypeAscription<ParseInfo, Identifier>;
 
 type ParserSymbolTable = SymbolTable<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
 type ParserSymbol = Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
@@ -160,6 +161,10 @@ impl<A> ast::Expr<A, Identifier> {
                 the.predicate.gather_free_variables(free);
                 the.consequent.gather_free_variables(free);
                 the.alternate.gather_free_variables(free);
+            }
+
+            Self::Annotation(_, the) => {
+                the.tree.gather_free_variables(free);
             }
 
             _otherwise => (),
@@ -1214,6 +1219,14 @@ impl parser::Expr {
                         .collect(),
                 ),
             ),
+
+            parser::Expr::Annotation(a, the) => parser::Expr::Annotation(
+                a,
+                parser::TypeAscription {
+                    tree: map_lower_tuples(the.tree),
+                    type_signature: the.type_signature,
+                },
+            ),
         }
     }
 
@@ -1307,6 +1320,11 @@ impl parser::Expr {
             Self::If(pi, node) => Ok(Expr::If(*pi, node.resolve(names, symbols, semantic_scope)?)),
 
             Self::Interpolate(pi, node) => Ok(Expr::Interpolate(
+                *pi,
+                node.resolve(names, symbols, semantic_scope)?,
+            )),
+
+            Self::Annotation(pi, node) => Ok(Expr::Annotation(
                 *pi,
                 node.resolve(names, symbols, semantic_scope)?,
             )),
@@ -1588,6 +1606,20 @@ impl parser::Interpolate {
     }
 }
 
+impl parser::TypeAscription {
+    fn resolve(
+        &self,
+        names: &mut DeBruijn,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> Naming<TypeAscription> {
+        Ok(TypeAscription {
+            tree: self.tree.resolve(names, symbols, semantic_scope)?.into(),
+            type_signature: self.type_signature.clone(),
+        })
+    }
+}
+
 impl parser::MatchClause {
     fn resolve(
         &self,
@@ -1717,26 +1749,35 @@ impl ParserSymbolTable {
         })
     }
 
-    // Own and move instead?
     fn rename_symbol(&self, pi: ParseInfo, symbol: &ParserSymbol) -> Naming<NamedSymbol> {
         match symbol {
-            Symbol::Term(symbol) => Ok(Symbol::Term(TermSymbol {
-                name: symbol.name.clone(),
-                type_signature: if let Some(ts) = &symbol.type_signature {
-                    let resolved = ts.body.resolve_names(self, pi, &symbol.name.module)?;
+            Symbol::Term(symbol) => Ok(Symbol::Term(if let Some(ts) = &symbol.type_signature {
+                let type_signature = TypeSignature {
+                    universal_quantifiers: ts.universal_quantifiers.clone(),
+                    body: ts.body.resolve_names(self, pi, &symbol.name.module)?,
+                    phase: PhantomData,
+                };
 
-                    Some(TypeSignature {
-                        universal_quantifiers: ts.universal_quantifiers.clone(),
-                        body: resolved,
-                        phase: PhantomData,
-                    })
-                } else {
-                    None
-                },
-                body: symbol
-                    .body()
-                    .resolve_names(self, &symbol.name.module)?
-                    .into(),
+                TermSymbol {
+                    name: symbol.name.clone(),
+                    type_signature: Some(type_signature.clone()),
+                    body: Some(Expr::Annotation(
+                        pi,
+                        TypeAscription {
+                            tree: symbol
+                                .body()
+                                .resolve_names(self, &symbol.name.module)?
+                                .into(),
+                            type_signature,
+                        },
+                    )),
+                }
+            } else {
+                TermSymbol {
+                    name: symbol.name.clone(),
+                    type_signature: None,
+                    body: Some(symbol.body().resolve_names(self, &symbol.name.module)?),
+                }
             })),
 
             Symbol::Type(symbol) => Ok(Symbol::Type({

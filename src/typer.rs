@@ -47,6 +47,7 @@ pub type Pattern = ast::pattern::Pattern<TypeInfo, namer::Identifier>;
 pub type ConstructorPattern = ast::pattern::ConstructorPattern<TypeInfo, namer::Identifier>;
 pub type StructPattern = ast::pattern::StructPattern<TypeInfo, namer::Identifier>;
 pub type TuplePattern = ast::pattern::TuplePattern<TypeInfo, namer::Identifier>;
+pub type TypeAscription = ast::TypeAscription<TypeInfo, namer::Identifier>;
 
 pub type RecordSymbol = namer::RecordSymbol<namer::QualifiedName>;
 pub type CoproductSymbol = namer::CoproductSymbol<namer::QualifiedName>;
@@ -1573,7 +1574,39 @@ impl TypingContext {
             UntypedExpr::Interpolate(pi, ast::Interpolate(segments)) => {
                 self.infer_interpolation(*pi, &segments)
             }
+
+            UntypedExpr::Annotation(pi, ascription) => self.infer_annotation(*pi, ascription),
         }
+    }
+
+    #[instrument]
+    fn infer_annotation(&mut self, pi: ParseInfo, ascription: &namer::TypeAscription) -> Typing {
+        let (subs, inferred_tree) = self.infer_expr(&ascription.tree)?;
+        let ascribed_type = ascription.type_signature.scheme(self)?.instantiate();
+
+        // Use these subs too?
+        let unification = ascribed_type
+            .unified_with(&inferred_tree.type_info().inferred_type)
+            .map_err(|e| e.at(pi))?;
+
+        let inferred_tree = inferred_tree.with_substitutions(&unification);
+        let inferred_type = inferred_tree.type_info().inferred_type.clone();
+        Ok((
+            subs.compose(&unification),
+            Expr::Annotation(
+                TypeInfo {
+                    parse_info: pi,
+                    inferred_type: inferred_type.clone(),
+                },
+                TypeAscription {
+                    tree: inferred_tree.into(),
+                    type_signature: ascription.type_signature.map_annotation(&|pi| TypeInfo {
+                        parse_info: *pi,
+                        inferred_type: inferred_type.clone(),
+                    }),
+                },
+            ),
+        ))
     }
 
     #[instrument]

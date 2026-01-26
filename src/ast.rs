@@ -183,6 +183,7 @@ pub enum Expr<A, Id> {
     Deconstruct(A, Deconstruct<A, Id>),
     If(A, IfThenElse<A, Id>),
     Interpolate(A, Interpolate<A, Id>),
+    Annotation(A, TypeAscription<A, Id>),
 }
 
 impl<A, Id> Expr<A, Id> {
@@ -202,7 +203,8 @@ impl<A, Id> Expr<A, Id> {
             | Expr::Sequence(a, ..)
             | Expr::Deconstruct(a, ..)
             | Expr::If(a, ..)
-            | Expr::Interpolate(a, ..) => a,
+            | Expr::Interpolate(a, ..)
+            | Expr::Annotation(a, ..) => a,
         }
     }
 
@@ -221,6 +223,12 @@ pub struct Interpolate<A, Id>(pub Vec<Segment<A, Id>>);
 pub enum Segment<A, Id> {
     Literal(A, Literal),
     Expression(Tree<A, Id>),
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeAscription<A, Id> {
+    pub tree: Tree<A, Id>,
+    pub type_signature: TypeSignature<A, QualifiedName>,
 }
 
 #[derive(Debug, Clone)]
@@ -354,6 +362,7 @@ where
             Self::Deconstruct(_, x) => write!(f, "{x}"),
             Self::If(_, x) => write!(f, "{x}"),
             Self::Interpolate(_, x) => write!(f, "{x}"),
+            Self::Annotation(_, x) => write!(f, "{}::{}", x.tree, x.type_signature),
         }
     }
 }
