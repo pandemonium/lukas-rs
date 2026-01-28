@@ -1762,7 +1762,7 @@ impl ParserSymbolTable {
                     name: symbol.name.clone(),
                     type_signature: Some(type_signature.clone()),
                     body: Some(Expr::Annotation(
-                        pi,
+                        *symbol.body().parse_info(),
                         TypeAscription {
                             tree: symbol
                                 .body()

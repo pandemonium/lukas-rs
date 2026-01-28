@@ -118,16 +118,25 @@ where
 }
 
 impl namer::TypeSignature {
-    pub fn scheme(&self, ctx: &TypingContext) -> Typing<TypeScheme> {
+    pub fn scheme(
+        &self,
+        type_param_map: &mut HashMap<parser::Identifier, TypeParameter>,
+        ctx: &TypingContext,
+    ) -> Typing<TypeScheme> {
         let type_params = self
             .universal_quantifiers
             .iter()
             .map(|id| (id.clone(), TypeParameter::fresh()))
-            .collect::<HashMap<_, _>>();
+            .collect::<Vec<_>>();
+
+        let quantifiers = type_params.iter().map(|(_, p)| *p).collect();
+        println!("scheme: quantifiers {:?}", quantifiers);
+
+        *type_param_map = type_params.iter().cloned().collect::<HashMap<_, _>>();
 
         Ok(TypeScheme {
-            quantifiers: type_params.values().cloned().collect(),
-            underlying: self.body.synthesize_type(&type_params, ctx)?,
+            quantifiers,
+            underlying: self.body.synthesize_type(&type_param_map, ctx)?,
         })
     }
 }
@@ -181,36 +190,14 @@ impl namer::NamedSymbolTable {
         symbol: &TermSymbol<ParseInfo, namer::QualifiedName, Identifier>,
         ctx: &mut TypingContext,
     ) -> Typing<TypedSymbol> {
-        let body = if let Some(type_signature) = &symbol.type_signature {
-            let (subs, body) = ctx.infer_expr(symbol.body())?;
+        let (_, body) = ctx.infer_expr(&symbol.body())?;
 
-            ctx.substitute_mut(&subs);
+        let qualified_name = symbol.name.clone();
+        let inferred_type = &body.type_info().inferred_type;
+        let scheme = inferred_type.generalize(&ctx);
+        println!("typer: {qualified_name} => {scheme}");
 
-            let inferred_type = body.type_info().inferred_type.with_substitutions(&subs);
-            let inferred_scheme = inferred_type.generalize(ctx);
-
-            let type_scheme = type_signature.scheme(ctx)?;
-
-            type_scheme
-                .instantiate()
-                .check_instance_of(body.type_info().parse_info, &inferred_scheme)?;
-
-            let qualified_name = symbol.name.clone();
-            println!("typer: {qualified_name} => {inferred_scheme}, <== {type_scheme}");
-
-            ctx.bind_free_term(qualified_name, type_scheme);
-            body
-        } else {
-            let (_, body) = ctx.infer_expr(&symbol.body())?;
-
-            let qualified_name = symbol.name.clone();
-            let inferred_type = &body.type_info().inferred_type;
-            let scheme = inferred_type.generalize(&ctx);
-            println!("typer: {qualified_name} => {scheme}");
-
-            ctx.bind_free_term(qualified_name, scheme);
-            body
-        };
+        ctx.bind_free_term(qualified_name, scheme);
 
         Ok(namer::Symbol::Term(TermSymbol {
             name: symbol.name.clone(),
@@ -306,6 +293,23 @@ pub enum TypeError {
 
     #[error("all of {} is not covered", deconstruct.scrutinee)]
     MatchNotExhaustive { deconstruct: Deconstruct },
+
+    #[error("Bad specialization: {0}")]
+    BadSpecialization(Specialization),
+}
+
+#[derive(Debug)]
+pub struct Specialization {
+    map: Vec<(parser::Identifier, Type)>,
+}
+
+impl fmt::Display for Specialization {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (id, ty) in &self.map {
+            writeln!(f, "{id} := {ty}")?;
+        }
+        Ok(())
+    }
 }
 
 pub type Typing<A = (Substitutions, Expr)> = Result<A, Located<TypeError>>;
@@ -472,59 +476,61 @@ impl Type {
         Self::Variable(TypeParameter::fresh())
     }
 
-    pub fn check_instance_of(&self, pi: ParseInfo, scheme: &TypeScheme) -> Typing<()> {
-        let instantiated_signature = scheme.instantiate();
-
-        let subs = instantiated_signature
-            .unified_with(self)
-            .map_err(|e| e.at(pi))?;
-
-        println!("check_instance_of: scheme {instantiated_signature}, self {self}, subs {subs}");
-
-        Ok(())
-    }
-
     pub fn is_base(&self) -> bool {
         matches!(self, Type::Base(..))
     }
 
-    pub fn variables(&self) -> HashSet<TypeParameter> {
+    pub fn walk<F>(&self, f: &mut F)
+    where
+        F: FnMut(&Type),
+    {
         match self {
-            Self::Variable(param) => [*param].into(),
-
-            Self::Base(..) => [].into(),
-
             Self::Arrow { domain, codomain } => {
-                let mut variables = domain.variables();
-                variables.extend(codomain.variables());
-                variables
+                f(domain);
+                domain.walk(f);
+                f(codomain);
+                codomain.walk(f);
             }
 
-            Self::Tuple(tuple) => tuple
-                .elements()
-                .iter()
-                .flat_map(|ty| ty.variables())
-                .collect(),
+            Self::Tuple(tuple) => tuple.elements().iter().for_each(|ty| {
+                f(ty);
+                ty.walk(f)
+            }),
 
-            Self::Record(record) => record.0.iter().flat_map(|(_, ty)| ty.variables()).collect(),
+            Self::Record(record) => record.0.iter().for_each(|(_, ty)| {
+                f(ty);
+                ty.walk(f)
+            }),
 
-            Self::Coproduct(coproduct) => coproduct
-                .0
-                .iter()
-                .flat_map(|(_, ty)| ty.iter().flat_map(|ty| ty.variables()))
-                .collect(),
-
-            Self::Constructor(..) => [].into(),
+            Self::Coproduct(coproduct) => coproduct.0.iter().for_each(|(_, args)| {
+                args.iter().for_each(|ty| {
+                    f(ty);
+                    ty.walk(f);
+                })
+            }),
 
             Self::Apply {
                 constructor,
                 argument,
             } => {
-                let mut variables = constructor.variables();
-                variables.extend(argument.variables());
-                variables
+                f(constructor);
+                constructor.walk(f);
+                f(argument);
+                argument.walk(f);
             }
+
+            otherwise => f(otherwise),
         }
+    }
+
+    pub fn variables(&self) -> HashSet<TypeParameter> {
+        let mut vars = HashSet::default();
+        self.walk(&mut |ty| {
+            if let Type::Variable(tp) = ty {
+                vars.insert(*tp);
+            }
+        });
+        vars
     }
 
     //    #[instrument]
@@ -986,15 +992,43 @@ impl TypeScheme {
         }
     }
 
-    pub fn instantiate(&self) -> Type {
-        let substitutions = self
-            .quantifiers
+    fn check_instance_of<F>(&self, rhs: &TypeScheme, type_params: F) -> Result<(), TypeError>
+    where
+        F: FnOnce() -> HashMap<TypeParameter, parser::Identifier>,
+    {
+        let rhs_instantiation = rhs.instantiation_substitutions();
+        let rhs = rhs.underlying.with_substitutions(&rhs_instantiation);
+        let rhs_qualifiers = rhs_instantiation.codomain();
+
+        let lhs = self.instantiate();
+        let unification = lhs.unified_with(&rhs)?;
+
+        if unification.iter().any(|(domain, codomain)| {
+            // inferred type must not specialize the signature (rhs)
+            rhs_qualifiers.contains(domain) && !matches!(codomain, Type::Variable(..))
+        }) {
+            let type_parameter_map =
+                find_type_parameters(&type_params(), &rhs_instantiation, unification);
+
+            Err(TypeError::BadSpecialization(Specialization {
+                map: type_parameter_map,
+            }))?
+        }
+
+        Ok(())
+    }
+
+    fn instantiation_substitutions(&self) -> Substitutions {
+        self.quantifiers
             .iter()
             .map(|tp| (*tp, Type::fresh()))
             .collect::<Vec<_>>()
-            .into();
+            .into()
+    }
 
-        self.underlying.with_substitutions(&substitutions)
+    pub fn instantiate(&self) -> Type {
+        self.underlying
+            .with_substitutions(&self.instantiation_substitutions())
     }
 
     pub fn from_constant(ty: Type) -> TypeScheme {
@@ -1011,6 +1045,39 @@ impl TypeScheme {
         }
         vars
     }
+}
+
+fn find_type_parameters(
+    type_params: &HashMap<TypeParameter, parser::Identifier>,
+    rhs_instantiation: &Substitutions,
+    unification: Substitutions,
+) -> Vec<(parser::Identifier, Type)> {
+    let rhs_qualifiers = rhs_instantiation.codomain();
+    let s_rhs = rhs_instantiation
+        .iter()
+        .filter_map(|(p, q)| {
+            if let Type::Variable(q) = q {
+                Some((q, p))
+            } else {
+                None
+            }
+        })
+        .collect::<HashMap<_, _>>();
+
+    unification
+        .iter()
+        .filter_map(|(domain, codomain)| {
+            if rhs_qualifiers.contains(domain) {
+                s_rhs.get(domain).and_then(|p| {
+                    type_params
+                        .get(p)
+                        .map(|param| (param.clone(), codomain.clone()))
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1055,6 +1122,20 @@ impl Substitutions {
 
     fn remove(&mut self, param: TypeParameter) {
         self.0.retain(|(tp, ..)| param != *tp);
+    }
+
+    fn domain(&self) -> HashSet<&TypeParameter> {
+        self.0.iter().map(|(t, _)| t).collect()
+    }
+
+    fn codomain(&self) -> HashSet<&TypeParameter> {
+        self.0
+            .iter()
+            .filter_map(|(_, u)| match u {
+                Type::Variable(tp) => Some(tp),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -1582,17 +1663,24 @@ impl TypingContext {
     #[instrument]
     fn infer_annotation(&mut self, pi: ParseInfo, ascription: &namer::TypeAscription) -> Typing {
         let (subs, inferred_tree) = self.infer_expr(&ascription.tree)?;
-        let ascribed_type = ascription.type_signature.scheme(self)?.instantiate();
 
-        // Use these subs too?
-        let unification = ascribed_type
-            .unified_with(&inferred_tree.type_info().inferred_type)
+        let mut type_params = HashMap::default();
+        let ascribed_scheme = ascription.type_signature.scheme(&mut type_params, self)?;
+        let inferred_scheme = inferred_tree.type_info().inferred_type.generalize(self);
+
+        inferred_scheme
+            .check_instance_of(&ascribed_scheme, || {
+                type_params
+                    .into_iter()
+                    .map(|(id, param)| (param, id))
+                    .collect::<HashMap<_, _>>()
+            })
             .map_err(|e| e.at(pi))?;
 
-        let inferred_tree = inferred_tree.with_substitutions(&unification);
-        let inferred_type = inferred_tree.type_info().inferred_type.clone();
+        let inferred_type = ascribed_scheme.instantiate();
+
         Ok((
-            subs.compose(&unification),
+            subs,
             Expr::Annotation(
                 TypeInfo {
                     parse_info: pi,

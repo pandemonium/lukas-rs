@@ -1,0 +1,16 @@
+List ::= ∀α. Nil | Cons α (List α)
+
+fold_right :: ∀z α. (α -> z -> z) -> z -> List α -> z :=
+  λf z xs.
+    deconstruct xs into
+      Cons a tail -> f a (fold_right f z tail)
+    | Nil         -> "z"
+
+map :: ∀α β. (α -> β) -> List α -> List β :=
+  λf. fold_right (compose Cons f) Nil
+
+compose :: ∀α β γ. (β -> γ) -> (α -> β) -> α -> γ :=
+  λg f a. g (f a)
+
+start := λ_.
+  print_endline "Hi, mom"
