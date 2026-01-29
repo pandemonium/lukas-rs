@@ -657,6 +657,8 @@ impl Type {
                     lhs.constructor_names().all(|lhs| rhs_names.contains(lhs))
                 }*/ =>
             {
+                // What in the flightrecorder?
+                // I never unify Coproducts?! Or is it that I never unify expanded types?
                 todo!()
             }
 
@@ -676,7 +678,7 @@ impl Type {
             }
 
             (lhs, rhs) => {
-                panic!("unification failed: lhs {lhs} rhs {rhs}");
+                //panic!("unification failed: lhs {lhs} rhs {rhs}");
                 Err(TypeError::UnificationImpossible { lhs: lhs.clone(), rhs: rhs.clone() })
             },
         }
@@ -922,7 +924,7 @@ impl TypeConstructor {
                 structure: constructor.structure.with_substitutions(subs),
             })
         } else {
-            todo!()
+            panic!("Attempt to substitute into unelaborated type constructor `{self}`")
         }
     }
 
@@ -1521,7 +1523,7 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn check_expr(&mut self, expected_type: &Type, expr: &UntypedExpr) -> Typing<Expr> {
+    fn check_expr(&mut self, expected_type: &Type, expr: &UntypedExpr) -> Typing {
         println!("check_expr: expected {expected_type} for {expr}");
         match expr {
             UntypedExpr::RecursiveLambda(pi, rec) => {
@@ -1542,20 +1544,21 @@ impl TypingContext {
 
             otherwise => {
                 println!("check_expr: infer {expr:?}");
-                let (subs1, expr) = self.infer_expr(expr)?;
+                let (s_expr, expr) = self.infer_expr(expr)?;
 
-                let lhs = expr.type_info().inferred_type.with_substitutions(&subs1);
-                let rhs = expected_type.with_substitutions(&subs1);
+                let lhs = expr.type_info().inferred_type.with_substitutions(&s_expr);
+                let rhs = expected_type.with_substitutions(&s_expr);
 
-                let subs2 = lhs
+                let s_unification = lhs
                     .unified_with(&rhs)
                     .map_err(|e| e.at(*otherwise.annotation()))?;
 
-                let subs = subs1.compose(&subs2);
+                let subs = s_expr.compose(&s_unification);
 
                 self.substitute_mut(&subs);
 
-                Ok(expr.with_substitutions(&subs))
+                let expr = expr.with_substitutions(&subs);
+                Ok((subs, expr))
             }
         }
     }
@@ -1566,7 +1569,7 @@ impl TypingContext {
         pi: ParseInfo,
         expected_type: &Type,
         construct: &namer::Construct,
-    ) -> Typing<Expr> {
+    ) -> Typing {
         let normalized_type = self.normalize_type_application(pi, expected_type)?;
 
         println!(
@@ -1578,23 +1581,29 @@ impl TypingContext {
             let signature = coproduct.signature(&construct.constructor).ok_or_else(|| {
                 TypeError::NoSuchCoproductConstructor(construct.constructor.clone()).at(pi)
             })?;
-            let typed_args = signature
-                .iter()
-                .zip(&construct.arguments)
-                .map(|(ty, e)| self.check_expr(ty, &e).map(|e| e.into()))
-                .collect::<Typing<Vec<_>>>()?;
-            Ok(Expr::Construct(
-                TypeInfo {
-                    parse_info: pi,
-                    inferred_type: expected_type.clone(),
-                },
-                Construct {
-                    constructor: construct.constructor.clone(),
-                    arguments: typed_args,
-                },
+            let mut typed_args = Vec::with_capacity(signature.len());
+            let mut s_args = Substitutions::default();
+
+            for (expected, expr) in signature.iter().zip(&construct.arguments) {
+                let (s_arg, arg) = self.check_expr(expected, expr)?;
+                s_args = s_args.compose(&s_arg);
+                typed_args.push(arg.into());
+            }
+            Ok((
+                Substitutions::default(),
+                Expr::Construct(
+                    TypeInfo {
+                        parse_info: pi,
+                        inferred_type: expected_type.clone(),
+                    },
+                    Construct {
+                        constructor: construct.constructor.clone(),
+                        arguments: typed_args,
+                    },
+                ),
             ))
         } else {
-            todo!()
+            self.infer_coproduct_construct(pi, construct)
         }
     }
 
@@ -1604,7 +1613,7 @@ impl TypingContext {
         pi: ParseInfo,
         expected_type: &Type,
         rec: &namer::SelfReferential,
-    ) -> Typing<Expr> {
+    ) -> Typing {
         let normalized_type = self.normalize_type_application(pi, &expected_type)?;
         if let Type::Arrow { domain, codomain } = &normalized_type {
             self.bind_term_and_then(
@@ -1615,27 +1624,30 @@ impl TypingContext {
                         rec.lambda.parameter.clone(),
                         TypeScheme::from_constant(*domain.clone()),
                         |ctx| {
-                            let body = ctx.check_expr(codomain, &rec.lambda.body)?;
+                            let (s_body, body) = ctx.check_expr(codomain, &rec.lambda.body)?;
 
-                            Ok(Expr::RecursiveLambda(
-                                TypeInfo {
-                                    parse_info: pi,
-                                    inferred_type: expected_type.clone(),
-                                },
-                                SelfReferential {
-                                    own_name: rec.own_name.clone(),
-                                    lambda: Lambda {
-                                        parameter: rec.lambda.parameter.clone(),
-                                        body: body.into(),
+                            Ok((
+                                s_body,
+                                Expr::RecursiveLambda(
+                                    TypeInfo {
+                                        parse_info: pi,
+                                        inferred_type: expected_type.clone(),
                                     },
-                                },
+                                    SelfReferential {
+                                        own_name: rec.own_name.clone(),
+                                        lambda: Lambda {
+                                            parameter: rec.lambda.parameter.clone(),
+                                            body: body.into(),
+                                        },
+                                    },
+                                ),
                             ))
                         },
                     )
                 },
             )
         } else {
-            todo!()
+            self.infer_recursive_lambda(pi, rec)
         }
     }
 
@@ -1657,24 +1669,27 @@ impl TypingContext {
         pi: ParseInfo,
         expected_type: &Type,
         lambda: &namer::Lambda,
-    ) -> Typing<Expr> {
+    ) -> Typing {
         let normalized_type = self.normalize_type_application(pi, &expected_type)?;
         if let Type::Arrow { domain, codomain } = &normalized_type {
             self.bind_term_and_then(
                 lambda.parameter.clone(),
                 TypeScheme::from_constant(*domain.clone()),
                 |ctx| {
-                    let body = ctx.check_expr(codomain, &lambda.body)?;
+                    let (s_body, body) = ctx.check_expr(codomain, &lambda.body)?;
 
-                    Ok(Expr::Lambda(
-                        TypeInfo {
-                            parse_info: pi,
-                            inferred_type: expected_type.clone(),
-                        },
-                        Lambda {
-                            parameter: lambda.parameter.clone(),
-                            body: body.into(),
-                        },
+                    Ok((
+                        s_body,
+                        Expr::Lambda(
+                            TypeInfo {
+                                parse_info: pi,
+                                inferred_type: expected_type.clone(),
+                            },
+                            Lambda {
+                                parameter: lambda.parameter.clone(),
+                                body: body.into(),
+                            },
+                        ),
                     ))
                 },
             )
@@ -1684,30 +1699,33 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn check_tuple(
-        &mut self,
-        pi: ParseInfo,
-        expected_type: &Type,
-        tuple: &namer::Tuple,
-    ) -> Typing<Expr> {
+    fn check_tuple(&mut self, pi: ParseInfo, expected_type: &Type, tuple: &namer::Tuple) -> Typing {
         let normalized_type = self.normalize_type_application(pi, &expected_type)?;
 
         if let Type::Tuple(TupleType(elements)) = &normalized_type {
-            let elements = tuple
-                .elements
-                .iter()
-                .zip(elements)
-                .map(|(e, t)| self.check_expr(t, e).map(|e| e.into()))
-                .collect::<Typing<_>>()?;
-            Ok(Expr::Tuple(
-                TypeInfo {
-                    parse_info: pi,
-                    inferred_type: expected_type.clone(),
-                },
-                Tuple { elements },
+            let mut typed_elements = Vec::with_capacity(elements.len());
+            let mut s_tuple = Substitutions::default();
+
+            for (expr, expected) in tuple.elements.iter().zip(elements) {
+                let (s_element, element) = self.check_expr(expected, expr)?;
+                s_tuple = s_tuple.compose(&s_element);
+                typed_elements.push(element.into());
+            }
+
+            Ok((
+                s_tuple,
+                Expr::Tuple(
+                    TypeInfo {
+                        parse_info: pi,
+                        inferred_type: expected_type.clone(),
+                    },
+                    Tuple {
+                        elements: typed_elements,
+                    },
+                ),
             ))
         } else {
-            panic!("{pi} check {tuple}, was {expected_type:?}",)
+            self.infer_tuple(pi, tuple)
         }
     }
 
@@ -1767,14 +1785,14 @@ impl TypingContext {
             }
 
             UntypedExpr::Apply(pi, ast::Apply { function, argument }) => {
-                self.infer_apply(*pi, function, argument)
+                self.infer_apply_with_arg_check(*pi, function, argument)
             }
 
-            UntypedExpr::Let(pi, binding) => self.infer_binding(pi, binding),
+            UntypedExpr::Let(pi, binding) => self.infer_binding(*pi, binding),
 
             UntypedExpr::Record(pi, record) => self.infer_record(*pi, record),
 
-            UntypedExpr::Tuple(pi, tuple) => self.infer_tuple(pi, tuple),
+            UntypedExpr::Tuple(pi, tuple) => self.infer_tuple(*pi, tuple),
 
             UntypedExpr::Construct(pi, constructor) => {
                 self.infer_coproduct_construct(*pi, constructor)
@@ -1804,9 +1822,7 @@ impl TypingContext {
             .type_signature
             .scheme(&mut HashMap::default(), self)?;
         let ascribed_type = ascribed_scheme.instantiate();
-        let typed_tree = self.check_expr(&ascribed_type, &ascription.tree)?;
-
-        Ok((Substitutions::default(), typed_tree))
+        self.check_expr(&ascribed_type, &ascription.tree)
     }
 
     #[instrument]
@@ -1859,8 +1875,8 @@ impl TypingContext {
         pi: ParseInfo,
         expected_type: &Type,
         deconstruct: &namer::Deconstruct,
-    ) -> Typing<Expr> {
-        let (s_substitutions, scrutinee) = self.infer_expr(&deconstruct.scrutinee)?;
+    ) -> Typing {
+        let (mut s_scrutinee, scrutinee) = self.infer_expr(&deconstruct.scrutinee)?;
         let scrutinee_type = &scrutinee.type_info().inferred_type;
         let mut typed_match_clauses = Vec::with_capacity(deconstruct.match_clauses.len());
 
@@ -1870,28 +1886,33 @@ impl TypingContext {
             let (s_pattern, pattern) = clause_ctx.infer_pattern(
                 &clause.pattern,
                 &mut bindings,
-                &scrutinee_type.with_substitutions(&s_substitutions),
+                &scrutinee_type.with_substitutions(&s_scrutinee),
             )?;
             clause_ctx.substitute_mut(&s_pattern);
             for (binding, ty) in bindings {
                 clause_ctx.bind_term(binding, TypeScheme::from_constant(ty));
             }
-            let consequent = clause_ctx.check_expr(expected_type, &clause.consequent)?;
+            let (s_consequent, consequent) =
+                clause_ctx.check_expr(expected_type, &clause.consequent)?;
+            s_scrutinee = s_scrutinee.compose(&s_consequent);
             typed_match_clauses.push(MatchClause {
                 pattern,
                 consequent: consequent.into(),
             });
         }
 
-        Ok(Expr::Deconstruct(
-            TypeInfo {
-                parse_info: pi,
-                inferred_type: expected_type.clone(),
-            },
-            Deconstruct {
-                scrutinee: scrutinee.into(),
-                match_clauses: typed_match_clauses,
-            },
+        Ok((
+            s_scrutinee,
+            Expr::Deconstruct(
+                TypeInfo {
+                    parse_info: pi,
+                    inferred_type: expected_type.clone(),
+                },
+                Deconstruct {
+                    scrutinee: scrutinee.into(),
+                    match_clauses: typed_match_clauses,
+                },
+            ),
         ))
     }
 
@@ -2393,14 +2414,14 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_tuple(&mut self, pi: &ParseInfo, tuple: &namer::Tuple) -> Typing {
+    fn infer_tuple(&mut self, pi: ParseInfo, tuple: &namer::Tuple) -> Typing {
         let (substitutions, elements, element_types) = self.infer_several(&tuple.elements)?;
 
         Ok((
             substitutions,
             Expr::Tuple(
                 TypeInfo {
-                    parse_info: *pi,
+                    parse_info: pi,
                     inferred_type: Type::Tuple(TupleType::from_signature(&element_types)),
                 },
                 Tuple { elements },
@@ -2490,65 +2511,54 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_apply2(
+    fn infer_apply_with_arg_check(
         &mut self,
         pi: ParseInfo,
         function: &namer::Expr,
         argument: &namer::Expr,
     ) -> Typing {
-        let (function_subs, function) = self.infer_expr(function)?;
-        let mut ctx = self.with_substitutions(&function_subs);
+        let (s_function, function) = self.infer_expr(function)?;
+        let domain = Type::fresh();
+        let codomain = Type::fresh();
+        let unification = Type::Arrow {
+            domain: domain.into(),
+            codomain: codomain.into(),
+        }
+        .unified_with(&function.type_info().inferred_type)
+        .map_err(|e| e.at(pi))?;
+        let function = function.with_substitutions(&unification);
+        let substitutions = s_function.compose(&unification);
 
-        let Type::Arrow { domain, codomain } = &function.type_info().inferred_type else {
-            panic!(
-                "Expected arrow, was: {:?}",
-                function.type_info().inferred_type
-            )
-        };
+        if let Type::Arrow { domain, codomain } = &function.type_info().inferred_type {
+            let mut ctx = self.with_substitutions(&substitutions);
+            let (s_argument, argument) =
+                ctx.check_expr(&domain.with_substitutions(&substitutions), argument)?;
 
-        let argument = self.check_expr(&domain, argument)?;
-
-        let return_ty = Type::fresh();
-
-        let substitutions = function_subs;
-
-        let expected_ty = Type::Arrow {
-            domain: argument
-                .type_info()
-                .inferred_type
-                .with_substitutions(&substitutions)
-                .into(),
-            codomain: return_ty.clone().into(),
-        };
-
-        let substitutions = expected_ty
-            .with_substitutions(&substitutions)
-            .unified_with(
-                &function
-                    .type_info()
-                    .inferred_type
-                    .with_substitutions(&substitutions),
-            )
-            .map_err(|e| e.at(pi))?
-            .compose(&substitutions);
-
-        let apply = Apply {
-            function: function.with_substitutions(&substitutions).into(),
-            argument: argument.with_substitutions(&substitutions).into(),
-        };
-
-        let inferred_type = return_ty.with_substitutions(&substitutions);
-
-        Ok((
-            substitutions,
-            Expr::Apply(
-                TypeInfo {
-                    parse_info: pi,
-                    inferred_type,
+            let substitutions = substitutions.compose(&s_argument);
+            let inferred_type = codomain.with_substitutions(&substitutions);
+            Ok((
+                substitutions,
+                Expr::Apply(
+                    TypeInfo {
+                        parse_info: pi,
+                        inferred_type,
+                    },
+                    Apply {
+                        function: function.into(),
+                        argument: argument.into(),
+                    },
+                ),
+            ))
+        } else {
+            Err(TypeError::ExpectedType {
+                expected: Type::Arrow {
+                    domain: Type::fresh().into(),
+                    codomain: Type::fresh().into(),
                 },
-                apply,
-            ),
-        ))
+                found: function.type_info().inferred_type.clone(),
+            }
+            .at(pi))
+        }
     }
 
     #[instrument]
@@ -2655,7 +2665,7 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_binding(&mut self, pi: &ParseInfo, binding: &namer::Binding) -> Typing {
+    fn infer_binding(&mut self, pi: ParseInfo, binding: &namer::Binding) -> Typing {
         let (bound_subs, bound) = self.infer_expr(&binding.bound)?;
         let bound_type = bound
             .type_info()
@@ -2673,7 +2683,7 @@ impl TypingContext {
                 substitutions,
                 Expr::Let(
                     TypeInfo {
-                        parse_info: *pi,
+                        parse_info: pi,
                         inferred_type: body.type_info().inferred_type.clone(),
                     },
                     Binding {
