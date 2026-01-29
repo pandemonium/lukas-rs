@@ -1,0 +1,96 @@
+List ::= ∀α. Nil | Cons α (List α)
+
+module List:
+  head :: ∀α. List α -> Perhaps α :=
+    λxs. deconstruct xs into Cons a tail -> This a | otherwise -> Nope
+
+  tail :: ∀α. List α -> List α :=
+    λxs. deconstruct xs into Cons a tail -> tail | tail -> tail
+
+  fold_right :: ∀z α. (α -> z -> z) -> z -> List α -> z :=
+    λf z xs.
+      deconstruct xs into
+        Cons a tail -> f a (fold_right f z tail)
+      | Nil         -> z
+
+  fold_left :: ∀z α. (z -> α -> z) -> z -> List α -> z :=
+    λf z xs.
+      deconstruct xs into
+        Cons a tail -> fold_left f (f z a) tail
+      | Nil         -> z
+
+  map :: ∀α β. (α -> β) -> List α -> List β :=
+    λf. fold_right (compose Cons f) Nil
+
+  bind :: ∀α β. (α -> List β) -> List α -> List β :=
+    λf. fold_right (λx. append (f x)) Nil
+
+  cartesian :: ∀α β. List α -> List β -> List (α, β) :=
+    λxs ys. bind (λx. map (λy. x, y) ys) xs
+
+  zip :: ∀α β. List α -> List β -> List (α, β) := λxs ys.
+    deconstruct xs, ys into
+      Cons x xs, Cons y ys -> Cons (x, y) (zip xs ys)
+    | otherwise            -> Nil
+
+  append :: ∀α. List α -> List α -> List α :=
+    λxs ys. fold_right Cons ys xs
+
+  reverse :: ∀α. List α -> List α :=
+    fold_left (λz a. Cons a z) Nil
+
+  length :: ∀α. List α -> Int :=
+    fold_right (λa z. 1 + z) 0
+
+  count :: ∀α. (α -> Bool) -> List α -> Int :=
+    λp. fold_left (λz x. if p x then 1 + z else z) 0
+
+  filter :: ∀α. (α -> Bool) -> List α -> List α :=
+    λp. bind (λx. if p x then Cons x Nil else Nil)
+
+  flatten :: ∀α. List (List α) -> List α :=
+    bind id
+
+  tabulate :: ∀α. Int -> (Int -> α) -> List α :=
+    λc f.
+      let loop = λi xs.
+        if i < c
+          then loop (1 + i) (Cons (f i) xs)
+          else xs
+      in loop 0 Nil
+
+
+Perhaps ::= ∀α. Nope | This α
+
+module Perhaps:
+  perhaps :: ∀α z. z -> (α -> z) -> Perhaps α -> z :=
+    λz f xa. deconstruct xa into This x -> f x | otherwise -> z
+
+  map :: ∀α β. (α -> β) -> Perhaps α -> Perhaps β :=
+    λf. perhaps Nope (compose This f)
+
+  bind :: ∀α β. (α -> Perhaps β) -> Perhaps α -> Perhaps β :=
+    λf. perhaps Nope f
+
+
+Result ::= ∀α e. Fault e | Return α
+
+module Result:
+  result :: ∀α e z. (e -> z) -> (α -> z) -> Result α e -> z :=
+    λfault return ra.
+      deconstruct ra into
+        Fault e  -> fault e
+      | Return a -> return a
+
+  map :: ∀α β e. (α -> β) -> Result α e -> Result β e :=
+    λf ra. result Fault (compose Return f) ra
+
+
+id :: ∀α. α -> α :=
+  λx. x
+
+flip :: ∀α β r. (α -> β -> r) -> β -> α -> r :=
+  λf b a. f a b
+
+compose :: ∀α β γ. (β -> γ) -> (α -> β) -> α -> γ :=
+  λg f a. g (f a)

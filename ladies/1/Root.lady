@@ -1,0 +1,5 @@
+module Stdlib.
+
+start := λ_.
+  let xs = Stdlib.Cons 1 Stdlib.Nil in
+  print_endline "Hi: `Stdlib.List.head xs`"

@@ -681,7 +681,8 @@ impl ParserSymbolTable {
         let mut ctx = Self::default();
 
         ctx.add_import_prefix(IdentifierPath::new(BUILTIN_MODULE_NAME));
-        ctx.add_import_prefix(IdentifierPath::new(STDLIB_MODULE_NAME));
+        let stdlib = IdentifierPath::new(STDLIB_MODULE_NAME);
+        ctx.add_import_prefix(stdlib.clone());
 
         for symbol in builtin::import() {
             match symbol {

@@ -61,8 +61,11 @@ pub type Compilation<A = CompilationUnit> = Result<A, CompilationError>;
 
 #[derive(Clone, Debug, Parser)]
 pub struct Compiler {
-    #[arg(long = "dir")]
-    pub source_directory: PathBuf,
+    #[arg(long = "library")]
+    pub library_path: PathBuf,
+
+    #[arg(long = "source")]
+    pub source_path: PathBuf,
 }
 
 impl Compiler {
@@ -85,10 +88,6 @@ impl Compiler {
         symbols.lower_tuples();
 
         let compilation = symbols.rename_symbols()?;
-
-        //for (name, sym) in &compilation.symbols {
-        //    println!("typecheck_and_initialize: {name} -> {sym:?}");
-        //}
 
         let dependencies = compilation.dependency_matrix();
         let evaluation_order = dependencies.in_resolvable_order();
@@ -115,14 +114,7 @@ impl Compiler {
         module: &parser::Identifier,
     ) -> Compilation<Vec<ast::Declaration<ParseInfo>>> {
         let source_path = self.get_source_path(module);
-        let source = fs::read_to_string(source_path)?.chars().collect::<Vec<_>>();
-
-        let mut lexer = LexicalAnalyzer::default();
-        let tokens = lexer.tokenize(&source);
-
-        let mut parser = parser::Parser::from_tokens(tokens);
-
-        Ok(parser.parse_declaration_list()?)
+        load_and_parse_module(source_path)
     }
 
     pub fn load_module(
@@ -136,16 +128,24 @@ impl Compiler {
     }
 
     fn get_source_path(&self, module: &parser::Identifier) -> PathBuf {
-        self.source_directory
-            .join(PathBuf::from(format!("{}.lady", module.as_str())))
+        let name = PathBuf::from(format!("{}.lady", module.as_str()));
+        let file_path = self.source_path.join(&name);
+        if fs::exists(&file_path).unwrap() {
+            file_path
+        } else {
+            self.library_path.join(name)
+        }
     }
 }
 
-impl CompilationUnit {
-    pub fn load_module(
-        &self,
-        name: &parser::Identifier,
-    ) -> Compilation<ast::ModuleDeclaration<ParseInfo>> {
-        self.compiler.load_module(name)
-    }
+fn load_and_parse_module(source_path: PathBuf) -> Compilation<Vec<ast::Declaration<ParseInfo>>> {
+    println!("load_and_parse_module: {:?}", source_path);
+    let source = fs::read_to_string(source_path)?.chars().collect::<Vec<_>>();
+
+    let mut lexer = LexicalAnalyzer::default();
+    let tokens = lexer.tokenize(&source);
+
+    let mut parser = parser::Parser::from_tokens(tokens);
+
+    Ok(parser.parse_declaration_list()?)
 }
