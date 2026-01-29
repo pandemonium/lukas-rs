@@ -43,7 +43,7 @@ where
                 Expr::Deconstruct(a, node) => Expr::Deconstruct(f(a), node.map_annotation(&f)),
                 Expr::If(a, node) => Expr::If(f(a), node.map_annotation(&f)),
                 Expr::Interpolate(a, node) => Expr::Interpolate(f(a), node.map_annotation(&f)),
-                Expr::Annotation(a, node) => Expr::Annotation(f(a), node.map_annotation(&f)),
+                Expr::Ascription(a, node) => Expr::Ascription(f(a), node.map_annotation(&f)),
             }
         }
 

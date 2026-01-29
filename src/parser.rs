@@ -35,7 +35,7 @@ pub type StructPattern = ast::pattern::StructPattern<ParseInfo, IdentifierPath>;
 pub type TypeExpression = ast::TypeExpression<ParseInfo, IdentifierPath>;
 pub type TypeSignature = ast::TypeSignature<ParseInfo, IdentifierPath>;
 
-impl Expr {
+impl<Id> ast::Expr<ParseInfo, Id> {
     pub fn parse_info(&self) -> &ParseInfo {
         self.annotation()
     }
@@ -1532,7 +1532,9 @@ impl<'a> Parser<'a> {
                     TypeExpression::Constructor(pi, IdentifierPath::new(&id))
                 });
             } else {
+                self.expect(TokenKind::LeftParen)?;
                 signature.push(self.parse_type_expression(0)?);
+                self.expect(TokenKind::RightParen)?;
             }
         }
 

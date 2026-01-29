@@ -163,7 +163,7 @@ impl Expr<(), namer::Identifier> {
                 Ok(Value::Constant(Literal::Text(rendering)))
             }
 
-            Self::Annotation(_, the) => {
+            Self::Ascription(_, the) => {
                 // TODO: The typer could remove these on successful checks
                 the.tree.reduce(env)
             }

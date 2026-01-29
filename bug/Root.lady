@@ -1,0 +1,3 @@
+Expr ::= ∀α id. Apply  α (Expr α id) (Expr α id)
+
+foo :: ∀α id. α -> (Expr α id) -> Int := 1

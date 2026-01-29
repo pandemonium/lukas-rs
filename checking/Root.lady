@@ -4,7 +4,7 @@ fold_right :: ∀z α. (α -> z -> z) -> z -> List α -> z :=
   λf z xs.
     deconstruct xs into
       Cons a tail -> f a (fold_right f z tail)
-    | Nil         -> "z"
+    | Nil         -> z
 
 map :: ∀α β. (α -> β) -> List α -> List β :=
   λf. fold_right (compose Cons f) Nil
@@ -12,5 +12,8 @@ map :: ∀α β. (α -> β) -> List α -> List β :=
 compose :: ∀α β γ. (β -> γ) -> (α -> β) -> α -> γ :=
   λg f a. g (f a)
 
+parse :: Text -> Int := λx. 1
+
 start := λ_.
+  parse "1"
   print_endline "Hi, mom"

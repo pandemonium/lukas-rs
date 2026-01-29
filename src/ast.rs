@@ -183,7 +183,7 @@ pub enum Expr<A, Id> {
     Deconstruct(A, Deconstruct<A, Id>),
     If(A, IfThenElse<A, Id>),
     Interpolate(A, Interpolate<A, Id>),
-    Annotation(A, TypeAscription<A, Id>),
+    Ascription(A, TypeAscription<A, Id>),
 }
 
 impl<A, Id> Expr<A, Id> {
@@ -204,7 +204,7 @@ impl<A, Id> Expr<A, Id> {
             | Expr::Deconstruct(a, ..)
             | Expr::If(a, ..)
             | Expr::Interpolate(a, ..)
-            | Expr::Annotation(a, ..) => a,
+            | Expr::Ascription(a, ..) => a,
         }
     }
 
@@ -362,7 +362,7 @@ where
             Self::Deconstruct(_, x) => write!(f, "{x}"),
             Self::If(_, x) => write!(f, "{x}"),
             Self::Interpolate(_, x) => write!(f, "{x}"),
-            Self::Annotation(_, x) => write!(f, "{}::{}", x.tree, x.type_signature),
+            Self::Ascription(_, x) => write!(f, "{}::{}", x.tree, x.type_signature),
         }
     }
 }

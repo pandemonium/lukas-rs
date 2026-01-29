@@ -163,7 +163,7 @@ impl<A> ast::Expr<A, Identifier> {
                 the.alternate.gather_free_variables(free);
             }
 
-            Self::Annotation(_, the) => {
+            Self::Ascription(_, the) => {
                 the.tree.gather_free_variables(free);
             }
 
@@ -892,12 +892,13 @@ impl ConstructorSymbol<parser::IdentifierPath> {
         type_parameters: &[parser::Identifier],
         type_constructor_name: &QualifiedName,
     ) -> TermSymbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath> {
+        let type_signature = self.make_type_signature(pi, type_parameters, type_constructor_name);
+        let body = self.make_curried_constructor_term(pi);
+        println!("make_constructor_term: {body} :: {type_signature}");
         TermSymbol {
             name: self.name.clone(),
-            type_signature: self
-                .make_type_signature(pi, type_parameters, type_constructor_name)
-                .into(),
-            body: self.make_curried_constructor_term(pi).into(),
+            type_signature: type_signature.into(),
+            body: body.into(),
         }
     }
 
@@ -1037,7 +1038,6 @@ impl parser::TypeExpression {
     ) -> Naming<TypeExpression> {
         match self {
             Self::Constructor(a, name) => Ok(TypeExpression::Constructor(*a, {
-                println!("resolve_names: {name}");
                 symbols.resolve_type_name(&name, pi, semantic_scope)?
             })),
 
@@ -1220,7 +1220,7 @@ impl parser::Expr {
                 ),
             ),
 
-            parser::Expr::Annotation(a, the) => parser::Expr::Annotation(
+            parser::Expr::Ascription(a, the) => parser::Expr::Ascription(
                 a,
                 parser::TypeAscription {
                     tree: map_lower_tuples(the.tree),
@@ -1324,7 +1324,7 @@ impl parser::Expr {
                 node.resolve(names, symbols, semantic_scope)?,
             )),
 
-            Self::Annotation(pi, node) => Ok(Expr::Annotation(
+            Self::Ascription(pi, node) => Ok(Expr::Ascription(
                 *pi,
                 node.resolve(names, symbols, semantic_scope)?,
             )),
@@ -1761,7 +1761,7 @@ impl ParserSymbolTable {
                 TermSymbol {
                     name: symbol.name.clone(),
                     type_signature: Some(type_signature.clone()),
-                    body: Some(Expr::Annotation(
+                    body: Some(Expr::Ascription(
                         *symbol.body().parse_info(),
                         TypeAscription {
                             tree: symbol

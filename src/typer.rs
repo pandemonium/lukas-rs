@@ -296,6 +296,9 @@ pub enum TypeError {
 
     #[error("Bad specialization: {0}")]
     BadSpecialization(Specialization),
+
+    #[error("expected: {expected}; found: {found}")]
+    ExpectedType { expected: Type, found: Type },
 }
 
 #[derive(Debug)]
@@ -672,7 +675,10 @@ impl Type {
                 Ok(constructor.compose(&argument))
             }
 
-            (lhs, rhs) => Err(TypeError::UnificationImpossible { lhs: lhs.clone(), rhs: rhs.clone() }),
+            (lhs, rhs) => {
+                panic!("unification failed: lhs {lhs} rhs {rhs}");
+                Err(TypeError::UnificationImpossible { lhs: lhs.clone(), rhs: rhs.clone() })
+            },
         }
     }
 
@@ -1514,47 +1520,28 @@ impl TypingContext {
         }
     }
 
+    #[instrument]
     fn check_expr(&mut self, expected_type: &Type, expr: &UntypedExpr) -> Typing<Expr> {
         println!("check_expr: expected {expected_type} for {expr}");
-
         match expr {
-            UntypedExpr::Lambda(pi, lambda) => {
-                let normalized_type = self.normalize_type_application(*pi, expected_type)?;
-                if let Type::Arrow { domain, codomain } = normalized_type {
-                    self.bind_term_and_then(
-                        lambda.parameter.clone(),
-                        TypeScheme::from_constant(*domain.clone()),
-                        |ctx| {
-                            let body = ctx.check_expr(&codomain, &lambda.body)?;
+            UntypedExpr::RecursiveLambda(pi, rec) => {
+                self.check_recursive_lambda(*pi, &expected_type, rec)
+            }
 
-                            let inferred_type = Type::Arrow {
-                                domain: domain.into(),
-                                codomain: codomain.into(),
-                            };
+            UntypedExpr::Lambda(pi, lambda) => self.check_lambda(*pi, &expected_type, lambda),
 
-                            Ok(Expr::Lambda(
-                                TypeInfo {
-                                    parse_info: *pi,
-                                    inferred_type: inferred_type,
-                                },
-                                Lambda {
-                                    parameter: lambda.parameter.clone(),
-                                    body: body.into(),
-                                },
-                            ))
-                        },
-                    )
-                } else {
-                    Err(TypeError::UnificationImpossible {
-                        lhs: normalized_type.clone(),
-                        rhs: Type::fresh(),
-                    }
-                    .at(*pi))?
-                }
+            UntypedExpr::Tuple(pi, tuple) => self.check_tuple(*pi, &expected_type, tuple),
+
+            UntypedExpr::Construct(pi, construct) => {
+                self.check_construct(*pi, &expected_type, construct)
+            }
+
+            UntypedExpr::Deconstruct(pi, deconstruct) => {
+                self.check_deconstruction(*pi, &expected_type, deconstruct)
             }
 
             otherwise => {
-                println!("check_expr: infer {expr}");
+                println!("check_expr: infer {expr:?}");
                 let (subs1, expr) = self.infer_expr(expr)?;
 
                 let lhs = expr.type_info().inferred_type.with_substitutions(&subs1);
@@ -1570,6 +1557,157 @@ impl TypingContext {
 
                 Ok(expr.with_substitutions(&subs))
             }
+        }
+    }
+
+    #[instrument]
+    fn check_construct(
+        &mut self,
+        pi: ParseInfo,
+        expected_type: &Type,
+        construct: &namer::Construct,
+    ) -> Typing<Expr> {
+        let normalized_type = self.normalize_type_application(pi, expected_type)?;
+
+        println!(
+            "check_construct: constructor {}, args: {:?}",
+            construct.constructor, construct.arguments
+        );
+
+        if let Type::Coproduct(coproduct) = &normalized_type {
+            let signature = coproduct.signature(&construct.constructor).ok_or_else(|| {
+                TypeError::NoSuchCoproductConstructor(construct.constructor.clone()).at(pi)
+            })?;
+            let typed_args = signature
+                .iter()
+                .zip(&construct.arguments)
+                .map(|(ty, e)| self.check_expr(ty, &e).map(|e| e.into()))
+                .collect::<Typing<Vec<_>>>()?;
+            Ok(Expr::Construct(
+                TypeInfo {
+                    parse_info: pi,
+                    inferred_type: expected_type.clone(),
+                },
+                Construct {
+                    constructor: construct.constructor.clone(),
+                    arguments: typed_args,
+                },
+            ))
+        } else {
+            todo!()
+        }
+    }
+
+    #[instrument]
+    fn check_recursive_lambda(
+        &mut self,
+        pi: ParseInfo,
+        expected_type: &Type,
+        rec: &namer::SelfReferential,
+    ) -> Typing<Expr> {
+        let normalized_type = self.normalize_type_application(pi, &expected_type)?;
+        if let Type::Arrow { domain, codomain } = &normalized_type {
+            self.bind_term_and_then(
+                rec.own_name.clone(),
+                TypeScheme::from_constant(expected_type.clone()),
+                |ctx| {
+                    ctx.bind_term_and_then(
+                        rec.lambda.parameter.clone(),
+                        TypeScheme::from_constant(*domain.clone()),
+                        |ctx| {
+                            let body = ctx.check_expr(codomain, &rec.lambda.body)?;
+
+                            Ok(Expr::RecursiveLambda(
+                                TypeInfo {
+                                    parse_info: pi,
+                                    inferred_type: expected_type.clone(),
+                                },
+                                SelfReferential {
+                                    own_name: rec.own_name.clone(),
+                                    lambda: Lambda {
+                                        parameter: rec.lambda.parameter.clone(),
+                                        body: body.into(),
+                                    },
+                                },
+                            ))
+                        },
+                    )
+                },
+            )
+        } else {
+            todo!()
+        }
+    }
+
+    //if let Some(sig) = symbol.type_signature {
+    //    let expected_type = sig.scheme(...).instantiate();
+    //
+    //    let typed_body = ctx.check_expr(&expected_type, &symbol.body)?;
+    //
+    //    let scheme = sig.scheme(...); // NOT generalized from body
+    //
+    //    ctx.bind_free_term(symbol.name.clone(), scheme);
+    //
+    //    return Ok(...)
+    //}
+
+    #[instrument]
+    fn check_lambda(
+        &mut self,
+        pi: ParseInfo,
+        expected_type: &Type,
+        lambda: &namer::Lambda,
+    ) -> Typing<Expr> {
+        let normalized_type = self.normalize_type_application(pi, &expected_type)?;
+        if let Type::Arrow { domain, codomain } = &normalized_type {
+            self.bind_term_and_then(
+                lambda.parameter.clone(),
+                TypeScheme::from_constant(*domain.clone()),
+                |ctx| {
+                    let body = ctx.check_expr(codomain, &lambda.body)?;
+
+                    Ok(Expr::Lambda(
+                        TypeInfo {
+                            parse_info: pi,
+                            inferred_type: expected_type.clone(),
+                        },
+                        Lambda {
+                            parameter: lambda.parameter.clone(),
+                            body: body.into(),
+                        },
+                    ))
+                },
+            )
+        } else {
+            todo!()
+        }
+    }
+
+    #[instrument]
+    fn check_tuple(
+        &mut self,
+        pi: ParseInfo,
+        expected_type: &Type,
+        tuple: &namer::Tuple,
+    ) -> Typing<Expr> {
+        let normalized_type = self.normalize_type_application(pi, &expected_type)?;
+
+        if let Type::Tuple(TupleType(elements)) = &normalized_type {
+            let elements = tuple
+                .elements
+                .iter()
+                .zip(elements)
+                .map(|(e, t)| self.check_expr(t, e).map(|e| e.into()))
+                .collect::<Typing<_>>()?;
+            Ok(Expr::Tuple(
+                TypeInfo {
+                    parse_info: pi,
+                    inferred_type: expected_type.clone(),
+                },
+                Tuple { elements },
+            ))
+        } else {
+            panic!("{pi} check {tuple}, was {expected_type:?}",)
         }
     }
 
@@ -1656,45 +1794,19 @@ impl TypingContext {
                 self.infer_interpolation(*pi, &segments)
             }
 
-            UntypedExpr::Annotation(pi, ascription) => self.infer_annotation(*pi, ascription),
+            UntypedExpr::Ascription(pi, ascription) => self.infer_ascription(*pi, ascription),
         }
     }
 
     #[instrument]
-    fn infer_annotation(&mut self, pi: ParseInfo, ascription: &namer::TypeAscription) -> Typing {
-        let (subs, inferred_tree) = self.infer_expr(&ascription.tree)?;
+    fn infer_ascription(&mut self, pi: ParseInfo, ascription: &namer::TypeAscription) -> Typing {
+        let ascribed_scheme = ascription
+            .type_signature
+            .scheme(&mut HashMap::default(), self)?;
+        let ascribed_type = ascribed_scheme.instantiate();
+        let typed_tree = self.check_expr(&ascribed_type, &ascription.tree)?;
 
-        let mut type_params = HashMap::default();
-        let ascribed_scheme = ascription.type_signature.scheme(&mut type_params, self)?;
-        let inferred_scheme = inferred_tree.type_info().inferred_type.generalize(self);
-
-        inferred_scheme
-            .check_instance_of(&ascribed_scheme, || {
-                type_params
-                    .into_iter()
-                    .map(|(id, param)| (param, id))
-                    .collect::<HashMap<_, _>>()
-            })
-            .map_err(|e| e.at(pi))?;
-
-        let inferred_type = ascribed_scheme.instantiate();
-
-        Ok((
-            subs,
-            Expr::Annotation(
-                TypeInfo {
-                    parse_info: pi,
-                    inferred_type: inferred_type.clone(),
-                },
-                TypeAscription {
-                    tree: inferred_tree.into(),
-                    type_signature: ascription.type_signature.map_annotation(&|pi| TypeInfo {
-                        parse_info: *pi,
-                        inferred_type: inferred_type.clone(),
-                    }),
-                },
-            ),
-        ))
+        Ok((Substitutions::default(), typed_tree))
     }
 
     #[instrument]
@@ -1742,13 +1854,53 @@ impl TypingContext {
     }
 
     #[instrument]
+    fn check_deconstruction(
+        &mut self,
+        pi: ParseInfo,
+        expected_type: &Type,
+        deconstruct: &namer::Deconstruct,
+    ) -> Typing<Expr> {
+        let (s_substitutions, scrutinee) = self.infer_expr(&deconstruct.scrutinee)?;
+        let scrutinee_type = &scrutinee.type_info().inferred_type;
+        let mut typed_match_clauses = Vec::with_capacity(deconstruct.match_clauses.len());
+
+        for clause in &deconstruct.match_clauses {
+            let mut clause_ctx = self.clone();
+            let mut bindings = Vec::default();
+            let (s_pattern, pattern) = clause_ctx.infer_pattern(
+                &clause.pattern,
+                &mut bindings,
+                &scrutinee_type.with_substitutions(&s_substitutions),
+            )?;
+            clause_ctx.substitute_mut(&s_pattern);
+            for (binding, ty) in bindings {
+                clause_ctx.bind_term(binding, TypeScheme::from_constant(ty));
+            }
+            let consequent = clause_ctx.check_expr(expected_type, &clause.consequent)?;
+            typed_match_clauses.push(MatchClause {
+                pattern,
+                consequent: consequent.into(),
+            });
+        }
+
+        Ok(Expr::Deconstruct(
+            TypeInfo {
+                parse_info: pi,
+                inferred_type: expected_type.clone(),
+            },
+            Deconstruct {
+                scrutinee: scrutinee.into(),
+                match_clauses: typed_match_clauses,
+            },
+        ))
+    }
+
+    #[instrument]
     fn infer_deconstruction(&mut self, pi: ParseInfo, deconstruct: &namer::Deconstruct) -> Typing {
         let (mut substitutions, scrutinee) = self.infer_expr(&deconstruct.scrutinee)?;
         let scrutinee_type = &scrutinee.type_info().inferred_type;
         let mut match_clauses = deconstruct.match_clauses.iter();
         let mut typed_match_clauses = Vec::with_capacity(deconstruct.match_clauses.len());
-
-        let normalized_scrutinee_type = self.normalize_type_application(pi, scrutinee_type)?;
 
         let mut clause_ctx = self.clone();
         if let Some(clause) = match_clauses.next() {
@@ -2335,6 +2487,68 @@ impl TypingContext {
                 )
             },
         )
+    }
+
+    #[instrument]
+    fn infer_apply2(
+        &mut self,
+        pi: ParseInfo,
+        function: &namer::Expr,
+        argument: &namer::Expr,
+    ) -> Typing {
+        let (function_subs, function) = self.infer_expr(function)?;
+        let mut ctx = self.with_substitutions(&function_subs);
+
+        let Type::Arrow { domain, codomain } = &function.type_info().inferred_type else {
+            panic!(
+                "Expected arrow, was: {:?}",
+                function.type_info().inferred_type
+            )
+        };
+
+        let argument = self.check_expr(&domain, argument)?;
+
+        let return_ty = Type::fresh();
+
+        let substitutions = function_subs;
+
+        let expected_ty = Type::Arrow {
+            domain: argument
+                .type_info()
+                .inferred_type
+                .with_substitutions(&substitutions)
+                .into(),
+            codomain: return_ty.clone().into(),
+        };
+
+        let substitutions = expected_ty
+            .with_substitutions(&substitutions)
+            .unified_with(
+                &function
+                    .type_info()
+                    .inferred_type
+                    .with_substitutions(&substitutions),
+            )
+            .map_err(|e| e.at(pi))?
+            .compose(&substitutions);
+
+        let apply = Apply {
+            function: function.with_substitutions(&substitutions).into(),
+            argument: argument.with_substitutions(&substitutions).into(),
+        };
+
+        let inferred_type = return_ty.with_substitutions(&substitutions);
+
+        Ok((
+            substitutions,
+            Expr::Apply(
+                TypeInfo {
+                    parse_info: pi,
+                    inferred_type,
+                },
+                apply,
+            ),
+        ))
     }
 
     #[instrument]
