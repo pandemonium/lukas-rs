@@ -14,7 +14,7 @@ use crate::{
     ast::{
         self, ApplyTypeExpr, ArrowTypeExpr, BUILTIN_MODULE_NAME, CompilationUnit, Declaration,
         ModuleDeclarator, ProductElement, STDLIB_MODULE_NAME, Tree, TupleTypeExpr,
-        pattern::{StructPattern, TuplePattern},
+        pattern::TuplePattern,
     },
     builtin,
     compiler::{Compilation, Compiler, Located, LocatedError},
@@ -39,6 +39,7 @@ pub type Segment = ast::Segment<ParseInfo, Identifier>;
 pub type MatchClause = ast::pattern::MatchClause<ParseInfo, Identifier>;
 pub type Pattern = ast::pattern::Pattern<ParseInfo, Identifier>;
 pub type ConstructorPattern = ast::pattern::ConstructorPattern<ParseInfo, Identifier>;
+pub type StructPattern = ast::pattern::StructPattern<ParseInfo, Identifier>;
 pub type TypeExpression = ast::TypeExpression<ParseInfo, QualifiedName>;
 pub type TypeSignature = ast::TypeSignature<ParseInfo, QualifiedName>;
 pub type TypeAscription = ast::TypeAscription<ParseInfo, Identifier>;

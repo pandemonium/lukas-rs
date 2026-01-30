@@ -1,5 +1,14 @@
 module Stdlib.
 
+list_eq :: ∀α. Stdlib.List α -> Stdlib.List α -> Bool := λxs ys.
+  let zipped = Stdlib.List.zip xs ys in
+  let cmp = λt z.
+    deconstruct t into
+      p, q -> z and p = q
+  in
+    Stdlib.List.fold_right cmp true zipped
+
 start := λ_.
   let xs = Stdlib.Cons 1 Stdlib.Nil in
-  print_endline "Hi: `Stdlib.List.head xs`"
+  let ys = Stdlib.Cons 2 Stdlib.Nil in
+  print_endline "Hi: `list_eq xs ys`"

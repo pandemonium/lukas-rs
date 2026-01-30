@@ -257,6 +257,9 @@ pub enum TypeError {
     #[error("{0} does not match a known record type")]
     NoSuchRecordType(RecordType),
 
+    #[error("{0} does not match a known record type")]
+    NoRecordTypWithShape(RecordShape),
+
     #[error("unknown type parameter {0} in type expression")]
     UnquantifiedTypeParameter(parser::Identifier),
 
@@ -347,6 +350,10 @@ impl RecordType {
         fields.sort_by(|(t, _), (u, _)| t.cmp(u));
 
         Self(fields)
+    }
+
+    fn shape(&self) -> RecordShape {
+        RecordShape(self.0.iter().map(|(l, _)| l.clone()).collect())
     }
 
     fn with_substitutions(&self, subs: &Substitutions) -> Self {
@@ -637,7 +644,6 @@ impl Type {
             (Self::Record(lhs), Self::Record(rhs)) if lhs.0.len() == rhs.0.len() => {
                 let mut subs = Substitutions::default();
 
-                println!("unify_with: {lhs:?} {rhs:?}");
                 // Sort first?
                 for ((lhs_label, lhs), (rhs_label, rhs)) in lhs.0.iter().zip(&rhs.0) {
                     if lhs_label != rhs_label {
@@ -1206,22 +1212,14 @@ impl TermEnvironment {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct RecordShape(Vec<parser::Identifier>);
-
-impl RecordShape {
-    fn from_record_type(record: &RecordType) -> Self {
-        Self(
-            record
-                .0
-                .iter()
-                .map(|(id, _)| id.clone())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>(),
-        )
+impl namer::StructPattern {
+    fn shape(&self) -> RecordShape {
+        RecordShape(self.fields.iter().map(|(l, ..)| l.clone()).collect())
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RecordShape(Vec<parser::Identifier>);
 
 impl fmt::Display for RecordShape {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1246,10 +1244,7 @@ struct RecordShapeIndex(HashMap<RecordShape, Vec<namer::QualifiedName>>);
 
 impl RecordShapeIndex {
     fn insert(&mut self, record_type: &RecordType, name: namer::QualifiedName) {
-        self.0
-            .entry(RecordShape::from_record_type(record_type))
-            .or_default()
-            .push(name);
+        self.0.entry(record_type.shape()).or_default().push(name);
     }
 
     fn matching(&self, image: &RecordShape) -> impl Iterator<Item = &namer::QualifiedName> {
@@ -1883,7 +1878,7 @@ impl TypingContext {
         for clause in &deconstruct.match_clauses {
             let mut clause_ctx = self.clone();
             let mut bindings = Vec::default();
-            let (s_pattern, pattern) = clause_ctx.infer_pattern(
+            let (s_pattern, pattern) = clause_ctx.check_pattern(
                 &clause.pattern,
                 &mut bindings,
                 &scrutinee_type.with_substitutions(&s_scrutinee),
@@ -1928,7 +1923,7 @@ impl TypingContext {
             let mut consequent_type = {
                 let mut bindings = Vec::default();
                 let (subs1, pattern) =
-                    clause_ctx.infer_pattern(&clause.pattern, &mut bindings, scrutinee_type)?;
+                    clause_ctx.check_pattern(&clause.pattern, &mut bindings, scrutinee_type)?;
                 clause_ctx.substitute_mut(&subs1);
                 for (binding, ty) in bindings {
                     clause_ctx.bind_term(binding, TypeScheme::from_constant(ty));
@@ -1948,7 +1943,7 @@ impl TypingContext {
                 let mut bindings = Vec::default();
                 let scrutinee_type = &scrutinee_type.with_substitutions(&substitutions);
                 let (pattern_subs, pattern) =
-                    clause_ctx.infer_pattern(&clause.pattern, &mut bindings, scrutinee_type)?;
+                    clause_ctx.check_pattern(&clause.pattern, &mut bindings, scrutinee_type)?;
                 clause_ctx.substitute_mut(&pattern_subs);
                 for (binding, ty) in bindings {
                     clause_ctx.bind_term(binding, TypeScheme::from_constant(ty));
@@ -2016,7 +2011,107 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_pattern(
+    fn infer_scrutinee(
+        &mut self,
+        pattern: &namer::Pattern,
+        bindings: &mut Vec<(namer::Identifier, Type)>,
+        scrutinee: TypeParameter,
+    ) -> Typing<(Substitutions, Pattern)> {
+        match pattern {
+            namer::Pattern::Coproduct(pi, coproduct) => {
+                let constructor = coproduct
+                    .constructor
+                    .try_as_free()
+                    .expect("expected Free identifier");
+
+                let inferred = self
+                    .types
+                    .query_coproduct_type_constructors(&constructor)?
+                    .first()
+                    .ok_or_else(|| {
+                        TypeError::NoSuchCoproductConstructor(constructor.clone()).at(*pi)
+                    })?
+                    .instantiate(&self)?
+                    .make_spine();
+
+                let substitutions = Substitutions::from(vec![(scrutinee, inferred.clone())]);
+
+                self.substitute_mut(&substitutions);
+
+                let (s_pattern, pattern) = self.check_pattern(pattern, bindings, &inferred)?;
+                Ok((s_pattern.compose(&substitutions), pattern))
+            }
+
+            namer::Pattern::Struct(pi, record) => {
+                let shape = record.shape();
+                let inferred = self
+                    .types
+                    .query_record_type_constructor(&shape)
+                    .first()
+                    .ok_or_else(|| TypeError::NoRecordTypWithShape(shape))
+                    .map_err(|e| e.at(*pi))?
+                    .instantiate(&self)?
+                    .make_spine();
+
+                let substitutions = Substitutions::from(vec![(scrutinee, inferred.clone())]);
+
+                self.substitute_mut(&substitutions);
+
+                let (s_pattern, pattern) = self.check_pattern(pattern, bindings, &inferred)?;
+                Ok((s_pattern.compose(&substitutions), pattern))
+            }
+
+            namer::Pattern::Tuple(pi, tuple) => {
+                let tuple = Type::Tuple(TupleType(
+                    tuple.elements.iter().map(|_| Type::fresh()).collect(),
+                ));
+                let unification = tuple
+                    .unified_with(&Type::Variable(scrutinee))
+                    .map_err(|e| e.at(*pi))?;
+
+                self.substitute_mut(&unification);
+
+                let (s_pattern, pattern) = self.check_pattern(pattern, bindings, &tuple)?;
+
+                Ok((s_pattern.compose(&unification), pattern))
+            }
+
+            namer::Pattern::Literally(pi, pattern) => {
+                let scrutinee = Type::Variable(scrutinee);
+                let inferred = pattern.synthesize_type();
+                let s_pattern = inferred.unified_with(&scrutinee).map_err(|e| e.at(*pi))?;
+
+                Ok((
+                    s_pattern,
+                    Pattern::Literally(
+                        TypeInfo {
+                            parse_info: *pi,
+                            inferred_type: inferred,
+                        },
+                        pattern.clone(),
+                    ),
+                ))
+            }
+
+            namer::Pattern::Bind(pi, pattern) => {
+                let scrutinee = Type::Variable(scrutinee);
+                bindings.push((pattern.clone(), scrutinee.clone()));
+                Ok((
+                    Substitutions::default(),
+                    Pattern::Bind(
+                        TypeInfo {
+                            parse_info: *pi,
+                            inferred_type: scrutinee,
+                        },
+                        pattern.clone(),
+                    ),
+                ))
+            }
+        }
+    }
+
+    #[instrument]
+    fn check_pattern(
         &mut self,
         pattern: &namer::Pattern,
         bindings: &mut Vec<(namer::Identifier, Type)>,
@@ -2026,28 +2121,7 @@ impl TypingContext {
         let normalized_scrutinee = self.normalize_type_application(pi, &scrutinee)?;
 
         match (pattern, &normalized_scrutinee) {
-            (namer::Pattern::Coproduct(_, coproduct_pattern), Type::Variable(p)) => {
-                if let namer::Identifier::Free(constructor) = &coproduct_pattern.constructor {
-                    let inferred = self
-                        .types
-                        .query_coproduct_type_constructors(&constructor)?
-                        .first()
-                        .ok_or_else(|| {
-                            TypeError::NoSuchCoproductConstructor(constructor.clone()).at(pi)
-                        })?
-                        .instantiate(&self)?
-                        .make_spine();
-
-                    let substitutions = Substitutions::from(vec![(*p, inferred.clone())]);
-
-                    self.substitute_mut(&substitutions);
-
-                    let (subs, pattern) = self.infer_pattern(pattern, bindings, &inferred)?;
-                    Ok((subs.compose(&substitutions), pattern))
-                } else {
-                    todo!()
-                }
-            }
+            (_, Type::Variable(p)) => self.infer_scrutinee(pattern, bindings, *p),
 
             (namer::Pattern::Coproduct(pi, pattern), Type::Coproduct(coproduct)) => {
                 if let namer::Identifier::Free(constructor) = &pattern.constructor
@@ -2058,7 +2132,7 @@ impl TypingContext {
                     let mut substitutions = Substitutions::default();
 
                     for (scrutinee, pattern) in signature.iter().zip(&pattern.arguments) {
-                        let (subs, argument) = self.infer_pattern(
+                        let (subs, argument) = self.check_pattern(
                             pattern,
                             bindings,
                             &scrutinee.with_substitutions(&substitutions),
@@ -2086,25 +2160,6 @@ impl TypingContext {
                 }
             }
 
-            (namer::Pattern::Coproduct(pi, coproduct_pattern), _ty) => {
-                if let namer::Identifier::Free(constructor) = &coproduct_pattern.constructor {
-                    let inferred = self
-                        .types
-                        .query_coproduct_type_constructors(&constructor)?
-                        .first()
-                        .ok_or_else(|| {
-                            TypeError::NoSuchCoproductConstructor(constructor.clone()).at(*pi)
-                        })?
-                        .instantiate(&self)?
-                        .structure()
-                        .cloned()?;
-
-                    self.infer_pattern(pattern, bindings, &inferred)
-                } else {
-                    todo!()
-                }
-            }
-
             (namer::Pattern::Tuple(pi, pattern), Type::Tuple(tuple))
                 if pattern.elements.len() == tuple.arity() =>
             {
@@ -2112,7 +2167,7 @@ impl TypingContext {
                 let mut substitutions = Substitutions::default();
 
                 for (pattern, scrutinee) in pattern.elements.iter().zip(tuple.elements()) {
-                    let (subs, element) = self.infer_pattern(pattern, bindings, scrutinee)?;
+                    let (subs, element) = self.check_pattern(pattern, bindings, scrutinee)?;
                     elements.push(element);
                     substitutions = substitutions.compose(&subs);
                 }
@@ -2146,7 +2201,7 @@ impl TypingContext {
                         .at(*pi))?;
                     }
 
-                    let (subs, pattern) = self.infer_pattern(pattern, bindings, scrutinee)?;
+                    let (subs, pattern) = self.check_pattern(pattern, bindings, scrutinee)?;
                     arguments.push((pattern_field.clone(), pattern));
                     substitutions = substitutions.compose(&subs);
                 }
@@ -2285,7 +2340,7 @@ impl TypingContext {
 
         let type_constructors = self
             .types
-            .query_record_type_constructor(&RecordShape::from_record_type(&record_type));
+            .query_record_type_constructor(&record_type.shape());
 
         let type_constructor = type_constructors
             .first()
