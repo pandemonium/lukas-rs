@@ -25,6 +25,13 @@ pub enum Declaration<A> {
     Value(A, ValueDeclaration<A>),
     Module(A, ModuleDeclaration<A>),
     Type(A, TypeDeclaration<A>),
+    Use(A, UseDeclaration<A>),
+}
+
+#[derive(Debug)]
+pub struct UseDeclaration<A> {
+    pub qualified_binder: Option<parser::Identifier>,
+    pub module: ModuleDeclaration<A>,
 }
 
 #[derive(Debug)]
@@ -503,12 +510,28 @@ impl<A> fmt::Display for CompilationUnit<A> {
     }
 }
 
+impl<A> fmt::Display for UseDeclaration<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            qualified_binder,
+            module,
+        } = self;
+        write!(f, "{module}")?;
+        if let Some(qualifier) = qualified_binder {
+            write!(f, " at {qualifier}")?;
+        }
+
+        Ok(())
+    }
+}
+
 impl<A> fmt::Display for Declaration<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Value(_, decl) => write!(f, "value {decl}"),
             Self::Module(_, decl) => write!(f, "module {decl}"),
             Self::Type(_, decl) => write!(f, "type {decl}"),
+            Self::Use(_, decl) => write!(f, "use {decl}"),
         }
     }
 }

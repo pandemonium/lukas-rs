@@ -7,7 +7,8 @@ use crate::{
     ast::{
         self, ApplyTypeExpr, ArrowTypeExpr, CoproductConstructor, CoproductDeclarator, Declaration,
         FieldDeclarator, ModuleDeclaration, ModuleDeclarator, RecordDeclarator, Tree,
-        TupleTypeExpr, TypeDeclaration, TypeDeclarator, ValueDeclaration, ValueDeclarator,
+        TupleTypeExpr, TypeDeclaration, TypeDeclarator, UseDeclaration, ValueDeclaration,
+        ValueDeclarator,
     },
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
 };
@@ -433,6 +434,12 @@ impl<'a> Parser<'a> {
                     ..
                 },
                 ..
+            ] | [
+                Token {
+                    kind: TokenKind::Keyword(Keyword::Use),
+                    ..
+                },
+                ..
             ]
         )
     }
@@ -572,6 +579,33 @@ impl<'a> Parser<'a> {
                     ModuleDeclaration {
                         name: name.clone(),
                         declarator: ast::ModuleDeclarator::External(name),
+                    },
+                ))
+            }
+
+            [
+                Token {
+                    kind: TokenKind::Keyword(Keyword::Use),
+                    ..
+                },
+                Token {
+                    kind: TokenKind::Identifier(name),
+                    position,
+                },
+                ..,
+            ] => {
+                // <module> <id> <.>
+                self.advance(3);
+
+                let name = Identifier::from_str(name);
+                Ok(Declaration::Use(
+                    ParseInfo::from_position(*position),
+                    UseDeclaration {
+                        qualified_binder: None,
+                        module: ModuleDeclaration {
+                            name: name.clone(),
+                            declarator: ast::ModuleDeclarator::External(name),
+                        },
                     },
                 ))
             }

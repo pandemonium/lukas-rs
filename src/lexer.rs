@@ -523,22 +523,28 @@ pub enum Layout {
 pub enum Keyword {
     Let,
     In,
+
     If,
     Then,
     Else,
+
     Struct,
     Coproduct,
     Alias,
     Module,
     Use,
+
     Lambda,
+    Forall,
+
+    Deconstruct,
+    Into,
+
     And,
     Or,
     Xor,
     Not,
-    Forall,
-    Deconstruct,
-    Into,
+
     Where,
 }
 

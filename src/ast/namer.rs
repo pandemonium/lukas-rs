@@ -669,6 +669,14 @@ impl ParserSymbolTable {
                     self.add_module_declaration(&module_path, decl, compiler)?
                 }
                 Declaration::Type(_, decl) => self.add_type_declaration(&module_path, decl),
+                Declaration::Use(_, use_declaration) => {
+                    if use_declaration.qualified_binder.is_some() {
+                        todo!()
+                    }
+                    let module = use_declaration.module;
+                    self.add_import_prefix(module_path.clone().with_suffix(module.name.as_str()));
+                    self.add_module_declaration(&module_path, module, compiler)?;
+                }
             }
         }
         Ok(())
