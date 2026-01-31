@@ -179,6 +179,7 @@ fn join_many(lhs: &mut Vec<Denotation>, rhs: &[Denotation]) -> Option<()> {
 
 impl<A, Id> fmt::Display for MatchClause<A, Id>
 where
+    A: fmt::Display,
     Id: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -192,6 +193,7 @@ where
 
 impl<A, Id> fmt::Display for Pattern<A, Id>
 where
+    A: fmt::Display,
     Id: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -207,6 +209,7 @@ where
 
 impl<A, Id> fmt::Display for ConstructorPattern<A, Id>
 where
+    A: fmt::Display,
     Id: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -225,6 +228,7 @@ where
 
 impl<A, Id> fmt::Display for TuplePattern<A, Id>
 where
+    A: fmt::Display,
     Id: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -245,6 +249,7 @@ where
 
 impl<A, Id> fmt::Display for StructPattern<A, Id>
 where
+    A: fmt::Display,
     Id: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::{
     ast::{
-        self, Expr, Interpolate, ProductElement, Tree,
+        self, Erased, Expr, Interpolate, ProductElement, Tree,
         namer::{self, Identifier},
         pattern::Pattern,
     },
@@ -18,8 +18,8 @@ use crate::{
 };
 
 // Erasing the annotation is not really done for a good reason here
-impl Expr<(), namer::Identifier> {
-    pub fn reduce(self: &Tree<(), namer::Identifier>, env: &Environment) -> Interpretation {
+impl Expr<Erased, namer::Identifier> {
+    pub fn reduce(self: &Tree<Erased, namer::Identifier>, env: &Environment) -> Interpretation {
         // Plenty of clone calls here.
         match self.as_ref() {
             Self::Variable(_, the) => env
@@ -171,7 +171,7 @@ impl Expr<(), namer::Identifier> {
     }
 }
 
-impl Pattern<(), namer::Identifier> {
+impl Pattern<Erased, namer::Identifier> {
     fn deconstruct(&self, scrutinee: &Value) -> Option<Vec<(Identifier, Value)>> {
         match (self, scrutinee) {
             (
@@ -406,11 +406,11 @@ impl From<ast::Literal> for Literal {
 #[derive(Debug, Clone)]
 pub struct Closure {
     capture: Environment,
-    body: Tree<(), namer::Identifier>,
+    body: Tree<Erased, namer::Identifier>,
 }
 
 impl Closure {
-    fn capture(capture: &Environment, body: &Tree<(), namer::Identifier>) -> Rc<RefCell<Self>> {
+    fn capture(capture: &Environment, body: &Tree<Erased, namer::Identifier>) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
             capture: capture.clone(),
             body: Rc::clone(body),

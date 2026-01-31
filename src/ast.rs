@@ -215,13 +215,16 @@ impl<A, Id> Expr<A, Id> {
         }
     }
 
-    pub fn erase_annotation(&self) -> Expr<(), Id>
+    pub fn erase_annotation(&self) -> Expr<Erased, Id>
     where
-        Self: Annotated<A, (), Id, Output = Expr<(), Id>>,
+        Self: Annotated<A, Erased, Id, Output = Expr<Erased, Id>>,
     {
-        self.map_annotation(&|_| ())
+        self.map_annotation(&|_| Erased)
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct Erased;
 
 #[derive(Debug, Clone)]
 pub struct Interpolate<A, Id>(pub Vec<Segment<A, Id>>);
@@ -341,11 +344,12 @@ pub struct Sequence<A, Id> {
 
 impl<A, Id> fmt::Display for Expr<A, Id>
 where
+    A: fmt::Display,
     Id: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Variable(_, x) => write!(f, "{x}"),
+            Self::Variable(a, x) => write!(f, "{x}::{a}"),
             Self::InvokeBridge(_, x) => write!(f, "bridge_{}", x),
             Self::Constant(_, x) => write!(f, "{x}"),
             Self::RecursiveLambda(_, x) => write!(f, "{} := {}", x.own_name, x.lambda),
@@ -376,6 +380,7 @@ where
 
 impl<A, Id> fmt::Display for Interpolate<A, Id>
 where
+    A: fmt::Display,
     Id: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -391,6 +396,7 @@ where
 
 impl<A, Id> fmt::Display for Segment<A, Id>
 where
+    A: fmt::Display,
     Id: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -401,8 +407,15 @@ where
     }
 }
 
+impl fmt::Display for Erased {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "()")
+    }
+}
+
 impl<A, Id> fmt::Display for Projection<A, Id>
 where
+    A: fmt::Display,
     Id: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -413,6 +426,7 @@ where
 
 impl<A, Id> fmt::Display for Deconstruct<A, Id>
 where
+    A: fmt::Display,
     Id: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -432,6 +446,7 @@ where
 
 impl<A, Id> fmt::Display for IfThenElse<A, Id>
 where
+    A: fmt::Display,
     Id: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -455,6 +470,7 @@ impl fmt::Display for ProductElement {
 
 impl<A, Id> fmt::Display for Lambda<A, Id>
 where
+    A: fmt::Display,
     Id: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -465,6 +481,7 @@ where
 
 impl<A, Id> fmt::Display for Record<A, Id>
 where
+    A: fmt::Display,
     Id: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -480,6 +497,7 @@ where
 
 impl<A, Id> fmt::Display for Tuple<A, Id>
 where
+    A: fmt::Display,
     Id: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -504,13 +522,19 @@ impl fmt::Display for Literal {
     }
 }
 
-impl<A> fmt::Display for CompilationUnit<A> {
+impl<A> fmt::Display for CompilationUnit<A>
+where
+    A: fmt::Display,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.root_module)
     }
 }
 
-impl<A> fmt::Display for UseDeclaration<A> {
+impl<A> fmt::Display for UseDeclaration<A>
+where
+    A: fmt::Display,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             qualified_binder,
@@ -525,7 +549,10 @@ impl<A> fmt::Display for UseDeclaration<A> {
     }
 }
 
-impl<A> fmt::Display for Declaration<A> {
+impl<A> fmt::Display for Declaration<A>
+where
+    A: fmt::Display,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Value(_, decl) => write!(f, "value {decl}"),
@@ -536,14 +563,20 @@ impl<A> fmt::Display for Declaration<A> {
     }
 }
 
-impl<A> fmt::Display for ValueDeclaration<A> {
+impl<A> fmt::Display for ValueDeclaration<A>
+where
+    A: fmt::Display,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { name, declarator } = self;
         write!(f, "{name} is {declarator}")
     }
 }
 
-impl<A> fmt::Display for ValueDeclarator<A> {
+impl<A> fmt::Display for ValueDeclarator<A>
+where
+    A: fmt::Display,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             type_signature,
@@ -558,7 +591,10 @@ impl<A> fmt::Display for ValueDeclarator<A> {
     }
 }
 
-impl<A> fmt::Display for ModuleDeclaration<A> {
+impl<A> fmt::Display for ModuleDeclaration<A>
+where
+    A: fmt::Display,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { name, declarator } = self;
         write!(f, "module {name}:")?;
@@ -566,7 +602,10 @@ impl<A> fmt::Display for ModuleDeclaration<A> {
     }
 }
 
-impl<A> fmt::Display for ModuleDeclarator<A> {
+impl<A> fmt::Display for ModuleDeclarator<A>
+where
+    A: fmt::Display,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Inline(declarations) => {
