@@ -8,15 +8,5 @@ list_eq :: ∀α. List α -> List α -> Bool := λxs ys.
   in
     List.fold_right cmp true zipped
 
-list_eq2 := λxs ys.
-  let zipped = List.zip xs ys in
-  let cmp = λt z.
-    deconstruct t into
-      p, q -> z and p = q
-  in
-    List.fold_right cmp true zipped
-
 start := λ_.
-  let xs = Cons 1 Nil in
-  let ys = Cons 2 Nil in
-  print_endline "Hi: `list_eq2 xs ys`"
+  print_endline "Hi, mom"

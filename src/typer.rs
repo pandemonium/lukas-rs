@@ -137,6 +137,7 @@ impl namer::TypeSignature {
         Ok(TypeScheme {
             quantifiers,
             underlying: self.body.synthesize_type(&type_param_map, ctx)?,
+            constraints: ConstraintSet::default(),
         })
     }
 }
@@ -193,16 +194,17 @@ impl namer::NamedSymbolTable {
         let typed_expr = ctx.infer_expr(&symbol.body())?;
 
         println!(
-            "compute_term_symbol: {} -> {:?}",
+            "compute_term_symbol: {} -> {}",
             symbol.name, typed_expr.tree
         );
 
         let qualified_name = symbol.name.clone();
-        let inferred_type = &typed_expr.tree.type_info().inferred_type;
+        let inferred_type = &typed_expr.as_constrained_type();
         let scheme = inferred_type.generalize(&ctx);
-        println!("typer: {qualified_name} => {scheme}");
+        println!("typer: {qualified_name} :: {scheme}");
+        println!("typer: retained constraints: {}", scheme.constraints);
 
-        ctx.bind_free_term(qualified_name, scheme);
+        ctx.bind_free_term(qualified_name, scheme.underlying);
 
         Ok(namer::Symbol::Term(TermSymbol {
             name: symbol.name.clone(),
@@ -354,11 +356,44 @@ pub struct Constrained<A> {
 }
 
 impl<A> Constrained<A> {
-    pub fn simple_value(value: A) -> Self {
+    pub fn unconstrained(underlying: A) -> Self {
         Self {
             constraints: ConstraintSet::default(),
-            underlying: value,
+            underlying,
         }
+    }
+}
+
+impl Constrained<Type> {
+    pub fn generalize(&self, ctx: &TypingContext) -> Constrained<TypeScheme> {
+        let quantifiers = self.free_variables(ctx);
+        let (quantified, retained) = self
+            .constraints
+            .iter()
+            .partition::<Vec<_>, _>(|c| c.variables().iter().all(|t| quantifiers.contains(t)));
+
+        println!(
+            "generalize: {self} R {} Q {}",
+            display_list(", ", &retained),
+            display_list(", ", &quantified)
+        );
+
+        Constrained {
+            constraints: ConstraintSet::from(retained.as_slice()),
+            underlying: TypeScheme {
+                quantifiers: quantifiers.iter().copied().collect(),
+                underlying: self.underlying.clone(),
+                // in
+                constraints: ConstraintSet::from(quantified.as_slice()),
+            },
+        }
+    }
+
+    fn free_variables(&self, ctx: &TypingContext) -> HashSet<TypeParameter> {
+        let mut ty_vars = self.underlying.variables();
+        ty_vars.extend(self.constraints.variables());
+        let ctx_bounds = ctx.free_variables();
+        ty_vars.difference(&ctx_bounds).copied().collect()
     }
 }
 
@@ -387,6 +422,8 @@ impl Typed {
     }
 
     fn constrain(self, extra: ConstraintSet) -> Self {
+        println!("constrain: {self:?} with {extra}");
+
         let extra = extra.with_substitutions(&self.substitutions);
         let constraints = self.constraints.union(extra);
 
@@ -407,12 +444,23 @@ impl Typed {
             tree,
         }
     }
+
+    fn as_constrained_type(&self) -> Constrained<Type> {
+        Constrained {
+            constraints: self.constraints.clone(),
+            underlying: self.tree.type_info().inferred_type.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ConstraintSet(Vec<Constraint>);
 
 impl ConstraintSet {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     fn with_substitutions(&self, subst: &Substitutions) -> Self {
         let Self(constraints) = self;
         Self(
@@ -434,6 +482,20 @@ impl ConstraintSet {
 
         Self(rhs)
     }
+
+    fn variables(&self) -> HashSet<TypeParameter> {
+        self.iter().flat_map(|c| c.variables()).collect()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Constraint> {
+        self.0.iter()
+    }
+}
+
+impl From<&[&Constraint]> for ConstraintSet {
+    fn from(value: &[&Constraint]) -> Self {
+        Self(value.iter().copied().cloned().collect())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -452,6 +514,10 @@ impl Constraint {
                 .map(|t| t.with_substitutions(subst))
                 .collect(),
         }
+    }
+
+    fn variables(&self) -> HashSet<TypeParameter> {
+        self.at.iter().flat_map(|t| t.variables()).collect()
     }
 }
 
@@ -812,6 +878,7 @@ impl Type {
         TypeScheme {
             quantifiers: quantified.copied().collect(),
             underlying: self.clone(),
+            constraints: ConstraintSet::default(),
         }
     }
 }
@@ -1106,17 +1173,19 @@ impl TypeDefinition<QualifiedName> {
 pub struct TypeScheme {
     pub quantifiers: Vec<TypeParameter>,
     pub underlying: Type,
+    pub constraints: ConstraintSet,
 }
 
 impl TypeScheme {
-    pub fn with_substitutions(&self, subs: &Substitutions) -> Self {
-        let mut subs = subs.clone();
+    pub fn with_substitutions(&self, subst: &Substitutions) -> Self {
+        let mut subst = subst.clone();
         for q in &self.quantifiers {
-            subs.remove(*q);
+            subst.remove(*q);
         }
         Self {
             quantifiers: self.quantifiers.clone(),
-            underlying: self.underlying.with_substitutions(&subs),
+            underlying: self.underlying.with_substitutions(&subst),
+            constraints: self.constraints.with_substitutions(&subst),
         }
     }
 
@@ -1129,14 +1198,19 @@ impl TypeScheme {
     }
 
     pub fn instantiate(&self) -> Constrained<Type> {
+        println!("instantiate: {self}");
         let subst = self.instantiation_substitutions();
-        Constrained::simple_value(self.underlying.with_substitutions(&subst))
+        Constrained {
+            constraints: self.constraints.with_substitutions(&subst),
+            underlying: self.underlying.with_substitutions(&subst),
+        }
     }
 
     pub fn from_constant(ty: Type) -> TypeScheme {
         Self {
             quantifiers: vec![],
             underlying: ty,
+            constraints: ConstraintSet::default(),
         }
     }
 
@@ -1646,11 +1720,12 @@ impl TypingContext {
             }
 
             constraints = constraints.with_substitutions(&substitutions);
+            let type_info = pi.with_inferred_type(expected_type.with_substitutions(&substitutions));
             Ok(Typed::computed(
                 substitutions,
                 constraints,
                 Expr::Construct(
-                    pi.with_inferred_type(expected_type.clone()),
+                    type_info,
                     Construct {
                         constructor: construct.constructor.clone(),
                         arguments: typed_args,
@@ -1681,11 +1756,16 @@ impl TypingContext {
                         |ctx| {
                             let typed_body = ctx.check_expr(codomain, &rec.lambda.body)?;
 
+                            let type_info = pi.with_inferred_type(
+                                expected_type
+                                    .with_substitutions(&typed_body.substitutions)
+                                    .clone(),
+                            );
                             Ok(Typed::computed(
                                 typed_body.substitutions,
                                 typed_body.constraints,
                                 Expr::RecursiveLambda(
-                                    pi.with_inferred_type(expected_type.clone()),
+                                    type_info,
                                     SelfReferential {
                                         own_name: rec.own_name.clone(),
                                         lambda: Lambda {
@@ -1719,11 +1799,13 @@ impl TypingContext {
                 |ctx| {
                     let body = ctx.check_expr(codomain, &lambda.body)?;
 
+                    let type_info = pi
+                        .with_inferred_type(expected_type.with_substitutions(&body.substitutions));
                     Ok(Typed::computed(
                         body.substitutions,
                         body.constraints,
                         Expr::Lambda(
-                            pi.with_inferred_type(expected_type.clone()),
+                            type_info,
                             Lambda {
                                 parameter: lambda.parameter.clone(),
                                 body: body.tree.into(),
@@ -1755,11 +1837,12 @@ impl TypingContext {
                     .union(typed_element.constraints.with_substitutions(&substitutions))
             }
 
+            let type_info = pi.with_inferred_type(expected_type.with_substitutions(&substitutions));
             Ok(Typed::computed(
                 substitutions,
                 constraints,
                 Expr::Tuple(
-                    pi.with_inferred_type(expected_type.clone()),
+                    type_info,
                     Tuple {
                         elements: typed_elements,
                     },
@@ -1798,6 +1881,8 @@ impl TypingContext {
 
             UntypedExpr::InvokeBridge(pi, bridge) => {
                 let inferred_type = bridge.external.type_scheme().instantiate();
+                println!("infer_expr: bridge {inferred_type}");
+
                 Ok(Typed::computed(
                     Substitutions::default(),
                     inferred_type.constraints,
@@ -1830,7 +1915,8 @@ impl TypingContext {
             }
 
             UntypedExpr::Apply(pi, ast::Apply { function, argument }) => {
-                self.infer_apply_with_arg_check(*pi, function, argument)
+                //                self.infer_apply_with_arg_check(*pi, function, argument)
+                self.infer_apply2(*pi, function, argument)
             }
 
             UntypedExpr::Let(pi, binding) => self.infer_binding(*pi, binding),
@@ -1866,10 +1952,8 @@ impl TypingContext {
         let ascribed_scheme = ascription
             .type_signature
             .scheme(&mut HashMap::default(), self)?;
-        let inferred_type = ascribed_scheme.instantiate();
-        let typed = self.check_expr(&inferred_type.underlying, &ascription.tree)?;
-
-        Ok(typed.constrain(inferred_type.constraints))
+        let ascribed_type = ascribed_scheme.instantiate();
+        self.check_expr(&ascribed_type.underlying, &ascription.ascribed_tree)
     }
 
     #[instrument]
@@ -1956,11 +2040,12 @@ impl TypingContext {
             });
         }
 
+        let type_info = pi.with_inferred_type(expected_type.with_substitutions(&substitutions));
         Ok(Typed::computed(
             substitutions,
             constraints,
             Expr::Deconstruct(
-                pi.with_inferred_type(expected_type.clone()),
+                type_info,
                 Deconstruct {
                     scrutinee: scrutinee.into(),
                     match_clauses: typed_match_clauses,
@@ -2602,6 +2687,66 @@ impl TypingContext {
     }
 
     #[instrument]
+    fn infer_apply2(
+        &mut self,
+        pi: ParseInfo,
+        function: &namer::Expr,
+        argument: &namer::Expr,
+    ) -> Typing {
+        let mut function = self.infer_expr(function)?;
+        let function_type = &function.tree.type_info().inferred_type;
+
+        if let Type::Variable(..) = function_type {
+            println!("infer_apply2: unknown function");
+            let domain = Type::fresh();
+            let codomain = Type::fresh();
+            let unification = Type::Arrow {
+                domain: domain.into(),
+                codomain: codomain.into(),
+            }
+            .unified_with(&function_type)
+            .map_err(|e| e.at(pi))?;
+
+            let s_function = function.substitutions.compose(&unification);
+            function = function.with_substitutions(&s_function);
+            self.substitute_mut(&s_function);
+        }
+
+        let function_type = &function.tree.type_info().inferred_type;
+        if let Type::Arrow { domain, codomain } = &function_type {
+            let argument = self.check_expr(
+                &domain.with_substitutions(&function.substitutions),
+                argument,
+            )?;
+
+            println!("infer_apply2: argument {argument:?}");
+
+            let substitutions = function.substitutions.compose(&argument.substitutions);
+            let codomain = codomain.with_substitutions(&substitutions);
+            let argument = argument.with_substitutions(&substitutions);
+
+            let constraints = function
+                .constraints
+                .with_substitutions(&substitutions)
+                .union(argument.constraints);
+
+            Ok(Typed::computed(
+                substitutions,
+                constraints,
+                Expr::Apply(
+                    pi.with_inferred_type(codomain),
+                    Apply {
+                        function: function.tree.into(),
+                        argument: argument.tree.into(),
+                    },
+                ),
+            ))
+        } else {
+            todo!()
+        }
+    }
+
+    #[instrument]
     fn infer_apply_with_arg_check(
         &mut self,
         pi: ParseInfo,
@@ -2775,22 +2920,25 @@ impl TypingContext {
     #[instrument]
     fn infer_binding(&mut self, pi: ParseInfo, binding: &namer::Binding) -> Typing {
         let typed_bound = self.infer_expr(&binding.bound)?;
-        let bound_type = typed_bound
-            .tree
-            .type_info()
-            .inferred_type
-            .generalize(&self.with_substitutions(&typed_bound.substitutions));
+        let ctx = self.with_substitutions(&typed_bound.substitutions);
 
-        self.bind_term_and_then(binding.binder.clone(), bound_type, |ctx| {
+        let bound_type = typed_bound.as_constrained_type().generalize(&ctx);
+        println!("infer_binding: {} {bound_type}", binding.binder);
+
+        self.bind_term_and_then(binding.binder.clone(), bound_type.underlying, |ctx| {
             let typed_body = ctx.infer_expr(&binding.body)?;
             let substitutions = typed_bound.substitutions.compose(&typed_body.substitutions);
 
             let bound = typed_bound.tree.with_substitutions(&substitutions);
             let body = typed_body.tree.with_substitutions(&substitutions);
+            let constraints = bound_type
+                .constraints
+                .with_substitutions(&substitutions)
+                .union(typed_body.constraints.with_substitutions(&substitutions));
 
             Ok(Typed::computed(
                 substitutions,
-                ConstraintSet::default(),
+                constraints,
                 Expr::Let(
                     pi.with_inferred_type(body.type_info().inferred_type.clone()),
                     Binding {
@@ -3122,6 +3270,32 @@ impl fmt::Display for Type {
     }
 }
 
+impl<A> fmt::Display for Constrained<A>
+where
+    A: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            constraints,
+            underlying,
+        } = self;
+        write!(f, "[{constraints}] => {underlying}")
+    }
+}
+
+impl fmt::Display for ConstraintSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", display_list(", ", &self.0))
+    }
+}
+
+impl fmt::Display for Constraint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { class, at } = self;
+        write!(f, "{class} {}", display_list(" ", at))
+    }
+}
+
 impl fmt::Display for BaseType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -3140,7 +3314,11 @@ impl fmt::Display for TypeScheme {
             for param in &self.quantifiers[1..] {
                 write!(f, ", {param}")?;
             }
-            write!(f, ". ",)?;
+            if self.constraints.is_empty() {
+                write!(f, ". ",)?;
+            } else {
+                write!(f, ". {} => ", self.constraints)?;
+            }
         }
 
         write!(f, "{}", self.underlying)

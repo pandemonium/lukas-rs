@@ -165,7 +165,7 @@ impl Expr<Erased, namer::Identifier> {
 
             Self::Ascription(_, the) => {
                 // TODO: The typer could remove these on successful checks
-                the.tree.reduce(env)
+                the.ascribed_tree.reduce(env)
             }
         }
     }

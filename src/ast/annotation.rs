@@ -292,7 +292,7 @@ where
         F: Fn(&A) -> B,
     {
         TypeAscription {
-            tree: self.tree.map_annotation(f),
+            ascribed_tree: self.ascribed_tree.map_annotation(f),
             type_signature: self.type_signature.map_annotation(f),
         }
     }

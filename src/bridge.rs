@@ -4,7 +4,7 @@ use crate::{
     ast::namer::{self, QualifiedName, TermSymbol},
     interpreter::{Interpretation, Literal, RuntimeError, Value},
     parser::{self, ParseInfo},
-    typer::{BaseType, Type, TypeParameter, TypeScheme},
+    typer::{BaseType, ConstraintSet, Type, TypeParameter, TypeScheme},
 };
 
 #[derive(Clone)]
@@ -231,6 +231,7 @@ where
                 domain: Type::Variable(tp).into(),
                 codomain: R::TYPE.into(),
             },
+            constraints: ConstraintSet::default(),
         }
     }
 }

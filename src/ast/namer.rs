@@ -165,7 +165,7 @@ impl<A> ast::Expr<A, Identifier> {
             }
 
             Self::Ascription(_, the) => {
-                the.tree.gather_free_variables(free);
+                the.ascribed_tree.gather_free_variables(free);
             }
 
             _otherwise => (),
@@ -1233,7 +1233,7 @@ impl parser::Expr {
             parser::Expr::Ascription(a, the) => parser::Expr::Ascription(
                 a,
                 parser::TypeAscription {
-                    tree: map_lower_tuples(the.tree),
+                    ascribed_tree: map_lower_tuples(the.ascribed_tree),
                     type_signature: the.type_signature,
                 },
             ),
@@ -1624,7 +1624,10 @@ impl parser::TypeAscription {
         semantic_scope: &parser::IdentifierPath,
     ) -> Naming<TypeAscription> {
         Ok(TypeAscription {
-            tree: self.tree.resolve(names, symbols, semantic_scope)?.into(),
+            ascribed_tree: self
+                .ascribed_tree
+                .resolve(names, symbols, semantic_scope)?
+                .into(),
             type_signature: self.type_signature.clone(),
         })
     }
@@ -1774,7 +1777,7 @@ impl ParserSymbolTable {
                     body: Some(Expr::Ascription(
                         *symbol.body().parse_info(),
                         TypeAscription {
-                            tree: symbol
+                            ascribed_tree: symbol
                                 .body()
                                 .resolve_names(self, &symbol.name.module)?
                                 .into(),

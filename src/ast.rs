@@ -237,7 +237,7 @@ pub enum Segment<A, Id> {
 
 #[derive(Debug, Clone)]
 pub struct TypeAscription<A, Id> {
-    pub tree: Tree<A, Id>,
+    pub ascribed_tree: Tree<A, Id>,
     pub type_signature: TypeSignature<A, QualifiedName>,
 }
 
@@ -373,7 +373,7 @@ where
             Self::Deconstruct(_, x) => write!(f, "{x}"),
             Self::If(_, x) => write!(f, "{x}"),
             Self::Interpolate(_, x) => write!(f, "{x}"),
-            Self::Ascription(_, x) => write!(f, "{}::{}", x.tree, x.type_signature),
+            Self::Ascription(_, x) => write!(f, "{}::{}", x.ascribed_tree, x.type_signature),
         }
     }
 }
