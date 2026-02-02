@@ -94,37 +94,18 @@ pub struct FieldDeclarator<A> {
 }
 
 #[derive(Debug, Clone)]
-pub struct TypeSignature<A, TypeId> {
-    pub universal_quantifiers: Vec<parser::Identifier>,
-    pub body: TypeExpression<A, TypeId>,
-    pub phase: PhantomData<A>,
+pub struct ConstraintExpression<A, TypeId> {
+    pub annotation: A,
+    pub class: TypeId,
+    pub parameters: Vec<TypeExpression<A, TypeId>>,
 }
 
-impl<A, TypeId> TypeSignature<A, TypeId> {
-    pub fn map<F, B, TypeId2>(self, f: F) -> TypeSignature<B, TypeId2>
-    where
-        F: FnOnce(TypeExpression<A, TypeId>) -> TypeExpression<B, TypeId2>,
-    {
-        TypeSignature {
-            universal_quantifiers: self.universal_quantifiers,
-            body: f(self.body),
-            phase: PhantomData,
-        }
-    }
-
-    // Is this really a workable thing?
-    pub fn ultimate(&self) -> Self
-    where
-        A: Clone,
-        TypeId: Clone,
-    {
-        let ultimate = self.body.ultimate();
-        Self {
-            universal_quantifiers: self.universal_quantifiers.clone(),
-            body: ultimate.clone(),
-            phase: PhantomData,
-        }
-    }
+#[derive(Debug, Clone)]
+pub struct TypeSignature<A, TypeId> {
+    pub universal_quantifiers: Vec<parser::Identifier>,
+    pub constraints: Vec<ConstraintExpression<A, TypeId>>,
+    pub body: TypeExpression<A, TypeId>,
+    pub phase: PhantomData<A>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,25 +115,6 @@ pub enum TypeExpression<A, TypeId> {
     Apply(A, ApplyTypeExpr<A, TypeId>),
     Arrow(A, ArrowTypeExpr<A, TypeId>),
     Tuple(A, TupleTypeExpr<A, TypeId>),
-}
-
-impl<A, TypeId> TypeExpression<A, TypeId> {
-    pub fn annotation(&self) -> &A {
-        match self {
-            Self::Constructor(a, _)
-            | Self::Parameter(a, _)
-            | Self::Apply(a, _)
-            | Self::Arrow(a, _)
-            | Self::Tuple(a, _) => a,
-        }
-    }
-
-    fn ultimate(&self) -> &Self {
-        match self {
-            Self::Constructor(..) | Self::Parameter(..) | Self::Apply(..) | Self::Tuple(..) => self,
-            Self::Arrow(_, ArrowTypeExpr { codomain, .. }) => codomain.ultimate(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

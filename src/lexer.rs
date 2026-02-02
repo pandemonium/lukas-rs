@@ -29,6 +29,7 @@ impl LexicalAnalyzer {
                 [':', '=', remains @ ..] => self.emit(2, TokenKind::Assign, remains),
                 [':', ':', remains @ ..] => self.emit(2, TokenKind::TypeAscribe, remains),
                 ['-', '>', remains @ ..] => self.emit(2, TokenKind::Arrow, remains),
+                ['|', '-', remains @ ..] => self.emit(2, TokenKind::TypeConstraint, remains),
 
                 ['>', '=', remains @ ..] => self.emit(2, TokenKind::Gte, remains),
                 ['<', '=', remains @ ..] => self.emit(2, TokenKind::Lte, remains),
@@ -351,32 +352,33 @@ impl Default for SourceLocation {
 // What does this hierarchy buy me?
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenKind {
-    Equals,      // =
-    TypeAssign,  // ::=
-    TypeAscribe, // ::
-    Assign,      // :=
-    Arrow,       // ->
-    Comma,       // ,
-    LeftParen,   // (
-    RightParen,  // )
-    LeftBrace,   // {
-    RightBrace,  // }
-    Underscore,  // _
-    Pipe,        // |
-    DoubleQuote, // "
-    SingleQuote, // '
-    Colon,       // :
-    Semicolon,   // ;
-    Period,      // .
-    Plus,        // +
-    Minus,       // -
-    Star,        // *
-    Slash,       // /
-    Percent,     // %
-    Gte,         // >=
-    Lte,         // <=
-    Gt,          // >
-    Lt,          // <
+    Equals,         // =
+    TypeAssign,     // ::=
+    TypeAscribe,    // ::
+    TypeConstraint, // |-
+    Assign,         // :=
+    Arrow,          // ->
+    Comma,          // ,
+    LeftParen,      // (
+    RightParen,     // )
+    LeftBrace,      // {
+    RightBrace,     // }
+    Underscore,     // _
+    Pipe,           // |
+    DoubleQuote,    // "
+    SingleQuote,    // '
+    Colon,          // :
+    Semicolon,      // ;
+    Period,         // .
+    Plus,           // +
+    Minus,          // -
+    Star,           // *
+    Slash,          // /
+    Percent,        // %
+    Gte,            // >=
+    Lte,            // <=
+    Gt,             // >
+    Lt,             // <
 
     Identifier(String),
 
@@ -656,6 +658,7 @@ impl fmt::Display for TokenKind {
             Self::Equals => write!(f, "="),
             Self::TypeAssign => write!(f, "::="),
             Self::TypeAscribe => write!(f, "::"),
+            Self::TypeConstraint => write!(f, "|-"),
             Self::Assign => write!(f, ":="),
             Self::Arrow => write!(f, "->"),
             Self::Comma => write!(f, ","),

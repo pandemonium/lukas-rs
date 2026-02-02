@@ -43,6 +43,7 @@ pub type StructPattern = ast::pattern::StructPattern<ParseInfo, Identifier>;
 pub type TypeExpression = ast::TypeExpression<ParseInfo, QualifiedName>;
 pub type TypeSignature = ast::TypeSignature<ParseInfo, QualifiedName>;
 pub type TypeAscription = ast::TypeAscription<ParseInfo, Identifier>;
+pub type ConstraintExpression = ast::ConstraintExpression<ParseInfo, QualifiedName>;
 
 type ParserSymbolTable = SymbolTable<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
 type ParserSymbol = Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
@@ -920,6 +921,7 @@ impl ConstructorSymbol<parser::IdentifierPath> {
     ) -> parser::TypeSignature {
         parser::TypeSignature {
             universal_quantifiers: type_parameters.to_vec(),
+            constraints: Vec::default(),
             body: self.signature.iter().cloned().rfold(
                 self.make_applied_type_constructor(pi, type_parameters, type_constructor_name),
                 |rhs, lhs| {
@@ -1036,6 +1038,30 @@ impl DeBruijn {
         let de_bruijn_index = self.stack.len();
         self.stack.push(id);
         de_bruijn_index
+    }
+}
+
+impl parser::ConstraintExpression {
+    pub fn resolve_names(
+        &self,
+        symbols: &ParserSymbolTable,
+        pi: ParseInfo,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> Naming<ConstraintExpression> {
+        let Self {
+            annotation,
+            class,
+            parameters,
+        } = self;
+
+        Ok(ConstraintExpression {
+            annotation: *annotation,
+            class: symbols.resolve_type_name(class, pi, semantic_scope)?,
+            parameters: parameters
+                .iter()
+                .map(|te| te.resolve_names(symbols, pi, semantic_scope))
+                .collect::<Naming<_>>()?,
+        })
     }
 }
 
@@ -1767,6 +1793,11 @@ impl ParserSymbolTable {
             Symbol::Term(symbol) => Ok(Symbol::Term(if let Some(ts) = &symbol.type_signature {
                 let type_signature = TypeSignature {
                     universal_quantifiers: ts.universal_quantifiers.clone(),
+                    constraints: ts
+                        .constraints
+                        .iter()
+                        .map(|ce| ce.resolve_names(self, pi, &symbol.name.module))
+                        .collect::<Naming<_>>()?,
                     body: ts.body.resolve_names(self, pi, &symbol.name.module)?,
                     phase: PhantomData,
                 };

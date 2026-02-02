@@ -35,6 +35,7 @@ pub type TuplePattern = ast::pattern::TuplePattern<ParseInfo, IdentifierPath>;
 pub type StructPattern = ast::pattern::StructPattern<ParseInfo, IdentifierPath>;
 pub type TypeExpression = ast::TypeExpression<ParseInfo, IdentifierPath>;
 pub type TypeSignature = ast::TypeSignature<ParseInfo, IdentifierPath>;
+pub type ConstraintExpression = ast::ConstraintExpression<ParseInfo, IdentifierPath>;
 
 impl<Id> ast::Expr<ParseInfo, Id> {
     pub fn parse_info(&self) -> &ParseInfo {
@@ -1498,12 +1499,82 @@ impl<'a> Parser<'a> {
         let _t = self.trace();
 
         let quantifiers = self.parse_forall_clause()?;
+        let constraints = if self.has_type_constraints() {
+            println!("parse_type_signature: Hi");
+            self.parse_constraint_clause()?
+        } else {
+            println!("parse_type_signature: Ho");
+            Vec::default()
+        };
         let body = self.parse_type_expression(0)?;
 
         Ok(TypeSignature {
             universal_quantifiers: quantifiers,
+            constraints,
             body,
             phase: PhantomData,
+        })
+    }
+
+    fn parse_constraint_clause(&mut self) -> Result<Vec<ConstraintExpression>> {
+        let _t = self.trace();
+
+        // Foo bar, Baz quux Int |-
+        // So if there is a |- before :=, then there constraints
+        let mut constraints = vec![self.parse_type_constraint()?];
+
+        while self.peek()?.kind == TokenKind::Plus {
+            self.advance(1);
+            constraints.push(self.parse_type_constraint()?);
+        }
+
+        self.expect(TokenKind::TypeConstraint)?;
+
+        Ok(constraints)
+    }
+
+    fn has_type_constraints(&mut self) -> bool {
+        self.remains()
+            .iter()
+            .position(|t| t.kind == TokenKind::Assign)
+            .is_some_and(|p| {
+                self.remains()[..p]
+                    .iter()
+                    .position(|t| t.kind == TokenKind::TypeConstraint)
+                    .is_some()
+            })
+    }
+
+    fn parse_type_constraint(&mut self) -> Result<ConstraintExpression> {
+        let _t = self.trace();
+
+        let (pos, id) = self.identifier()?;
+
+        let mut arguments = vec![];
+
+        while matches!(
+            self.peek()?.kind,
+            TokenKind::Identifier(..) | TokenKind::LeftParen
+        ) {
+            if self.peek()?.is_identifier() {
+                let (pos, id) = self.identifier()?;
+                let pi = ParseInfo::from_position(pos);
+                arguments.push(if is_lowercase(&id) {
+                    TypeExpression::Parameter(pi, Identifier::from_str(&id))
+                } else {
+                    TypeExpression::Constructor(pi, IdentifierPath::new(&id))
+                });
+            } else {
+                self.expect(TokenKind::LeftParen)?;
+                arguments.push(self.parse_type_expression(0)?);
+                self.expect(TokenKind::RightParen)?;
+            }
+        }
+
+        Ok(ConstraintExpression {
+            annotation: ParseInfo::from_position(pos),
+            class: IdentifierPath::new(&id),
+            parameters: arguments,
         })
     }
 

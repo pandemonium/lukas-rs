@@ -310,8 +310,37 @@ where
     {
         TypeSignature {
             universal_quantifiers: self.universal_quantifiers.clone(),
+            constraints: self
+                .constraints
+                .iter()
+                .map(|ce| ce.map_annotation(f))
+                .collect(),
             body: self.body.map_annotation(f),
             phase: PhantomData,
+        }
+    }
+}
+
+impl<A, B, Id> Annotated<A, B, Id> for ConstraintExpression<A, Id>
+where
+    Id: Clone,
+{
+    type Output = ConstraintExpression<B, Id>;
+
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
+    where
+        F: Fn(&A) -> B,
+    {
+        let Self {
+            annotation,
+            class,
+            parameters,
+        } = self;
+
+        ConstraintExpression {
+            annotation: f(annotation),
+            class: class.clone(),
+            parameters: parameters.iter().map(|te| te.map_annotation(f)).collect(),
         }
     }
 }
