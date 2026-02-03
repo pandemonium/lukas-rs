@@ -1,0 +1,26 @@
+use Stdlib.
+
+constraint Eq ::= ∀α.
+  { eq :: α -> α -> Bool
+  }
+
+constraint Ord ::= ∀α.
+  { cmp :: α -> α -> Bool
+  }
+
+witness eqInt :: Eq Int :=
+  { eq: λp q. p = q
+  }
+
+list_eq :: ∀α. Eq α + Ord α |- List α -> List α -> Bool := λxs ys.
+  let zipped = List.zip xs ys in
+  let cmp = λt z.
+    deconstruct t into
+      p, q -> z and p = q
+  in
+    List.fold_right cmp true zipped
+
+start := λ_.
+  let xs = List.tabulate 10 id in
+  let ys = List.tabulate 10 id in
+  print_endline "Lists equality is `list_eq xs ys`"

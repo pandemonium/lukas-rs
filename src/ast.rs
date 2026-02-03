@@ -4,6 +4,7 @@ use crate::{
     ast::{self, annotation::Annotated, namer::QualifiedName},
     bridge::Bridge,
     compiler, parser,
+    typer::display_list,
 };
 
 pub mod annotation;
@@ -26,6 +27,22 @@ pub enum Declaration<A> {
     Module(A, ModuleDeclaration<A>),
     Type(A, TypeDeclaration<A>),
     Use(A, UseDeclaration<A>),
+    Constraint(A, ConstraintDeclaration<A>),
+    Witness(A, WitnessDeclaration<A>),
+}
+
+#[derive(Debug)]
+pub struct ConstraintDeclaration<A> {
+    pub name: parser::Identifier,
+    pub type_parameters: Vec<parser::Identifier>,
+    pub declarator: RecordDeclarator<A>,
+}
+
+#[derive(Debug)]
+pub struct WitnessDeclaration<A> {
+    pub name: parser::Identifier,
+    pub type_signature: TypeSignature<A, parser::IdentifierPath>,
+    pub body: ast::Expr<A, parser::IdentifierPath>,
 }
 
 #[derive(Debug)]
@@ -521,7 +538,43 @@ where
             Self::Module(_, decl) => write!(f, "module {decl}"),
             Self::Type(_, decl) => write!(f, "type {decl}"),
             Self::Use(_, decl) => write!(f, "use {decl}"),
+            Self::Constraint(_, decl) => write!(f, "constraint {decl}"),
+            Self::Witness(_, decl) => write!(f, "witness {decl}"),
         }
+    }
+}
+
+impl<A> fmt::Display for ConstraintDeclaration<A>
+where
+    A: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            name,
+            type_parameters,
+            declarator,
+        } = self;
+
+        write!(
+            f,
+            "∀{}. {name} ::= {declarator}",
+            display_list(" ", type_parameters)
+        )
+    }
+}
+
+impl<A> fmt::Display for WitnessDeclaration<A>
+where
+    A: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            name,
+            type_signature,
+            body,
+        } = self;
+
+        write!(f, "{name} :: {type_signature} ::= {body}")
     }
 }
 

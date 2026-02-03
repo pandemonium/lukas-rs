@@ -408,13 +408,61 @@ impl parser::IdentifierPath {
     }
 }
 
+impl parser::RecordDeclarator {
+    fn as_type_symbol(
+        &self,
+        type_parameters: &Vec<parser::Identifier>,
+        name: &QualifiedName,
+    ) -> TypeSymbol<IdentifierPath> {
+        TypeSymbol {
+            definition: TypeDefinition::Record(RecordSymbol {
+                name: name.clone(),
+                type_parameters: type_parameters.clone(),
+                fields: self
+                    .fields
+                    .iter()
+                    .map(|decl| FieldSymbol {
+                        name: decl.name.clone(),
+                        type_signature: decl.type_signature.clone(),
+                    })
+                    .collect(),
+            }),
+            origin: TypeOrigin::UserDefined,
+            arity: type_parameters.len(),
+        }
+    }
+}
+
+impl parser::CoproductDeclarator {
+    fn as_type_symbol(
+        &self,
+        type_parameters: Vec<parser::Identifier>,
+        name: &QualifiedName,
+        constructors: Vec<ConstructorSymbol<IdentifierPath>>,
+    ) -> TypeSymbol<IdentifierPath> {
+        TypeSymbol {
+            definition: TypeDefinition::Coproduct(CoproductSymbol {
+                name: name.clone(),
+                type_parameters: type_parameters.clone(),
+                constructors,
+            }),
+            origin: TypeOrigin::UserDefined,
+            arity: type_parameters.len(),
+        }
+    }
+}
+
 // Rename to Symbols? SymbolContext?
 #[derive(Debug, Clone)]
 pub struct SymbolTable<A, GlobalName, LocalId> {
     pub module_members: HashMap<parser::IdentifierPath, Vec<ModuleMember>>,
     pub member_modules: HashMap<ModuleMember, Vec<parser::IdentifierPath>>,
+
     pub symbols: HashMap<SymbolName, Symbol<A, GlobalName, LocalId>>,
     pub imports: Vec<parser::IdentifierPath>,
+
+    pub constraints: HashSet<QualifiedName>,
+    pub witnesses: HashSet<QualifiedName>,
 }
 
 impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
@@ -424,6 +472,8 @@ impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
             member_modules: HashMap::default(),
             symbols: HashMap::default(),
             imports: Vec::default(),
+            constraints: HashSet::default(),
+            witnesses: HashSet::default(),
         }
     }
 }
@@ -563,22 +613,7 @@ impl ParserSymbolTable {
                 ast::TypeDeclarator::Record(_, record) => {
                     self.add_type_symbol(
                         name.clone(),
-                        TypeSymbol {
-                            definition: TypeDefinition::Record(RecordSymbol {
-                                name: name,
-                                type_parameters: type_parameters.clone(),
-                                fields: record
-                                    .fields
-                                    .iter()
-                                    .map(|decl| FieldSymbol {
-                                        name: decl.name.clone(),
-                                        type_signature: decl.type_signature.clone(),
-                                    })
-                                    .collect(),
-                            }),
-                            origin: TypeOrigin::UserDefined,
-                            arity: type_parameters.len(),
-                        },
+                        record.as_type_symbol(&type_parameters, &name),
                     );
                 }
 
@@ -599,21 +634,13 @@ impl ParserSymbolTable {
                         );
                         self.add_term_symbol(
                             constructor.name.clone(),
-                            constructor.make_constructor_term(pi, &type_parameters, &name),
+                            constructor.as_constructor_term_symbol(pi, &type_parameters, &name),
                         );
                     }
 
                     self.add_type_symbol(
                         name.clone(),
-                        TypeSymbol {
-                            definition: TypeDefinition::Coproduct(CoproductSymbol {
-                                name: name,
-                                type_parameters: type_parameters.clone(),
-                                constructors,
-                            }),
-                            origin: TypeOrigin::UserDefined,
-                            arity: type_parameters.len(),
-                        },
+                        coproduct.as_type_symbol(type_parameters, &name, constructors),
                     );
                 }
             };
@@ -666,21 +693,76 @@ impl ParserSymbolTable {
         for decl in declarations {
             match decl {
                 Declaration::Value(_, decl) => self.add_value_declaration(&module_path, decl),
+
                 Declaration::Module(_, decl) => {
                     self.add_module_declaration(&module_path, decl, compiler)?
                 }
+
                 Declaration::Type(_, decl) => self.add_type_declaration(&module_path, decl),
-                Declaration::Use(_, use_declaration) => {
-                    if use_declaration.qualified_binder.is_some() {
-                        todo!()
-                    }
-                    let module = use_declaration.module;
-                    self.add_import_prefix(module_path.clone().with_suffix(module.name.as_str()));
-                    self.add_module_declaration(&module_path, module, compiler)?;
+
+                Declaration::Use(_, decl) => {
+                    self.add_use_declaration(compiler, &module_path, decl)?
                 }
-            }
+
+                Declaration::Constraint(_, decl) => {
+                    self.add_constraint_declaration(&module_path, decl)
+                }
+
+                Declaration::Witness(_, decl) => {
+                    println!("add_module_contents: witness {decl}");
+                    self.add_witness_declaration(&module_path, decl)
+                }
+            };
         }
+
         Ok(())
+    }
+
+    fn add_witness_declaration(
+        &mut self,
+        module_path: &IdentifierPath,
+        decl: ast::WitnessDeclaration<ParseInfo>,
+    ) {
+        // These must be indexed by type signature
+        let name = QualifiedName::new(module_path.clone(), decl.name.as_str());
+        self.add_module_term_member(module_path.clone(), decl.name);
+        self.add_term_symbol(
+            name.clone(),
+            TermSymbol {
+                name: name.clone(),
+                type_signature: Some(decl.type_signature),
+                body: Some(decl.body),
+            },
+        );
+        self.witnesses.insert(name);
+    }
+
+    fn add_constraint_declaration(
+        &mut self,
+        module_path: &IdentifierPath,
+        decl: ast::ConstraintDeclaration<ParseInfo>,
+    ) {
+        let name = QualifiedName::new(module_path.clone(), decl.name.as_str());
+        self.add_module_type_member(module_path.clone(), decl.name);
+        self.add_type_symbol(
+            name.clone(),
+            decl.declarator.as_type_symbol(&decl.type_parameters, &name),
+        );
+        self.constraints.insert(name);
+    }
+
+    fn add_use_declaration(
+        &mut self,
+        compiler: &Compiler,
+        module_path: &IdentifierPath,
+        use_declaration: ast::UseDeclaration<ParseInfo>,
+    ) -> Compilation<()> {
+        if use_declaration.qualified_binder.is_some() {
+            todo!()
+        }
+        let module = use_declaration.module;
+        self.add_import_prefix(module_path.clone().with_suffix(module.name.as_str()));
+        self.add_module_declaration(module_path, module, compiler)
     }
 
     pub fn add_import_prefix(&mut self, prefix: parser::IdentifierPath) {
@@ -897,7 +979,7 @@ impl ConstructorSymbol<parser::IdentifierPath> {
         )
     }
 
-    fn make_constructor_term(
+    fn as_constructor_term_symbol(
         &self,
         pi: ParseInfo,
         type_parameters: &[parser::Identifier],
@@ -1785,6 +1867,10 @@ impl ParserSymbolTable {
                 })
                 .collect::<Naming<_>>()?,
             imports: self.imports,
+            // Any kind of renaming necessary here?
+            constraints: self.constraints.clone(),
+            // Any kind of renaming necessary here?
+            witnesses: self.witnesses.clone(),
         })
     }
 

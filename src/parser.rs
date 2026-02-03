@@ -5,10 +5,10 @@ use thiserror::Error;
 
 use crate::{
     ast::{
-        self, ApplyTypeExpr, ArrowTypeExpr, CoproductConstructor, CoproductDeclarator, Declaration,
-        FieldDeclarator, ModuleDeclaration, ModuleDeclarator, RecordDeclarator, Tree,
-        TupleTypeExpr, TypeDeclaration, TypeDeclarator, UseDeclaration, ValueDeclaration,
-        ValueDeclarator,
+        self, ApplyTypeExpr, ArrowTypeExpr, ConstraintDeclaration, CoproductConstructor,
+        Declaration, FieldDeclarator, ModuleDeclaration, ModuleDeclarator, Tree, TupleTypeExpr,
+        TypeDeclaration, TypeDeclarator, UseDeclaration, ValueDeclaration, ValueDeclarator,
+        WitnessDeclaration,
     },
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
 };
@@ -27,14 +27,19 @@ pub type Deconstruct = ast::Deconstruct<ParseInfo, IdentifierPath>;
 pub type IfThenElse = ast::IfThenElse<ParseInfo, IdentifierPath>;
 pub type Interpolate = ast::Interpolate<ParseInfo, IdentifierPath>;
 pub type TypeAscription = ast::TypeAscription<ParseInfo, IdentifierPath>;
+pub type RecordDeclarator = ast::RecordDeclarator<ParseInfo>;
+pub type CoproductDeclarator = ast::CoproductDeclarator<ParseInfo>;
+
 pub type Segment = ast::Sequence<ParseInfo, IdentifierPath>;
 pub type Pattern = ast::pattern::Pattern<ParseInfo, IdentifierPath>;
 pub type MatchClause = ast::pattern::MatchClause<ParseInfo, IdentifierPath>;
+
 pub type ConstructorPattern = ast::pattern::ConstructorPattern<ParseInfo, IdentifierPath>;
 pub type TuplePattern = ast::pattern::TuplePattern<ParseInfo, IdentifierPath>;
 pub type StructPattern = ast::pattern::StructPattern<ParseInfo, IdentifierPath>;
 pub type TypeExpression = ast::TypeExpression<ParseInfo, IdentifierPath>;
 pub type TypeSignature = ast::TypeSignature<ParseInfo, IdentifierPath>;
+
 pub type ConstraintExpression = ast::ConstraintExpression<ParseInfo, IdentifierPath>;
 
 impl<Id> ast::Expr<ParseInfo, Id> {
@@ -431,13 +436,9 @@ impl<'a> Parser<'a> {
                 ..
             ] | [
                 Token {
-                    kind: TokenKind::Keyword(Keyword::Module),
-                    ..
-                },
-                ..
-            ] | [
-                Token {
-                    kind: TokenKind::Keyword(Keyword::Use),
+                    kind: TokenKind::Keyword(
+                        Keyword::Module | Keyword::Use | Keyword::Constraint | Keyword::Witness
+                    ),
                     ..
                 },
                 ..
@@ -530,10 +531,7 @@ impl<'a> Parser<'a> {
             }
 
             [
-                Token {
-                    kind: TokenKind::Keyword(Keyword::Module),
-                    ..
-                },
+                t,
                 Token {
                     kind: TokenKind::Identifier(name),
                     position,
@@ -543,7 +541,7 @@ impl<'a> Parser<'a> {
                     ..
                 },
                 ..,
-            ] => {
+            ] if t.is_keyword(Keyword::Module) => {
                 // <module> <id> <:>
                 self.advance(3);
 
@@ -557,10 +555,7 @@ impl<'a> Parser<'a> {
             }
 
             [
-                Token {
-                    kind: TokenKind::Keyword(Keyword::Module),
-                    ..
-                },
+                t,
                 Token {
                     kind: TokenKind::Identifier(name),
                     position,
@@ -570,7 +565,7 @@ impl<'a> Parser<'a> {
                     ..
                 },
                 ..,
-            ] => {
+            ] if t.is_keyword(Keyword::Module) => {
                 // <module> <id> <.>
                 self.advance(3);
 
@@ -585,16 +580,13 @@ impl<'a> Parser<'a> {
             }
 
             [
-                Token {
-                    kind: TokenKind::Keyword(Keyword::Use),
-                    ..
-                },
+                t,
                 Token {
                     kind: TokenKind::Identifier(name),
                     position,
                 },
                 ..,
-            ] => {
+            ] if t.is_keyword(Keyword::Use) => {
                 // <module> <id> <.>
                 self.advance(3);
 
@@ -607,6 +599,69 @@ impl<'a> Parser<'a> {
                             name: name.clone(),
                             declarator: ast::ModuleDeclarator::External(name),
                         },
+                    },
+                ))
+            }
+
+            [
+                t,
+                Token {
+                    kind: TokenKind::Identifier(name),
+                    position,
+                },
+                ..,
+            ] if t.is_keyword(Keyword::Constraint) => {
+                // constraint <id> <::=>
+                self.advance(3);
+
+                Ok(Declaration::Constraint(
+                    ParseInfo::from_position(*position),
+                    ConstraintDeclaration {
+                        name: Identifier::from_str(name),
+                        type_parameters: self.parse_forall_clause()?,
+                        declarator: if let TypeDeclarator::Record(_, record) =
+                            self.parse_block(|parser| parser.parse_type_declarator())?
+                        {
+                            record
+                        } else {
+                            Err(ParseError::Expected {
+                                expected: TokenKind::LeftBrace,
+                                found: self.peek()?.kind.clone(),
+                                position: *position,
+                            })?
+                        },
+                    },
+                ))
+            }
+
+            [
+                t,
+                Token {
+                    kind: TokenKind::Identifier(name),
+                    position,
+                },
+                Token {
+                    kind: TokenKind::TypeAscribe,
+                    ..
+                },
+                ..,
+            ] if t.is_keyword(Keyword::Witness) => {
+                // witness <id> <::>
+                self.advance(3);
+
+                let type_signature = self.parse_type_signature()?;
+
+                // <:=>
+                self.advance(1);
+
+                let body = self.parse_block(|parser| parser.parse_record())?;
+
+                Ok(Declaration::Witness(
+                    ParseInfo::from_position(*position),
+                    WitnessDeclaration {
+                        name: Identifier::from_str(name),
+                        type_signature,
+                        body,
                     },
                 ))
             }
@@ -701,7 +756,7 @@ impl<'a> Parser<'a> {
     }
 
     // This is incredibly noisy for something very simple
-    fn parse_record_type_decl(&mut self) -> Result<RecordDeclarator<ParseInfo>> {
+    fn parse_record_type_decl(&mut self) -> Result<RecordDeclarator> {
         let _t = self.trace();
 
         self.strip_layout()?;
@@ -1519,7 +1574,7 @@ impl<'a> Parser<'a> {
     fn parse_constraint_clause(&mut self) -> Result<Vec<ConstraintExpression>> {
         let _t = self.trace();
 
-        // Foo bar, Baz quux Int |-
+        // Foo bar + Baz quux Int |-
         // So if there is a |- before :=, then there constraints
         let mut constraints = vec![self.parse_type_constraint()?];
 
@@ -1578,7 +1633,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_coproduct(&mut self) -> Result<CoproductDeclarator<ParseInfo>> {
+    fn parse_coproduct(&mut self) -> Result<CoproductDeclarator> {
         let _t = self.trace();
 
         let mut constructors = vec![self.parse_coproduct_constructor()?];

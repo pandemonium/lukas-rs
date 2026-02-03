@@ -184,6 +184,8 @@ impl namer::NamedSymbolTable {
             member_modules: self.member_modules,
             symbols,
             imports: self.imports,
+            constraints: HashSet::default(),
+            witnesses: HashSet::default(),
         })
     }
 
