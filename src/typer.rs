@@ -113,6 +113,29 @@ where
             matrix.add_edge(id.clone(), symbol.dependencies().into_iter().collect());
         }
 
+        // Also add constraint methods
+        for constraint_name in &self.constraints {
+            let constraint = self
+                .symbols
+                .get(&SymbolName::Type(constraint_name.clone()))
+                .and_then(|symbol| {
+                    if let Symbol::Type(symbol) = symbol
+                        && let TypeDefinition::Record(symbol) = &symbol.definition
+                    {
+                        Some(symbol)
+                    } else {
+                        None
+                    }
+                })
+                .expect("Internal error");
+            let semantic_context = constraint_name.module();
+
+            for method in &constraint.fields {
+                let name = QualifiedName::new(semantic_context.clone(), method.name.as_str());
+                matrix.add_edge(SymbolName::Term(name), vec![]);
+            }
+        }
+
         matrix
     }
 }
@@ -160,8 +183,17 @@ impl namer::NamedSymbolTable {
 
         ctx.elaborate_type_constructors()?;
 
+        self.elaborate_constraints(&mut ctx)?;
+
+        let is_typed = |id: &&&SymbolName| match id {
+            // Some term symbols are already
+            SymbolName::Type(name) => !ctx.types.bindings.contains_key(name),
+            SymbolName::Term(name) => !ctx.terms.free.contains_key(name),
+        };
+
         // Enter terms
         for (id, symbol) in evaluation_order
+            .filter(is_typed)
             .map(|&id| {
                 self.symbols
                     .get(id)
@@ -184,9 +216,31 @@ impl namer::NamedSymbolTable {
             member_modules: self.member_modules,
             symbols,
             imports: self.imports,
-            constraints: HashSet::default(),
-            witnesses: HashSet::default(),
+            constraints: self.constraints,
+            witnesses: self.witnesses,
         })
+    }
+
+    fn elaborate_constraints(&self, ctx: &mut TypingContext) -> Typing<()> {
+        for c in &self.constraints {
+            let tc = ctx
+                .types
+                .lookup(c)
+                .cloned()
+                .expect("Constraint name does not match type constructor.");
+            let semantic_context = tc.definition().name.module();
+
+            if let Type::Record(RecordType(shape)) = tc.structure()? {
+                for (id, ty) in shape {
+                    let scheme = ty.generalize(ctx);
+                    let name = QualifiedName::new(semantic_context.clone(), id.as_str());
+                    println!("elaborate_constraints: bind {name} to {scheme}");
+                    ctx.bind_free_term(name, scheme);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn compute_term_symbol(
@@ -2721,8 +2775,6 @@ impl TypingContext {
                 argument,
             )?;
 
-            println!("infer_apply2: argument {argument:?}");
-
             let substitutions = function.substitutions.compose(&argument.substitutions);
             let codomain = codomain.with_substitutions(&substitutions);
             let argument = argument.with_substitutions(&substitutions);
@@ -2745,66 +2797,6 @@ impl TypingContext {
             ))
         } else {
             todo!()
-        }
-    }
-
-    #[instrument]
-    fn infer_apply_with_arg_check(
-        &mut self,
-        pi: ParseInfo,
-        function: &namer::Expr,
-        argument: &namer::Expr,
-    ) -> Typing {
-        let typed_function = self.infer_expr(function)?;
-        let domain = Type::fresh();
-        let codomain = Type::fresh();
-        let unification = Type::Arrow {
-            domain: domain.into(),
-            codomain: codomain.into(),
-        }
-        .unified_with(&typed_function.tree.type_info().inferred_type)
-        .map_err(|e| e.at(pi))?;
-
-        let function = typed_function.tree.with_substitutions(&unification);
-        let substitutions = typed_function.substitutions.compose(&unification);
-
-        if let Type::Arrow { domain, codomain } = &function.type_info().inferred_type {
-            let mut ctx = self.with_substitutions(&substitutions);
-            let typed_argument =
-                ctx.check_expr(&domain.with_substitutions(&substitutions), argument)?;
-
-            let substitutions = substitutions.compose(&typed_argument.substitutions);
-            let inferred_type = codomain.with_substitutions(&substitutions);
-
-            let constraints = typed_function
-                .constraints
-                .with_substitutions(&substitutions)
-                .union(
-                    typed_argument
-                        .constraints
-                        .with_substitutions(&substitutions),
-                );
-
-            Ok(Typed::computed(
-                substitutions,
-                constraints,
-                Expr::Apply(
-                    pi.with_inferred_type(inferred_type),
-                    Apply {
-                        function: function.into(),
-                        argument: typed_argument.tree.into(),
-                    },
-                ),
-            ))
-        } else {
-            Err(TypeError::ExpectedType {
-                expected: Type::Arrow {
-                    domain: Type::fresh().into(),
-                    codomain: Type::fresh().into(),
-                },
-                found: function.type_info().inferred_type.clone(),
-            }
-            .at(pi))
         }
     }
 

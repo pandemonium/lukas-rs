@@ -1,4 +1,10 @@
-use std::{cell::Cell, fmt, marker::PhantomData, result, vec};
+use std::{
+    cell::Cell,
+    fmt,
+    hash::{DefaultHasher, Hash, Hasher},
+    marker::PhantomData,
+    result, vec,
+};
 
 use backtrace::Backtrace;
 use thiserror::Error;
@@ -634,22 +640,15 @@ impl<'a> Parser<'a> {
                 ))
             }
 
-            [
-                t,
-                Token {
-                    kind: TokenKind::Identifier(name),
-                    position,
-                },
-                Token {
-                    kind: TokenKind::TypeAscribe,
-                    ..
-                },
-                ..,
-            ] if t.is_keyword(Keyword::Witness) => {
-                // witness <id> <::>
-                self.advance(3);
+            [t, u, ..] if t.is_keyword(Keyword::Witness) && u.kind == TokenKind::TypeAscribe => {
+                // witness <::>
+                self.advance(2);
 
                 let type_signature = self.parse_type_signature()?;
+                let hasher = &mut DefaultHasher::default();
+                type_signature.to_string().hash(hasher);
+
+                let hash = hasher.finish();
 
                 // <:=>
                 self.advance(1);
@@ -657,11 +656,10 @@ impl<'a> Parser<'a> {
                 let body = self.parse_block(|parser| parser.parse_record())?;
 
                 Ok(Declaration::Witness(
-                    ParseInfo::from_position(*position),
+                    ParseInfo::from_position(*&t.position),
                     WitnessDeclaration {
-                        name: Identifier::from_str(name),
                         type_signature,
-                        body,
+                        implementation: body,
                     },
                 ))
             }

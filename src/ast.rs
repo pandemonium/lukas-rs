@@ -8,6 +8,7 @@ use crate::{
 };
 
 pub mod annotation;
+pub mod constraints;
 pub mod namer;
 pub mod pattern;
 
@@ -40,9 +41,8 @@ pub struct ConstraintDeclaration<A> {
 
 #[derive(Debug)]
 pub struct WitnessDeclaration<A> {
-    pub name: parser::Identifier,
     pub type_signature: TypeSignature<A, parser::IdentifierPath>,
-    pub body: ast::Expr<A, parser::IdentifierPath>,
+    pub implementation: ast::Expr<A, parser::IdentifierPath>,
 }
 
 #[derive(Debug)]
@@ -569,12 +569,11 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
-            name,
             type_signature,
-            body,
+            implementation: body,
         } = self;
 
-        write!(f, "{name} :: {type_signature} ::= {body}")
+        write!(f, "witness :: {type_signature} ::= {body}")
     }
 }
 

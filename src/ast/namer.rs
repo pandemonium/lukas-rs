@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
-    hash::Hash,
+    hash::{DefaultHasher, Hash, Hasher},
     iter,
     marker::PhantomData,
     rc::Rc,
@@ -458,6 +458,7 @@ pub struct SymbolTable<A, GlobalName, LocalId> {
     pub module_members: HashMap<parser::IdentifierPath, Vec<ModuleMember>>,
     pub member_modules: HashMap<ModuleMember, Vec<parser::IdentifierPath>>,
 
+    // Why only one table?
     pub symbols: HashMap<SymbolName, Symbol<A, GlobalName, LocalId>>,
     pub imports: Vec<parser::IdentifierPath>,
 
@@ -723,15 +724,20 @@ impl ParserSymbolTable {
         module_path: &IdentifierPath,
         decl: ast::WitnessDeclaration<ParseInfo>,
     ) {
+        let decl_name = fresh_name("witness_", &decl.type_signature.to_string());
+
         // These must be indexed by type signature
-        let name = QualifiedName::new(module_path.clone(), decl.name.as_str());
-        self.add_module_term_member(module_path.clone(), decl.name);
+        let name = QualifiedName::new(module_path.clone(), &decl_name);
+        self.add_module_term_member(
+            module_path.clone(),
+            parser::Identifier::from_str(&decl_name),
+        );
         self.add_term_symbol(
             name.clone(),
             TermSymbol {
                 name: name.clone(),
                 type_signature: Some(decl.type_signature),
-                body: Some(decl.body),
+                body: Some(decl.implementation),
             },
         );
         self.witnesses.insert(name);
@@ -744,6 +750,9 @@ impl ParserSymbolTable {
     ) {
         let name = QualifiedName::new(module_path.clone(), decl.name.as_str());
         self.add_module_type_member(module_path.clone(), decl.name);
+        for field in &decl.declarator.fields {
+            self.add_module_member(module_path.clone(), ModuleMember::Term(field.name.clone()));
+        }
         self.add_type_symbol(
             name.clone(),
             decl.declarator.as_type_symbol(&decl.type_parameters, &name),
@@ -818,6 +827,13 @@ impl ParserSymbolTable {
             }
         }
     }
+}
+
+fn fresh_name(prefix: &str, source: &str) -> String {
+    let hasher = &mut DefaultHasher::default();
+    source.hash(hasher);
+    let hash = hasher.finish();
+    format!("{prefix}{hash}")
 }
 
 fn prefix_chain(identifier_path: &IdentifierPath) -> impl Iterator<Item = IdentifierPath> {
@@ -1373,7 +1389,7 @@ impl parser::Expr {
                 // identier_path is a free term
                 // Module1.ModuleN.term.projection1.projectionN
                 } else if let Some(path) =
-                    { symbols.resolve_free_term_name(identifier_path, semantic_scope) }
+                    symbols.resolve_free_term_name(identifier_path, semantic_scope)
                 {
                     Ok(path.into_projection(*pi))
                 } else {
