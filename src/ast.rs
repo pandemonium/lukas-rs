@@ -1,7 +1,7 @@
 use std::{fmt, marker::PhantomData, rc::Rc};
 
 use crate::{
-    ast::{self, annotation::Annotated, namer::QualifiedName},
+    ast::{self, annotation::Annotated, namer::QualifiedName, pattern::MatchClause},
     bridge::Bridge,
     compiler, parser,
     typer::display_list,
@@ -199,6 +199,150 @@ impl<A, Id> Expr<A, Id> {
         Self: Annotated<A, Erased, Id, Output = Expr<Erased, Id>>,
     {
         self.map_annotation(&|_| Erased)
+    }
+
+    pub fn map<F>(self, f: &F) -> Expr<A, Id>
+    where
+        F: Fn(Expr<A, Id>) -> Expr<A, Id>,
+        A: Clone,
+        Id: Clone,
+    {
+        // helper: recurse structurally, forcing ownership once
+        fn go<A, Id, F>(tree: Tree<A, Id>, f: &F) -> Tree<A, Id>
+        where
+            F: Fn(Expr<A, Id>) -> Expr<A, Id>,
+            A: Clone,
+            Id: Clone,
+        {
+            let owned = Rc::unwrap_or_clone(tree);
+            Rc::new(owned.map(f))
+        }
+
+        let rebuilt = match self {
+            Expr::RecursiveLambda(a, the) => Expr::RecursiveLambda(
+                a,
+                SelfReferential {
+                    own_name: the.own_name,
+                    lambda: Lambda {
+                        parameter: the.lambda.parameter,
+                        body: go(the.lambda.body, f),
+                    },
+                },
+            ),
+
+            Expr::Lambda(a, the) => Expr::Lambda(
+                a,
+                Lambda {
+                    parameter: the.parameter,
+                    body: go(the.body, f),
+                },
+            ),
+
+            Expr::Apply(a, the) => Expr::Apply(
+                a,
+                Apply {
+                    function: go(the.function, f),
+                    argument: go(the.argument, f),
+                },
+            ),
+
+            Expr::Let(a, the) => Expr::Let(
+                a,
+                Binding {
+                    binder: the.binder,
+                    bound: go(the.bound, f),
+                    body: go(the.body, f),
+                },
+            ),
+
+            Expr::Tuple(a, the) => Expr::Tuple(
+                a,
+                Tuple {
+                    elements: the.elements.into_iter().map(|e| go(e, f)).collect(),
+                },
+            ),
+
+            Expr::Record(a, the) => Expr::Record(
+                a,
+                Record {
+                    fields: the.fields.into_iter().map(|(k, v)| (k, go(v, f))).collect(),
+                },
+            ),
+
+            Expr::Construct(a, the) => Expr::Construct(
+                a,
+                Construct {
+                    constructor: the.constructor,
+                    arguments: the.arguments.into_iter().map(|e| go(e, f)).collect(),
+                },
+            ),
+
+            Expr::Project(a, the) => Expr::Project(
+                a,
+                Projection {
+                    base: go(the.base, f),
+                    select: the.select,
+                },
+            ),
+
+            Expr::Sequence(a, the) => Expr::Sequence(
+                a,
+                Sequence {
+                    this: go(the.this, f),
+                    and_then: go(the.and_then, f),
+                },
+            ),
+
+            Expr::Deconstruct(a, the) => Expr::Deconstruct(
+                a,
+                Deconstruct {
+                    scrutinee: go(the.scrutinee, f),
+                    match_clauses: the
+                        .match_clauses
+                        .into_iter()
+                        .map(|clause| MatchClause {
+                            pattern: clause.pattern,
+                            consequent: go(clause.consequent, f),
+                        })
+                        .collect(),
+                },
+            ),
+
+            Expr::If(a, the) => Expr::If(
+                a,
+                IfThenElse {
+                    predicate: go(the.predicate, f),
+                    consequent: go(the.consequent, f),
+                    alternate: go(the.alternate, f),
+                },
+            ),
+
+            Expr::Interpolate(a, the) => Expr::Interpolate(
+                a,
+                Interpolate(
+                    the.0
+                        .into_iter()
+                        .map(|s| match s {
+                            Segment::Expression(expr) => Segment::Expression(go(expr, f)),
+                            other => other,
+                        })
+                        .collect(),
+                ),
+            ),
+
+            Expr::Ascription(a, the) => Expr::Ascription(
+                a,
+                TypeAscription {
+                    ascribed_tree: go(the.ascribed_tree, f),
+                    type_signature: the.type_signature,
+                },
+            ),
+
+            simple => simple,
+        };
+
+        // apply rewrite exactly once at this node
+        f(rebuilt)
     }
 }
 

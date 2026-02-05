@@ -1,7 +1,7 @@
 use crate::{
     ast::{
         BUILTIN_MODULE_NAME, STDLIB_MODULE_NAME,
-        namer::{QualifiedName, Symbol, TypeDefinition, TypeOrigin, TypeSymbol},
+        namer::{Symbol, TypeDefinition, TypeOrigin, TypeSymbol},
     },
     bridge::{External, Lambda1, Lambda2, PartialRawLambda2, RawLambda1},
     interpreter::{Literal, Value},
@@ -9,7 +9,7 @@ use crate::{
     lexer::Operator,
     parser::{self, ParseInfo},
     rawlambda1,
-    typer::{BaseType, Constraint, ConstraintSet, Type, TypeParameter, TypeScheme},
+    typer::{BaseType, ConstraintSet, Type, TypeParameter, TypeScheme},
 };
 
 fn comparison_signature() -> TypeScheme {
@@ -25,13 +25,7 @@ fn comparison_signature() -> TypeScheme {
             .into(),
         },
         // todo: Some sort of Ord constraint here? Be an interesting test!
-        constraints: ConstraintSet::from(
-            vec![&Constraint {
-                class: QualifiedName::builtin("Tårta"),
-                at: vec![Type::Variable(tp)],
-            }]
-            .as_slice(),
-        ),
+        constraints: ConstraintSet::default(),
     }
 }
 

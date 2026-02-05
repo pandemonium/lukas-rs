@@ -13,8 +13,7 @@ use thiserror::Error;
 use crate::{
     ast::{
         self, ApplyTypeExpr, ArrowTypeExpr, BUILTIN_MODULE_NAME, CompilationUnit, Declaration,
-        ModuleDeclarator, ProductElement, STDLIB_MODULE_NAME, Tree, TupleTypeExpr,
-        pattern::TuplePattern,
+        ModuleDeclarator, ProductElement, STDLIB_MODULE_NAME, TupleTypeExpr, pattern::TuplePattern,
     },
     builtin,
     compiler::{Compilation, Compiler, Located, LocatedError},
@@ -300,6 +299,10 @@ impl QualifiedName {
 
     pub fn module(&self) -> &parser::IdentifierPath {
         &self.module
+    }
+
+    pub fn member(&self) -> &parser::Identifier {
+        &self.member
     }
 }
 
@@ -1220,148 +1223,17 @@ impl parser::TypeExpression {
     }
 }
 
-fn map_lower_tuples(body: Tree<ParseInfo, IdentifierPath>) -> Tree<ParseInfo, IdentifierPath> {
-    Rc::unwrap_or_clone(body).lower_tuples().into()
-}
-
 impl parser::Expr {
     pub fn lower_tuples(self) -> parser::Expr {
-        match self {
-            parser::Expr::Variable(..)
-            | parser::Expr::Constant(..)
-            | parser::Expr::InvokeBridge(..) => self,
-
-            parser::Expr::RecursiveLambda(a, the) => parser::Expr::RecursiveLambda(
+        self.map(&|e| match e {
+            parser::Expr::Tuple(a, tuple) => parser::Expr::Tuple(
                 a,
-                parser::SelfReferential {
-                    own_name: the.own_name,
-                    lambda: parser::Lambda {
-                        parameter: the.lambda.parameter,
-                        body: map_lower_tuples(the.lambda.body),
-                    },
+                parser::Tuple {
+                    elements: unspine_tuple(tuple.elements),
                 },
             ),
-
-            parser::Expr::Lambda(a, the) => parser::Expr::Lambda(
-                a,
-                parser::Lambda {
-                    parameter: the.parameter,
-                    body: map_lower_tuples(the.body),
-                },
-            ),
-
-            parser::Expr::Apply(a, the) => parser::Expr::Apply(
-                a,
-                parser::Apply {
-                    function: map_lower_tuples(the.function),
-                    argument: map_lower_tuples(the.argument),
-                },
-            ),
-
-            parser::Expr::Let(a, the) => parser::Expr::Let(
-                a,
-                parser::Binding {
-                    binder: the.binder,
-                    bound: map_lower_tuples(the.bound),
-                    body: map_lower_tuples(the.body),
-                },
-            ),
-
-            parser::Expr::Tuple(a, the) => {
-                let elements = the.elements;
-                parser::Expr::Tuple(
-                    a,
-                    parser::Tuple {
-                        elements: unspine_tuple(elements),
-                    },
-                )
-            }
-
-            parser::Expr::Record(a, the) => parser::Expr::Record(
-                a,
-                parser::Record {
-                    fields: the
-                        .fields
-                        .into_iter()
-                        .map(|(label, e)| (label, map_lower_tuples(e)))
-                        .collect(),
-                },
-            ),
-
-            parser::Expr::Construct(a, the) => parser::Expr::Construct(
-                a,
-                parser::Construct {
-                    constructor: the.constructor,
-                    arguments: the
-                        .arguments
-                        .into_iter()
-                        .map(|e| map_lower_tuples(e))
-                        .collect(),
-                },
-            ),
-
-            parser::Expr::Project(a, the) => parser::Expr::Project(
-                a,
-                parser::Projection {
-                    base: map_lower_tuples(the.base),
-                    select: the.select,
-                },
-            ),
-
-            parser::Expr::Sequence(a, the) => parser::Expr::Sequence(
-                a,
-                parser::Sequence {
-                    this: map_lower_tuples(the.this),
-                    and_then: map_lower_tuples(the.and_then),
-                },
-            ),
-
-            parser::Expr::Deconstruct(a, the) => parser::Expr::Deconstruct(
-                a,
-                parser::Deconstruct {
-                    scrutinee: map_lower_tuples(the.scrutinee),
-                    match_clauses: the
-                        .match_clauses
-                        .iter()
-                        .map(|clause| parser::MatchClause {
-                            pattern: clause.pattern.normalize(),
-                            consequent: map_lower_tuples(clause.consequent.clone()),
-                        })
-                        .collect(),
-                },
-            ),
-
-            parser::Expr::If(a, the) => parser::Expr::If(
-                a,
-                parser::IfThenElse {
-                    predicate: map_lower_tuples(the.predicate),
-                    consequent: map_lower_tuples(the.consequent),
-                    alternate: map_lower_tuples(the.alternate),
-                },
-            ),
-
-            parser::Expr::Interpolate(a, ast::Interpolate(the)) => parser::Expr::Interpolate(
-                a,
-                ast::Interpolate(
-                    the.into_iter()
-                        .map(|s| match s {
-                            ast::Segment::Literal(a, literal) => ast::Segment::Literal(a, literal),
-                            ast::Segment::Expression(expr) => {
-                                ast::Segment::Expression(map_lower_tuples(expr))
-                            }
-                        })
-                        .collect(),
-                ),
-            ),
-
-            parser::Expr::Ascription(a, the) => parser::Expr::Ascription(
-                a,
-                parser::TypeAscription {
-                    ascribed_tree: map_lower_tuples(the.ascribed_tree),
-                    type_signature: the.type_signature,
-                },
-            ),
-        }
+            otherwise => otherwise,
+        })
     }
 
     pub fn resolve_names(

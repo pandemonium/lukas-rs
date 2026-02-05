@@ -1,9 +1,32 @@
 use std::collections::HashMap;
 
 use crate::{
-    ast::namer::TypeSignature,
-    typer::{self, Constraint},
+    ast::namer::{QualifiedName, TypeSignature},
+    parser,
+    typer::{self, Constraint, Type, TypeEnvironment, TypeError},
 };
+
+pub struct ConstraintSignature {
+    pub name: QualifiedName,
+    pub methods: Vec<parser::Identifier>,
+}
+
+impl Constraint {
+    pub fn signature(&self, env: &TypeEnvironment) -> Result<ConstraintSignature, TypeError> {
+        let type_constructor = env
+            .lookup(&self.class)
+            .ok_or_else(|| TypeError::UndefinedSignature(self.class.clone()))?;
+
+        if let Type::Record(record) = type_constructor.structure().map_err(|e| e.error)? {
+            Ok(ConstraintSignature {
+                name: self.class.clone(),
+                methods: record.shape().fields().to_vec(),
+            })
+        } else {
+            Err(TypeError::InternalAssertion("expected a record".to_owned()))
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Witness {

@@ -1,9 +1,5 @@
 use Stdlib.
 
-constraint Ord ::= ∀α.
-  { cmp :: α -> α -> Bool
-  }
-
 constraint Eq ::= ∀α.
   { eq :: α -> α -> Bool
   }
@@ -12,9 +8,8 @@ witness :: Eq Int :=
   { eq: λp q. p = q
   }
 
-witness_1 :: Eq Int :=
-  { eq: λp q. p = q
-  }
+boo := λ_.
+  eq 1 1
 
 list_eq :: ∀α. Eq α |- List α -> List α -> Bool := λxs ys.
   let zipped = List.zip xs ys in
@@ -24,15 +19,13 @@ list_eq :: ∀α. Eq α |- List α -> List α -> Bool := λxs ys.
   in
     List.fold_right cmp true zipped
 
-list_eq2 :: ∀α. Eq α -> List α -> List α -> Bool := λc0 xs ys.
+list_eq2 :: ∀α. List α -> List α -> Bool := λxs ys.
   let zipped = List.zip xs ys in
   let cmp = λt z.
     deconstruct t into
-      p, q -> z and c0.eq p q
+      p, q -> z and p = q
   in
     List.fold_right cmp true zipped
 
 start := λ_.
-  let xs = List.tabulate 10 id in
-  let ys = List.tabulate 10 id in
-  print_endline "Lists equality is `list_eq2 witness_1 xs ys`"
+  print_endline "Hello!"
