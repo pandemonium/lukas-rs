@@ -207,7 +207,6 @@ impl<A, Id> Expr<A, Id> {
         A: Clone,
         Id: Clone,
     {
-        // helper: recurse structurally, forcing ownership once
         fn go<A, Id, F>(tree: Tree<A, Id>, f: &F) -> Tree<A, Id>
         where
             F: Fn(Expr<A, Id>) -> Expr<A, Id>,

@@ -311,73 +311,14 @@ impl namer::NamedSymbolTable {
         let inferred_type = &expr.as_constrained_type();
         let scheme = inferred_type.generalize(&ctx);
         println!("typer: {qualified_name} :: {scheme}");
-        println!(
-            "typer: retained constraints {}, applied {}",
-            scheme.constraints, scheme.underlying.constraints
-        );
 
         if !scheme.underlying.constraints.is_empty() {
-            let mut constraint_index_by_method = HashMap::new();
-            for (i, constraint) in scheme.underlying.constraints.iter().enumerate() {
-                let signature = constraint
-                    .signature(&ctx.types)
-                    .map_err(|e| e.at(expr.tree.type_info().parse_info))?;
-                for method in &signature.methods {
-                    constraint_index_by_method.insert(
-                        QualifiedName::new(constraint.class.module().clone(), method.as_str()),
-                        i,
-                    );
-                }
-            }
+            // Once per term like this is dumb
+            let constraint_method_map =
+                constraint_methods(&expr.tree, &scheme.underlying, &ctx.types)?;
 
-            expr = if let Expr::Ascription(a0, ascription) = expr.tree.clone()
-                && let Expr::RecursiveLambda(a1, rec) = &ascription.ascribed_tree.as_ref()
-            {
-                println!("XXX");
-
-                expr.map_tree(&|_| {
-                    Expr::Ascription(
-                        a0.clone(),
-                        TypeAscription {
-                            ascribed_tree: Expr::RecursiveLambda(
-                                a1.clone(),
-                                SelfReferential {
-                                    own_name: rec.own_name.clone(),
-                                    lambda: rec.lambda.clone().prepend_parameter(),
-                                },
-                            )
-                            .into(),
-                            type_signature: ascription.type_signature.clone(),
-                        },
-                    )
-                })
-            } else {
-                expr
-            };
-
-            expr = expr.map_tree(&|e| match e {
-                Expr::Variable(a, Identifier::Free(method))
-                    if constraint_index_by_method.contains_key(&method) =>
-                {
-                    Expr::Project(
-                        a.clone(),
-                        Projection {
-                            base: Expr::Variable(
-                                a,
-                                Identifier::Bound(
-                                    *constraint_index_by_method.get(&method).expect(&format!(
-                                        "failed to project {method} off of dict."
-                                    )),
-                                ),
-                            )
-                            .into(),
-                            select: ProductElement::Name(method.member().clone()),
-                        },
-                    )
-                }
-
-                others => others,
-            });
+            expr.tree = add_constraint_parameters(&expr.tree, &scheme.underlying.constraints);
+            expr.tree = add_dictionary_projections(&expr.tree, &constraint_method_map);
 
             println!("compute_term_symbol: transformed tree {}", expr.tree);
         }
@@ -390,6 +331,76 @@ impl namer::NamedSymbolTable {
             body: expr.tree.into(),
         }))
     }
+}
+
+fn add_dictionary_projections(
+    tree: &ast::Expr<TypeInfo, Identifier>,
+    constraint_methods: &HashMap<QualifiedName, usize>,
+) -> ast::Expr<TypeInfo, Identifier> {
+    tree.clone().map(&|e| match e {
+        Expr::Variable(a, Identifier::Free(method)) if constraint_methods.contains_key(&method) => {
+            Expr::Project(
+                a.clone(),
+                Projection {
+                    base: Expr::Variable(
+                        a.clone(),
+                        Identifier::Bound(*constraint_methods.get(&method).unwrap()), //checked
+                    )
+                    .into(),
+                    select: ProductElement::Name(method.member().clone()),
+                },
+            )
+        }
+
+        others => others.clone(),
+    })
+}
+
+fn add_constraint_parameters(expr: &Expr, constraints: &ConstraintSet) -> Expr {
+    if let Expr::Ascription(a0, ascription) = expr
+        && let Expr::RecursiveLambda(a1, rec) = &ascription.ascribed_tree.as_ref()
+    {
+        let lambda = constraints
+            .iter()
+            .fold(rec.lambda.clone(), |z, c| z.prepend_parameter());
+
+        Expr::Ascription(
+            a0.clone(),
+            TypeAscription {
+                ascribed_tree: Expr::RecursiveLambda(
+                    a1.clone(),
+                    SelfReferential {
+                        own_name: rec.own_name.clone(),
+                        lambda: lambda.clone(),
+                    },
+                )
+                .into(),
+                type_signature: ascription.type_signature.clone(),
+            },
+        )
+    } else {
+        expr.clone()
+    }
+}
+
+fn constraint_methods(
+    expr: &Expr,
+    scheme: &TypeScheme,
+    ctx: &TypeEnvironment,
+) -> Typing<HashMap<QualifiedName, usize>> {
+    let mut constraint_index_by_method = HashMap::default();
+    for (i, constraint) in scheme.constraints.iter().enumerate() {
+        let signature = constraint
+            .signature(&ctx)
+            .map_err(|e| e.at(expr.type_info().parse_info))?;
+        for method in &signature.methods {
+            constraint_index_by_method.insert(
+                QualifiedName::new(constraint.class.module().clone(), method.as_str()),
+                i,
+            );
+        }
+    }
+    Ok(constraint_index_by_method)
 }
 
 impl Lambda {
@@ -641,7 +652,7 @@ impl Constrained<Type> {
         );
 
         Constrained {
-            constraints: ConstraintSet::from(retained.as_slice()),
+            constraints: ConstraintSet::default(),
             underlying: TypeScheme {
                 quantifiers: quantifiers.iter().copied().collect(),
                 underlying: self.underlying.clone(),
@@ -652,8 +663,7 @@ impl Constrained<Type> {
     }
 
     fn free_variables(&self, ctx: &TypingContext) -> HashSet<TypeParameter> {
-        let mut ty_vars = self.underlying.variables();
-        ty_vars.extend(self.constraints.variables());
+        let ty_vars = self.underlying.variables();
         let ctx_bounds = ctx.free_variables();
         ty_vars.difference(&ctx_bounds).copied().collect()
     }
@@ -727,7 +737,7 @@ impl Typed {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct ConstraintSet(Vec<Constraint>);
+pub struct ConstraintSet(BTreeSet<Constraint>);
 
 impl ConstraintSet {
     fn is_empty(&self) -> bool {
@@ -744,16 +754,14 @@ impl ConstraintSet {
         )
     }
 
-    fn union(&self, ConstraintSet(mut rhs): ConstraintSet) -> ConstraintSet {
+    fn union(&self, ConstraintSet(rhs): ConstraintSet) -> ConstraintSet {
         let Self(lhs) = self;
 
-        for c in lhs {
-            if !rhs.contains(&c) {
-                rhs.push(c.clone());
-            }
-        }
+        //        for c in lhs {
+        //            rhs.insert(c.clone());
+        //        }
 
-        Self(rhs)
+        Self(lhs.union(&rhs).cloned().collect())
     }
 
     fn variables(&self) -> HashSet<TypeParameter> {
@@ -776,7 +784,7 @@ impl From<&[&Constraint]> for ConstraintSet {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Constraint {
     pub class: QualifiedName,
     pub at: Vec<Type>,
@@ -799,7 +807,7 @@ impl Constraint {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RecordType(Vec<(parser::Identifier, Type)>);
 
 impl RecordType {
@@ -832,7 +840,7 @@ impl RecordType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CoproductType(Vec<(QualifiedName, Vec<Type>)>);
 
 impl CoproductType {
@@ -871,7 +879,7 @@ impl CoproductType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Type {
     Variable(TypeParameter),
     Base(BaseType),
@@ -1164,7 +1172,7 @@ impl Type {
 const BUILTIN_BASE_TYPE_NAMES: [&str; 2] =
     [BaseType::Int.local_name(), BaseType::Text.local_name()];
 
-#[derive(Copy, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BaseType {
     Int,
     Text,
@@ -1191,7 +1199,7 @@ impl BaseType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TupleType(pub Vec<Type>);
 
 impl TupleType {
@@ -1514,7 +1522,7 @@ impl TypeScheme {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TypeParameter(u32);
 
 static FRESH_TYPE_ID: AtomicU32 = AtomicU32::new(0);
@@ -3173,9 +3181,9 @@ impl TypingContext {
     #[instrument]
     fn infer_binding(&mut self, pi: ParseInfo, binding: &namer::Binding) -> Typing {
         let typed_bound = self.infer_expr(&binding.bound)?;
-        let ctx = self.with_substitutions(&typed_bound.substitutions);
+        let ctx1 = self.with_substitutions(&typed_bound.substitutions);
 
-        let bound_type = typed_bound.as_constrained_type().generalize(&ctx);
+        let bound_type = typed_bound.as_constrained_type().generalize(&ctx1);
         println!(
             "infer_binding: {} bound retained {}, quantified {}",
             binding.binder, bound_type.constraints, bound_type.underlying.constraints
@@ -3197,6 +3205,17 @@ impl TypingContext {
                 .with_substitutions(&substitutions)
                 .union(typed_body.constraints.with_substitutions(&substitutions));
 
+            //            let constraints = ConstraintSet::from(
+            //                constraints
+            //                    .iter()
+            //                    .filter(|c| {
+            //                        c.variables()
+            //                            .iter()
+            //                            .all(|v| ctx1.free_variables().contains(v))
+            //                    })
+            //                    .collect::<Vec<_>>()
+            //                    .as_slice(),
+            //            );
             Ok(Typed::computed(
                 substitutions,
                 constraints,
@@ -3592,7 +3611,11 @@ where
 
 impl fmt::Display for ConstraintSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", display_list(", ", &self.0))
+        write!(
+            f,
+            "{}",
+            display_list(", ", &self.0.iter().collect::<Vec<_>>())
+        )
     }
 }
 

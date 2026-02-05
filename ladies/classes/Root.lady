@@ -4,6 +4,10 @@ constraint Eq ::= ∀α.
   { eq :: α -> α -> Bool
   }
 
+constraint Cmp ::= ∀α.
+  { compare :: α -> α -> Bool
+  }
+
 witness :: Eq Int :=
   { eq: λp q. p = q
   }
@@ -11,11 +15,11 @@ witness :: Eq Int :=
 boo := λ_.
   eq 1 1
 
-list_eq :: ∀α. Eq α |- List α -> List α -> Bool := λxs ys.
+list_eq :: ∀α. Eq α + Cmp α |- List α -> List α -> Bool := λxs ys.
   let zipped = List.zip xs ys in
   let cmp = λt z.
     deconstruct t into
-      p, q -> z and eq p q
+      p, q -> z and eq p q and compare p q
   in
     List.fold_right cmp true zipped
 
