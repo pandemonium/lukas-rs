@@ -1,35 +1,18 @@
-use Stdlib.
-
 constraint Eq ::= ∀α.
   { eq :: α -> α -> Bool
-  }
-
-constraint Cmp ::= ∀α.
-  { compare :: α -> α -> Bool
   }
 
 witness :: Eq Int :=
   { eq: λp q. p = q
   }
 
-boo := λ_.
-  eq 1 1
+boo :: Bool :=
+  eq 1 2
 
-list_eq :: ∀α. Eq α + Cmp α |- List α -> List α -> Bool := λxs ys.
-  let zipped = List.zip xs ys in
-  let cmp = λt z.
-    deconstruct t into
-      p, q -> z and eq p q and compare p q
-  in
-    List.fold_right cmp true zipped
-
-list_eq2 :: ∀α. List α -> List α -> Bool := λxs ys.
-  let zipped = List.zip xs ys in
-  let cmp = λt z.
-    deconstruct t into
-      p, q -> z and p = q
-  in
-    List.fold_right cmp true zipped
+quux :: ∀α. Eq α |- α -> α -> Text :=
+  λp q.
+    if eq p q then "hej" else "ho"
 
 start := λ_.
-  print_endline "Hello!"
+  print_endline "Hello boo: `boo`"
+  print_endline "Hello quux: `quux 2 1`"

@@ -287,12 +287,14 @@ impl Environment {
 
         match symbol {
             Value::Closure(closure) => apply_closure(closure, Value::Constant(argument.into())),
+
             Value::RecursiveClosure { inner, .. } => {
                 let closure = inner.upgrade().ok_or_else(|| {
                     RuntimeError::ExpiredSelfReferential(format!("{symbol_name}"))
                 })?;
                 apply_closure(closure, Value::Constant(argument.into()))
             }
+
             otherwise => Err(RuntimeError::ExpectedClosure(otherwise)),
         }
     }

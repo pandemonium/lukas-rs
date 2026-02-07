@@ -471,7 +471,7 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Variable(a, x) => write!(f, "{x}::{a}"),
+            Self::Variable(_, x) => write!(f, "{x}"),
             Self::InvokeBridge(_, x) => write!(f, "bridge_{}", x),
             Self::Constant(_, x) => write!(f, "{x}"),
             Self::RecursiveLambda(_, x) => write!(f, "{} := {}", x.own_name, x.lambda),

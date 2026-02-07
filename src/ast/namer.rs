@@ -307,11 +307,17 @@ impl QualifiedName {
 }
 
 #[derive(Debug, Clone)]
-pub struct DependencyMatrix<Id>(HashMap<Id, Vec<Id>>);
+pub struct DependencyMatrix<Id> {
+    graph: HashMap<Id, Vec<Id>>,
+    witnesses: HashSet<Id>,
+}
 
 impl<Id> Default for DependencyMatrix<Id> {
     fn default() -> Self {
-        Self(HashMap::default())
+        Self {
+            graph: HashMap::default(),
+            witnesses: HashSet::default(),
+        }
     }
 }
 
@@ -320,14 +326,19 @@ where
     Id: Eq + Hash + fmt::Display + fmt::Debug,
 {
     pub fn add_edge(&mut self, node: Id, vertices: Vec<Id>) {
-        self.0.insert(node, vertices);
+        self.graph.insert(node, vertices);
+    }
+
+    pub fn add_witness(&mut self, witness: Id) {
+        self.witnesses.insert(witness);
     }
 
     pub fn are_sound(&self) -> bool {
-        let Self(map) = self;
-        let unsatisfieds = map
+        //        let Self(map) = self;
+        let unsatisfieds = self
+            .graph
             .iter()
-            .filter_map(|(_, deps)| deps.iter().find(|&dep| !map.contains_key(dep)))
+            .filter_map(|(_, deps)| deps.iter().find(|&dep| !self.graph.contains_key(dep)))
             .collect::<Vec<_>>();
 
         println!("dependencies: unsatisfied {:?}", unsatisfieds);
@@ -336,10 +347,10 @@ where
     }
 
     pub fn in_resolvable_order(&self) -> Vec<&Id> {
-        let mut resolved = Vec::with_capacity(self.0.len());
+        let mut resolved = Vec::with_capacity(self.graph.len());
 
         let mut graph = self
-            .0
+            .graph
             .iter()
             // Filter out recursive definitions
             .map(|(node, edges)| {
@@ -358,12 +369,29 @@ where
             .map(|(node, edges)| (*node, edges.len()))
             .collect::<HashMap<_, _>>();
 
-        let mut queue = in_degrees
-            .iter()
-            .filter_map(|(node, in_degree)| (*in_degree == 0).then_some(*node))
-            .collect::<VecDeque<_>>();
+        //        let mut queue = in_degrees
+        //            .iter()
+        //            .filter_map(|(node, in_degree)| (*in_degree == 0).then_some(*node))
+        //            .collect::<VecDeque<_>>();
 
-        while let Some(independent) = queue.pop_front() {
+        let mut witnesses = VecDeque::new();
+        let mut non_witnesses = VecDeque::new();
+
+        for (&node, in_degree) in &in_degrees {
+            if *in_degree == 0 {
+                if self.witnesses.contains(node) {
+                    witnesses.push_back(node);
+                } else {
+                    non_witnesses.push_back(node);
+                }
+            }
+        }
+
+        while let Some(independent) = if !witnesses.is_empty() {
+            witnesses.pop_front()
+        } else {
+            non_witnesses.pop_front()
+        } {
             resolved.push(independent);
 
             for (node, edges) in &mut graph {
@@ -372,7 +400,12 @@ where
                 {
                     *count -= 1;
                     if *count == 0 {
-                        queue.push_back(node);
+                        //                        queue.push_back(node);
+                        if self.witnesses.contains(node) {
+                            witnesses.push_back(node);
+                        } else {
+                            non_witnesses.push_back(node);
+                        }
                     }
                 }
             }
@@ -390,6 +423,15 @@ where
 pub enum SymbolName {
     Type(QualifiedName),
     Term(QualifiedName),
+}
+
+impl SymbolName {
+    pub fn name(&self) -> &QualifiedName {
+        match self {
+            Self::Type(name) => name,
+            Self::Term(name) => name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1891,7 +1933,7 @@ impl fmt::Display for NameExpr {
 impl fmt::Display for QualifiedName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { module, member } = self;
-        write!(f, "{module}::{member}")
+        write!(f, "{module}.{member}")
     }
 }
 

@@ -15,8 +15,8 @@ use tracing::{instrument, trace};
 use crate::{
     ast::{
         self, ApplyTypeExpr, ArrowTypeExpr, Literal, ProductElement, Tree, TupleTypeExpr,
-        TypeSignature,
         annotation::Annotated,
+        constraints::{Witness, WitnessIndex},
         namer::{
             self, DependencyMatrix, Identifier, QualifiedName, Symbol, SymbolName, SymbolTable,
             TermSymbol, TypeDefinition, TypeExpression, TypeSymbol,
@@ -112,6 +112,9 @@ where
         // This function is incredibly inefficient.
         for (id, symbol) in &self.symbols {
             matrix.add_edge(id.clone(), symbol.dependencies().into_iter().collect());
+            if self.witnesses.contains(id.name()) {
+                matrix.add_witness(id.clone());
+            }
         }
 
         // Also add constraint methods
@@ -189,11 +192,15 @@ impl namer::NamedSymbolTable {
 
         self.elaborate_constraints(&mut ctx)?;
 
+        let mut witness_index = WitnessIndex::default();
+
         let is_typed = |id: &&&SymbolName| match id {
             // Some term symbols are already
             SymbolName::Type(name) => !ctx.types.bindings.contains_key(name),
             SymbolName::Term(name) => !ctx.terms.free.contains_key(name),
         };
+
+        println!("compute_types: known witnesses {:?}", self.witnesses);
 
         // Enter terms
         for (id, symbol) in evaluation_order
@@ -208,7 +215,14 @@ impl namer::NamedSymbolTable {
             .collect::<Typing<Vec<_>>>()?
         {
             let symbol = match symbol {
-                namer::Symbol::Term(symbol) => Self::compute_term_symbol(symbol, &mut ctx)?,
+                namer::Symbol::Term(symbol) => {
+                    println!("compute_types: me {id} {}", symbol.name);
+                    namer::Symbol::Term(self.elaborate_term(
+                        symbol,
+                        &mut witness_index,
+                        &mut ctx,
+                    )?)
+                }
                 namer::Symbol::Type(symbol) => namer::Symbol::Type(symbol.clone()),
             };
 
@@ -227,35 +241,6 @@ impl namer::NamedSymbolTable {
 
     fn elaborate_constraints(&mut self, ctx: &mut TypingContext) -> Typing<()> {
         self.insert_constraint_method_placeholders(ctx)?;
-
-        //        for symbol in self.symbols.values_mut() {
-        //            if let Symbol::Term(symbol) = symbol
-        //                && let Some(signature) = &symbol.type_signature
-        //                && !signature.constraints.is_empty()
-        //            {
-        //                for c in &signature.constraints {
-        //                    // 1. insert a correctly typed parameter in the signature
-        //                    //   1.a. Arrow { domain: constraint ty, codomain: signature } enough?
-        //                    // 2. insert a wrapping lambda with this parameter
-        //                    //   2.a. rewrite all bound + k, where k is the number of dicts
-        //                    // 3. for all methods of c.class, rewrite every occurence with
-        //                    //    a projection off of the parameter named in the lambda.
-        //                    println!("elaborate_constraints: {:?}", symbol.body);
-        //
-        //                    let body = symbol.body.take().expect("expected symbol body");
-        //                    let body = body.map(&|e| match e {
-        //                        Expr::Apply(a, Apply { function, argument })
-        //                            if matches!(function.as_ref(), Expr::Variable(..)) =>
-        //                        {
-        //                            Expr::Apply(a, Apply { function, argument })
-        //                        }
-        //
-        //                        others => others,
-        //                    });
-        //                }
-        //            }
-        //        }
-
         Ok(())
     }
 
@@ -267,28 +252,25 @@ impl namer::NamedSymbolTable {
                 .cloned()
                 .expect("internal error: constraint name does not match type constructor.");
 
-            let generalize_method = |underlying| TypeScheme {
-                quantifiers: type_constructor.quantifiers().collect(),
-                underlying,
-                constraints: ConstraintSet::from(
-                    [Constraint {
-                        class: type_constructor.definition().name.clone(),
-                        at: type_constructor.quantifiers().map(Type::Variable).collect(),
-                    }]
-                    .as_slice(),
-                ),
-            };
+            let type_constructor = type_constructor.instantiate(ctx)?;
+            let constraints = ConstraintSet::from(
+                [Constraint::from_type_constructor(&type_constructor)].as_slice(),
+            );
 
             if let Type::Record(RecordType(shape)) = type_constructor.structure()? {
                 for (method_id, ty) in shape {
-                    let scheme = generalize_method(ty.clone());
+                    let scheme = Constrained {
+                        constraints: constraints.clone(),
+                        underlying: ty.clone(),
+                    }
+                    .generalize(ctx);
 
                     let name = QualifiedName::new(
                         type_constructor.defining_context().clone(),
                         method_id.as_str(),
                     );
                     println!("elaborate_constraints: bind {name} to {scheme}");
-                    ctx.bind_free_term(name, scheme);
+                    ctx.bind_free_term(name, scheme.underlying);
                 }
             }
         }
@@ -296,73 +278,202 @@ impl namer::NamedSymbolTable {
         Ok(())
     }
 
-    fn compute_term_symbol(
+    fn elaborate_term(
+        &self,
         symbol: &TermSymbol<ParseInfo, namer::QualifiedName, Identifier>,
+        witness_index: &mut WitnessIndex,
         ctx: &mut TypingContext,
-    ) -> Typing<TypedSymbol> {
+    ) -> Typing<TermSymbol<TypeInfo, QualifiedName, Identifier>> {
         let mut expr = ctx.infer_expr(&symbol.body())?;
 
         println!(
-            "compute_term_symbol: constraints [{}] {} -> {}",
+            "elaborate_term: [{}] {} -> {}",
             expr.constraints, symbol.name, expr.tree
         );
 
         let qualified_name = symbol.name.clone();
+
+        println!("elaborate_term: discharging for {}", symbol.name);
+        expr = discharge_ground_constraints(&expr, witness_index, &ctx)?;
+
         let inferred_type = &expr.as_constrained_type();
         let scheme = inferred_type.generalize(&ctx);
         println!("typer: {qualified_name} :: {scheme}");
 
-        if !scheme.underlying.constraints.is_empty() {
-            // Once per term like this is dumb
-            let constraint_method_map =
-                constraint_methods(&expr.tree, &scheme.underlying, &ctx.types)?;
-
-            expr.tree = add_constraint_parameters(&expr.tree, &scheme.underlying.constraints);
-            expr.tree = add_dictionary_projections(&expr.tree, &constraint_method_map);
-
-            println!("compute_term_symbol: transformed tree {}", expr.tree);
+        for c in scheme.underlying.constraints.iter() {
+            expr.tree = add_constraint_parameter_slot(&expr.tree);
+            expr.tree = add_constraint_projections(&expr.tree, c, &ctx)
+                .map_err(|e| e.at(ParseInfo::default()))?;
         }
 
-        ctx.bind_free_term(qualified_name, scheme.underlying);
+        println!(
+            "elaborate_term: {} transformed tree {}",
+            symbol.name, expr.tree
+        );
 
-        Ok(namer::Symbol::Term(TermSymbol {
+        ctx.bind_free_term(qualified_name.clone(), scheme.clone().underlying);
+
+        if self.witnesses.contains(&qualified_name) {
+            println!(
+                "elaborate_term: witness {qualified_name} :: {}",
+                scheme.underlying
+            );
+            witness_index.insert(Witness {
+                ty: scheme.underlying.underlying.clone(),
+                //                dictionary: expr.tree.clone(),
+                dictionary: Expr::Variable(
+                    expr.tree.type_info().clone(),
+                    Identifier::Free(qualified_name.clone()),
+                ),
+            });
+        }
+
+        Ok(TermSymbol {
             name: symbol.name.clone(),
             type_signature: symbol.type_signature.clone(),
             body: expr.tree.into(),
-        }))
+        })
     }
 }
 
-fn add_dictionary_projections(
-    tree: &ast::Expr<TypeInfo, Identifier>,
-    constraint_methods: &HashMap<QualifiedName, usize>,
-) -> ast::Expr<TypeInfo, Identifier> {
-    tree.clone().map(&|e| match e {
-        Expr::Variable(a, Identifier::Free(method)) if constraint_methods.contains_key(&method) => {
-            Expr::Project(
-                a.clone(),
-                Projection {
-                    base: Expr::Variable(
-                        a.clone(),
-                        Identifier::Bound(*constraint_methods.get(&method).unwrap()), //checked
-                    )
-                    .into(),
-                    select: ProductElement::Name(method.member().clone()),
-                },
-            )
+fn discharge_ground_constraints(
+    expr: &Typed,
+    witness_index: &WitnessIndex,
+    ctx: &TypingContext,
+) -> Typing<Typed> {
+    let (ground, nonground) = expr
+        .constraints
+        .iter()
+        .partition::<Vec<_>, _>(|c| c.is_ground());
+
+    let mut evidence = Vec::with_capacity(ground.len());
+    let pi = expr.tree.type_info().parse_info;
+
+    for &c in &ground {
+        let Some(witness) = witness_index.witness(c) else {
+            Err(TypeError::NoWitness(c.clone())).map_err(|e| e.at(pi))?
+        };
+
+        evidence.push((c, witness));
+    }
+
+    let mut tree = expr.tree.clone();
+
+    for (constraint, evidence) in evidence {
+        let signature = constraint.signature(&ctx.types).map_err(|e| e.at(pi))?;
+
+        tree = insert_witness(
+            tree,
+            &signature.shape,
+            constraint,
+            &evidence.dictionary,
+            &ctx.terms,
+        );
+    }
+
+    Ok(Typed::computed(
+        expr.substitutions.clone(),
+        ConstraintSet::from(nonground.as_slice()),
+        tree,
+    ))
+}
+
+// A HashSet of parser::Identifier as members compared to a qualified name. Hmm.
+fn insert_witness(
+    tree: Expr,
+    shape: &RecordShape,
+    constraint: &Constraint,
+    witness: &Expr,
+    ctx: &TermEnvironment,
+) -> Expr {
+    tree.map(&|e| match e {
+        Expr::Variable(a, Identifier::Free(m)) if shape.contains(m.member()) => Expr::Project(
+            a,
+            Projection {
+                base: witness.clone().into(),
+                // This must be the field index
+                select: ProductElement::Ordinal(shape.index_of(&m.member()).unwrap()),
+            },
+        ),
+
+        Expr::Variable(a, term_id @ Identifier::Free(..)) => {
+            let scheme = ctx.lookup(&term_id).unwrap();
+            println!(
+                "insert_witness: {term_id} {constraint} constraints `{}`",
+                scheme.constraints
+            );
+            if scheme
+                .constraints
+                .iter()
+                .any(|c| c.name() == constraint.name())
+            {
+                Expr::Apply(
+                    a.clone(),
+                    Apply {
+                        function: Expr::Variable(a, term_id).into(),
+                        argument: witness.clone().into(),
+                    },
+                )
+            } else {
+                Expr::Variable(a, term_id)
+            }
         }
 
         others => others.clone(),
     })
 }
 
-fn add_constraint_parameters(expr: &Expr, constraints: &ConstraintSet) -> Expr {
+fn add_constraint_projections(
+    tree: &Expr,
+    constraint: &Constraint,
+    ctx: &TypingContext,
+) -> Result<Expr, TypeError> {
+    let signature = constraint.signature(&ctx.types)?;
+
+    let tree = tree.clone().map(&|e| match e {
+        Expr::Variable(a, Identifier::Free(m)) if signature.shape.contains(m.member()) => {
+            println!("add_constraint_projections: projecting {m} from #1");
+            Expr::Project(
+                a.clone(),
+                Projection {
+                    base: Expr::Variable(a.clone(), Identifier::Bound(1)).into(),
+                    select: ProductElement::Ordinal(signature.shape.index_of(m.member()).unwrap()),
+                },
+            )
+        }
+
+        Expr::Variable(a, term_id @ Identifier::Free(..)) => {
+            let scheme = ctx.terms.lookup(&term_id).unwrap();
+            println!(
+                "add_constraint_projections: {term_id} constraints {}, constraint {constraint}",
+                scheme.constraints,
+            );
+
+            if scheme.constraints.contains(constraint) {
+                println!("add_constraint_projections: applying #1 to {term_id}");
+                Expr::Apply(
+                    a.clone(),
+                    Apply {
+                        function: Expr::Variable(a.clone(), term_id).into(),
+                        argument: Expr::Variable(a.clone(), Identifier::Bound(1)).into(),
+                    },
+                )
+            } else {
+                Expr::Variable(a, term_id)
+            }
+        }
+
+        others => others.clone(),
+    });
+
+    Ok(tree)
+}
+
+fn add_constraint_parameter_slot(expr: &Expr) -> Expr {
     if let Expr::Ascription(a0, ascription) = expr
         && let Expr::RecursiveLambda(a1, rec) = &ascription.ascribed_tree.as_ref()
     {
-        let lambda = constraints
-            .iter()
-            .fold(rec.lambda.clone(), |z, c| z.prepend_parameter());
+        let lambda = rec.lambda.clone().prepend_parameter();
 
         Expr::Ascription(
             a0.clone(),
@@ -381,26 +492,6 @@ fn add_constraint_parameters(expr: &Expr, constraints: &ConstraintSet) -> Expr {
     } else {
         expr.clone()
     }
-}
-
-fn constraint_methods(
-    expr: &Expr,
-    scheme: &TypeScheme,
-    ctx: &TypeEnvironment,
-) -> Typing<HashMap<QualifiedName, usize>> {
-    let mut constraint_index_by_method = HashMap::default();
-    for (i, constraint) in scheme.constraints.iter().enumerate() {
-        let signature = constraint
-            .signature(&ctx)
-            .map_err(|e| e.at(expr.type_info().parse_info))?;
-        for method in &signature.methods {
-            constraint_index_by_method.insert(
-                QualifiedName::new(constraint.class.module().clone(), method.as_str()),
-                i,
-            );
-        }
-    }
-    Ok(constraint_index_by_method)
 }
 
 impl Lambda {
@@ -582,6 +673,9 @@ pub enum TypeError {
 
     #[error("undefined constraint signature {0}")]
     UndefinedSignature(QualifiedName),
+
+    #[error("no witness found for constraint {0}")]
+    NoWitness(Constraint),
 }
 
 #[derive(Debug)]
@@ -740,6 +834,10 @@ impl Typed {
 pub struct ConstraintSet(BTreeSet<Constraint>);
 
 impl ConstraintSet {
+    fn contains(&self, constraint: &Constraint) -> bool {
+        self.0.contains(constraint)
+    }
+
     fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -756,10 +854,6 @@ impl ConstraintSet {
 
     fn union(&self, ConstraintSet(rhs): ConstraintSet) -> ConstraintSet {
         let Self(lhs) = self;
-
-        //        for c in lhs {
-        //            rhs.insert(c.clone());
-        //        }
 
         Self(lhs.union(&rhs).cloned().collect())
     }
@@ -786,24 +880,47 @@ impl From<&[&Constraint]> for ConstraintSet {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Constraint {
-    pub class: QualifiedName,
-    pub at: Vec<Type>,
+    pub constraint_type: Type,
+}
+
+impl Type {
+    fn applied_name(&self) -> &QualifiedName {
+        match self {
+            Type::Apply { constructor, .. } => constructor.applied_name(),
+            Type::Constructor(name) => name,
+            _otherwise => todo!(),
+        }
+    }
 }
 
 impl Constraint {
+    pub fn is_witness(&self, w: &Type) -> bool {
+        &self.constraint_type == w
+    }
+
+    pub fn from_type_constructor(constructor: &TypeConstructor) -> Self {
+        println!("from_type_constructor: {constructor}");
+        Self {
+            constraint_type: constructor.make_spine(),
+        }
+    }
+
+    pub fn name(&self) -> &QualifiedName {
+        self.constraint_type.applied_name()
+    }
+
     fn with_substitutions(&self, subst: &Substitutions) -> Self {
         Self {
-            class: self.class.clone(),
-            at: self
-                .at
-                .iter()
-                .map(|t| t.with_substitutions(subst))
-                .collect(),
+            constraint_type: self.constraint_type.with_substitutions(subst),
         }
     }
 
     fn variables(&self) -> HashSet<TypeParameter> {
-        self.at.iter().flat_map(|t| t.variables()).collect()
+        self.constraint_type.variables()
+    }
+
+    fn is_ground(&self) -> bool {
+        self.variables().is_empty()
     }
 }
 
@@ -1653,6 +1770,14 @@ impl RecordShape {
     pub fn fields(&self) -> &[parser::Identifier] {
         self.0.as_slice()
     }
+
+    pub fn index_of(&self, field_name: &parser::Identifier) -> Option<usize> {
+        self.0.iter().position(|f| f == field_name)
+    }
+
+    pub fn contains(&self, field_name: &parser::Identifier) -> bool {
+        self.0.contains(field_name)
+    }
 }
 
 impl fmt::Display for RecordShape {
@@ -2174,7 +2299,10 @@ impl TypingContext {
                     })?
                     .instantiate();
 
-                println!("infer_expr: variable {name} {}", inferred_type.underlying);
+                println!(
+                    "infer_expr: variable {name} constraints `{}` ty `{}`",
+                    inferred_type.constraints, inferred_type.underlying
+                );
 
                 Ok(Typed::computed(
                     Substitutions::default(),
@@ -3118,6 +3246,7 @@ impl TypingContext {
         };
 
         let inferred_type = return_ty.with_substitutions(&substitutions);
+        constraints = constraints.with_substitutions(&substitutions);
 
         Ok(Typed::computed(
             substitutions,
@@ -3205,17 +3334,6 @@ impl TypingContext {
                 .with_substitutions(&substitutions)
                 .union(typed_body.constraints.with_substitutions(&substitutions));
 
-            //            let constraints = ConstraintSet::from(
-            //                constraints
-            //                    .iter()
-            //                    .filter(|c| {
-            //                        c.variables()
-            //                            .iter()
-            //                            .all(|v| ctx1.free_variables().contains(v))
-            //                    })
-            //                    .collect::<Vec<_>>()
-            //                    .as_slice(),
-            //            );
             Ok(Typed::computed(
                 substitutions,
                 constraints,
@@ -3621,8 +3739,8 @@ impl fmt::Display for ConstraintSet {
 
 impl fmt::Display for Constraint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { class, at } = self;
-        write!(f, "{class} {}", display_list(" ", at))
+        let Self { constraint_type } = self;
+        write!(f, "constraint {constraint_type}")
     }
 }
 
