@@ -170,41 +170,42 @@ impl namer::TypeSignature {
 }
 
 impl namer::NamedSymbolTable {
-    pub fn compute_types(
+    pub fn elaborate_compilation_unit(
         mut self,
         evaluation_order: Iter<&SymbolName>,
     ) -> Typing<TypedSymbolTable> {
-        let mut ctx = TypingContext::default();
-        let mut symbols = HashMap::with_capacity(self.symbols.len());
+        let mut symbols = HashMap::default();
 
-        // Enter types
-        for symbol in self.symbols.iter().filter_map(|(_, sym)| match sym {
-            Symbol::Type(symbol) => Some(symbol),
-            _ => None,
-        }) {
-            ctx.bind_type(
-                symbol.qualified_name().clone(),
-                TypeConstructor::from_symbol(symbol),
-            );
-        }
-
-        ctx.elaborate_type_constructors()?;
-
+        let mut ctx = self.elaborate_types(&mut symbols)?;
         self.elaborate_constraints(&mut ctx)?;
+        self.elaborate_terms(evaluation_order, &mut symbols, ctx)?;
 
+        Ok(SymbolTable {
+            module_members: self.module_members,
+            member_modules: self.member_modules,
+            symbols,
+            imports: self.imports,
+            constraints: self.constraints,
+            witnesses: self.witnesses,
+        })
+    }
+
+    fn elaborate_terms(
+        &self,
+        evaluation_order: Iter<&SymbolName>,
+        symbols: &mut HashMap<SymbolName, Symbol<TypeInfo, QualifiedName, Identifier>>,
+        mut ctx: TypingContext,
+    ) -> Typing<()> {
         let mut witness_index = WitnessIndex::default();
 
-        let is_typed = |id: &&&SymbolName| match id {
+        let is_untyped = |id: &&&SymbolName| match id {
             // Some term symbols are already
             SymbolName::Type(name) => !ctx.types.bindings.contains_key(name),
             SymbolName::Term(name) => !ctx.terms.free.contains_key(name),
         };
 
-        println!("compute_types: known witnesses {:?}", self.witnesses);
-
-        // Enter terms
         for (id, symbol) in evaluation_order
-            .filter(is_typed)
+            .filter(is_untyped)
             .map(|&id| {
                 self.symbols
                     .get(id)
@@ -215,28 +216,39 @@ impl namer::NamedSymbolTable {
             .collect::<Typing<Vec<_>>>()?
         {
             let symbol = match symbol {
-                namer::Symbol::Term(symbol) => {
-                    println!("compute_types: me {id} {}", symbol.name);
-                    namer::Symbol::Term(self.elaborate_term(
-                        symbol,
-                        &mut witness_index,
-                        &mut ctx,
-                    )?)
-                }
+                namer::Symbol::Term(symbol) => namer::Symbol::Term(self.elaborate_term(
+                    symbol,
+                    &mut witness_index,
+                    &mut ctx,
+                )?),
                 namer::Symbol::Type(symbol) => namer::Symbol::Type(symbol.clone()),
             };
 
             symbols.insert(id.clone(), symbol);
         }
 
-        Ok(SymbolTable {
-            module_members: self.module_members,
-            member_modules: self.member_modules,
-            symbols,
-            imports: self.imports,
-            constraints: self.constraints,
-            witnesses: self.witnesses,
-        })
+        Ok(())
+    }
+
+    fn elaborate_types(
+        &self,
+        // Wait -- types do not involve symbols?
+        symbols: &mut HashMap<SymbolName, Symbol<TypeInfo, QualifiedName, Identifier>>,
+    ) -> Typing<TypingContext> {
+        let mut ctx = TypingContext::default();
+
+        for symbol in self.symbols.iter().filter_map(|(_, sym)| match sym {
+            Symbol::Type(symbol) => Some(symbol),
+            _ => None,
+        }) {
+            ctx.bind_type(
+                symbol.qualified_name().clone(),
+                TypeConstructor::from_symbol(symbol),
+            );
+        }
+        ctx.elaborate_type_constructors()?;
+
+        Ok(ctx)
     }
 
     fn elaborate_constraints(&mut self, ctx: &mut TypingContext) -> Typing<()> {
@@ -285,20 +297,12 @@ impl namer::NamedSymbolTable {
         ctx: &mut TypingContext,
     ) -> Typing<TermSymbol<TypeInfo, QualifiedName, Identifier>> {
         let mut expr = ctx.infer_expr(&symbol.body())?;
-
-        println!(
-            "elaborate_term: [{}] {} -> {}",
-            expr.constraints, symbol.name, expr.tree
-        );
-
         let qualified_name = symbol.name.clone();
 
-        println!("elaborate_term: discharging for {}", symbol.name);
         expr = discharge_ground_constraints(&expr, witness_index, &ctx)?;
 
         let inferred_type = &expr.as_constrained_type();
         let scheme = inferred_type.generalize(&ctx);
-        println!("typer: {qualified_name} :: {scheme}");
 
         for c in scheme.underlying.constraints.iter() {
             expr.tree = add_constraint_parameter_slot(&expr.tree);
@@ -306,24 +310,14 @@ impl namer::NamedSymbolTable {
                 .map_err(|e| e.at(ParseInfo::default()))?;
         }
 
-        println!(
-            "elaborate_term: {} transformed tree {}",
-            symbol.name, expr.tree
-        );
-
         ctx.bind_free_term(qualified_name.clone(), scheme.clone().underlying);
 
         if self.witnesses.contains(&qualified_name) {
-            println!(
-                "elaborate_term: witness {qualified_name} :: {}",
-                scheme.underlying
-            );
             witness_index.insert(Witness {
                 ty: scheme.underlying.underlying.clone(),
-                //                dictionary: expr.tree.clone(),
                 dictionary: Expr::Variable(
                     expr.tree.type_info().clone(),
-                    Identifier::Free(qualified_name.clone()),
+                    Identifier::Free(qualified_name.clone().into()),
                 ),
             });
         }
@@ -341,7 +335,7 @@ fn discharge_ground_constraints(
     witness_index: &WitnessIndex,
     ctx: &TypingContext,
 ) -> Typing<Typed> {
-    let (ground, nonground) = expr
+    let (ground, non_ground) = expr
         .constraints
         .iter()
         .partition::<Vec<_>, _>(|c| c.is_ground());
@@ -349,7 +343,7 @@ fn discharge_ground_constraints(
     let mut evidence = Vec::with_capacity(ground.len());
     let pi = expr.tree.type_info().parse_info;
 
-    for &c in &ground {
+    for c in ground {
         let Some(witness) = witness_index.witness(c) else {
             Err(TypeError::NoWitness(c.clone())).map_err(|e| e.at(pi))?
         };
@@ -373,7 +367,7 @@ fn discharge_ground_constraints(
 
     Ok(Typed::computed(
         expr.substitutions.clone(),
-        ConstraintSet::from(nonground.as_slice()),
+        ConstraintSet::from(non_ground.as_slice()),
         tree,
     ))
 }
@@ -734,23 +728,16 @@ impl<A> Constrained<A> {
 impl Constrained<Type> {
     pub fn generalize(&self, ctx: &TypingContext) -> Constrained<TypeScheme> {
         let quantifiers = self.free_variables(ctx);
-        let (quantified, retained) = self
+        let (quantified, _retained) = self
             .constraints
             .iter()
             .partition::<Vec<_>, _>(|c| c.variables().iter().all(|t| quantifiers.contains(t)));
-
-        println!(
-            "generalize: {self} R {} Q {}",
-            display_list(", ", &retained),
-            display_list(", ", &quantified)
-        );
 
         Constrained {
             constraints: ConstraintSet::default(),
             underlying: TypeScheme {
                 quantifiers: quantifiers.iter().copied().collect(),
                 underlying: self.underlying.clone(),
-                // in
                 constraints: ConstraintSet::from(quantified.as_slice()),
             },
         }
@@ -1614,7 +1601,6 @@ impl TypeScheme {
     }
 
     pub fn instantiate(&self) -> Constrained<Type> {
-        println!("instantiate: {self}");
         let subst = self.instantiation_substitutions();
         Constrained {
             constraints: self.constraints.with_substitutions(&subst),
@@ -2007,15 +1993,6 @@ impl TypingContext {
 
                     _ => (),
                 }
-                if let Type::Record(image) = &constructor.structure {
-                    println!(
-                        "elaborate_type_constructors: {image} -> {}",
-                        constructor.definition.name
-                    );
-                    self.types
-                        .record_shapes
-                        .insert(image, constructor.definition.name.clone());
-                }
             }
         }
 
@@ -2032,11 +2009,8 @@ impl TypingContext {
 
     pub fn bind_term(&mut self, name: Identifier, scheme: TypeScheme) {
         match name {
-            // How in the f is this supposed to work?
-            // Just push and hope they get the correct DeBruijn index?
-            // Assertion here that  self.terms.bound.len() == id?
             Identifier::Bound(..) => self.terms.bound.push(scheme),
-            Identifier::Free(name) => self.bind_free_term(name, scheme),
+            Identifier::Free(name) => self.bind_free_term(*name, scheme),
         }
     }
 
@@ -2064,10 +2038,10 @@ impl TypingContext {
             }
 
             namer::Identifier::Free(id) => {
-                let previous = self.terms.free.insert(id.clone(), scheme);
+                let previous = self.terms.free.insert(*id.clone(), scheme);
                 let v = block(self);
                 if let Some(previous) = previous {
-                    self.terms.free.insert(id, previous);
+                    self.terms.free.insert(*id, previous);
                 } else {
                     self.terms.free.remove(&id);
                 }
@@ -2078,7 +2052,6 @@ impl TypingContext {
 
     #[instrument]
     fn check_expr(&mut self, expected_type: &Type, expr: &UntypedExpr) -> Typing {
-        println!("check_expr: expected {expected_type} for {expr}");
         match expr {
             UntypedExpr::RecursiveLambda(pi, rec) => {
                 self.check_recursive_lambda(*pi, &expected_type, rec)
@@ -2096,31 +2069,36 @@ impl TypingContext {
                 self.check_deconstruction(*pi, &expected_type, deconstruct)
             }
 
-            otherwise => {
-                // Extract this to check_inferencing_fallback or something
-                println!("check_expr: infer {expr:?}");
-                let expr = self.infer_expr(expr)?;
-
-                let lhs = expr
-                    .tree
-                    .type_info()
-                    .inferred_type
-                    .with_substitutions(&expr.substitutions);
-                let rhs = expected_type.with_substitutions(&expr.substitutions);
-
-                let s_unification = lhs
-                    .unified_with(&rhs)
-                    .map_err(|e| e.at(*otherwise.annotation()))?;
-
-                let substitutions = expr.substitutions.compose(&s_unification);
-                let constraints = expr.constraints.with_substitutions(&substitutions);
-
-                self.substitute_mut(&substitutions);
-
-                let expr = expr.tree.with_substitutions(&substitutions);
-                Ok(Typed::computed(substitutions, constraints, expr))
-            }
+            _ => self.check_expr_fallback_inferencing(expected_type, expr),
         }
+    }
+
+    fn check_expr_fallback_inferencing(
+        &mut self,
+        expected_type: &Type,
+        expr: &UntypedExpr,
+    ) -> Typing {
+        // Extract this to check_inferencing_fallback or something
+        let expr = self.infer_expr(expr)?;
+
+        let lhs = expr
+            .tree
+            .type_info()
+            .inferred_type
+            .with_substitutions(&expr.substitutions);
+        let rhs = expected_type.with_substitutions(&expr.substitutions);
+
+        let s_unification = lhs
+            .unified_with(&rhs)
+            .map_err(|e| e.at(expr.tree.annotation().parse_info))?;
+
+        let substitutions = expr.substitutions.compose(&s_unification);
+        let constraints = expr.constraints.with_substitutions(&substitutions);
+
+        self.substitute_mut(&substitutions);
+
+        let expr = expr.tree.with_substitutions(&substitutions);
+        Ok(Typed::computed(substitutions, constraints, expr))
     }
 
     #[instrument]
@@ -2299,11 +2277,6 @@ impl TypingContext {
                     })?
                     .instantiate();
 
-                println!(
-                    "infer_expr: variable {name} constraints `{}` ty `{}`",
-                    inferred_type.constraints, inferred_type.underlying
-                );
-
                 Ok(Typed::computed(
                     Substitutions::default(),
                     inferred_type.constraints,
@@ -2316,7 +2289,6 @@ impl TypingContext {
 
             UntypedExpr::InvokeBridge(pi, bridge) => {
                 let inferred_type = bridge.external.type_scheme().instantiate();
-                println!("infer_expr: bridge {inferred_type}");
 
                 Ok(Typed::computed(
                     Substitutions::default(),
@@ -3313,17 +3285,9 @@ impl TypingContext {
         let ctx1 = self.with_substitutions(&typed_bound.substitutions);
 
         let bound_type = typed_bound.as_constrained_type().generalize(&ctx1);
-        println!(
-            "infer_binding: {} bound retained {}, quantified {}",
-            binding.binder, bound_type.constraints, bound_type.underlying.constraints
-        );
 
         self.bind_term_and_then(binding.binder.clone(), bound_type.underlying, |ctx| {
             let typed_body = ctx.infer_expr(&binding.body)?;
-            println!(
-                "infer_binding: {} body retained {}",
-                binding.binder, typed_body.constraints
-            );
 
             let substitutions = typed_bound.substitutions.compose(&typed_body.substitutions);
 
@@ -3441,10 +3405,10 @@ impl TypingContext {
 impl Literal {
     fn synthesize_type(&self) -> Type {
         Type::Base(match self {
-            ast::Literal::Int(..) => BaseType::Int,
-            ast::Literal::Text(..) => BaseType::Text,
-            ast::Literal::Bool(..) => BaseType::Bool,
-            ast::Literal::Unit => BaseType::Unit,
+            Self::Int(..) => BaseType::Int,
+            Self::Text(..) => BaseType::Text,
+            Self::Bool(..) => BaseType::Bool,
+            Self::Unit => BaseType::Unit,
         })
     }
 }

@@ -83,7 +83,7 @@ impl Compiler {
     }
 
     pub fn typecheck_and_initialize(&self, program: CompilationUnit) -> Compilation<Environment> {
-        let mut environment = Environment::default();
+        let environment = Environment::default();
         let mut symbols = namer::SymbolTable::import_compilation_unit(program)?;
         symbols.lower_tuples();
 
@@ -94,13 +94,14 @@ impl Compiler {
 
         if dependencies.are_sound() {
             for symbol in compilation
-                .compute_types(evaluation_order.iter())?
+                .elaborate_compilation_unit(evaluation_order.iter())?
                 .terms(evaluation_order.iter())
             {
                 let value = Rc::new(symbol.body().erase_annotation())
-                    .reduce(&environment)
+                    .reduce(&environment.clone().sealed())
                     .expect("successful static init");
-                environment.define_global(&symbol.name, value);
+
+                environment.define_global(&symbol.name, value)?;
             }
         } else {
             panic!("Bad dependencies")

@@ -95,7 +95,7 @@ flip :: ∀α β r. (α -> β -> r) -> β -> α -> r :=
 compose :: ∀α β γ. (β -> γ) -> (α -> β) -> α -> γ :=
   λg f a. g (f a)
 
-long_list := List.tabulate 50 id
+long_list := List.tabulate 120 id
 
 fibonacci :: Int -> Int := λn.
   if n = 0 or n = 1 then 1

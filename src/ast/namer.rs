@@ -210,7 +210,7 @@ impl TypeExpression {
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum Identifier {
     Bound(usize),
-    Free(QualifiedName),
+    Free(Box<QualifiedName>),
 }
 
 impl Identifier {
@@ -237,9 +237,9 @@ impl NameExpr {
             member: parser::Identifier::from_str(&self.member),
         };
 
-        self.projections
-            .iter()
-            .fold(Expr::Variable(pi, Identifier::Free(path)), |base, field| {
+        self.projections.iter().fold(
+            Expr::Variable(pi, Identifier::Free(path.into())),
+            |base, field| {
                 ast::Expr::Project(
                     pi,
                     ast::Projection {
@@ -247,7 +247,8 @@ impl NameExpr {
                         select: ProductElement::Name(parser::Identifier::from_str(field.as_str())),
                     },
                 )
-            })
+            },
+        )
     }
 
     pub fn into_qualified_name(self) -> QualifiedName {
@@ -1162,7 +1163,7 @@ impl DeBruijn {
         if let Some(index) = self.stack.iter().rposition(|n| n == id) {
             Identifier::Bound(index)
         } else {
-            Identifier::Free(QualifiedName::from_root_symbol(id.to_owned()))
+            Identifier::Free(QualifiedName::from_root_symbol(id.to_owned()).into())
         }
     }
 
@@ -1709,7 +1710,8 @@ impl parser::Pattern {
                         symbols
                             .resolve_free_term_name(&pattern.constructor, semantic_scope)
                             .expect("msg")
-                            .into_qualified_name(),
+                            .into_qualified_name()
+                            .into(),
                     ),
                     arguments: pattern
                         .arguments

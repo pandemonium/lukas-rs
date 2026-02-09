@@ -10,7 +10,7 @@ use crate::{
 #[derive(Clone)]
 pub struct Bridge {
     pub external: Rc<dyn External + 'static>,
-    pub qualified_name: QualifiedName,
+    pub qualified_name: Box<QualifiedName>,
 }
 
 #[derive(Debug)]
@@ -46,7 +46,7 @@ impl Bridge {
         let qualified_name = QualifiedName::new(module.clone(), external.name());
         Bridge {
             external: Rc::new(external),
-            qualified_name,
+            qualified_name: qualified_name.into(),
         }
     }
 

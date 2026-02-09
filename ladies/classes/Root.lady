@@ -1,18 +1,21 @@
-constraint Eq ::= ∀α.
-  { eq :: α -> α -> Bool
+use Stdlib.
+
+signature Monoid ::= ∀α.
+  { mempty  :: α
+    mappend :: α -> α -> α
   }
 
-witness :: Eq Int :=
-  { eq: λp q. p = q
+witness :: Monoid Int :=
+  { mempty  : 0
+    mappend : λp q. p + q
   }
 
-boo :: Bool :=
-  eq 1 2
+mconcat :: ∀α. Monoid α |- List α -> α :=
+  λxs.
+    List.fold_right mappend mempty xs
 
-quux :: ∀α. Eq α |- α -> α -> Text :=
-  λp q.
-    if eq p q then "hej" else "ho"
+
 
 start := λ_.
-  print_endline "Hello boo: `boo`"
-  print_endline "Hello quux: `quux 2 1`"
+  let xs = List.tabulate 10 id in
+  print_endline "Hi, mom: `mconcat xs`"

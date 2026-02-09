@@ -549,7 +549,7 @@ pub enum Keyword {
 
     Where,
 
-    Constraint,
+    Signature,
     Witness,
 }
 
@@ -575,7 +575,7 @@ impl Keyword {
             "deconstruct" => Some(Self::Deconstruct),
             "into" => Some(Self::Into),
             "where" => Some(Self::Where),
-            "constraint" => Some(Self::Constraint),
+            "signature" => Some(Self::Signature),
             "witness" => Some(Self::Witness),
             _otherwise => None,
         }
@@ -775,7 +775,7 @@ impl fmt::Display for Keyword {
             Self::Deconstruct => write!(f, "Deconstruct"),
             Self::Into => write!(f, "Into"),
             Self::Where => write!(f, "Where"),
-            Self::Constraint => write!(f, "Constraint"),
+            Self::Signature => write!(f, "Signature"),
             Self::Witness => write!(f, "Witness"),
         }
     }

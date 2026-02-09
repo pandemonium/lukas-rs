@@ -1,1 +1,9 @@
-Expr ::= ∀α id. Apply  α (Expr α id) (Expr α id)
+foo := λx y.
+  print_endline ">> `x`"
+  if x > y then
+    foo (x - 1) y
+  else print_endline "done."
+
+start := λ_.
+  print_endline "starting"
+  foo 1000 0

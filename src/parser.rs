@@ -443,7 +443,7 @@ impl<'a> Parser<'a> {
             ] | [
                 Token {
                     kind: TokenKind::Keyword(
-                        Keyword::Module | Keyword::Use | Keyword::Constraint | Keyword::Witness
+                        Keyword::Module | Keyword::Use | Keyword::Signature | Keyword::Witness
                     ),
                     ..
                 },
@@ -616,7 +616,7 @@ impl<'a> Parser<'a> {
                     position,
                 },
                 ..,
-            ] if t.is_keyword(Keyword::Constraint) => {
+            ] if t.is_keyword(Keyword::Signature) => {
                 // constraint <id> <::=>
                 self.advance(3);
 
