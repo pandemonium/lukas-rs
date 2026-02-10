@@ -1,9 +1,11 @@
-foo := λx y.
-  print_endline ">> `x`"
-  if x > y then
-    foo (x - 1) y
-  else print_endline "done."
+bar := λx.
+  print_endline "bar"
+  print_endline (show x)
+
+foo := λx.
+  print_endline (show (bar (x - 1)))
+
 
 start := λ_.
-  print_endline "starting"
-  foo 1000 0
+  let x = 10 in
+  foo x

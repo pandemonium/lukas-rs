@@ -95,7 +95,7 @@ flip :: ∀α β r. (α -> β -> r) -> β -> α -> r :=
 compose :: ∀α β γ. (β -> γ) -> (α -> β) -> α -> γ :=
   λg f a. g (f a)
 
-long_list := List.tabulate 120 id
+long_list := List.tabulate 1200 id
 
 fibonacci :: Int -> Int := λn.
   if n = 0 or n = 1 then 1
@@ -202,7 +202,7 @@ start := λx.
   print_endline "`true and false or true`"
 
   let render = λx. "I, `x`, can be anything `and_function any_expression / 69`." in
-  print_endline "... when I say the name, Biggus: `render "Optim¢us Prime"`?"
+  print_endline "... when I say the name, Biggus: `render "Optimus Prime"`?"
 
   say_real_name "Slim Shady" "Marshall Mathers"
 
@@ -217,6 +217,8 @@ start := λx.
   let xs = long_list in
   let ys = List.map (λx. Cons x Nil) xs in
   List.count (λx. x > 1) (List.flatten ys)
+
+  print_endline "long list is `List.length long_list` long."
 
   let ps = Cons 1 (Cons 2 (Cons 3 Nil)) in
   let qs = Cons "ett" (Cons "två" (Cons "tre" Nil)) in

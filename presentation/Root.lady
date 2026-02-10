@@ -148,6 +148,6 @@ start := λ_.
     | Fault e  -> show_arithmetic_error e
   in print_endline "4 / 2 is `show_result (divide2 4 2)` but 4 / 0 is `show_result (divide2 4 0)`."
 
-  print_endline "switch(2) -> `switch 2` and switch(7) -> `switch 7`"
+  print_endline "switch(2) -> `switch 2` and switch(7) -> `switch 7`."
 
   let another_thing = 1 in another_thing + 2

@@ -1,5 +1,8 @@
+bar := λy.
+  y * y
+
 foo := λx.
-  print_endline "foo: hi! `x`"
+  print_endline "foo: hi! `bar x`; `bar 27`."
 
 start := λx.
-  foo 1
+  foo 2

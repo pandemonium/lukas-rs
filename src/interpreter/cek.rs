@@ -181,7 +181,7 @@ impl Env {
             Val::Closure(closure) => {
                 let closure = closure.borrow();
                 closure.provide_argument(Val::Constant(argument.into()));
-                closure.body.reduce(&closure.capture.shared())
+                closure.body.interpret(closure.capture.shared())
             }
 
             Val::RecursiveClosure { inner, .. } => {
@@ -190,7 +190,7 @@ impl Env {
                 })?;
                 let closure = closure.borrow();
                 closure.provide_argument(Val::Constant(argument.into()));
-                closure.body.reduce(&closure.capture.shared())
+                closure.body.interpret(closure.capture.shared())
             }
 
             otherwise => Err(RuntimeError::ExpectedClosure(otherwise.clone())),
@@ -294,7 +294,8 @@ enum AndThen {
     },
 
     EvalInterpolation {
-        segments: Vec<Segment<Erased, namer::Identifier>>,
+        buffer: String,
+        segments: Rc<Vec<Segment<Erased, namer::Identifier>>>,
         index: usize,
         environment: Env,
         k: Box<AndThen>,
@@ -374,11 +375,13 @@ fn and_then(value: Val, k: AndThen) -> Suspension {
         AndThen::Apply { function, k } => match function {
             Val::Closure(closure) => {
                 let closure = closure.borrow();
-                closure.provide_argument(value);
                 Suspension::Suspend(Suspended::Eval {
                     expression: Rc::clone(&closure.body),
-                    // capture already disjoint
-                    environment: closure.capture.shared(),
+                    environment: {
+                        let env = closure.capture.disjoint();
+                        env.push_local(value);
+                        env
+                    },
                     k: *k,
                 })
             }
@@ -386,11 +389,13 @@ fn and_then(value: Val, k: AndThen) -> Suspension {
             Val::RecursiveClosure { name, inner } => match inner.upgrade() {
                 Some(closure) => {
                     let closure = closure.borrow();
-                    closure.provide_argument(value);
                     Suspension::Suspend(Suspended::Eval {
                         expression: Rc::clone(&closure.body),
-                        // capture already disjoint
-                        environment: closure.capture.shared(),
+                        environment: {
+                            let env = closure.capture.disjoint();
+                            env.push_local(value);
+                            env
+                        },
                         k: *k,
                     })
                 }
@@ -580,6 +585,7 @@ fn and_then(value: Val, k: AndThen) -> Suspension {
         }),
 
         AndThen::EvalInterpolation {
+            mut buffer,
             segments,
             index,
             environment,
@@ -587,44 +593,43 @@ fn and_then(value: Val, k: AndThen) -> Suspension {
         } => {
             use std::fmt::Write as _;
 
-            let Val::Constant(Literal::Text(mut buffer)) = value else {
-                panic!("{value}");
-            };
+            // value comes from return and eval. If I eval an expr, then its evalutation
+            // is that value is, which is different types. So value cannot carry the buffer.
 
             match &segments[index] {
                 Segment::Literal(_, literal) => {
-                    let _ = write!(buffer, "{literal}");
-                    Suspension::return_and(Val::Constant(Literal::Text(buffer)), {
-                        let index = 1 + index;
-                        if index < segments.len() {
+                    let _ = write!(buffer, "{value}{literal}");
+
+                    let index = 1 + index;
+                    if index < segments.len() {
+                        Suspension::return_and(value, {
                             AndThen::EvalInterpolation {
+                                buffer,
                                 segments,
                                 index,
                                 environment,
                                 k,
                             }
-                        } else {
-                            *k
-                        }
-                    })
+                        })
+                    } else {
+                        Suspension::return_and(Val::Constant(Literal::Text(buffer)), *k)
+                    }
                 }
 
-                Segment::Expression(expr) => Suspension::Suspend(Suspended::Eval {
-                    expression: Rc::clone(expr),
-                    environment: environment.shared(),
-                    k: {
-                        let index = 1 + index;
-                        if index < segments.len() {
-                            AndThen::EvalInterpolation {
-                                segments,
-                                index,
-                                environment,
-                                k,
-                            }
-                        } else {
-                            *k
+                Segment::Expression(expr) => Suspension::eval_and(expr, &environment.shared(), {
+                    let index = 1 + index;
+                    if index < segments.len() {
+                        AndThen::EvalInterpolation {
+                            buffer,
+                            segments: Rc::clone(&segments),
+                            index,
+                            environment,
+                            k,
                         }
-                    },
+                    } else {
+                        // What happens with the return value of this?
+                        *k
+                    }
                 }),
             }
         }
@@ -672,11 +677,9 @@ impl Expr {
 
             Self::RecursiveLambda(_, the) => {
                 let closure = Closure::capture(&environment, &the.lambda.body);
-                // Could I do away with the RefCell since Env uses internal mutation?
-                closure.borrow().provide_argument(Val::RecursiveClosure {
-                    name: the.own_name.clone().into(),
-                    inner: Rc::downgrade(&closure),
-                });
+                closure
+                    .borrow()
+                    .provide_argument(Val::Closure(Rc::clone(&closure)));
                 Suspension::return_and(Val::Closure(Rc::clone(&closure)), k)
             }
 
@@ -684,49 +687,48 @@ impl Expr {
                 Suspension::return_and(Val::Closure(Closure::capture(&environment, &the.body)), k)
             }
 
-            Self::Apply(_, the) => Suspension::Suspend(Suspended::Eval {
-                expression: Rc::clone(&the.function),
-                environment: environment.shared(),
-                k: AndThen::EvalArgument {
+            Self::Apply(_, the) => Suspension::eval_and(
+                &the.function,
+                &environment.shared(),
+                AndThen::EvalArgument {
                     argument: Rc::clone(&the.argument),
                     environment,
                     k: k.into(),
                 },
-            }),
+            ),
 
-            Self::Let(_, the) => Suspension::Suspend(Suspended::Eval {
-                expression: Rc::clone(&the.bound),
-                environment: environment.shared(),
-                k: AndThen::EvalLetBody {
+            Self::Let(_, the) => Suspension::eval_and(
+                &the.bound,
+                &environment.shared(),
+                AndThen::EvalLetBody {
                     binder: the.binder.clone().into(),
                     body: the.body.clone(),
                     environment,
                     k: k.into(),
                 },
-            }),
+            ),
 
-            Self::Tuple(_, the) => Suspension::Suspend(Suspended::Eval {
-                expression: Rc::clone(&the.elements[0]),
-                environment: environment.shared(),
-                k: AndThen::EvalTupleElement {
+            Self::Tuple(_, the) => Suspension::eval_and(
+                &the.elements[0],
+                &environment.shared(),
+                AndThen::EvalTupleElement {
                     input: the.elements.clone(),
                     output: Vec::with_capacity(the.elements.len()),
                     environment,
                     k: k.into(),
-                }
-                .into(),
-            }),
+                },
+            ),
 
-            Self::Record(_, the) => Suspension::Suspend(Suspended::Eval {
-                expression: Rc::clone(&the.fields[0].1),
-                environment: environment.shared(),
-                k: AndThen::EvalRecordField {
+            Self::Record(_, the) => Suspension::eval_and(
+                &the.fields[0].1,
+                &environment.shared(),
+                AndThen::EvalRecordField {
                     input: the.fields.clone(),
                     output: Vec::with_capacity(the.fields.len()),
                     environment,
                     k: k.into(),
                 },
-            }),
+            ),
 
             Self::Construct(_, the) => {
                 if the.arguments.is_empty() {
@@ -741,75 +743,88 @@ impl Expr {
                         k,
                     )
                 } else {
-                    Suspension::Suspend(Suspended::Eval {
-                        expression: Rc::clone(&the.arguments[0]),
-                        environment: environment.shared(),
-                        k: AndThen::EvalConstructor {
+                    Suspension::eval_and(
+                        &the.arguments[0],
+                        &environment.shared(),
+                        AndThen::EvalConstructor {
                             input: the.arguments.clone(),
                             output: Vec::with_capacity(the.arguments.len()),
                             environment,
                             constructor: the.constructor.clone(),
                             k: k.into(),
                         },
-                    })
+                    )
                 }
             }
 
-            Self::Project(_, the) => Suspension::Suspend(Suspended::Eval {
-                expression: Rc::clone(&the.base),
-                environment: environment,
-                k: AndThen::EvalProjection {
+            Self::Project(_, the) => Suspension::eval_and(
+                &the.base,
+                &environment,
+                AndThen::EvalProjection {
                     select: the.select.clone(),
                     k: k.into(),
                 },
-            }),
+            ),
 
-            Self::Sequence(_, the) => Suspension::Suspend(Suspended::Eval {
-                expression: Rc::clone(&the.this),
-                environment: environment.shared(),
-                k: AndThen::Eval {
+            Self::Sequence(_, the) => Suspension::eval_and(
+                &the.this,
+                &environment.shared(),
+                AndThen::Eval {
                     expression: Rc::clone(&the.and_then),
-                    environment,
-                    k: k.into(),
-                },
-            }),
-
-            Self::Deconstruct(_, the) => Suspension::Suspend(Suspended::Eval {
-                expression: Rc::clone(&the.scrutinee),
-                environment: environment.shared(),
-                k: AndThen::EvalDeconstruct {
-                    clauses: the.match_clauses.clone(),
-                    environment,
-                    k: k.into(),
-                },
-            }),
-
-            Self::If(_, the) => Suspension::Suspend(Suspended::Eval {
-                expression: Rc::clone(&the.predicate),
-                environment: environment.shared(),
-                k: AndThen::EvalConditional {
-                    consequent: Rc::clone(&the.consequent),
-                    alternate: Rc::clone(&the.alternate),
-                    environment,
-                    k: k.into(),
-                },
-            }),
-
-            Self::Interpolate(_, the) => Suspension::return_and(
-                Val::Constant(Literal::Text("".to_owned())),
-                AndThen::EvalInterpolation {
-                    segments: the.0.clone(),
-                    index: 0,
                     environment,
                     k: k.into(),
                 },
             ),
 
-            Self::Ascription(_, the) => Suspension::Suspend(Suspended::Eval {
-                expression: Rc::clone(&the.ascribed_tree),
-                environment,
-                k,
-            }),
+            Self::Deconstruct(_, the) => Suspension::eval_and(
+                &the.scrutinee,
+                &environment.shared(),
+                AndThen::EvalDeconstruct {
+                    clauses: the.match_clauses.clone(),
+                    environment,
+                    k: k.into(),
+                },
+            ),
+
+            Self::If(_, the) => Suspension::eval_and(
+                &the.predicate,
+                &environment.shared(),
+                AndThen::EvalConditional {
+                    consequent: Rc::clone(&the.consequent),
+                    alternate: Rc::clone(&the.alternate),
+                    environment,
+                    k: k.into(),
+                },
+            ),
+
+            Self::Interpolate(_, ast::Interpolate(segments)) => match segments.first() {
+                Some(Segment::Expression(expr)) => Suspension::eval_and(
+                    expr,
+                    &environment.shared(),
+                    AndThen::EvalInterpolation {
+                        buffer: String::new(),
+                        segments: Rc::new(segments.clone()),
+                        index: 1,
+                        environment,
+                        k: k.into(),
+                    },
+                ),
+
+                Some(Segment::Literal(_, x)) => Suspension::return_and(
+                    Val::Constant(Literal::Text("".to_owned())),
+                    AndThen::EvalInterpolation {
+                        buffer: format!("{x}"),
+                        segments: Rc::new(segments.clone()),
+                        index: 1,
+                        environment,
+                        k: k.into(),
+                    },
+                ),
+
+                None => Suspension::return_and(Val::Constant(Literal::Text("".to_owned())), k),
+            },
+
+            Self::Ascription(_, the) => Suspension::eval_and(&the.ascribed_tree, &environment, k),
         }
     }
 }

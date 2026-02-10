@@ -3594,8 +3594,6 @@ impl MatchSpace {
             .join(&self.covered)
             .expect("code that typechecks");
 
-        println!("join: new {:?} old {:?}", new_coverage, self.covered);
-
         let useful = new_coverage != self.covered;
         self.covered = new_coverage;
 

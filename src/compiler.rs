@@ -102,8 +102,8 @@ impl Compiler {
                 .terms(evaluation_order.iter())
             {
                 let value = Rc::new(symbol.body().erase_annotation())
-                    //                    .interpret(Env::from_globals(globals.clone()))
-                    .reduce(&Env::from_globals(globals.clone()))
+                    .interpret(Env::from_globals(globals.clone()))
+                    //.reduce(&Env::from_globals(globals.clone()))
                     .expect("successful static init");
 
                 globals.define(symbol.name.clone(), value);
