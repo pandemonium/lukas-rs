@@ -8,7 +8,10 @@ use crate::{
         self, ROOT_MODULE_NAME,
         namer::{self, NameError},
     },
-    interpreter::{self, Environment, RuntimeError},
+    interpreter::{
+        self, Environment, RuntimeError,
+        cek::{Env, Globals},
+    },
     lexer::LexicalAnalyzer,
     parser::{self, ParseError, ParseInfo},
     typer::TypeError,
@@ -83,7 +86,6 @@ impl Compiler {
     }
 
     pub fn typecheck_and_initialize(&self, program: CompilationUnit) -> Compilation<Environment> {
-        let environment = Environment::default();
         let mut symbols = namer::SymbolTable::import_compilation_unit(program)?;
         symbols.lower_tuples();
 
@@ -93,21 +95,24 @@ impl Compiler {
         let evaluation_order = dependencies.in_resolvable_order();
 
         if dependencies.are_sound() {
+            let mut globals = Globals::default();
+
             for symbol in compilation
                 .elaborate_compilation_unit(evaluation_order.iter())?
                 .terms(evaluation_order.iter())
             {
                 let value = Rc::new(symbol.body().erase_annotation())
-                    .reduce(&environment.clone().sealed())
+                    //                    .interpret(Env::from_globals(globals.clone()))
+                    .reduce(&Env::from_globals(globals.clone()))
                     .expect("successful static init");
 
-                environment.define_global(&symbol.name, value)?;
+                globals.define(symbol.name.clone(), value);
             }
+
+            Ok(Env::from_globals(globals))
         } else {
             panic!("Bad dependencies")
         }
-
-        Ok(environment)
     }
 
     pub fn load_module_declarations(

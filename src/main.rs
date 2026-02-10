@@ -77,6 +77,8 @@ fn main() {
             let return_value = program
                 .call(
                     &namer::QualifiedName::new(
+                        // Move both Identifier types to namer or someething
+                        // Path.t and Name.t
                         parser::IdentifierPath::new(ROOT_MODULE_NAME),
                         "start",
                     ),

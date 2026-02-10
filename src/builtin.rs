@@ -4,7 +4,7 @@ use crate::{
         namer::{Symbol, TypeDefinition, TypeOrigin, TypeSymbol},
     },
     bridge::{External, Lambda1, Lambda2, PartialRawLambda2, RawLambda1},
-    interpreter::{Literal, Value},
+    interpreter::{Literal, cek::Val},
     lambda1, lambda2,
     lexer::Operator,
     parser::{self, ParseInfo},
@@ -46,13 +46,9 @@ fn artithmetic_signature() -> TypeScheme {
     }
 }
 
-fn mk_comparison_op(
-    op: fn(Literal, Literal) -> Option<bool>,
-) -> impl Fn(Value, Value) -> Option<Value> {
+fn mk_comparison_op(op: fn(Literal, Literal) -> Option<bool>) -> impl Fn(Val, Val) -> Option<Val> {
     move |t, u| match (t, u) {
-        (Value::Constant(t), Value::Constant(u)) => {
-            op(t, u).map(|r| Value::Constant(Literal::Bool(r)))
-        }
+        (Val::Constant(t), Val::Constant(u)) => op(t, u).map(|r| Val::Constant(Literal::Bool(r))),
 
         _otherwise => None,
     }
@@ -60,9 +56,9 @@ fn mk_comparison_op(
 
 fn mk_artithmetic_op(
     op: fn(Literal, Literal) -> Option<Literal>,
-) -> impl Fn(Value, Value) -> Option<Value> {
+) -> impl Fn(Val, Val) -> Option<Val> {
     move |t, u| match (t, u) {
-        (Value::Constant(t), Value::Constant(u)) => op(t, u).map(|r| Value::Constant(r)),
+        (Val::Constant(t), Val::Constant(u)) => op(t, u).map(|r| Val::Constant(r)),
 
         _otherwise => None,
     }
@@ -74,7 +70,7 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, parser::Identif
 
     let eq = PartialRawLambda2 {
         name: Operator::Equals.name(),
-        apply: |p, q| equals(p, q).map(|r| Value::Constant(Literal::Bool(r))),
+        apply: |p, q| equals(p, q).map(|r| Val::Constant(Literal::Bool(r))),
         type_scheme: comparison_signature(),
     };
 
@@ -180,7 +176,7 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, parser::Identif
         .collect()
 }
 
-pub fn show(x: Value) -> String {
+pub fn show(x: Val) -> String {
     format!("{x}")
 }
 
@@ -188,13 +184,13 @@ pub fn print_endline(x: String) {
     println!("{x}")
 }
 
-pub fn equals(p: Value, q: Value) -> Option<bool> {
+pub fn equals(p: Val, q: Val) -> Option<bool> {
     match (p, q) {
-        (Value::Constant(Literal::Int(p)), Value::Constant(Literal::Int(q))) => Some(p == q),
-        (Value::Constant(Literal::Bool(p)), Value::Constant(Literal::Bool(q))) => Some(p == q),
-        (Value::Constant(Literal::Text(p)), Value::Constant(Literal::Text(q))) => Some(p == q),
-        (Value::Constant(Literal::Unit), Value::Constant(Literal::Unit)) => Some(true),
-        (Value::Product(p), Value::Product(q)) => {
+        (Val::Constant(Literal::Int(p)), Val::Constant(Literal::Int(q))) => Some(p == q),
+        (Val::Constant(Literal::Bool(p)), Val::Constant(Literal::Bool(q))) => Some(p == q),
+        (Val::Constant(Literal::Text(p)), Val::Constant(Literal::Text(q))) => Some(p == q),
+        (Val::Constant(Literal::Unit), Val::Constant(Literal::Unit)) => Some(true),
+        (Val::Product(p), Val::Product(q)) => {
             let result = p.len() == q.len()
                 && p.into_iter()
                     .zip(q)

@@ -1,12 +1,5 @@
-use Stdlib
+foo := λx.
+  print_endline "foo: hi! `x`"
 
-list_eq :: ∀α. List α -> List α -> Bool := λxs ys.
-  let zipped = List.zip xs ys in
-  let cmp = λt z.
-    deconstruct t into
-      p, q -> z and p = q
-  in
-    List.fold_right cmp true zipped
-
-start := λ_.
-  print_endline "Hi, mom"
+start := λx.
+  foo 1

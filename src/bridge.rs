@@ -2,7 +2,7 @@ use std::{fmt, rc::Rc};
 
 use crate::{
     ast::namer::{self, QualifiedName, TermSymbol},
-    interpreter::{Interpretation, Literal, RuntimeError, Value},
+    interpreter::{Interpretation, Literal, RuntimeError, cek::Val},
     parser::{self, ParseInfo},
     typer::{BaseType, ConstraintSet, Type, TypeParameter, TypeScheme},
 };
@@ -28,7 +28,7 @@ pub struct Lambda2<A, B, R> {
 #[derive(Debug)]
 pub struct RawLambda1<R> {
     pub name: &'static str,
-    pub apply: fn(Value) -> R,
+    pub apply: fn(Val) -> R,
 }
 
 #[derive(Debug)]
@@ -64,7 +64,7 @@ pub trait External {
 
     fn arity(&self) -> usize;
 
-    fn invoke(&self, arguments: &[Value]) -> Interpretation;
+    fn invoke(&self, arguments: &[Val]) -> Interpretation;
 
     fn type_scheme(&self) -> TypeScheme;
 
@@ -147,8 +147,8 @@ macro_rules! rawlambda1 {
 
 impl<A, R> External for Lambda1<A, R>
 where
-    A: TypeBridge + TryFrom<Value, Error = RuntimeError>,
-    R: TypeBridge + Into<Value>,
+    A: TypeBridge + TryFrom<Val, Error = RuntimeError>,
+    R: TypeBridge + Into<Val>,
 {
     fn name(&self) -> &'static str {
         self.name
@@ -158,7 +158,7 @@ where
         1
     }
 
-    fn invoke(&self, arguments: &[Value]) -> Interpretation {
+    fn invoke(&self, arguments: &[Val]) -> Interpretation {
         let Self { apply, .. } = self;
         Ok(apply(arguments[0].clone().try_into()?).into())
     }
@@ -173,9 +173,9 @@ where
 
 impl<A, B, R> External for Lambda2<A, B, R>
 where
-    A: TypeBridge + TryFrom<Value, Error = RuntimeError>,
-    B: TypeBridge + TryFrom<Value, Error = RuntimeError>,
-    R: TypeBridge + Into<Value>,
+    A: TypeBridge + TryFrom<Val, Error = RuntimeError>,
+    B: TypeBridge + TryFrom<Val, Error = RuntimeError>,
+    R: TypeBridge + Into<Val>,
 {
     fn name(&self) -> &'static str {
         self.name
@@ -185,7 +185,7 @@ where
         2
     }
 
-    fn invoke(&self, arguments: &[Value]) -> Interpretation {
+    fn invoke(&self, arguments: &[Val]) -> Interpretation {
         let Self { apply, .. } = self;
         Ok(apply(
             arguments[0].clone().try_into()?,
@@ -208,7 +208,7 @@ where
 
 impl<R> External for RawLambda1<R>
 where
-    R: TypeBridge + Into<Value>,
+    R: TypeBridge + Into<Val>,
 {
     fn name(&self) -> &'static str {
         self.name
@@ -218,7 +218,7 @@ where
         1
     }
 
-    fn invoke(&self, arguments: &[Value]) -> Interpretation {
+    fn invoke(&self, arguments: &[Val]) -> Interpretation {
         let Self { apply, .. } = self;
         Ok(apply(arguments[0].clone()).into())
     }
@@ -239,7 +239,7 @@ where
 impl<F> External for PartialRawLambda2<F>
 where
     // By reference instead?
-    F: Fn(Value, Value) -> Option<Value>,
+    F: Fn(Val, Val) -> Option<Val>,
 {
     fn name(&self) -> &'static str {
         self.name
@@ -249,7 +249,7 @@ where
         2
     }
 
-    fn invoke(&self, arguments: &[Value]) -> Interpretation {
+    fn invoke(&self, arguments: &[Val]) -> Interpretation {
         let Self { apply, .. } = self;
         let a = &arguments[0];
         let b = &arguments[1];
@@ -264,11 +264,11 @@ where
     }
 }
 
-impl TryFrom<Value> for () {
+impl TryFrom<Val> for () {
     type Error = RuntimeError;
 
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
-        if let Value::Constant(Literal::Unit) = value {
+    fn try_from(Val: Val) -> Result<Self, Self::Error> {
+        if let Val::Constant(Literal::Unit) = Val {
             Ok(())
         } else {
             Err(RuntimeError::ExpectedType(Type::Base(BaseType::Unit)))
@@ -276,17 +276,17 @@ impl TryFrom<Value> for () {
     }
 }
 
-impl From<()> for Value {
+impl From<()> for Val {
     fn from(_value: ()) -> Self {
         Self::Constant(Literal::Unit)
     }
 }
 
-impl TryFrom<Value> for String {
+impl TryFrom<Val> for String {
     type Error = RuntimeError;
 
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
-        if let Value::Constant(Literal::Text(s)) = value {
+    fn try_from(Val: Val) -> Result<Self, Self::Error> {
+        if let Val::Constant(Literal::Text(s)) = Val {
             Ok(s)
         } else {
             Err(RuntimeError::ExpectedType(Type::Base(BaseType::Text)))
@@ -294,17 +294,17 @@ impl TryFrom<Value> for String {
     }
 }
 
-impl From<String> for Value {
-    fn from(value: String) -> Self {
-        Self::Constant(Literal::Text(value))
+impl From<String> for Val {
+    fn from(Val: String) -> Self {
+        Self::Constant(Literal::Text(Val))
     }
 }
 
-impl TryFrom<Value> for i64 {
+impl TryFrom<Val> for i64 {
     type Error = RuntimeError;
 
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
-        if let Value::Constant(Literal::Int(s)) = value {
+    fn try_from(Val: Val) -> Result<Self, Self::Error> {
+        if let Val::Constant(Literal::Int(s)) = Val {
             Ok(s)
         } else {
             Err(RuntimeError::ExpectedType(Type::Base(BaseType::Text)))
@@ -312,17 +312,17 @@ impl TryFrom<Value> for i64 {
     }
 }
 
-impl From<i64> for Value {
-    fn from(value: i64) -> Self {
-        Self::Constant(Literal::Int(value))
+impl From<i64> for Val {
+    fn from(Val: i64) -> Self {
+        Self::Constant(Literal::Int(Val))
     }
 }
 
-impl TryFrom<Value> for bool {
+impl TryFrom<Val> for bool {
     type Error = RuntimeError;
 
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
-        if let Value::Constant(Literal::Bool(s)) = value {
+    fn try_from(Val: Val) -> Result<Self, Self::Error> {
+        if let Val::Constant(Literal::Bool(s)) = Val {
             Ok(s)
         } else {
             Err(RuntimeError::ExpectedType(Type::Base(BaseType::Text)))
@@ -330,9 +330,9 @@ impl TryFrom<Value> for bool {
     }
 }
 
-impl From<bool> for Value {
-    fn from(value: bool) -> Self {
-        Self::Constant(Literal::Bool(value))
+impl From<bool> for Val {
+    fn from(Val: bool) -> Self {
+        Self::Constant(Literal::Bool(Val))
     }
 }
 
