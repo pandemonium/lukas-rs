@@ -160,8 +160,8 @@ impl Expr {
                             let _ = write!(rendering, "{literal}");
                         }
                         ast::Segment::Expression(expr) => {
-                            let Val = expr.reduce(env)?;
-                            let _ = write!(rendering, "{Val}");
+                            let value = expr.reduce(env)?;
+                            let _ = write!(rendering, "{value}");
                         }
                     }
                 }
@@ -282,8 +282,8 @@ pub enum Literal {
 }
 
 impl From<ast::Literal> for Literal {
-    fn from(Val: ast::Literal) -> Self {
-        match Val {
+    fn from(value: ast::Literal) -> Self {
+        match value {
             ast::Literal::Int(x) => Self::Int(x),
             ast::Literal::Text(x) => Self::Text(x),
             ast::Literal::Bool(x) => Self::Bool(x),

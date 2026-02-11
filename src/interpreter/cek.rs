@@ -241,31 +241,30 @@ enum AndThen {
     },
 
     EvalLetBody {
-        binder: Box<namer::Identifier>,
         body: Tree,
         environment: Env,
         k: Box<AndThen>,
     },
 
     EvalTupleElement {
-        input: Vec<Tree>,
+        input: Rc<Vec<Tree>>,
         output: Vec<Val>,
         environment: Env,
         k: Box<AndThen>,
     },
 
     EvalRecordField {
-        input: Vec<(parser::Identifier, Tree)>,
+        input: Rc<Vec<(parser::Identifier, Tree)>>,
         output: Vec<Val>,
         environment: Env,
         k: Box<AndThen>,
     },
 
     EvalConstructor {
-        input: Vec<Tree>,
+        input: Rc<Vec<Tree>>,
         output: Vec<Val>,
         environment: Env,
-        constructor: namer::QualifiedName,
+        constructor: Box<namer::QualifiedName>,
         k: Box<AndThen>,
     },
 
@@ -281,7 +280,7 @@ enum AndThen {
     },
 
     EvalDeconstruct {
-        clauses: Vec<ast::pattern::MatchClause<Erased, namer::Identifier>>,
+        clauses: Rc<Vec<ast::pattern::MatchClause<Erased, namer::Identifier>>>,
         environment: Env,
         k: Box<AndThen>,
     },
@@ -351,7 +350,7 @@ impl Suspension {
         Suspension::Suspend(Suspended::Return { value, k })
     }
 
-    fn eval_and(expr: &Tree, environment: &Env, k: AndThen) -> Self {
+    fn eval_and(expr: &Tree, environment: Env, k: AndThen) -> Self {
         Suspension::Suspend(Suspended::Eval {
             expression: Rc::clone(&expr),
             environment: environment.shared(),
@@ -425,7 +424,6 @@ fn and_then(value: Val, k: AndThen) -> Suspension {
         },
 
         AndThen::EvalLetBody {
-            binder,
             body,
             environment,
             k,
@@ -501,17 +499,17 @@ fn and_then(value: Val, k: AndThen) -> Suspension {
             output.push(value);
 
             if output.len() < input.len() {
-                Suspension::Suspend(Suspended::Eval {
-                    expression: Rc::clone(&input[output.len()]),
-                    environment: environment.shared(),
-                    k: AndThen::EvalConstructor {
+                Suspension::eval_and(
+                    &Rc::clone(&input[output.len()]),
+                    environment.shared(),
+                    AndThen::EvalConstructor {
                         input,
                         output,
                         environment,
                         constructor,
                         k,
                     },
-                })
+                )
             } else {
                 Suspension::return_and(
                     Val::Variant(
@@ -538,11 +536,11 @@ fn and_then(value: Val, k: AndThen) -> Suspension {
             environment,
             k,
         } => {
-            if let Some((bindings, consequent)) = clauses.into_iter().find_map(|clause| {
+            if let Some((bindings, consequent)) = clauses.iter().find_map(|clause| {
                 clause
                     .pattern
                     .deconstruct(&value)
-                    .map(|bindings| (bindings, clause.consequent))
+                    .map(|bindings| (bindings, Rc::clone(&clause.consequent)))
             }) {
                 let env = environment.disjoint();
                 for (_, binding) in bindings {
@@ -616,7 +614,7 @@ fn and_then(value: Val, k: AndThen) -> Suspension {
                     }
                 }
 
-                Segment::Expression(expr) => Suspension::eval_and(expr, &environment.shared(), {
+                Segment::Expression(expr) => Suspension::eval_and(expr, environment.shared(), {
                     let index = 1 + index;
                     if index < segments.len() {
                         AndThen::EvalInterpolation {
@@ -651,7 +649,7 @@ impl Expr {
         })
     }
 
-    fn eval(self: &Tree, environment: Env, k: AndThen) -> Suspension {
+    fn eval(self: Tree, environment: Env, k: AndThen) -> Suspension {
         match self.as_ref() {
             Self::Variable(_, the) => {
                 let value = match the {
@@ -689,7 +687,7 @@ impl Expr {
 
             Self::Apply(_, the) => Suspension::eval_and(
                 &the.function,
-                &environment.shared(),
+                environment.shared(),
                 AndThen::EvalArgument {
                     argument: Rc::clone(&the.argument),
                     environment,
@@ -699,9 +697,8 @@ impl Expr {
 
             Self::Let(_, the) => Suspension::eval_and(
                 &the.bound,
-                &environment.shared(),
+                environment.shared(),
                 AndThen::EvalLetBody {
-                    binder: the.binder.clone().into(),
                     body: the.body.clone(),
                     environment,
                     k: k.into(),
@@ -710,9 +707,9 @@ impl Expr {
 
             Self::Tuple(_, the) => Suspension::eval_and(
                 &the.elements[0],
-                &environment.shared(),
+                environment.shared(),
                 AndThen::EvalTupleElement {
-                    input: the.elements.clone(),
+                    input: Rc::new(the.elements.clone()),
                     output: Vec::with_capacity(the.elements.len()),
                     environment,
                     k: k.into(),
@@ -721,9 +718,9 @@ impl Expr {
 
             Self::Record(_, the) => Suspension::eval_and(
                 &the.fields[0].1,
-                &environment.shared(),
+                environment.shared(),
                 AndThen::EvalRecordField {
-                    input: the.fields.clone(),
+                    input: Rc::new(the.fields.clone()),
                     output: Vec::with_capacity(the.fields.len()),
                     environment,
                     k: k.into(),
@@ -745,12 +742,12 @@ impl Expr {
                 } else {
                     Suspension::eval_and(
                         &the.arguments[0],
-                        &environment.shared(),
+                        environment.shared(),
                         AndThen::EvalConstructor {
-                            input: the.arguments.clone(),
+                            input: Rc::new(the.arguments.clone()),
                             output: Vec::with_capacity(the.arguments.len()),
                             environment,
-                            constructor: the.constructor.clone(),
+                            constructor: the.constructor.clone().into(),
                             k: k.into(),
                         },
                     )
@@ -759,7 +756,7 @@ impl Expr {
 
             Self::Project(_, the) => Suspension::eval_and(
                 &the.base,
-                &environment,
+                environment,
                 AndThen::EvalProjection {
                     select: the.select.clone(),
                     k: k.into(),
@@ -768,7 +765,7 @@ impl Expr {
 
             Self::Sequence(_, the) => Suspension::eval_and(
                 &the.this,
-                &environment.shared(),
+                environment.shared(),
                 AndThen::Eval {
                     expression: Rc::clone(&the.and_then),
                     environment,
@@ -778,9 +775,9 @@ impl Expr {
 
             Self::Deconstruct(_, the) => Suspension::eval_and(
                 &the.scrutinee,
-                &environment.shared(),
+                environment.shared(),
                 AndThen::EvalDeconstruct {
-                    clauses: the.match_clauses.clone(),
+                    clauses: Rc::new(the.match_clauses.clone()),
                     environment,
                     k: k.into(),
                 },
@@ -788,7 +785,7 @@ impl Expr {
 
             Self::If(_, the) => Suspension::eval_and(
                 &the.predicate,
-                &environment.shared(),
+                environment.shared(),
                 AndThen::EvalConditional {
                     consequent: Rc::clone(&the.consequent),
                     alternate: Rc::clone(&the.alternate),
@@ -800,7 +797,7 @@ impl Expr {
             Self::Interpolate(_, ast::Interpolate(segments)) => match segments.first() {
                 Some(Segment::Expression(expr)) => Suspension::eval_and(
                     expr,
-                    &environment.shared(),
+                    environment.shared(),
                     AndThen::EvalInterpolation {
                         buffer: String::new(),
                         segments: Rc::new(segments.clone()),
@@ -824,7 +821,7 @@ impl Expr {
                 None => Suspension::return_and(Val::Constant(Literal::Text("".to_owned())), k),
             },
 
-            Self::Ascription(_, the) => Suspension::eval_and(&the.ascribed_tree, &environment, k),
+            Self::Ascription(_, the) => Suspension::eval_and(&the.ascribed_tree, environment, k),
         }
     }
 }

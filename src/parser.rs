@@ -640,9 +640,9 @@ impl<'a> Parser<'a> {
                 ))
             }
 
-            [t, u, ..] if t.is_keyword(Keyword::Witness) && u.kind == TokenKind::TypeAscribe => {
-                // witness <::>
-                self.advance(2);
+            [t, ..] if t.is_keyword(Keyword::Witness) => {
+                // witness
+                self.advance(1);
 
                 let type_signature = self.parse_type_signature()?;
                 let hasher = &mut DefaultHasher::default();

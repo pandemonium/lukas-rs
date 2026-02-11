@@ -157,7 +157,6 @@ impl namer::TypeSignature {
             .collect::<Vec<_>>();
 
         let quantifiers = type_params.iter().map(|(_, p)| *p).collect();
-        println!("scheme: quantifiers {:?}", quantifiers);
 
         *type_param_map = type_params.iter().cloned().collect::<HashMap<_, _>>();
 
@@ -310,6 +309,7 @@ impl namer::NamedSymbolTable {
                 .map_err(|e| e.at(ParseInfo::default()))?;
         }
 
+        println!(">>> {} :: {}", qualified_name, scheme.underlying);
         ctx.bind_free_term(qualified_name.clone(), scheme.clone().underlying);
 
         if self.witnesses.contains(&qualified_name) {
@@ -598,10 +598,20 @@ pub enum TypeError {
     #[error("infinite type\ntype variable: {param}\noccurs in: {ty}")]
     InfiniteType { param: TypeParameter, ty: Type },
 
-    #[error("bad projection\nfrom type: {projection}\nit does not have a member: {inferred_type}")]
+    #[error(
+        "bad projection\nfrom type: {inferred_base_type}\n{} does not have a member: {}",
+        projection.base, projection.select
+    )]
     BadProjection {
         projection: namer::Projection,
-        inferred_type: Type,
+        inferred_base_type: Type,
+    },
+
+    #[error("Ambiguous base type projecting field {} from {} with choices {}",
+        projection.select, projection.base, display_list(", ", choices))]
+    AmbiguousRecordProjection {
+        projection: namer::Projection,
+        choices: Vec<Type>,
     },
 
     #[error("undefined name {name}\nat: {parse_info}")]
@@ -941,6 +951,13 @@ impl RecordType {
 
     fn fields(&self) -> &[(parser::Identifier, Type)] {
         &self.0
+    }
+
+    fn field_type(&self, field_name: &parser::Identifier) -> Option<(usize, &Type)> {
+        self.0
+            .iter()
+            .enumerate()
+            .find_map(|(index, (name, ty))| (name == field_name).then_some((index, ty)))
     }
 }
 
@@ -1785,15 +1802,37 @@ impl fmt::Display for RecordShape {
 }
 
 #[derive(Debug, Clone, Default)]
-struct RecordShapeIndex(HashMap<RecordShape, Vec<namer::QualifiedName>>);
+struct RecordShapeIndex {
+    shape_name: HashMap<RecordShape, Vec<namer::QualifiedName>>,
+    field_names: HashMap<parser::Identifier, Vec<namer::QualifiedName>>,
+}
 
 impl RecordShapeIndex {
     fn insert(&mut self, record_type: &RecordType, name: namer::QualifiedName) {
-        self.0.entry(record_type.shape()).or_default().push(name);
+        for field_name in record_type.fields() {
+            self.field_names
+                .entry(field_name.0.clone())
+                .or_default()
+                .push(name.clone());
+        }
+        self.shape_name
+            .entry(record_type.shape())
+            .or_default()
+            .push(name);
     }
 
-    fn matching(&self, image: &RecordShape) -> impl Iterator<Item = &namer::QualifiedName> {
-        self.0.get(image).into_iter().flatten()
+    fn type_constructor_names_by_shape(
+        &self,
+        image: &RecordShape,
+    ) -> impl Iterator<Item = &namer::QualifiedName> {
+        self.shape_name.get(image).into_iter().flatten()
+    }
+
+    fn type_constructor_names_by_field(
+        &self,
+        field: &parser::Identifier,
+    ) -> impl Iterator<Item = &namer::QualifiedName> {
+        self.field_names.get(field).into_iter().flatten()
     }
 }
 
@@ -1832,7 +1871,17 @@ impl TypeEnvironment {
 
     fn query_record_type_constructor(&self, shape: &RecordShape) -> Vec<&TypeConstructor> {
         self.record_shapes
-            .matching(shape)
+            .type_constructor_names_by_shape(shape)
+            .flat_map(|name| self.lookup(name))
+            .collect()
+    }
+
+    fn query_record_type_from_field(
+        &self,
+        field_name: &parser::Identifier,
+    ) -> Vec<&TypeConstructor> {
+        self.record_shapes
+            .type_constructor_names_by_field(field_name)
             .flat_map(|name| self.lookup(name))
             .collect()
     }
@@ -2919,13 +2968,13 @@ impl TypingContext {
         let normalized_base_type = self.normalize_type_application(pi, base_type)?;
 
         match &projection.select {
-            ProductElement::Name(field) => {
-                if let Type::Record(record) = &normalized_base_type {
+            ProductElement::Name(field_name) => match normalized_base_type {
+                Type::Record(record) => {
                     if let Some((field_index, (_, field_type))) = record
                         .0
                         .iter()
                         .enumerate()
-                        .find(|(_, (label, _))| label == field)
+                        .find(|(_, (label, _))| label == field_name)
                     {
                         Ok(Typed::computed(
                             substitutions,
@@ -2941,14 +2990,68 @@ impl TypingContext {
                     } else {
                         Err(TypeError::BadProjection {
                             projection: projection.clone(),
-                            inferred_type: base_type.clone(),
+                            inferred_base_type: base_type.clone(),
                         }
                         .at(pi))
                     }
-                } else {
-                    panic!("{base_type}")
                 }
-            }
+
+                Type::Variable(..) => {
+                    let candidates = self.types.query_record_type_from_field(field_name);
+                    if candidates.len() == 1 {
+                        let base_type = candidates[0].instantiate(&self)?;
+                        let structure = base_type.structure()?;
+                        if let Type::Record(record_type) = structure
+                            && let Some((field_index, field_type)) =
+                                record_type.field_type(field_name)
+                        {
+                            let unification = normalized_base_type
+                                .unified_with(&base_type.make_spine())
+                                .map_err(|e| e.at(pi))?;
+
+                            let base = base.with_substitutions(&unification);
+                            Ok(Typed::computed(
+                                unification,
+                                constraints,
+                                Expr::Project(
+                                    pi.with_inferred_type(field_type.clone()),
+                                    Projection {
+                                        base: base.into(),
+                                        select: ProductElement::Ordinal(field_index),
+                                    },
+                                ),
+                            ))
+                        } else {
+                            Err(TypeError::BadProjection {
+                                projection: projection.clone(),
+                                inferred_base_type: structure.clone(),
+                            }
+                            .at(pi))
+                        }
+                    } else if candidates.is_empty() {
+                        Err(TypeError::BadProjection {
+                            projection: projection.clone(),
+                            inferred_base_type: normalized_base_type.clone(),
+                        }
+                        .at(pi))
+                    } else {
+                        Err(TypeError::AmbiguousRecordProjection {
+                            projection: projection.clone(),
+                            choices: candidates
+                                .iter()
+                                .map(|tc| tc.structure().cloned())
+                                .collect::<Typing<_>>()?,
+                        }
+                        .at(pi))
+                    }
+                }
+
+                _ => Err(TypeError::BadProjection {
+                    projection: projection.clone(),
+                    inferred_base_type: base.type_info().inferred_type.clone(),
+                }
+                .at(pi)),
+            },
 
             ProductElement::Ordinal(ordinal) => match normalized_base_type {
                 Type::Tuple(tuple) => {
@@ -3001,7 +3104,7 @@ impl TypingContext {
 
                 _ => Err(TypeError::BadProjection {
                     projection: projection.clone(),
-                    inferred_type: base.type_info().inferred_type.clone(),
+                    inferred_base_type: base.type_info().inferred_type.clone(),
                 }
                 .at(pi)),
             },
