@@ -14,7 +14,7 @@ use crate::{
         self, ApplyTypeExpr, ArrowTypeExpr, ConstraintDeclaration, CoproductConstructor,
         Declaration, FieldDeclarator, ModuleDeclaration, ModuleDeclarator, Tree, TupleTypeExpr,
         TypeDeclaration, TypeDeclarator, UseDeclaration, ValueDeclaration, ValueDeclarator,
-        WitnessDeclaration,
+        WitnessDeclaration, namer::QualifiedName,
     },
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
 };
@@ -1248,7 +1248,6 @@ impl<'a> Parser<'a> {
             TokenKind::Semicolon,
             TokenKind::Pipe,
             TokenKind::Assign,
-            TokenKind::TypeAscribe,
             TokenKind::TypeAssign,
             TokenKind::Layout(Layout::Dedent),
             TokenKind::Keyword(Keyword::Let),
@@ -1388,14 +1387,41 @@ impl<'a> Parser<'a> {
 
         if computed_precedence > context_precedence {
             match operator {
+                Operator::Ascribe => {
+                    let type_signature = self
+                        .parse_type_signature()?
+                        .map_names(&|name| QualifiedName::new(name, "<<smuggler>>"));
+
+                    // Have to hack type_signature because its name type
+                    // here is IdentiferPath but Expr requires that it be
+                    // QualifiedName because Expr is not parameterized
+                    // over type name types.
+                    //
+                    // I could mangle a QualifiedName with a bogus contents
+                    // that can be turned into an IdentifierPath in the
+                    // resolution stage, so that it might be correctly
+                    // qualified.
+
+                    Ok(Expr::Ascription(
+                        *lhs.parse_info(),
+                        TypeAscription {
+                            ascribed_tree: lhs.into(),
+                            type_signature,
+                        },
+                    ))
+                }
+
                 Operator::Select => {
                     let lhs = self.parse_select_operator(lhs)?;
                     self.parse_expr_infix(lhs, context_precedence)
                 }
 
-                Operator::Tuple => {
-                    self.parse_tuple_expression(lhs, operator_position, context_precedence)
-                }
+                Operator::Tuple => self.parse_tuple_expression(
+                    lhs,
+                    operator_position,
+                    computed_precedence,
+                    context_precedence,
+                ),
 
                 _ => self.parse_operator_default(
                     lhs,
@@ -1417,9 +1443,10 @@ impl<'a> Parser<'a> {
         &mut self,
         lhs: Expr,
         operator_position: SourceLocation,
+        computed_precedence: usize,
         context_precedence: usize,
     ) -> Result<Expr> {
-        let rhs = self.parse_expression(context_precedence)?;
+        let rhs = self.parse_expression(computed_precedence)?;
         self.parse_expr_infix(
             Expr::Tuple(
                 ParseInfo::from_position(operator_position),
@@ -1551,18 +1578,16 @@ impl<'a> Parser<'a> {
     fn parse_type_signature(&mut self) -> Result<TypeSignature> {
         let _t = self.trace();
 
-        let quantifiers = self.parse_forall_clause()?;
+        let universal_quantifiers = self.parse_forall_clause()?;
         let constraints = if self.has_type_constraints() {
-            println!("parse_type_signature: Hi");
             self.parse_constraint_clause()?
         } else {
-            println!("parse_type_signature: Ho");
             Vec::default()
         };
         let body = self.parse_type_expression(0)?;
 
         Ok(TypeSignature {
-            universal_quantifiers: quantifiers,
+            universal_quantifiers,
             constraints,
             body,
             phase: PhantomData,

@@ -5,17 +5,30 @@ signature Monoid ::= ∀α.
     mappend :: α -> α -> α
   }
 
-witness :: Monoid Int :=
+witness Monoid Int :=
   { mempty  : 0
     mappend : λp q. p + q
   }
+
+witness Monoid Sum :=
+  { mempty  : mksum 0
+    mappend : λp q. mksum (unsum p + unsum q)
+  }
+
+Sum ::= { X :: Int }
+
+unsum := λs. s.X
+
+mksum := λx. { X: x }
 
 mconcat :: ∀α. Monoid α |- List α -> α :=
   λxs.
     List.fold_right mappend mempty xs
 
-
-
 start := λ_.
-  let xs = List.tabulate 10 id in
-  print_endline "Hi, mom: `mconcat xs`"
+  let xs = List.tabulate 1000 mksum in
+  let ys = List.reverse xs in
+  let qs = List.zip xs ys in
+  let zs = List.map (λpq. deconstruct pq into p, q -> mksum (unsum p + unsum q)) qs in
+
+  print_endline "Hi, mom: `unsum (mconcat zs)`"

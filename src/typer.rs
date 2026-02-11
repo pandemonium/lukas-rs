@@ -675,6 +675,9 @@ pub enum TypeError {
     #[error("expected: {expected}; found: {found}")]
     ExpectedType { expected: Type, found: Type },
 
+    #[error("{from} is not {expected}")]
+    Disappointed { expected: Type, from: namer::Expr },
+
     #[error("undefined constraint signature {0}")]
     UndefinedSignature(QualifiedName),
 
@@ -1334,6 +1337,10 @@ impl TupleType {
 
     pub fn arity(&self) -> usize {
         self.0.len()
+    }
+
+    pub fn is_fully_typed(&self) -> bool {
+        self.0.iter().all(|t| t.variables().is_empty())
     }
 }
 
@@ -2281,32 +2288,41 @@ impl TypingContext {
         let mut constraints = ConstraintSet::default();
         let normalized_type = self.normalize_type_application(pi, &expected_type)?;
 
-        if let Type::Tuple(TupleType(elements)) = &normalized_type {
-            let mut typed_elements = Vec::with_capacity(elements.len());
-            let mut substitutions = Substitutions::default();
+        match normalized_type {
+            Type::Tuple(TupleType(elements)) => {
+                let mut typed_elements = Vec::with_capacity(elements.len());
+                let mut substitutions = Substitutions::default();
 
-            for (expr, expected) in tuple.elements.iter().zip(elements) {
-                let typed_element = self.check_expr(expected, expr)?;
-                substitutions = substitutions.compose(&typed_element.substitutions);
-                typed_elements.push(typed_element.tree.into());
-                constraints = constraints
-                    .with_substitutions(&substitutions)
-                    .union(typed_element.constraints.with_substitutions(&substitutions))
+                for (expr, expected) in tuple.elements.iter().zip(elements) {
+                    let typed_element = self.check_expr(&expected, expr)?;
+                    substitutions = substitutions.compose(&typed_element.substitutions);
+                    typed_elements.push(typed_element.tree.into());
+                    constraints = constraints
+                        .with_substitutions(&substitutions)
+                        .union(typed_element.constraints.with_substitutions(&substitutions))
+                }
+
+                let type_info =
+                    pi.with_inferred_type(expected_type.with_substitutions(&substitutions));
+                Ok(Typed::computed(
+                    substitutions,
+                    constraints,
+                    Expr::Tuple(
+                        type_info,
+                        Tuple {
+                            elements: typed_elements,
+                        },
+                    ),
+                ))
             }
 
-            let type_info = pi.with_inferred_type(expected_type.with_substitutions(&substitutions));
-            Ok(Typed::computed(
-                substitutions,
-                constraints,
-                Expr::Tuple(
-                    type_info,
-                    Tuple {
-                        elements: typed_elements,
-                    },
-                ),
-            ))
-        } else {
-            self.infer_tuple(pi, tuple)
+            Type::Variable(..) => todo!(),
+
+            otherwise => Err(TypeError::Disappointed {
+                expected: expected_type.clone(),
+                from: namer::Expr::Tuple(pi, tuple.clone()),
+            }
+            .at(pi)),
         }
     }
 
@@ -3054,7 +3070,7 @@ impl TypingContext {
             },
 
             ProductElement::Ordinal(ordinal) => match normalized_base_type {
-                Type::Tuple(tuple) => {
+                Type::Tuple(tuple) if tuple.is_fully_typed() => {
                     if let Some(element) = tuple.elements().get(*ordinal) {
                         Ok(Typed::computed(
                             substitutions,
@@ -3083,14 +3099,16 @@ impl TypingContext {
                     }
                     let tuple_ty = Type::Tuple(TupleType::from_signature(&elems));
                     let subs = base_type.unified_with(&tuple_ty).map_err(|e| e.at(pi))?;
+
                     let projected_ty = match tuple_ty.with_substitutions(&subs) {
                         Type::Tuple(tuple) => tuple.elements()[*ordinal].clone(),
                         _ => unreachable!(),
                     };
+
                     let substitutions = substitutions.compose(&subs);
                     let constraints = constraints.with_substitutions(&substitutions);
                     Ok(Typed::computed(
-                        substitutions.compose(&subs),
+                        substitutions,
                         constraints,
                         Expr::Project(
                             pi.with_inferred_type(projected_ty),

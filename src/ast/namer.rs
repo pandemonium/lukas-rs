@@ -1662,12 +1662,28 @@ impl parser::TypeAscription {
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
     ) -> Naming<TypeAscription> {
+        let ast::TypeSignature {
+            universal_quantifiers,
+            constraints,
+            body,
+            phase,
+        } = self.type_signature.clone().map_names(&|qn| qn.module);
+
         Ok(TypeAscription {
             ascribed_tree: self
                 .ascribed_tree
                 .resolve(names, symbols, semantic_scope)?
                 .into(),
-            type_signature: self.type_signature.clone(),
+
+            type_signature: TypeSignature {
+                universal_quantifiers,
+                constraints: constraints
+                    .into_iter()
+                    .map(|e| e.resolve_names(symbols, ParseInfo::default(), semantic_scope))
+                    .collect::<Naming<_>>()?,
+                body: body.resolve_names(symbols, ParseInfo::default(), semantic_scope)?,
+                phase,
+            },
         })
     }
 }

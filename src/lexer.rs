@@ -435,6 +435,8 @@ pub enum Operator {
     Not,
 
     Juxtaposition,
+
+    Ascribe,
 }
 
 impl Operator {
@@ -460,6 +462,7 @@ impl Operator {
             TokenKind::Keyword(Keyword::Or) => Some(Self::Or),
             TokenKind::Keyword(Keyword::Xor) => Some(Self::Xor),
             TokenKind::Keyword(Keyword::Not) => Some(Self::Not),
+            TokenKind::TypeAscribe => Some(Self::Ascribe),
             _otherwise => None,
         }
     }
@@ -483,6 +486,8 @@ impl Operator {
 
             Self::And => 11,
             Self::Xor | Self::Or => 10,
+
+            Self::Ascribe => 8,
         }
     }
 
@@ -510,6 +515,7 @@ impl Operator {
             Self::Not => "not",
 
             Self::Juxtaposition => "ap",
+            Self::Ascribe => "::",
         }
     }
 }
@@ -749,6 +755,7 @@ impl fmt::Display for Operator {
             Self::Not => write!(f, "not"),
 
             Self::Juxtaposition => write!(f, "ap"),
+            Self::Ascribe => write!(f, "::"),
         }
     }
 }

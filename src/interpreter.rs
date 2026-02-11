@@ -23,11 +23,11 @@ impl Expr {
         // Plenty of clone calls here.
         match self.as_ref() {
             Self::Variable(_, the) => {
-                let Val = match the {
+                let value = match the {
                     namer::Identifier::Bound(index) => env.local(*index),
                     namer::Identifier::Free(name) => env.global(name).cloned(),
                 };
-                Val.ok_or_else(|| RuntimeError::NoSuchSymbol(the.clone()))
+                value.ok_or_else(|| RuntimeError::NoSuchSymbol(the.clone()))
             }
 
             Self::InvokeBridge(_, bridge) => Ok(Val::PartiallyAppliedBridge {

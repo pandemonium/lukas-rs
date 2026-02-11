@@ -117,12 +117,50 @@ pub struct ConstraintExpression<A, TypeId> {
     pub parameters: Vec<TypeExpression<A, TypeId>>,
 }
 
+impl<A, TypeId> ConstraintExpression<A, TypeId> {
+    fn map_names<F, B>(self, f: &F) -> ConstraintExpression<A, B>
+    where
+        F: Fn(TypeId) -> B,
+    {
+        let Self {
+            annotation,
+            class,
+            parameters,
+        } = self;
+        ConstraintExpression {
+            annotation,
+            class: f(class),
+            parameters: parameters.into_iter().map(|p| p.map_name(f)).collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TypeSignature<A, TypeId> {
     pub universal_quantifiers: Vec<parser::Identifier>,
     pub constraints: Vec<ConstraintExpression<A, TypeId>>,
     pub body: TypeExpression<A, TypeId>,
     pub phase: PhantomData<A>,
+}
+
+impl<A, TypeId> TypeSignature<A, TypeId> {
+    pub fn map_names<F, B>(self, f: &F) -> TypeSignature<A, B>
+    where
+        F: Fn(TypeId) -> B,
+    {
+        let Self {
+            universal_quantifiers,
+            constraints,
+            body,
+            phase,
+        } = self;
+        TypeSignature {
+            universal_quantifiers,
+            constraints: constraints.into_iter().map(|c| c.map_names(f)).collect(),
+            body: body.map_name(f),
+            phase,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +170,44 @@ pub enum TypeExpression<A, TypeId> {
     Apply(A, ApplyTypeExpr<A, TypeId>),
     Arrow(A, ArrowTypeExpr<A, TypeId>),
     Tuple(A, TupleTypeExpr<A, TypeId>),
+}
+
+impl<A, TypeId> TypeExpression<A, TypeId> {
+    fn map_name<F, B>(self, f: &F) -> TypeExpression<A, B>
+    where
+        F: Fn(TypeId) -> B,
+    {
+        match self {
+            Self::Constructor(a, name) => TypeExpression::Constructor(a, f(name)),
+            Self::Parameter(a, id) => TypeExpression::Parameter(a, id),
+            Self::Apply(
+                a,
+                ApplyTypeExpr {
+                    function,
+                    argument,
+                    phase,
+                },
+            ) => TypeExpression::Apply(
+                a,
+                ApplyTypeExpr {
+                    function: function.map_name(f).into(),
+                    argument: argument.map_name(f).into(),
+                    phase: PhantomData,
+                },
+            ),
+            Self::Arrow(a, ArrowTypeExpr { domain, codomain }) => TypeExpression::Arrow(
+                a,
+                ArrowTypeExpr {
+                    domain: domain.map_name(f).into(),
+                    codomain: codomain.map_name(f).into(),
+                },
+            ),
+            Self::Tuple(a, TupleTypeExpr(elements)) => TypeExpression::Tuple(
+                a,
+                TupleTypeExpr(elements.into_iter().map(|e| e.map_name(f)).collect()),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
