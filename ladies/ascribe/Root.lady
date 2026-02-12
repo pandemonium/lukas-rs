@@ -1,2 +1,2 @@
 start := λ_.
-  1, "Hej", if true then 1 else 2 :: Text
+  1, "Hej", (if true then 1 else 2) :: Int, Text, Int

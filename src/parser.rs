@@ -1282,7 +1282,7 @@ impl<'a> Parser<'a> {
                 if (t.is_indent() || t.is_newline())
                     && Self::is_expr_prefix(&u.kind)
                     && Operator::Juxtaposition.precedence() > context_precedence
-                    && u.location().is_descendant_of(lhs.position()) =>
+                    && u.position.is_descendant_of(lhs.position()) =>
             {
                 self.advance(1); //the indent
                 self.parse_juxtaposed(lhs, context_precedence)
@@ -1291,10 +1291,7 @@ impl<'a> Parser<'a> {
             // f x
             [t, u, ..]
                 if Self::is_expr_prefix(&t.kind)
-                    && !matches!(
-                        u.kind,
-                        TokenKind::Assign | TokenKind::TypeAscribe | TokenKind::TypeAssign
-                    )
+                    && t.position.is_descendant_of(lhs.position())
                     && Operator::Juxtaposition.precedence() > context_precedence =>
             {
                 self.parse_juxtaposed(lhs, context_precedence)

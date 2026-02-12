@@ -28,7 +28,7 @@ mconcat :: ∀α. Monoid α |- List α -> α :=
 start := λ_.
   let xs = List.tabulate 1000 mksum in
   let ys = List.reverse xs in
-  let qs = List.zip xs ys in
-  let zs = List.map (λpq. deconstruct pq into p, q -> mksum (unsum p + unsum q)) qs in
+  let qs = List.zip xs ys :: List (Sum, Sum) in
+  let zs = List.map (λpq. mksum (unsum pq.0 + unsum pq.1)) qs in
 
   print_endline "Hi, mom: `unsum (mconcat zs)`"
