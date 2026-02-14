@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 
 use crate::{
-    ast::namer::QualifiedName,
-    typer::{self, Constraint, RecordShape, Type, TypeEnvironment, TypeError},
+    ast::namer::{self, Identifier, QualifiedName},
+    parser::ParseInfo,
+    typer::{
+        Apply, Constraint, Expr, RecordShape, Substitutions, Type, TypeEnvironment, TypeError,
+        Typing, TypingContext, display_list,
+    },
 };
 
 pub struct ConstraintSignature {
@@ -29,23 +33,122 @@ impl Constraint {
 
 #[derive(Debug)]
 pub struct Witness {
-    // Perhaps this should have the instantiated type? I mean: why not?
-    pub ty: Type,
-    pub dictionary: typer::Expr,
+    pub head: Constraint,
+    pub premises: Vec<Constraint>,
+    pub name: QualifiedName,
+}
+
+impl Witness {
+    pub fn from_type_signature(
+        name: QualifiedName,
+        witness: namer::TypeSignature,
+        ctx: &TypingContext,
+    ) -> Typing<Self> {
+        let witness_signature = witness.type_scheme(&mut HashMap::default(), ctx)?;
+        let witness_type = witness_signature.instantiate();
+
+        Ok(Self {
+            head: Constraint::from_assumed_spine(witness_type.underlying),
+            premises: witness_type.constraints.iter().cloned().collect(),
+            name,
+        })
+    }
+
+    pub fn with_substitutions(&self, subst: &Substitutions) -> Self {
+        Self {
+            head: self.head.with_substitutions(&subst),
+            premises: self
+                .premises
+                .iter()
+                .map(|c| c.with_substitutions(subst))
+                .collect(),
+            name: self.name.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct WitnessIndex {
-    store: HashMap<Type, Witness>,
+    store: HashMap<QualifiedName, Vec<Witness>>,
 }
 
 impl WitnessIndex {
-    // This has to change with premises
     pub fn insert(&mut self, witness: Witness) {
-        self.store.insert(witness.ty.clone(), witness);
+        self.store
+            .entry(witness.head.name().clone())
+            .or_default()
+            .push(witness);
     }
 
-    pub fn witness(&self, constraint: &Constraint) -> Option<&Witness> {
-        self.store.get(&constraint.constraint_type)
+    pub fn resolve_witness(&self, constraint: &Constraint) -> Result<Expr, TypeError> {
+        println!(
+            "resolve_witness: {constraint} -- {}",
+            display_list(
+                ", ",
+                &self
+                    .store
+                    .iter()
+                    .map(|(p, q)| format!("{p} -> {q:?}"))
+                    .collect::<Vec<_>>()
+            )
+        );
+
+        let candidates = self
+            .store
+            .get(constraint.name())
+            .ok_or_else(|| TypeError::NoWitness(constraint.clone()))?;
+
+        println!("resolve_witness: candidates {candidates:?}");
+
+        for witness in candidates {
+            let subst = constraint
+                .constraint_type
+                .unified_with(&witness.head.constraint_type);
+
+            if subst.is_err() {
+                continue;
+            }
+
+            let subst = subst?;
+
+            println!(
+                "resolve_witness: {constraint} subst {subst} head {} premises `{}`",
+                witness.head.constraint_type,
+                display_list(", ", &witness.premises),
+            );
+
+            let witness = witness.with_substitutions(&subst);
+
+            let solution = witness
+                .premises
+                .iter()
+                .map(|c| self.resolve_witness(&c))
+                .collect::<Result<Vec<_>, _>>();
+
+            // Compute some honest type info to insert?
+            if let Ok(solution) = solution {
+                println!("resolve_witness: solution {solution:?}");
+
+                // surely the witness can contain this.
+                let pi = ParseInfo::default();
+                return Ok(solution.into_iter().fold(
+                    Expr::Variable(
+                        pi.with_inferred_type(Type::fresh()),
+                        Identifier::Free(witness.name.clone().into()),
+                    ),
+                    |f, x| {
+                        Expr::Apply(
+                            pi.with_inferred_type(Type::fresh()),
+                            Apply {
+                                function: f.into(),
+                                argument: x.into(),
+                            },
+                        )
+                    },
+                ));
+            }
+        }
+
+        Err(TypeError::NoWitness(constraint.clone()))
     }
 }

@@ -49,11 +49,10 @@ pub type ConstructorPattern = ast::pattern::ConstructorPattern<TypeInfo, namer::
 pub type StructPattern = ast::pattern::StructPattern<TypeInfo, namer::Identifier>;
 pub type TuplePattern = ast::pattern::TuplePattern<TypeInfo, namer::Identifier>;
 pub type TypeAscription = ast::TypeAscription<TypeInfo, namer::Identifier>;
-
+pub type TypeSignature = ast::TypeSignature<TypeInfo, namer::QualifiedName>;
 pub type RecordSymbol = namer::RecordSymbol<namer::QualifiedName>;
 pub type CoproductSymbol = namer::CoproductSymbol<namer::QualifiedName>;
 
-type TypedSymbol = namer::Symbol<TypeInfo, namer::QualifiedName, namer::Identifier>;
 type TypedSymbolTable = namer::SymbolTable<TypeInfo, namer::QualifiedName, namer::Identifier>;
 
 pub fn display_list<A>(sep: &str, xs: &[A]) -> String
@@ -145,7 +144,7 @@ where
 }
 
 impl namer::TypeSignature {
-    pub fn scheme(
+    pub fn type_scheme(
         &self,
         type_param_map: &mut HashMap<parser::Identifier, TypeParameter>,
         ctx: &TypingContext,
@@ -160,10 +159,16 @@ impl namer::TypeSignature {
 
         *type_param_map = type_params.iter().cloned().collect::<HashMap<_, _>>();
 
+        let constraints = self
+            .constraints
+            .iter()
+            .map(|c| Constraint::from_constraint_expr(type_param_map, c, ctx))
+            .collect::<Typing<Vec<_>>>()?;
+
         Ok(TypeScheme {
             quantifiers,
             underlying: self.body.synthesize_type(&type_param_map, ctx)?,
-            constraints: ConstraintSet::default(),
+            constraints: ConstraintSet::from(constraints.as_slice()),
         })
     }
 }
@@ -173,10 +178,11 @@ impl namer::NamedSymbolTable {
         mut self,
         evaluation_order: Iter<&SymbolName>,
     ) -> Typing<TypedSymbolTable> {
-        let mut symbols = HashMap::default();
+        let mut ctx = self.elaborate_types()?;
 
-        let mut ctx = self.elaborate_types(&mut symbols)?;
         self.elaborate_constraints(&mut ctx)?;
+
+        let mut symbols = HashMap::default();
         self.elaborate_terms(evaluation_order, &mut symbols, ctx)?;
 
         Ok(SymbolTable {
@@ -229,11 +235,7 @@ impl namer::NamedSymbolTable {
         Ok(())
     }
 
-    fn elaborate_types(
-        &self,
-        // Wait -- types do not involve symbols?
-        symbols: &mut HashMap<SymbolName, Symbol<TypeInfo, QualifiedName, Identifier>>,
-    ) -> Typing<TypingContext> {
+    fn elaborate_types(&self) -> Typing<TypingContext> {
         let mut ctx = TypingContext::default();
 
         for symbol in self.symbols.iter().filter_map(|(_, sym)| match sym {
@@ -297,29 +299,51 @@ impl namer::NamedSymbolTable {
     ) -> Typing<TermSymbol<TypeInfo, QualifiedName, Identifier>> {
         let mut expr = ctx.infer_expr(&symbol.body())?;
         let qualified_name = symbol.name.clone();
+        let is_witness_term = self.witnesses.contains(&qualified_name);
 
-        expr = discharge_ground_constraints(&expr, witness_index, &ctx)?;
-
-        let inferred_type = &expr.as_constrained_type();
-        let scheme = inferred_type.generalize(&ctx);
-
-        for c in scheme.underlying.constraints.iter() {
-            expr.tree = add_constraint_parameter_slot(&expr.tree);
-            expr.tree = add_constraint_projections(&expr.tree, c, &ctx)
-                .map_err(|e| e.at(ParseInfo::default()))?;
+        if !is_witness_term {
+            println!("elaborate_term: {qualified_name} discharge");
+            expr = discharge_ground_constraints(&expr, witness_index, &ctx)?;
         }
 
-        println!(">>> {} :: {}", qualified_name, scheme.underlying);
-        ctx.bind_free_term(qualified_name.clone(), scheme.clone().underlying);
+        if let Some(signature) = &symbol.type_signature {
+            let scheme = signature.type_scheme(&mut HashMap::default(), ctx)?;
+            let ty = scheme.instantiate();
 
-        if self.witnesses.contains(&qualified_name) {
-            witness_index.insert(Witness {
-                ty: scheme.underlying.underlying.clone(),
-                dictionary: Expr::Variable(
-                    expr.tree.type_info().clone(),
-                    Identifier::Free(qualified_name.clone().into()),
-                ),
-            });
+            for c in scheme.constraints.iter() {
+                println!("elaborate_term: {qualified_name} {c} -- add slot");
+                expr.tree = add_constraint_parameter_slot(&expr.tree);
+                println!("elaborate_term: {qualified_name} {c} -- add projections");
+                expr.tree = add_constraint_projections(&expr.tree, c, &ctx)
+                    .map_err(|e| e.at(expr.tree.type_info().parse_info))?;
+            }
+
+            println!(">>> {} :: {}", qualified_name, scheme);
+            ctx.bind_free_term(qualified_name.clone(), scheme);
+        } else {
+            let inferred_type = &expr.as_constrained_type();
+            let scheme = inferred_type.generalize(&ctx);
+
+            for c in scheme.underlying.constraints.iter() {
+                println!("elaborate_term: {qualified_name} {c} -- add slot");
+                expr.tree = add_constraint_parameter_slot(&expr.tree);
+                println!("elaborate_term: {qualified_name} {c} -- add projections");
+                expr.tree = add_constraint_projections(&expr.tree, c, &ctx)
+                    .map_err(|e| e.at(expr.tree.type_info().parse_info))?;
+            }
+
+            println!(">>> {} :: {}", qualified_name, scheme.underlying);
+            ctx.bind_free_term(qualified_name.clone(), scheme.clone().underlying);
+        }
+
+        if is_witness_term {
+            let witness = Witness::from_type_signature(
+                qualified_name.clone(),
+                symbol.type_signature.clone().unwrap(),
+                ctx,
+            )?;
+            println!("elaborate_term: {qualified_name} add witness {witness:?}");
+            witness_index.insert(witness);
         }
 
         Ok(TermSymbol {
@@ -344,9 +368,7 @@ fn discharge_ground_constraints(
     let pi = expr.tree.type_info().parse_info;
 
     for c in ground {
-        let Some(witness) = witness_index.witness(c) else {
-            Err(TypeError::NoWitness(c.clone())).map_err(|e| e.at(pi))?
-        };
+        let witness = witness_index.resolve_witness(c).map_err(|e| e.at(pi))?;
 
         evidence.push((c, witness));
     }
@@ -356,13 +378,7 @@ fn discharge_ground_constraints(
     for (constraint, evidence) in evidence {
         let signature = constraint.signature(&ctx.types).map_err(|e| e.at(pi))?;
 
-        tree = insert_witness(
-            tree,
-            &signature.shape,
-            constraint,
-            &evidence.dictionary,
-            &ctx.terms,
-        );
+        tree = insert_witness(tree, &signature.shape, constraint, &evidence, &ctx.terms);
     }
 
     Ok(Typed::computed(
@@ -375,18 +391,18 @@ fn discharge_ground_constraints(
 // A HashSet of parser::Identifier as members compared to a qualified name. Hmm.
 fn insert_witness(
     tree: Expr,
-    shape: &RecordShape,
+    signature: &RecordShape,
     constraint: &Constraint,
     witness: &Expr,
     ctx: &TermEnvironment,
 ) -> Expr {
     tree.map(&|e| match e {
-        Expr::Variable(a, Identifier::Free(m)) if shape.contains(m.member()) => Expr::Project(
+        Expr::Variable(a, Identifier::Free(m)) if signature.contains(m.member()) => Expr::Project(
             a,
             Projection {
                 base: witness.clone().into(),
                 // This must be the field index
-                select: ProductElement::Ordinal(shape.index_of(&m.member()).unwrap()),
+                select: ProductElement::Ordinal(signature.index_of(&m.member()).unwrap()),
             },
         ),
 
@@ -464,25 +480,41 @@ fn add_constraint_projections(
 }
 
 fn add_constraint_parameter_slot(expr: &Expr) -> Expr {
-    if let Expr::Ascription(a0, ascription) = expr
-        && let Expr::RecursiveLambda(a1, rec) = &ascription.ascribed_tree.as_ref()
-    {
-        let lambda = rec.lambda.clone().prepend_parameter();
+    if let Expr::Ascription(a0, ascription) = expr {
+        match ascription.ascribed_tree.as_ref() {
+            Expr::RecursiveLambda(a1, rec) => Expr::Ascription(
+                a0.clone(),
+                TypeAscription {
+                    ascribed_tree: Expr::RecursiveLambda(
+                        a1.clone(),
+                        SelfReferential {
+                            own_name: rec.own_name.clone(),
+                            lambda: rec.lambda.clone().prepend_parameter().clone(),
+                        },
+                    )
+                    .into(),
+                    type_signature: ascription.type_signature.clone(),
+                },
+            ),
 
-        Expr::Ascription(
-            a0.clone(),
-            TypeAscription {
-                ascribed_tree: Expr::RecursiveLambda(
-                    a1.clone(),
-                    SelfReferential {
-                        own_name: rec.own_name.clone(),
-                        lambda: lambda.clone(),
-                    },
-                )
-                .into(),
-                type_signature: ascription.type_signature.clone(),
-            },
-        )
+            expr => Expr::Ascription(
+                a0.clone(),
+                TypeAscription {
+                    ascribed_tree: Expr::RecursiveLambda(
+                        a0.clone(),
+                        SelfReferential {
+                            own_name: Identifier::Bound(0),
+                            lambda: Lambda {
+                                parameter: Identifier::Bound(1),
+                                body: expr.clone().map(&|e| e.shift_de_bruijn_levels(0, 2)).into(),
+                            },
+                        },
+                    )
+                    .into(),
+                    type_signature: ascription.type_signature.clone(),
+                },
+            ),
+        }
     } else {
         expr.clone()
     }
@@ -501,66 +533,7 @@ impl Lambda {
                 Lambda {
                     parameter: Identifier::Bound(1 + first_level),
                     body: Rc::unwrap_or_clone(self.body)
-                        .map(&|e| match e {
-                            Expr::Variable(a, Identifier::Bound(l)) if l >= first_level => {
-                                Expr::Variable(a.clone(), Identifier::Bound(1 + l))
-                            }
-
-                            Expr::Lambda(
-                                a,
-                                Lambda {
-                                    parameter: Identifier::Bound(l),
-                                    body,
-                                },
-                            ) if l >= first_level => Expr::Lambda(
-                                a.clone(),
-                                Lambda {
-                                    parameter: Identifier::Bound(1 + l),
-                                    body,
-                                },
-                            ),
-
-                            Expr::Let(
-                                a,
-                                Binding {
-                                    binder: Identifier::Bound(l),
-                                    bound,
-                                    body,
-                                },
-                            ) if l >= first_level => Expr::Let(
-                                a.clone(),
-                                Binding {
-                                    binder: Identifier::Bound(1 + l),
-                                    bound,
-                                    body,
-                                },
-                            ),
-
-                            Expr::Deconstruct(
-                                a,
-                                ast::Deconstruct {
-                                    scrutinee,
-                                    match_clauses,
-                                },
-                            ) => Expr::Deconstruct(
-                                a,
-                                ast::Deconstruct {
-                                    scrutinee,
-                                    match_clauses: match_clauses
-                                        .into_iter()
-                                        .map(|clause| MatchClause {
-                                            pattern: clause.pattern.map_binders(&|id| match id {
-                                                Identifier::Bound(l) => Identifier::Bound(1 + l),
-                                                id => id,
-                                            }),
-                                            consequent: clause.consequent,
-                                        })
-                                        .collect(),
-                                },
-                            ),
-
-                            e => e,
-                        })
+                        .map(&|e| e.shift_de_bruijn_levels(first_level, 1))
                         .into(),
                 },
             )
@@ -572,6 +545,69 @@ impl Lambda {
 impl Expr {
     pub fn type_info(&self) -> &TypeInfo {
         self.annotation()
+    }
+
+    pub fn shift_de_bruijn_levels(self, threshold: usize, delta: usize) -> Self {
+        match self {
+            Self::Variable(a, Identifier::Bound(l)) if l >= threshold => {
+                Self::Variable(a.clone(), Identifier::Bound(delta + l))
+            }
+
+            Self::Lambda(
+                a,
+                Lambda {
+                    parameter: Identifier::Bound(l),
+                    body,
+                },
+            ) if l >= threshold => Self::Lambda(
+                a.clone(),
+                Lambda {
+                    parameter: Identifier::Bound(delta + l),
+                    body,
+                },
+            ),
+
+            Self::Let(
+                a,
+                Binding {
+                    binder: Identifier::Bound(l),
+                    bound,
+                    body,
+                },
+            ) if l >= threshold => Self::Let(
+                a.clone(),
+                Binding {
+                    binder: Identifier::Bound(delta + l),
+                    bound,
+                    body,
+                },
+            ),
+
+            Self::Deconstruct(
+                a,
+                ast::Deconstruct {
+                    scrutinee,
+                    match_clauses,
+                },
+            ) => Self::Deconstruct(
+                a,
+                ast::Deconstruct {
+                    scrutinee,
+                    match_clauses: match_clauses
+                        .into_iter()
+                        .map(|clause| MatchClause {
+                            pattern: clause.pattern.map_binders(&|id| match id {
+                                Identifier::Bound(l) => Identifier::Bound(delta + l),
+                                id => id,
+                            }),
+                            consequent: clause.consequent,
+                        })
+                        .collect(),
+                },
+            ),
+
+            e => e,
+        }
     }
 }
 
@@ -725,8 +761,8 @@ impl TypeInfo {
 
 #[derive(Debug, Clone)]
 pub struct Constrained<A> {
-    constraints: ConstraintSet,
-    underlying: A,
+    pub constraints: ConstraintSet,
+    pub underlying: A,
 }
 
 impl<A> Constrained<A> {
@@ -784,19 +820,6 @@ impl Typed {
             substitutions,
             constraints,
             tree,
-        }
-    }
-
-    fn constrain(self, extra: ConstraintSet) -> Self {
-        println!("constrain: {self:?} with {extra}");
-
-        let extra = extra.with_substitutions(&self.substitutions);
-        let constraints = self.constraints.union(extra);
-
-        Self {
-            substitutions: self.substitutions,
-            constraints,
-            tree: self.tree,
         }
     }
 
@@ -862,7 +885,7 @@ impl ConstraintSet {
         self.iter().flat_map(|c| c.variables()).collect()
     }
 
-    fn iter(&self) -> impl Iterator<Item = &Constraint> {
+    pub fn iter(&self) -> impl Iterator<Item = &Constraint> {
         self.0.iter()
     }
 }
@@ -894,22 +917,31 @@ impl Type {
 }
 
 impl Constraint {
-    pub fn is_witness(&self, w: &Type) -> bool {
-        &self.constraint_type == w
+    pub fn from_constraint_expr(
+        types: &HashMap<parser::Identifier, TypeParameter>,
+        expr: &namer::ConstraintExpression,
+        ctx: &TypingContext,
+    ) -> Typing<Constraint> {
+        let constructor = ctx.types.lookup(&expr.class).ok_or_else(|| {
+            TypeError::UndefinedSignature(expr.class.clone()).at(ParseInfo::default())
+        })?;
+        let constraint_type = constructor.definition().make_spine_at(types);
+        Ok(Self { constraint_type })
     }
 
     pub fn from_type_constructor(constructor: &TypeConstructor) -> Self {
-        println!("from_type_constructor: {constructor}");
-        Self {
-            constraint_type: constructor.make_spine(),
-        }
+        Self::from_assumed_spine(constructor.make_spine())
+    }
+
+    pub fn from_assumed_spine(constraint_type: Type) -> Self {
+        Self { constraint_type }
     }
 
     pub fn name(&self) -> &QualifiedName {
         self.constraint_type.applied_name()
     }
 
-    fn with_substitutions(&self, subst: &Substitutions) -> Self {
+    pub fn with_substitutions(&self, subst: &Substitutions) -> Self {
         Self {
             constraint_type: self.constraint_type.with_substitutions(subst),
         }
@@ -1452,11 +1484,18 @@ pub struct TypeConstructorDefinition {
 
 impl TypeConstructorDefinition {
     fn make_spine(&self) -> Type {
+        self.make_spine_at(&self.instantiated_params)
+    }
+
+    pub fn make_spine_at(
+        &self,
+        type_parameters: &HashMap<parser::Identifier, TypeParameter>,
+    ) -> Type {
         self.defining_symbol.type_parameters().iter().fold(
             Type::Constructor(self.name.clone()),
             |constructor, param| Type::Apply {
                 constructor: constructor.into(),
-                argument: Type::Variable(self.instantiated_params[param]).into(),
+                argument: Type::Variable(type_parameters[param]).into(),
             },
         )
     }
@@ -2316,9 +2355,17 @@ impl TypingContext {
                 ))
             }
 
-            Type::Variable(..) => todo!(),
-
-            otherwise => Err(TypeError::Disappointed {
+            Type::Variable(..) => {
+                let inferred = self.infer_expr(&namer::Expr::Tuple(pi, tuple.clone()))?;
+                let unification = inferred
+                    .tree
+                    .type_info()
+                    .inferred_type
+                    .unified_with(expected_type)
+                    .map_err(|e| e.at(pi))?;
+                Ok(inferred.with_substitutions(&unification))
+            }
+            _otherwise => Err(TypeError::Disappointed {
                 expected: expected_type.clone(),
                 from: namer::Expr::Tuple(pi, tuple.clone()),
             }
@@ -2423,7 +2470,7 @@ impl TypingContext {
     fn infer_ascription(&mut self, pi: ParseInfo, ascription: &namer::TypeAscription) -> Typing {
         let ascribed_scheme = ascription
             .type_signature
-            .scheme(&mut HashMap::default(), self)?;
+            .type_scheme(&mut HashMap::default(), self)?;
         let ascribed_type = ascribed_scheme.instantiate();
         let ascribed_tree =
             self.check_expr(&ascribed_type.underlying, &ascription.ascribed_tree)?;
@@ -3535,7 +3582,7 @@ impl Literal {
 }
 
 impl ParseInfo {
-    fn with_inferred_type(self, inferred_type: Type) -> TypeInfo {
+    pub fn with_inferred_type(self, inferred_type: Type) -> TypeInfo {
         TypeInfo {
             parse_info: self,
             inferred_type,

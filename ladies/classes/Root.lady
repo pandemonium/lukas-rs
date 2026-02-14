@@ -25,10 +25,10 @@ mconcat :: ∀α. Monoid α |- List α -> α :=
   λxs.
     List.fold_right mappend mempty xs
 
-start := λ_.
+start :: Int -> Unit := λ_.
   let xs = List.tabulate 1000 mksum in
   let ys = List.reverse xs in
-  let qs = List.zip xs ys :: List (Sum, Sum) in
-  let zs = List.map (λpq. mksum (unsum pq.0 + unsum pq.1)) qs in
+  let qs = List.zip xs ys in
+  let zs = List.map (λpq. mksum (unsum (pq :: (Sum, Sum)).0 + unsum pq.1)) qs in
 
   print_endline "Hi, mom: `unsum (mconcat zs)`"

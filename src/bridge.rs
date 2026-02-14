@@ -267,8 +267,8 @@ where
 impl TryFrom<Val> for () {
     type Error = RuntimeError;
 
-    fn try_from(Val: Val) -> Result<Self, Self::Error> {
-        if let Val::Constant(Literal::Unit) = Val {
+    fn try_from(value: Val) -> Result<Self, Self::Error> {
+        if let Val::Constant(Literal::Unit) = value {
             Ok(())
         } else {
             Err(RuntimeError::ExpectedType(Type::Base(BaseType::Unit)))
@@ -285,8 +285,8 @@ impl From<()> for Val {
 impl TryFrom<Val> for String {
     type Error = RuntimeError;
 
-    fn try_from(Val: Val) -> Result<Self, Self::Error> {
-        if let Val::Constant(Literal::Text(s)) = Val {
+    fn try_from(value: Val) -> Result<Self, Self::Error> {
+        if let Val::Constant(Literal::Text(s)) = value {
             Ok(s)
         } else {
             Err(RuntimeError::ExpectedType(Type::Base(BaseType::Text)))
@@ -295,16 +295,16 @@ impl TryFrom<Val> for String {
 }
 
 impl From<String> for Val {
-    fn from(Val: String) -> Self {
-        Self::Constant(Literal::Text(Val))
+    fn from(value: String) -> Self {
+        Self::Constant(Literal::Text(value))
     }
 }
 
 impl TryFrom<Val> for i64 {
     type Error = RuntimeError;
 
-    fn try_from(Val: Val) -> Result<Self, Self::Error> {
-        if let Val::Constant(Literal::Int(s)) = Val {
+    fn try_from(value: Val) -> Result<Self, Self::Error> {
+        if let Val::Constant(Literal::Int(s)) = value {
             Ok(s)
         } else {
             Err(RuntimeError::ExpectedType(Type::Base(BaseType::Text)))
@@ -313,16 +313,16 @@ impl TryFrom<Val> for i64 {
 }
 
 impl From<i64> for Val {
-    fn from(Val: i64) -> Self {
-        Self::Constant(Literal::Int(Val))
+    fn from(value: i64) -> Self {
+        Self::Constant(Literal::Int(value))
     }
 }
 
 impl TryFrom<Val> for bool {
     type Error = RuntimeError;
 
-    fn try_from(Val: Val) -> Result<Self, Self::Error> {
-        if let Val::Constant(Literal::Bool(s)) = Val {
+    fn try_from(value: Val) -> Result<Self, Self::Error> {
+        if let Val::Constant(Literal::Bool(s)) = value {
             Ok(s)
         } else {
             Err(RuntimeError::ExpectedType(Type::Base(BaseType::Text)))
@@ -331,8 +331,8 @@ impl TryFrom<Val> for bool {
 }
 
 impl From<bool> for Val {
-    fn from(Val: bool) -> Self {
-        Self::Constant(Literal::Bool(Val))
+    fn from(value: bool) -> Self {
+        Self::Constant(Literal::Bool(value))
     }
 }
 

@@ -1,0 +1,20 @@
+signature Eq ::= ∀α.
+  { eq :: α -> α -> Bool
+  }
+
+witness Eq Int :=
+  { eq : λp q. p = q
+  }
+
+List ::= ∀α.
+  { inner :: α
+  }
+
+witness ∀α. Eq α |- Eq (List α) :=
+  { eq : λp q. eq p.inner q.inner
+  }
+
+start := λ_.
+  let xs = { inner: 2 } in
+  let ys = { inner: 2 } in
+  eq xs ys

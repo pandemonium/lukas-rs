@@ -183,9 +183,7 @@ impl<A, TypeId> TypeExpression<A, TypeId> {
             Self::Apply(
                 a,
                 ApplyTypeExpr {
-                    function,
-                    argument,
-                    phase,
+                    function, argument, ..
                 },
             ) => TypeExpression::Apply(
                 a,

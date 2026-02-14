@@ -1,10 +1,4 @@
-use std::{
-    cell::Cell,
-    fmt,
-    hash::{DefaultHasher, Hash, Hasher},
-    marker::PhantomData,
-    result, vec,
-};
+use std::{cell::Cell, fmt, hash::Hash, marker::PhantomData, result, vec};
 
 use backtrace::Backtrace;
 use thiserror::Error;
@@ -645,10 +639,6 @@ impl<'a> Parser<'a> {
                 self.advance(1);
 
                 let type_signature = self.parse_type_signature()?;
-                let hasher = &mut DefaultHasher::default();
-                type_signature.to_string().hash(hasher);
-
-                let hash = hasher.finish();
 
                 // <:=>
                 self.advance(1);
