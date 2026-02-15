@@ -52,7 +52,7 @@ impl Closure {
     pub fn capture(env: &Env, tree: &Tree) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
             capture: env.disjoint(),
-            body: Rc::clone(&tree),
+            body: Rc::clone(tree),
         }))
     }
 
@@ -352,7 +352,7 @@ impl Suspension {
 
     fn eval_and(expr: &Tree, environment: Env, k: AndThen) -> Self {
         Suspension::Suspend(Suspended::Eval {
-            expression: Rc::clone(&expr),
+            expression: Rc::clone(expr),
             environment: environment.shared(),
             k,
         })
@@ -514,7 +514,7 @@ fn and_then(value: Val, k: AndThen) -> Suspension {
                 Suspension::return_and(
                     Val::Variant(
                         VariantVal {
-                            constructor: constructor.into(),
+                            constructor,
                             arguments: output,
                         }
                         .into(),
@@ -645,7 +645,7 @@ impl Expr {
         Suspension::Suspend(Suspended::Eval {
             expression: self.clone(),
             environment,
-            k: AndThen::Hcf.into(),
+            k: AndThen::Hcf,
         })
     }
 

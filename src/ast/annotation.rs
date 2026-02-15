@@ -250,13 +250,13 @@ where
         F: Fn(&A) -> B,
     {
         Deconstruct {
-            scrutinee: self.scrutinee.map_annotation(f).into(),
+            scrutinee: self.scrutinee.map_annotation(f),
             match_clauses: self
                 .match_clauses
                 .iter()
                 .map(|clause| MatchClause {
                     pattern: clause.pattern.map_annotation(f),
-                    consequent: clause.consequent.map_annotation(f).into(),
+                    consequent: clause.consequent.map_annotation(f),
                 })
                 .collect(),
         }
@@ -427,7 +427,7 @@ where
         let Self(segments) = self;
         Interpolate(
             segments
-                .into_iter()
+                .iter()
                 .map(|s| match s {
                     Segment::Literal(a, literal) => Segment::Literal(f(a), literal.clone()),
                     Segment::Expression(expr) => Segment::Expression(expr.map_annotation(f)),

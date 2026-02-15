@@ -118,9 +118,8 @@ impl<A> ast::Expr<A, Identifier> {
 
             Self::Interpolate(_, ast::Interpolate(segments)) => {
                 for s in segments {
-                    match s {
-                        ast::Segment::Expression(expr) => expr.gather_free_variables(free),
-                        _ => (),
+                    if let ast::Segment::Expression(expr) = s {
+                        expr.gather_free_variables(free)
                     }
                 }
             }
@@ -457,13 +456,13 @@ impl parser::IdentifierPath {
 impl parser::RecordDeclarator {
     fn as_type_symbol(
         &self,
-        type_parameters: &Vec<parser::Identifier>,
+        type_parameters: &[parser::Identifier],
         name: &QualifiedName,
     ) -> TypeSymbol<IdentifierPath> {
         TypeSymbol {
             definition: TypeDefinition::Record(RecordSymbol {
                 name: name.clone(),
-                type_parameters: type_parameters.clone(),
+                type_parameters: type_parameters.to_owned(),
                 fields: self
                     .fields
                     .iter()
@@ -559,10 +558,7 @@ impl ParserSymbolTable {
                 .then_some(NameExpr {
                     module_prefix: prefix.clone(),
                     member: fully_qualified.element(prefix.len())?.to_owned(),
-                    projections: fully_qualified.tail[prefix.len()..]
-                        .iter()
-                        .cloned()
-                        .collect(),
+                    projections: fully_qualified.tail[prefix.len()..].to_vec(),
                 })
         })
     }
@@ -573,7 +569,7 @@ impl ParserSymbolTable {
         pi: ParseInfo,
         semantic_scope: &parser::IdentifierPath,
     ) -> Naming<QualifiedName> {
-        let type_name = parser::Identifier::from_str(&id.last());
+        let type_name = parser::Identifier::from_str(id.last());
         let member = ModuleMember::Type(type_name);
         let search_space = self
             .member_modules
@@ -704,7 +700,7 @@ impl ParserSymbolTable {
         self.add_term_symbol(
             name.clone(),
             TermSymbol {
-                name: name,
+                name,
                 type_signature: declarator.type_signature.clone(),
                 body: declarator.body.clone().into(),
             },
@@ -1082,7 +1078,7 @@ impl ConstructorSymbol<parser::IdentifierPath> {
     }
 
     pub fn make_curried_constructor_term(&self, pi: ParseInfo) -> parser::Expr {
-        let terms = (0..self.signature.len()).into_iter();
+        let terms = 0..self.signature.len();
         let construct = parser::Expr::Inject(
             pi,
             ast::Injection {
@@ -1217,7 +1213,7 @@ impl parser::TypeExpression {
     ) -> Naming<TypeExpression> {
         match self {
             Self::Constructor(a, name) => Ok(TypeExpression::Constructor(*a, {
-                symbols.resolve_type_name(&name, pi, semantic_scope)?
+                symbols.resolve_type_name(name, pi, semantic_scope)?
             })),
 
             Self::Parameter(a, name) => Ok(TypeExpression::Parameter(*a, name.clone())),
@@ -1639,7 +1635,7 @@ impl parser::Interpolate {
         let Self(segments) = self;
         Ok(ast::Interpolate(
             segments
-                .into_iter()
+                .iter()
                 .map(|s| match s {
                     ast::Segment::Literal(pi, literal) => {
                         Ok(ast::Segment::Literal(*pi, literal.clone()))
@@ -1781,15 +1777,12 @@ impl parser::Pattern {
 impl ParserSymbolTable {
     pub fn lower_tuples(&mut self) {
         for symbol in self.symbols.values_mut() {
-            match symbol {
-                Symbol::Term(symbol) => {
-                    let body = symbol
-                        .body
-                        .take()
-                        .expect("Internal Assertion - expected a symbol body.");
-                    symbol.body = body.lower_tuples().into();
-                }
-                _ => (),
+            if let Symbol::Term(symbol) = symbol {
+                let body = symbol
+                    .body
+                    .take()
+                    .expect("Internal Assertion - expected a symbol body.");
+                symbol.body = body.lower_tuples().into();
             }
         }
     }
@@ -1908,7 +1901,7 @@ impl ParserSymbolTable {
 
                     TypeDefinition::Builtin(base_type) => TypeSymbol {
                         definition: TypeDefinition::Builtin(*base_type),
-                        origin: symbol.origin.clone(),
+                        origin: symbol.origin,
                         arity: symbol.arity,
                     },
                 }

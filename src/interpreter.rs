@@ -181,13 +181,13 @@ impl Pattern<Erased, namer::Identifier> {
     fn deconstruct(&self, scrutinee: &Val) -> Option<Vec<(Identifier, Val)>> {
         match (self, scrutinee) {
             (Self::Coproduct(_, pattern), Val::Variant(variant))
-                if &pattern.constructor == &namer::Identifier::Free(variant.constructor.clone().into())  // W T F,
+                if pattern.constructor == namer::Identifier::Free(variant.constructor.clone())  // W T F,
                 && variant.arguments.len() == pattern.arguments.len() =>
             {
                 let mut bindings = Vec::with_capacity(variant.arguments.len());
 
                 for (pattern, scrutinee) in pattern.arguments.iter().zip(&variant.arguments) {
-                    bindings.extend(pattern.deconstruct(&scrutinee)?);
+                    bindings.extend(pattern.deconstruct(scrutinee)?);
                 }
 
                 Some(bindings)

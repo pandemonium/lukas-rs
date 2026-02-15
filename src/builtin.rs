@@ -58,7 +58,7 @@ fn mk_artithmetic_op(
     op: fn(Literal, Literal) -> Option<Literal>,
 ) -> impl Fn(Val, Val) -> Option<Val> {
     move |t, u| match (t, u) {
-        (Val::Constant(t), Val::Constant(u)) => op(t, u).map(|r| Val::Constant(r)),
+        (Val::Constant(t), Val::Constant(u)) => op(t, u).map(Val::Constant),
 
         _otherwise => None,
     }

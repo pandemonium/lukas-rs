@@ -43,7 +43,7 @@ where
     E: fmt::Debug,
 {
     pub parse_info: ParseInfo,
-    pub error: E,
+    pub error: Box<E>,
 }
 
 pub trait LocatedError
@@ -53,7 +53,7 @@ where
     fn at(self, pi: ParseInfo) -> Located<Self> {
         Located {
             parse_info: pi,
-            error: self,
+            error: self.into(),
         }
     }
 }

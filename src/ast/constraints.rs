@@ -5,7 +5,7 @@ use crate::{
     parser::ParseInfo,
     typer::{
         Apply, Constraint, Expr, RecordShape, Substitutions, Type, TypeEnvironment, TypeError,
-        Typing, TypingContext, display_list,
+        Typing, TypingContext,
     },
 };
 
@@ -17,10 +17,10 @@ pub struct ConstraintSignature {
 impl Constraint {
     pub fn signature(&self, env: &TypeEnvironment) -> Result<ConstraintSignature, TypeError> {
         let type_constructor = env
-            .lookup(&self.name())
+            .lookup(self.name())
             .ok_or_else(|| TypeError::UndefinedSignature(self.name().clone()))?;
 
-        if let Type::Record(record) = type_constructor.structure().map_err(|e| e.error)? {
+        if let Type::Record(record) = type_constructor.structure().map_err(|e| *e.error)? {
             Ok(ConstraintSignature {
                 name: self.name().clone(),
                 shape: record.shape(),
@@ -56,7 +56,7 @@ impl Witness {
 
     pub fn with_substitutions(&self, subst: &Substitutions) -> Self {
         Self {
-            head: self.head.with_substitutions(&subst),
+            head: self.head.with_substitutions(subst),
             premises: self
                 .premises
                 .iter()
@@ -122,7 +122,7 @@ impl WitnessIndex {
             let solution = witness
                 .premises
                 .iter()
-                .map(|c| self.resolve_witness(&c))
+                .map(|c| self.resolve_witness(c))
                 .collect::<Result<Vec<_>, _>>();
 
             // Compute some honest type info to insert?

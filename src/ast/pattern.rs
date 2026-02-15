@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    fmt,
+    default, fmt,
 };
 
 use crate::{
@@ -51,18 +51,13 @@ pub struct StructPattern<A, Id> {
     pub fields: Vec<(parser::Identifier, Pattern<A, Id>)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Denotation {
+    #[default]
     Empty,
     Structured(Shape),
     Finite(BTreeSet<ast::Literal>),
     Universal,
-}
-
-impl Default for Denotation {
-    fn default() -> Self {
-        Self::Empty
-    }
 }
 
 impl Denotation {
@@ -137,7 +132,7 @@ impl Shape {
             (Self::Coproduct(lhs), Self::Coproduct(rhs)) => {
                 let mut lhs = lhs.clone();
                 for (constructor, rhs) in rhs {
-                    if let Some(lhs) = lhs.get_mut(&constructor) {
+                    if let Some(lhs) = lhs.get_mut(constructor) {
                         join_many(lhs, rhs)?;
                     } else {
                         lhs.insert(constructor.clone(), rhs.clone());
@@ -150,7 +145,7 @@ impl Shape {
             (Self::Struct(lhs), Self::Struct(rhs)) => {
                 let mut lhs = lhs.clone();
                 for (field, rhs) in rhs {
-                    if let Some(lhs) = lhs.get_mut(&field) {
+                    if let Some(lhs) = lhs.get_mut(field) {
                         *lhs = lhs.join(rhs)?;
                     } else {
                         None?
@@ -170,7 +165,7 @@ impl Shape {
     }
 }
 
-fn join_many(lhs: &mut Vec<Denotation>, rhs: &[Denotation]) -> Option<()> {
+fn join_many(lhs: &mut [Denotation], rhs: &[Denotation]) -> Option<()> {
     for (lhs, rhs) in lhs.iter_mut().zip(rhs) {
         *lhs = lhs.join(rhs)?;
     }

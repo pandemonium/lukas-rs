@@ -88,7 +88,7 @@ impl IdentifierPath {
     }
 
     pub fn last(&self) -> &str {
-        self.tail.last().unwrap_or_else(|| &self.head)
+        self.tail.last().unwrap_or(&self.head)
     }
 
     pub fn in_module(&self, module: &IdentifierPath) -> Self {
@@ -646,7 +646,7 @@ impl<'a> Parser<'a> {
                 let body = self.parse_block(|parser| parser.parse_record())?;
 
                 Ok(Declaration::Witness(
-                    ParseInfo::from_position(*&t.position),
+                    ParseInfo::from_position(t.position),
                     WitnessDeclaration {
                         type_signature,
                         implementation: body,
@@ -704,13 +704,7 @@ impl<'a> Parser<'a> {
                 .parse_block(|parser| parser.parse_sequence())
                 .map(|body| {
                     if let Expr::Lambda(pi, lambda) = body {
-                        Expr::RecursiveLambda(
-                            pi,
-                            SelfReferential {
-                                own_name,
-                                lambda: lambda.into(),
-                            },
-                        )
+                        Expr::RecursiveLambda(pi, SelfReferential { own_name, lambda })
                     } else {
                         body
                     }
@@ -865,7 +859,7 @@ impl<'a> Parser<'a> {
     // This ought to be able to parse identifiers with dots in them
     fn parse_simple_type_expr_term(
         &mut self,
-        id: &String,
+        id: &str,
         position: &SourceLocation,
     ) -> Result<ast::TypeExpression<ParseInfo, IdentifierPath>> {
         let _t = self.trace();
@@ -1296,7 +1290,7 @@ impl<'a> Parser<'a> {
         prelude: Literal,
     ) -> Result<Expr> {
         let pi = ParseInfo::from_position(position);
-        let mut interpolator = Interpolate::begin(pi, prelude.into());
+        let mut interpolator = Interpolate::begin(pi, prelude);
         self.advance(1);
 
         loop {
@@ -1307,15 +1301,14 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Interpolate(Interpolation::Interlude(literal)),
                     position,
-                } => interpolator
-                    .literal(ParseInfo::from_position(*position), literal.clone().into()),
+                } => interpolator.literal(ParseInfo::from_position(*position), literal.clone()),
 
                 Token {
                     kind: TokenKind::Interpolate(Interpolation::Epilogue(literal)),
                     position,
                 } => {
                     let pi = ParseInfo::from_position(*position);
-                    interpolator.literal(pi, literal.clone().into());
+                    interpolator.literal(pi, literal.clone());
                     break Ok(Expr::Interpolate(pi, interpolator));
                 }
 
@@ -1603,8 +1596,7 @@ impl<'a> Parser<'a> {
             .is_some_and(|p| {
                 self.remains()[..p]
                     .iter()
-                    .position(|t| t.kind == TokenKind::TypeConstraint)
-                    .is_some()
+                    .any(|t| t.kind == TokenKind::TypeConstraint)
             })
     }
 
@@ -1975,7 +1967,7 @@ fn is_lowercase(id: &str) -> bool {
 }
 
 fn is_capital_case(id: &str) -> bool {
-    id.chars().nth(0).is_some_and(|c| c.is_uppercase())
+    id.chars().next().is_some_and(|c| c.is_uppercase())
 }
 
 impl Pattern {

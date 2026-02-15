@@ -581,10 +581,7 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self(segments) = self;
-        let segments = segments
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
+        let segments = segments.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         write!(f, "{}", segments.join(" "))
     }
