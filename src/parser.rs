@@ -21,7 +21,7 @@ pub type Binding = ast::Binding<ParseInfo, IdentifierPath>;
 pub type Record = ast::Record<ParseInfo, IdentifierPath>;
 pub type Tuple = ast::Tuple<ParseInfo, IdentifierPath>;
 pub type Projection = ast::Projection<ParseInfo, IdentifierPath>;
-pub type Construct = ast::Construct<ParseInfo, IdentifierPath>;
+pub type Injection = ast::Injection<ParseInfo, IdentifierPath>;
 pub type Sequence = ast::Sequence<ParseInfo, IdentifierPath>;
 pub type Deconstruct = ast::Deconstruct<ParseInfo, IdentifierPath>;
 pub type IfThenElse = ast::IfThenElse<ParseInfo, IdentifierPath>;
@@ -304,13 +304,13 @@ impl<'a> Parser<'a> {
 
             let indent = depth * 2;
 
-            println!(
-                "{:<width$}{}{}",
-                remains.into_iter().collect::<String>(),
-                " ".repeat(indent),
-                step,
-                width = REMAINS_COL
-            );
+            //println!(
+            //    "{:<width$}{}{}",
+            //    remains.into_iter().collect::<String>(),
+            //    " ".repeat(indent),
+            //    step,
+            //    width = REMAINS_COL
+            //);
         } else {
             println!("Unknown caller.");
         }
@@ -1038,7 +1038,7 @@ impl<'a> Parser<'a> {
         let _t = self.trace();
 
         let (_, label) = self.identifier()?;
-        self.expect(TokenKind::Colon)?;
+        self.expect(TokenKind::Assign)?;
 
         let expr = self.parse_expression(0)?;
 
@@ -1087,7 +1087,6 @@ impl<'a> Parser<'a> {
                     && Self::is_expr_prefix(&u.kind)
                     && Self::is_expr_prefix(&v.kind) =>
             {
-                println!("parse_sequence(1)");
                 self.consume()?;
                 self.parse_subsequent(prefix)
             }
@@ -1328,7 +1327,6 @@ impl<'a> Parser<'a> {
     fn parse_juxtaposed(&mut self, lhs: Expr, context_precedence: usize) -> Result<Expr> {
         let _t = self.trace();
 
-        println!("parse_juxtaposed: about take rhs");
         let rhs = self.parse_expression(Operator::Juxtaposition.precedence())?;
 
         self.parse_expr_infix(

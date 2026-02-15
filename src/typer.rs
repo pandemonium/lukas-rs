@@ -35,7 +35,7 @@ pub type SelfReferential = ast::SelfReferential<TypeInfo, namer::Identifier>;
 pub type Lambda = ast::Lambda<TypeInfo, namer::Identifier>;
 pub type Binding = ast::Binding<TypeInfo, namer::Identifier>;
 pub type Tuple = ast::Tuple<TypeInfo, namer::Identifier>;
-pub type Construct = ast::Construct<TypeInfo, namer::Identifier>;
+pub type Injection = ast::Injection<TypeInfo, namer::Identifier>;
 pub type Record = ast::Record<TypeInfo, namer::Identifier>;
 pub type Projection = ast::Projection<TypeInfo, namer::Identifier>;
 pub type Sequence = ast::Sequence<TypeInfo, namer::Identifier>;
@@ -294,56 +294,26 @@ impl namer::NamedSymbolTable {
     fn elaborate_term(
         &self,
         symbol: &TermSymbol<ParseInfo, namer::QualifiedName, Identifier>,
-        witness_index: &mut WitnessIndex,
+        witnesses: &mut WitnessIndex,
         ctx: &mut TypingContext,
     ) -> Typing<TermSymbol<TypeInfo, QualifiedName, Identifier>> {
         let mut expr = ctx.infer_expr(&symbol.body())?;
         let qualified_name = symbol.name.clone();
-        let is_witness_term = self.witnesses.contains(&qualified_name);
 
-        if !is_witness_term {
-            println!("elaborate_term: {qualified_name} discharge");
-            expr = discharge_ground_constraints(&expr, witness_index, &ctx)?;
-        }
+        expr = discharge_ground_constraints(&expr, witnesses, &ctx)?;
 
         if let Some(signature) = &symbol.type_signature {
-            let scheme = signature.type_scheme(&mut HashMap::default(), ctx)?;
-            let ty = scheme.instantiate();
-
-            for c in scheme.constraints.iter() {
-                println!("elaborate_term: {qualified_name} {c} -- add slot");
-                expr.tree = add_constraint_parameter_slot(&expr.tree);
-                println!("elaborate_term: {qualified_name} {c} -- add projections");
-                expr.tree = add_constraint_projections(&expr.tree, c, &ctx)
-                    .map_err(|e| e.at(expr.tree.type_info().parse_info))?;
-            }
-
-            println!(">>> {} :: {}", qualified_name, scheme);
-            ctx.bind_free_term(qualified_name.clone(), scheme);
+            elaborate_constraints_from_signature(&qualified_name, &mut expr, signature, ctx)?;
         } else {
-            let inferred_type = &expr.as_constrained_type();
-            let scheme = inferred_type.generalize(&ctx);
-
-            for c in scheme.underlying.constraints.iter() {
-                println!("elaborate_term: {qualified_name} {c} -- add slot");
-                expr.tree = add_constraint_parameter_slot(&expr.tree);
-                println!("elaborate_term: {qualified_name} {c} -- add projections");
-                expr.tree = add_constraint_projections(&expr.tree, c, &ctx)
-                    .map_err(|e| e.at(expr.tree.type_info().parse_info))?;
-            }
-
-            println!(">>> {} :: {}", qualified_name, scheme.underlying);
-            ctx.bind_free_term(qualified_name.clone(), scheme.clone().underlying);
+            elaborate_inferred_constraints(&qualified_name, &mut expr, ctx)?;
         }
 
-        if is_witness_term {
-            let witness = Witness::from_type_signature(
+        if self.witnesses.contains(&qualified_name) {
+            witnesses.register(Witness::from_type_signature(
                 qualified_name.clone(),
                 symbol.type_signature.clone().unwrap(),
                 ctx,
-            )?;
-            println!("elaborate_term: {qualified_name} add witness {witness:?}");
-            witness_index.insert(witness);
+            )?);
         }
 
         Ok(TermSymbol {
@@ -352,6 +322,43 @@ impl namer::NamedSymbolTable {
             body: expr.tree.into(),
         })
     }
+}
+
+fn elaborate_inferred_constraints(
+    qualified_name: &QualifiedName,
+    expr: &mut Typed,
+    ctx: &mut TypingContext,
+) -> Typing<()> {
+    let inferred_type = &expr.as_constrained_type();
+    let scheme = inferred_type.generalize(&ctx);
+    for c in scheme.underlying.constraints.iter() {
+        abstract_constraint(c, &mut expr.tree, ctx)?;
+    }
+    println!(">>> {} :: {}", qualified_name, scheme.underlying);
+    ctx.bind_free_term(qualified_name.clone(), scheme.clone().underlying);
+    Ok(())
+}
+
+fn elaborate_constraints_from_signature(
+    qualified_name: &QualifiedName,
+    expr: &mut Typed,
+    signature: &ast::TypeSignature<ParseInfo, QualifiedName>,
+    ctx: &mut TypingContext,
+) -> Typing<()> {
+    let scheme = signature.type_scheme(&mut HashMap::default(), ctx)?;
+    for c in scheme.constraints.iter() {
+        abstract_constraint(c, &mut expr.tree, ctx)?;
+    }
+    println!(">>> {} :: {}", qualified_name, scheme);
+    ctx.bind_free_term(qualified_name.clone(), scheme);
+    Ok(())
+}
+
+fn abstract_constraint(c: &Constraint, tree: &mut Expr, ctx: &mut TypingContext) -> Typing<()> {
+    *tree = add_constraint_parameter_slot(&tree);
+    *tree = add_constraint_projections(&tree, c, &ctx)
+        .map_err(|e| e.at(tree.type_info().parse_info))?;
+    Ok(())
 }
 
 fn discharge_ground_constraints(
@@ -369,7 +376,6 @@ fn discharge_ground_constraints(
 
     for c in ground {
         let witness = witness_index.resolve_witness(c).map_err(|e| e.at(pi))?;
-
         evidence.push((c, witness));
     }
 
@@ -377,8 +383,7 @@ fn discharge_ground_constraints(
 
     for (constraint, evidence) in evidence {
         let signature = constraint.signature(&ctx.types).map_err(|e| e.at(pi))?;
-
-        tree = insert_witness(tree, &signature.shape, constraint, &evidence, &ctx.terms);
+        tree = inject_witness(tree, &signature.shape, constraint, &evidence, &ctx.terms);
     }
 
     Ok(Typed::computed(
@@ -388,8 +393,7 @@ fn discharge_ground_constraints(
     ))
 }
 
-// A HashSet of parser::Identifier as members compared to a qualified name. Hmm.
-fn insert_witness(
+fn inject_witness(
     tree: Expr,
     signature: &RecordShape,
     constraint: &Constraint,
@@ -408,10 +412,10 @@ fn insert_witness(
 
         Expr::Variable(a, term_id @ Identifier::Free(..)) => {
             let scheme = ctx.lookup(&term_id).unwrap();
-            println!(
-                "insert_witness: {term_id} {constraint} constraints `{}`",
-                scheme.constraints
-            );
+            //println!(
+            //    "insert_witness: {term_id} {constraint} constraints `{}`",
+            //    scheme.constraints
+            //);
             if scheme
                 .constraints
                 .iter()
@@ -442,7 +446,7 @@ fn add_constraint_projections(
 
     let tree = tree.clone().map(&|e| match e {
         Expr::Variable(a, Identifier::Free(m)) if signature.shape.contains(m.member()) => {
-            println!("add_constraint_projections: projecting {m} from #1");
+            //            println!("add_constraint_projections: projecting {m} from #1");
             Expr::Project(
                 a.clone(),
                 Projection {
@@ -454,13 +458,13 @@ fn add_constraint_projections(
 
         Expr::Variable(a, term_id @ Identifier::Free(..)) => {
             let scheme = ctx.terms.lookup(&term_id).unwrap();
-            println!(
-                "add_constraint_projections: {term_id} constraints {}, constraint {constraint}",
-                scheme.constraints,
-            );
+            //println!(
+            //    "add_constraint_projections: {term_id} constraints {}, constraint {constraint}",
+            //    scheme.constraints,
+            //);
 
             if scheme.constraints.contains(constraint) {
-                println!("add_constraint_projections: applying #1 to {term_id}");
+                //                println!("add_constraint_projections: applying #1 to {term_id}");
                 Expr::Apply(
                     a.clone(),
                     Apply {
@@ -2156,8 +2160,10 @@ impl TypingContext {
 
             UntypedExpr::Tuple(pi, tuple) => self.check_tuple(*pi, &expected_type, tuple),
 
-            UntypedExpr::Construct(pi, construct) => {
-                self.check_construct(*pi, &expected_type, construct)
+            UntypedExpr::Record(pi, record) => self.check_record(*pi, &expected_type, record),
+
+            UntypedExpr::Inject(pi, construct) => {
+                self.check_injection(*pi, &expected_type, construct)
             }
 
             UntypedExpr::Deconstruct(pi, deconstruct) => {
@@ -2197,11 +2203,11 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn check_construct(
+    fn check_injection(
         &mut self,
         pi: ParseInfo,
         expected_type: &Type,
-        construct: &namer::Construct,
+        construct: &namer::Injection,
     ) -> Typing {
         let normalized_type = self.normalize_type_application(pi, expected_type)?;
 
@@ -2227,16 +2233,16 @@ impl TypingContext {
             Ok(Typed::computed(
                 substitutions,
                 constraints,
-                Expr::Construct(
+                Expr::Inject(
                     type_info,
-                    Construct {
+                    Injection {
                         constructor: construct.constructor.clone(),
                         arguments: typed_args,
                     },
                 ),
             ))
         } else {
-            self.infer_coproduct_construct(pi, construct)
+            self.infer_inject(pi, construct)
         }
     }
 
@@ -2323,6 +2329,60 @@ impl TypingContext {
     }
 
     #[instrument]
+    fn check_record(
+        &mut self,
+        pi: ParseInfo,
+        expected_type: &Type,
+        record: &namer::Record,
+    ) -> Typing {
+        println!("check_record: {expected_type} {record}");
+
+        let normalized_type = self.normalize_type_application(pi, &expected_type)?;
+
+        match normalized_type {
+            Type::Record(RecordType(expected_types)) => {
+                let mut constraints = ConstraintSet::default();
+                let mut subst = Substitutions::default();
+                let mut typed_fields = Vec::with_capacity(expected_types.len());
+
+                for ((name, expr), (_, ty)) in record.fields.iter().zip(&expected_types) {
+                    let typed = self.check_expr(&ty, expr)?;
+                    subst = subst.compose(&typed.substitutions);
+                    constraints = constraints
+                        .with_substitutions(&subst)
+                        .union(typed.constraints.with_substitutions(&subst));
+                    typed_fields.push((name.clone(), typed.tree.into()));
+                }
+
+                let type_info = pi
+                    .with_inferred_type(Type::Record(RecordType::from_fields(&expected_types)))
+                    .with_substitutions(&subst);
+
+                Ok(Typed::computed(
+                    subst,
+                    constraints,
+                    Expr::Record(
+                        type_info,
+                        Record {
+                            fields: typed_fields,
+                        },
+                    ),
+                ))
+            }
+
+            Type::Variable(..) => {
+                todo!()
+            }
+
+            _otherwise => Err(TypeError::Disappointed {
+                expected: expected_type.clone(),
+                from: namer::Expr::Record(pi, record.clone()),
+            }
+            .at(pi)),
+        }
+    }
+
+    #[instrument]
     fn check_tuple(&mut self, pi: ParseInfo, expected_type: &Type, tuple: &namer::Tuple) -> Typing {
         let mut constraints = ConstraintSet::default();
         let normalized_type = self.normalize_type_application(pi, &expected_type)?;
@@ -2365,6 +2425,7 @@ impl TypingContext {
                     .map_err(|e| e.at(pi))?;
                 Ok(inferred.with_substitutions(&unification))
             }
+
             _otherwise => Err(TypeError::Disappointed {
                 expected: expected_type.clone(),
                 from: namer::Expr::Tuple(pi, tuple.clone()),
@@ -2444,9 +2505,7 @@ impl TypingContext {
 
             UntypedExpr::Tuple(pi, tuple) => self.infer_tuple(*pi, tuple),
 
-            UntypedExpr::Construct(pi, constructor) => {
-                self.infer_coproduct_construct(*pi, constructor)
-            }
+            UntypedExpr::Inject(pi, constructor) => self.infer_inject(*pi, constructor),
 
             UntypedExpr::Project(pi, projection) => self.infer_projection(*pi, projection),
 
@@ -2908,7 +2967,7 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_coproduct_construct(&mut self, pi: ParseInfo, construct: &namer::Construct) -> Typing {
+    fn infer_inject(&mut self, pi: ParseInfo, construct: &namer::Injection) -> Typing {
         let (substitutions, constraints, typed_arguments, argument_types) =
             self.infer_several(&construct.arguments)?;
 
@@ -2944,9 +3003,9 @@ impl TypingContext {
         Ok(Typed::computed(
             substitutions,
             constraints,
-            Expr::Construct(
+            Expr::Inject(
                 pi.with_inferred_type(type_constructor.make_spine().with_substitutions(&subs)),
-                Construct {
+                Injection {
                     constructor: construct.constructor.clone(),
                     arguments: typed_arguments,
                 },
@@ -2998,15 +3057,14 @@ impl TypingContext {
             .first()
             .ok_or_else(|| TypeError::NoSuchRecordType(record_type.clone()).at(pi))?;
 
-        // This is needed for coproducts too
         let type_constructor = type_constructor.instantiate(self)?;
 
-        let subs = type_constructor
+        let subst = type_constructor
             .structure()?
             .unified_with(&Type::Record(record_type))
             .map_err(|e| e.at(pi))?;
 
-        let substitutions = substitutions.compose(&subs);
+        let substitutions = substitutions.compose(&subst);
         let constraints = constraints.with_substitutions(&substitutions);
         let type_info = pi.with_inferred_type(
             type_constructor

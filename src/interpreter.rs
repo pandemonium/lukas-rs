@@ -92,7 +92,7 @@ impl Expr {
                     .collect::<Interpretation<_>>()?,
             )),
 
-            Self::Construct(_, the) => Ok(Val::Variant(
+            Self::Inject(_, the) => Ok(Val::Variant(
                 VariantVal {
                     constructor: the.constructor.clone().into(),
                     arguments: the

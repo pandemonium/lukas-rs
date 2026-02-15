@@ -37,7 +37,7 @@ where
                 Expr::Let(a, node) => Expr::Let(f(a), node.map_annotation(&f)),
                 Expr::Record(a, node) => Expr::Record(f(a), node.map_annotation(&f)),
                 Expr::Tuple(a, node) => Expr::Tuple(f(a), node.map_annotation(&f)),
-                Expr::Construct(a, node) => Expr::Construct(f(a), node.map_annotation(&f)),
+                Expr::Inject(a, node) => Expr::Inject(f(a), node.map_annotation(&f)),
                 Expr::Project(a, node) => Expr::Project(f(a), node.map_annotation(&f)),
                 Expr::Sequence(a, node) => Expr::Sequence(f(a), node.map_annotation(&f)),
                 Expr::Deconstruct(a, node) => Expr::Deconstruct(f(a), node.map_annotation(&f)),
@@ -181,11 +181,11 @@ where
     }
 }
 
-impl<A, B, Id> Annotated<A, B, Id> for Construct<A, Id>
+impl<A, B, Id> Annotated<A, B, Id> for Injection<A, Id>
 where
     Id: Clone,
 {
-    type Output = Construct<B, Id>;
+    type Output = Injection<B, Id>;
 
     fn map_annotation<F>(&self, f: &F) -> Self::Output
     where
@@ -195,7 +195,7 @@ where
             constructor: name,
             arguments,
         } = self;
-        Construct {
+        Injection {
             constructor: name.clone(),
             arguments: arguments
                 .iter()

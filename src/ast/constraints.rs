@@ -73,7 +73,7 @@ pub struct WitnessIndex {
 }
 
 impl WitnessIndex {
-    pub fn insert(&mut self, witness: Witness) {
+    pub fn register(&mut self, witness: Witness) {
         self.store
             .entry(witness.head.name().clone())
             .or_default()
@@ -81,24 +81,24 @@ impl WitnessIndex {
     }
 
     pub fn resolve_witness(&self, constraint: &Constraint) -> Result<Expr, TypeError> {
-        println!(
-            "resolve_witness: {constraint} -- {}",
-            display_list(
-                ", ",
-                &self
-                    .store
-                    .iter()
-                    .map(|(p, q)| format!("{p} -> {q:?}"))
-                    .collect::<Vec<_>>()
-            )
-        );
+        //println!(
+        //    "resolve_witness: {constraint} -- {}",
+        //    display_list(
+        //        ", ",
+        //        &self
+        //            .store
+        //            .iter()
+        //            .map(|(p, q)| format!("{p} -> {q:?}"))
+        //            .collect::<Vec<_>>()
+        //    )
+        //);
 
         let candidates = self
             .store
             .get(constraint.name())
             .ok_or_else(|| TypeError::NoWitness(constraint.clone()))?;
 
-        println!("resolve_witness: candidates {candidates:?}");
+        //println!("resolve_witness: candidates {candidates:?}");
 
         for witness in candidates {
             let subst = constraint
@@ -111,11 +111,11 @@ impl WitnessIndex {
 
             let subst = subst?;
 
-            println!(
-                "resolve_witness: {constraint} subst {subst} head {} premises `{}`",
-                witness.head.constraint_type,
-                display_list(", ", &witness.premises),
-            );
+            //println!(
+            //    "resolve_witness: {constraint} subst {subst} head {} premises `{}`",
+            //    witness.head.constraint_type,
+            //    display_list(", ", &witness.premises),
+            //);
 
             let witness = witness.with_substitutions(&subst);
 
@@ -127,7 +127,7 @@ impl WitnessIndex {
 
             // Compute some honest type info to insert?
             if let Ok(solution) = solution {
-                println!("resolve_witness: solution {solution:?}");
+                //println!("resolve_witness: solution {solution:?}");
 
                 // surely the witness can contain this.
                 let pi = ParseInfo::default();

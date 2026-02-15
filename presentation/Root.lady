@@ -62,15 +62,15 @@ Dollars ::=
   }
 
 make_one := lambda good bad.
-  { The_Good: good; The_Bad: bad; The_Ugly: Nada }
+  { The_Good := good; The_Bad := bad; The_Ugly := Nada }
 
 dollars :: Text :=
   deconstruct
     make_one 1 "Sylvester"
   into
-    { The_Good: good; The_Bad: bad; The_Ugly: This ugly } ->
+    { The_Good : good; The_Bad : bad; The_Ugly : This ugly } ->
         "`good`, `bad`, `ugly`"
-  | { The_Good: good; The_Bad: bad; The_Ugly: Nada }       ->
+  | { The_Good : good; The_Bad : bad; The_Ugly : Nada }       ->
         "`good`, `bad`"
 
 print_scientific_fact := lambda icewalls.

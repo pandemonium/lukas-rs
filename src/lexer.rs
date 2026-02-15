@@ -127,8 +127,6 @@ impl LexicalAnalyzer {
             loop {
                 if remains.is_empty() {
                     break remains;
-                } else {
-                    println!("scan_text_literal: {:?}", &remains[..4]);
                 }
 
                 remains = self.emit(

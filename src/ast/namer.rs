@@ -29,7 +29,7 @@ pub type Binding = ast::Binding<ParseInfo, Identifier>;
 pub type Record = ast::Record<ParseInfo, Identifier>;
 pub type Tuple = ast::Tuple<ParseInfo, Identifier>;
 pub type Projection = ast::Projection<ParseInfo, Identifier>;
-pub type Construct = ast::Construct<ParseInfo, Identifier>;
+pub type Injection = ast::Injection<ParseInfo, Identifier>;
 pub type Sequence = ast::Sequence<ParseInfo, Identifier>;
 pub type Deconstruct = ast::Deconstruct<ParseInfo, Identifier>;
 pub type IfThenElse = ast::IfThenElse<ParseInfo, Identifier>;
@@ -127,9 +127,9 @@ impl<A> ast::Expr<A, Identifier> {
 
             Self::Project(_, projection) => projection.base.gather_free_variables(free),
 
-            Self::Construct(
+            Self::Inject(
                 _,
-                ast::Construct {
+                ast::Injection {
                     constructor,
                     arguments,
                 },
@@ -1049,7 +1049,6 @@ impl ConstructorSymbol<parser::IdentifierPath> {
     ) -> TermSymbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath> {
         let type_signature = self.make_type_signature(pi, type_parameters, type_constructor_name);
         let body = self.make_curried_constructor_term(pi);
-        println!("make_constructor_term: {body} :: {type_signature}");
         TermSymbol {
             name: self.name.clone(),
             type_signature: type_signature.into(),
@@ -1084,9 +1083,9 @@ impl ConstructorSymbol<parser::IdentifierPath> {
 
     pub fn make_curried_constructor_term(&self, pi: ParseInfo) -> parser::Expr {
         let terms = (0..self.signature.len()).into_iter();
-        let construct = parser::Expr::Construct(
+        let construct = parser::Expr::Inject(
             pi,
-            ast::Construct {
+            ast::Injection {
                 constructor: self.name.clone(),
                 arguments: terms
                     .clone()
@@ -1346,7 +1345,7 @@ impl parser::Expr {
                 node.resolve(names, symbols, semantic_scope)?,
             )),
 
-            Self::Construct(pi, node) => Ok(Expr::Construct(
+            Self::Inject(pi, node) => Ok(Expr::Inject(
                 *pi,
                 node.resolve(names, symbols, semantic_scope)?,
             )),
@@ -1530,14 +1529,14 @@ impl parser::Tuple {
     }
 }
 
-impl parser::Construct {
+impl parser::Injection {
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<Construct> {
-        Ok(Construct {
+    ) -> Naming<Injection> {
+        Ok(Injection {
             constructor: self.constructor.clone(),
             arguments: self
                 .arguments

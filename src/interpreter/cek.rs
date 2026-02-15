@@ -727,7 +727,7 @@ impl Expr {
                 },
             ),
 
-            Self::Construct(_, the) => {
+            Self::Inject(_, the) => {
                 if the.arguments.is_empty() {
                     Suspension::return_and(
                         Val::Variant(

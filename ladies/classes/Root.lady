@@ -6,20 +6,20 @@ signature Monoid ::= ∀α.
   }
 
 witness Monoid Int :=
-  { mempty  : 0
-    mappend : λp q. p + q
+  { mempty  := 0
+    mappend := λp q. p + q
   }
 
 witness Monoid Sum :=
-  { mempty  : mksum 0
-    mappend : λp q. mksum (unsum p + unsum q)
+  { mempty  := mksum 0
+    mappend := λp q. mksum (unsum p + unsum q)
   }
 
 Sum ::= { X :: Int }
 
 unsum := λs. s.X
 
-mksum := λx. { X: x }
+mksum := λx. { X := x }
 
 mconcat :: ∀α. Monoid α |- List α -> α :=
   λxs.

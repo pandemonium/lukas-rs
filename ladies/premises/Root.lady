@@ -1,20 +1,64 @@
+use Stdlib.
+
 signature Eq ::= ∀α.
   { eq :: α -> α -> Bool
   }
 
-witness Eq Int :=
-  { eq : λp q. p = q
+signature Monoid ::= ∀α.
+  { mempty  :: α
+    mappend :: α -> α -> α
   }
 
-List ::= ∀α.
-  { inner :: α
+And ::= { AndX :: Bool }
+
+mk_and :: Bool -> And :=
+  λx. { AndX := x }
+
+witness Monoid And :=
+  { mempty  := mk_and true
+    mappend := λp q. mk_and (p.AndX and q.AndX)
   }
+
+Or ::= { OrX :: Bool }
+
+Xor ::= { OrX :: Bool }
+
+mk_xor :: Bool -> Xor :=
+  λx. { OrX := x }
+
+mk_or :: Bool -> Or :=
+  λx. { OrX := x }
+
+witness Monoid Or :=
+  { mempty  := mk_or false
+    mappend := λp q. mk_or (p.OrX or q.OrX)
+  }
+
+witness Eq Int :=
+  { eq := λp q. p = q
+  }
+
+witness ∀α. Monoid (List α) :=
+  { mempty  := Nil
+    mappend := List.append
+  }
+
+list_eq :: ∀α. Eq α |- List α -> List α -> Bool :=
+  λxs ys.
+    let lengths_equal = eq (List.length xs) (List.length ys) in
+    let zipped = List.zip xs ys in
+    let res = List.fold_right (λxy z. deconstruct xy into x, y -> mappend z (mk_and (eq x y))) (mk_and lengths_equal) zipped in
+    res.AndX
 
 witness ∀α. Eq α |- Eq (List α) :=
-  { eq : λp q. eq p.inner q.inner
+  { eq := λxs ys.
+      let lengths_equal = eq (List.length xs) (List.length ys) in
+      let zipped = List.zip xs ys in
+      let res = List.fold_right (λxy z. deconstruct xy into x, y -> mappend z (mk_and (eq x y))) (mk_and lengths_equal) zipped in
+      res.AndX
   }
 
 start := λ_.
-  let xs = { inner: 2 } in
-  let ys = { inner: 2 } in
+  let xs = List.tabulate 10 id in
+  let ys = List.tabulate 10 id in
   eq xs ys

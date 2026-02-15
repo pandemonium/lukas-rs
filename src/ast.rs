@@ -237,7 +237,7 @@ pub enum Expr<A, Id> {
     Let(A, Binding<A, Id>),
     Tuple(A, Tuple<A, Id>),
     Record(A, Record<A, Id>),
-    Construct(A, Construct<A, Id>),
+    Inject(A, Injection<A, Id>),
     Project(A, Projection<A, Id>),
     Sequence(A, Sequence<A, Id>),
     Deconstruct(A, Deconstruct<A, Id>),
@@ -258,7 +258,7 @@ impl<A, Id> Expr<A, Id> {
             | Expr::Let(a, ..)
             | Expr::Record(a, ..)
             | Expr::Tuple(a, ..)
-            | Expr::Construct(a, ..)
+            | Expr::Inject(a, ..)
             | Expr::Project(a, ..)
             | Expr::Sequence(a, ..)
             | Expr::Deconstruct(a, ..)
@@ -342,9 +342,9 @@ impl<A, Id> Expr<A, Id> {
                 },
             ),
 
-            Expr::Construct(a, the) => Expr::Construct(
+            Expr::Inject(a, the) => Expr::Inject(
                 a,
-                Construct {
+                Injection {
                     constructor: the.constructor,
                     arguments: the.arguments.into_iter().map(|e| go(e, f)).collect(),
                 },
@@ -527,7 +527,7 @@ pub enum ProductElement {
 }
 
 #[derive(Debug, Clone)]
-pub struct Construct<A, Id> {
+pub struct Injection<A, Id> {
     pub constructor: QualifiedName,
     pub arguments: Vec<Tree<A, Id>>,
 }
@@ -554,7 +554,7 @@ where
             Self::Let(_, x) => write!(f, "let {} = {} in {}", x.binder, x.bound, x.body),
             Self::Record(_, x) => write!(f, "{x}"),
             Self::Tuple(_, x) => write!(f, "{x}"),
-            Self::Construct(_, x) => {
+            Self::Inject(_, x) => {
                 write!(
                     f,
                     "{} {}",
