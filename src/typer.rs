@@ -2642,113 +2642,103 @@ impl TypingContext {
     }
 
     #[instrument]
-    // Rewrite this sucker
     fn infer_deconstruction(&mut self, pi: ParseInfo, deconstruct: &namer::Deconstruct) -> Typing {
         let Typed {
             mut substitutions,
-            tree: scrutinee,
+            tree: mut scrutinee,
             mut constraints,
         } = self.infer_expr(&deconstruct.scrutinee)?;
-        let scrutinee_type = &scrutinee.type_info().inferred_type;
+
+        let mut clauses = Vec::with_capacity(deconstruct.match_clauses.len());
         let mut match_clauses = deconstruct.match_clauses.iter();
-        let mut typed_match_clauses = Vec::with_capacity(deconstruct.match_clauses.len());
 
-        let mut clause_ctx = self.clone();
-        if let Some(clause) = match_clauses.next() {
-            let mut consequent_type = {
-                let mut bindings = Vec::default();
-                let (s_pattern, pattern) =
-                    clause_ctx.check_pattern(&clause.pattern, &mut bindings, scrutinee_type)?;
-                clause_ctx.substitute_mut(&s_pattern);
-                for (binding, ty) in bindings {
-                    clause_ctx.bind_term(binding, TypeScheme::from_constant(ty));
-                }
-                let typed_expr = clause_ctx.infer_expr(&clause.consequent)?;
-                substitutions = substitutions
-                    .compose(&typed_expr.substitutions)
-                    .compose(&s_pattern);
-                let consequent_type = typed_expr.tree.type_info().inferred_type.clone();
-                typed_match_clauses.push(MatchClause {
-                    pattern,
-                    consequent: typed_expr.tree.into(),
-                });
-                constraints = constraints
-                    .with_substitutions(&substitutions)
-                    .union(typed_expr.constraints.with_substitutions(&substitutions));
-                consequent_type
-            };
-
-            for clause in match_clauses {
-                clause_ctx = self.clone();
-                let mut bindings = Vec::default();
-                let scrutinee_type = &scrutinee_type.with_substitutions(&substitutions);
-                let (pattern_subs, pattern) =
-                    clause_ctx.check_pattern(&clause.pattern, &mut bindings, scrutinee_type)?;
-                clause_ctx.substitute_mut(&pattern_subs);
-                for (binding, ty) in bindings {
-                    clause_ctx.bind_term(binding, TypeScheme::from_constant(ty));
-                }
-                let typed_expr = clause_ctx.infer_expr(&clause.consequent)?;
-                substitutions = substitutions
-                    .compose(&pattern_subs)
-                    .compose(&typed_expr.substitutions);
-
-                let branch_subs = typed_expr
-                    .tree
-                    .type_info()
-                    .inferred_type
-                    .with_substitutions(&substitutions)
-                    .unified_with(&consequent_type.with_substitutions(&substitutions))
-                    .map_err(|e| e.at(typed_expr.tree.annotation().parse_info))?;
-
-                substitutions = substitutions.compose(&branch_subs);
-                consequent_type = consequent_type.with_substitutions(&branch_subs);
-                clause_ctx.substitute_mut(&substitutions);
-                typed_match_clauses.push(MatchClause {
-                    pattern,
-                    consequent: typed_expr.tree.into(),
-                });
-
-                constraints = constraints
-                    .with_substitutions(&substitutions)
-                    .union(typed_expr.constraints.with_substitutions(&substitutions));
-            }
-
-            let mut match_space = MatchSpace::default();
-
-            for clause in &typed_match_clauses {
-                if !match_space.join(&clause.pattern) {
-                    Err(TypeError::UselessMatchClause {
-                        clause: clause.clone(),
-                    }
-                    .at(clause.pattern.annotation().parse_info))?;
-                }
-            }
-
-            let deconstruct = Deconstruct {
-                scrutinee: scrutinee.clone().into(),
-                match_clauses: typed_match_clauses,
-            };
-
-            if !match_space.is_exhaustive(
-                pi,
-                &scrutinee_type.with_substitutions(&substitutions),
-                self,
-            )? {
-                Err(TypeError::MatchNotExhaustive {
-                    deconstruct: deconstruct.clone(),
-                }
-                .at(pi))?;
-            }
-
-            Ok(Typed::computed(
-                substitutions,
-                constraints,
-                Expr::Deconstruct(pi.with_inferred_type(consequent_type), deconstruct),
+        let Some(clause) = match_clauses.next() else {
+            Err(TypeError::InternalAssertion(
+                "parser promises at least one clause".to_owned(),
             ))
-        } else {
-            panic!("Now wtf?")
+            .map_err(|e| e.at(pi))?
+        };
+
+        let mut first_clause = self.with_substitutions(&substitutions).infer_match_clause(
+            &mut substitutions,
+            &mut constraints,
+            clause,
+            &scrutinee.type_info().inferred_type,
+        )?;
+        scrutinee = scrutinee.with_substitutions(&substitutions);
+
+        while let Some(clause) = match_clauses.next() {
+            let mut clause_ctx = self.with_substitutions(&substitutions);
+            let clause = clause_ctx.infer_match_clause(
+                &mut substitutions,
+                &mut constraints,
+                clause,
+                &scrutinee.type_info().inferred_type,
+            )?;
+            let lhs = first_clause
+                .consequent
+                .type_info()
+                .inferred_type
+                .with_substitutions(&substitutions);
+            let rhs = clause
+                .consequent
+                .type_info()
+                .inferred_type
+                .with_substitutions(&substitutions);
+            let subst = lhs.unified_with(&rhs).map_err(|e| e.at(pi))?;
+            substitutions = substitutions.compose(&subst);
+            constraints = constraints.with_substitutions(&substitutions);
+            scrutinee = scrutinee.with_substitutions(&substitutions);
+            first_clause.consequent = first_clause.consequent.with_substitutions(&substitutions);
+
+            clauses.push(clause);
         }
+
+        let type_info =
+            pi.with_inferred_type(first_clause.consequent.type_info().inferred_type.clone());
+        clauses.insert(0, first_clause);
+
+        Ok(Typed::computed(
+            substitutions,
+            constraints,
+            Expr::Deconstruct(
+                type_info,
+                Deconstruct {
+                    scrutinee: scrutinee.into(),
+                    match_clauses: clauses,
+                },
+            ),
+        ))
+    }
+
+    fn infer_match_clause(
+        &mut self,
+        substitutions: &mut Substitutions,
+        constraints: &mut ConstraintSet,
+        clause: &namer::MatchClause,
+        scrutinee: &Type,
+    ) -> Typing<MatchClause> {
+        let mut bindings = Vec::default();
+        let (p_subst, pattern) = self.check_pattern(&clause.pattern, &mut bindings, &scrutinee)?;
+        self.substitute_mut(&p_subst);
+
+        for (binding, ty) in bindings {
+            self.bind_term(binding, TypeScheme::from_constant(ty));
+        }
+        let consequent = self.infer_expr(&clause.consequent)?;
+
+        *substitutions = substitutions
+            .compose(&p_subst)
+            .compose(&consequent.substitutions);
+        let consequent = consequent.with_substitutions(&substitutions);
+        *constraints = constraints
+            .with_substitutions(&substitutions)
+            .union(consequent.constraints);
+
+        Ok(MatchClause {
+            pattern,
+            consequent: consequent.tree.into(),
+        })
     }
 
     fn resolve_unique_record_type_constructor(

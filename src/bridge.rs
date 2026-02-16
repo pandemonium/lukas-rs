@@ -89,10 +89,6 @@ pub trait External {
 
 trait TypeBridge {
     const TYPE: Type;
-
-    fn synthesize_type() -> Type {
-        Self::TYPE
-    }
 }
 
 impl TypeBridge for String {

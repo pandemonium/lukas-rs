@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    default, fmt,
+    fmt,
 };
 
 use crate::{
