@@ -54,14 +54,10 @@ impl Witness {
         })
     }
 
-    pub fn with_substitutions(&self, subst: &Substitutions) -> Self {
+    pub fn apply(&self, subst: &Substitutions) -> Self {
         Self {
-            head: self.head.with_substitutions(subst),
-            premises: self
-                .premises
-                .iter()
-                .map(|c| c.with_substitutions(subst))
-                .collect(),
+            head: self.head.apply(subst),
+            premises: self.premises.iter().map(|c| c.apply(subst)).collect(),
             name: self.name.clone(),
         }
     }
@@ -117,7 +113,7 @@ impl WitnessIndex {
             //    display_list(", ", &witness.premises),
             //);
 
-            let witness = witness.with_substitutions(&subst);
+            let witness = witness.apply(&subst);
 
             let solution = witness
                 .premises

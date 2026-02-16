@@ -617,7 +617,7 @@ impl Expr {
 
 pub trait Substitutable {
     type Output;
-    fn with_substitutions(&self, subs: &Substitutions) -> Self::Output;
+    fn apply(&self, subs: &Substitutions) -> Self::Output;
 }
 
 impl<T> Substitutable for T
@@ -625,8 +625,8 @@ where
     T: Annotated<TypeInfo, TypeInfo, namer::Identifier, Output = T>,
 {
     type Output = T::Output;
-    fn with_substitutions(&self, subs: &Substitutions) -> Self::Output {
-        self.map_annotation(&move |ti| ti.with_substitutions(subs))
+    fn apply(&self, subs: &Substitutions) -> Self::Output {
+        self.map_annotation(&move |ti| ti.apply(subs))
     }
 }
 
@@ -773,10 +773,10 @@ impl TypeInfo {
         }
     }
 
-    pub fn with_substitutions(&self, subs: &Substitutions) -> Self {
+    pub fn apply(&self, subs: &Substitutions) -> Self {
         Self {
             parse_info: self.parse_info,
-            inferred_type: self.inferred_type.with_substitutions(subs),
+            inferred_type: self.inferred_type.apply(subs),
         }
     }
 }
@@ -845,10 +845,10 @@ impl Typed {
         }
     }
 
-    fn with_substitutions(&self, subst: &Substitutions) -> Self {
+    fn apply(&self, subst: &Substitutions) -> Self {
         let substitutions = self.substitutions.compose(subst);
-        let constraints = self.constraints.with_substitutions(&substitutions);
-        let tree = self.tree.with_substitutions(&substitutions);
+        let constraints = self.constraints.apply(&substitutions);
+        let tree = self.tree.apply(&substitutions);
         Self {
             substitutions,
             constraints,
@@ -887,14 +887,9 @@ impl ConstraintSet {
         self.0.is_empty()
     }
 
-    fn with_substitutions(&self, subst: &Substitutions) -> Self {
+    fn apply(&self, subst: &Substitutions) -> Self {
         let Self(constraints) = self;
-        Self(
-            constraints
-                .iter()
-                .map(|c| c.with_substitutions(subst))
-                .collect(),
-        )
+        Self(constraints.iter().map(|c| c.apply(subst)).collect())
     }
 
     fn union(&self, ConstraintSet(rhs): ConstraintSet) -> ConstraintSet {
@@ -959,9 +954,9 @@ impl Constraint {
         self.constraint_type.applied_name()
     }
 
-    pub fn with_substitutions(&self, subst: &Substitutions) -> Self {
+    pub fn apply(&self, subst: &Substitutions) -> Self {
         Self {
-            constraint_type: self.constraint_type.with_substitutions(subst),
+            constraint_type: self.constraint_type.apply(subst),
         }
     }
 
@@ -989,11 +984,11 @@ impl RecordType {
         RecordShape(self.0.iter().map(|(l, _)| l.clone()).collect())
     }
 
-    fn with_substitutions(&self, subs: &Substitutions) -> Self {
+    fn apply(&self, subs: &Substitutions) -> Self {
         Self(
             self.0
                 .iter()
-                .map(|(id, t)| (id.clone(), t.with_substitutions(subs)))
+                .map(|(id, t)| (id.clone(), t.apply(subs)))
                 .collect(),
         )
     }
@@ -1029,17 +1024,14 @@ impl CoproductType {
         self.0.len()
     }
 
-    fn with_substitutions(&self, subs: &Substitutions) -> Self {
+    fn apply(&self, subs: &Substitutions) -> Self {
         Self(
             self.0
                 .iter()
                 .map(|(id, signature)| {
                     (
                         id.clone(),
-                        signature
-                            .iter()
-                            .map(|ty| ty.with_substitutions(subs))
-                            .collect(),
+                        signature.iter().map(|ty| ty.apply(subs)).collect(),
                     )
                 })
                 .collect(),
@@ -1184,7 +1176,7 @@ impl Type {
     }
 
     //    #[instrument]
-    pub fn with_substitutions(&self, subs: &Substitutions) -> Self {
+    pub fn apply(&self, subs: &Substitutions) -> Self {
         //trace!("{self} -- subs {subs}");
 
         match self {
@@ -1194,7 +1186,7 @@ impl Type {
                     || p.clone(),
                     |t| {
                         if !matches!(t, Type::Variable(p2) if p2 == param) {
-                            t.with_substitutions(subs)
+                            t.apply(subs)
                         } else {
                             t.clone()
                         }
@@ -1205,21 +1197,21 @@ impl Type {
             Self::Base(b) => Self::Base(*b),
 
             Self::Arrow { domain, codomain } => Self::Arrow {
-                domain: domain.with_substitutions(subs).into(),
-                codomain: codomain.with_substitutions(subs).into(),
+                domain: domain.apply(subs).into(),
+                codomain: codomain.apply(subs).into(),
             },
 
             Self::Tuple(tuple) => Self::Tuple(TupleType::from_signature(
                 &tuple
                     .elements()
                     .iter()
-                    .map(|ty| ty.with_substitutions(subs))
+                    .map(|ty| ty.apply(subs))
                     .collect::<Vec<_>>(),
             )),
 
-            Self::Record(record) => Self::Record(record.with_substitutions(subs)),
+            Self::Record(record) => Self::Record(record.apply(subs)),
 
-            Self::Coproduct(coproduct) => Self::Coproduct(coproduct.with_substitutions(subs)),
+            Self::Coproduct(coproduct) => Self::Coproduct(coproduct.apply(subs)),
 
             Self::Constructor(..) => self.clone(),
 
@@ -1227,8 +1219,8 @@ impl Type {
                 constructor,
                 argument,
             } => Self::Apply {
-                constructor: constructor.with_substitutions(subs).into(),
-                argument: argument.with_substitutions(subs).into(),
+                constructor: constructor.apply(subs).into(),
+                argument: argument.apply(subs).into(),
             },
         }
     }
@@ -1263,9 +1255,9 @@ impl Type {
             ) => {
                 let domain = lhs_dom.unified_with(rhs_dom)?;
                 let codomain = lhs_codom
-                    .with_substitutions(&domain)
+                    .apply(&domain)
                     .unified_with(
-                        &rhs_codom.with_substitutions(&domain)
+                        &rhs_codom.apply(&domain)
                     )?;
                 Ok(domain.compose(&codomain))
             }
@@ -1275,7 +1267,7 @@ impl Type {
 
                 for (lhs, rhs) in lhs.elements().iter().zip(rhs.elements()) {
                     // compose_mut
-                    subs = subs.compose(&lhs.with_substitutions(&subs).unified_with(&rhs.with_substitutions(&subs))?);
+                    subs = subs.compose(&lhs.apply(&subs).unified_with(&rhs.apply(&subs))?);
                 }
 
                 Ok(subs)
@@ -1291,7 +1283,7 @@ impl Type {
                     }
 
                     // compose_mut
-                    subs = subs.compose(&lhs.with_substitutions(&subs).unified_with(&rhs.with_substitutions(&subs))?);
+                    subs = subs.compose(&lhs.apply(&subs).unified_with(&rhs.apply(&subs))?);
                 }
 
                 Ok(subs)
@@ -1319,7 +1311,7 @@ impl Type {
                 },
             ) => {
                 let constructor = lhs_con.unified_with(rhs_con)?;
-                let argument = lhs_arg.with_substitutions(&constructor).unified_with(&rhs_arg.with_substitutions(&constructor))?;
+                let argument = lhs_arg.apply(&constructor).unified_with(&rhs_arg.apply(&constructor))?;
                 Ok(constructor.compose(&argument))
             }
 
@@ -1575,11 +1567,11 @@ impl TypeConstructor {
         Ok(())
     }
 
-    fn with_substitutions(&self, subs: &Substitutions) -> Self {
+    fn apply(&self, subs: &Substitutions) -> Self {
         if let Self::Elaborated(constructor) = self {
             Self::Elaborated(ElaboratedTypeConstructor {
                 definition: constructor.definition.clone(),
-                structure: constructor.structure.with_substitutions(subs),
+                structure: constructor.structure.apply(subs),
             })
         } else {
             panic!("Attempt to substitute into unelaborated type constructor `{self}`")
@@ -1652,15 +1644,15 @@ pub struct TypeScheme {
 }
 
 impl TypeScheme {
-    pub fn with_substitutions(&self, subst: &Substitutions) -> Self {
+    pub fn apply(&self, subst: &Substitutions) -> Self {
         let mut subst = subst.clone();
         for q in &self.quantifiers {
             subst.remove(*q);
         }
         Self {
             quantifiers: self.quantifiers.clone(),
-            underlying: self.underlying.with_substitutions(&subst),
-            constraints: self.constraints.with_substitutions(&subst),
+            underlying: self.underlying.apply(&subst),
+            constraints: self.constraints.apply(&subst),
         }
     }
 
@@ -1675,8 +1667,8 @@ impl TypeScheme {
     pub fn instantiate(&self) -> Constrained<Type> {
         let subst = self.instantiation_substitutions();
         Constrained {
-            constraints: self.constraints.with_substitutions(&subst),
-            underlying: self.underlying.with_substitutions(&subst),
+            constraints: self.constraints.apply(&subst),
+            underlying: self.underlying.apply(&subst),
         }
     }
 
@@ -1727,7 +1719,7 @@ impl Substitutions {
         let mut out = Vec::new();
 
         for (param, ty) in rhs.iter() {
-            out.push((*param, ty.with_substitutions(self)));
+            out.push((*param, ty.apply(self)));
         }
 
         for (param, ty) in self.iter() {
@@ -1938,12 +1930,12 @@ impl TypeEnvironment {
             .collect())
     }
 
-    fn with_substitutions(&self, subs: &Substitutions) -> Self {
+    fn apply(&self, subs: &Substitutions) -> Self {
         Self {
             bindings: self
                 .bindings
                 .iter()
-                .map(|(id, tc)| (id.clone(), tc.with_substitutions(subs)))
+                .map(|(id, tc)| (id.clone(), tc.apply(subs)))
                 .collect(),
             record_shapes: self.record_shapes.clone(),
             coproduct_constructors: self.coproduct_constructors.clone(),
@@ -2010,7 +2002,7 @@ impl TypingContext {
                         .collect::<Vec<_>>(),
                 );
 
-                Ok(constructor.structure()?.with_substitutions(&subs))
+                Ok(constructor.structure()?.apply(&subs))
             }
 
             Type::Apply {
@@ -2026,9 +2018,9 @@ impl TypingContext {
     }
 
     // Why isn't this fucker &mut self?
-    pub fn with_substitutions(&self, subs: &Substitutions) -> Self {
+    pub fn apply(&self, subs: &Substitutions) -> Self {
         Self {
-            types: self.types.with_substitutions(subs),
+            types: self.types.apply(subs),
             terms: TermEnvironment {
                 bound: Self::substitute_bound(&self.terms.bound, subs),
                 free: Self::substitute_free(&self.terms.free, subs),
@@ -2037,15 +2029,12 @@ impl TypingContext {
     }
 
     fn substitute_mut(&mut self, subst: &Substitutions) {
-        let new_self = self.with_substitutions(subst);
+        let new_self = self.apply(subst);
         *self = new_self;
     }
 
     fn substitute_bound(terms: &[TypeScheme], subst: &Substitutions) -> Vec<TypeScheme> {
-        terms
-            .iter()
-            .map(|ty| ty.with_substitutions(subst))
-            .collect()
+        terms.iter().map(|ty| ty.apply(subst)).collect()
     }
 
     fn substitute_free(
@@ -2054,7 +2043,7 @@ impl TypingContext {
     ) -> HashMap<namer::QualifiedName, TypeScheme> {
         terms
             .iter()
-            .map(|(k, v)| (k.clone(), v.with_substitutions(subs)))
+            .map(|(k, v)| (k.clone(), v.apply(subs)))
             .collect()
     }
 
@@ -2180,19 +2169,19 @@ impl TypingContext {
             .tree
             .type_info()
             .inferred_type
-            .with_substitutions(&expr.substitutions);
-        let rhs = expected_type.with_substitutions(&expr.substitutions);
+            .apply(&expr.substitutions);
+        let rhs = expected_type.apply(&expr.substitutions);
 
         let s_unification = lhs
             .unified_with(&rhs)
             .map_err(|e| e.at(expr.tree.annotation().parse_info))?;
 
         let substitutions = expr.substitutions.compose(&s_unification);
-        let constraints = expr.constraints.with_substitutions(&substitutions);
+        let constraints = expr.constraints.apply(&substitutions);
 
         self.substitute_mut(&substitutions);
 
-        let expr = expr.tree.with_substitutions(&substitutions);
+        let expr = expr.tree.apply(&substitutions);
         Ok(Typed::computed(substitutions, constraints, expr))
     }
 
@@ -2217,13 +2206,13 @@ impl TypingContext {
                 let typed_arg = self.check_expr(expected, expr)?;
                 substitutions = substitutions.compose(&typed_arg.substitutions);
                 constraints = constraints
-                    .with_substitutions(&substitutions)
+                    .apply(&substitutions)
                     .union(typed_arg.constraints);
                 typed_args.push(typed_arg.tree.into());
             }
 
-            constraints = constraints.with_substitutions(&substitutions);
-            let type_info = pi.with_inferred_type(expected_type.with_substitutions(&substitutions));
+            constraints = constraints.apply(&substitutions);
+            let type_info = pi.with_inferred_type(expected_type.apply(&substitutions));
             Ok(Typed::computed(
                 substitutions,
                 constraints,
@@ -2260,9 +2249,7 @@ impl TypingContext {
                             let typed_body = ctx.check_expr(codomain, &rec.lambda.body)?;
 
                             let type_info = pi.with_inferred_type(
-                                expected_type
-                                    .with_substitutions(&typed_body.substitutions)
-                                    .clone(),
+                                expected_type.apply(&typed_body.substitutions).clone(),
                             );
                             Ok(Typed::computed(
                                 typed_body.substitutions,
@@ -2302,8 +2289,7 @@ impl TypingContext {
                 |ctx| {
                     let body = ctx.check_expr(codomain, &lambda.body)?;
 
-                    let type_info = pi
-                        .with_inferred_type(expected_type.with_substitutions(&body.substitutions));
+                    let type_info = pi.with_inferred_type(expected_type.apply(&body.substitutions));
                     Ok(Typed::computed(
                         body.substitutions,
                         body.constraints,
@@ -2344,14 +2330,14 @@ impl TypingContext {
                     let typed = self.check_expr(expected_type, expr)?;
                     subst = subst.compose(&typed.substitutions);
                     constraints = constraints
-                        .with_substitutions(&subst)
-                        .union(typed.constraints.with_substitutions(&subst));
+                        .apply(&subst)
+                        .union(typed.constraints.apply(&subst));
                     typed_fields.push((name.clone(), typed.tree.into()));
                 }
 
                 let type_info = pi
                     .with_inferred_type(Type::Record(RecordType::from_fields(&expected_types)))
-                    .with_substitutions(&subst);
+                    .apply(&subst);
 
                 Ok(Typed::computed(
                     subst,
@@ -2392,12 +2378,11 @@ impl TypingContext {
                     substitutions = substitutions.compose(&typed_element.substitutions);
                     typed_elements.push(typed_element.tree.into());
                     constraints = constraints
-                        .with_substitutions(&substitutions)
-                        .union(typed_element.constraints.with_substitutions(&substitutions))
+                        .apply(&substitutions)
+                        .union(typed_element.constraints.apply(&substitutions))
                 }
 
-                let type_info =
-                    pi.with_inferred_type(expected_type.with_substitutions(&substitutions));
+                let type_info = pi.with_inferred_type(expected_type.apply(&substitutions));
                 Ok(Typed::computed(
                     substitutions,
                     constraints,
@@ -2418,7 +2403,7 @@ impl TypingContext {
                     .inferred_type
                     .unified_with(expected_type)
                     .map_err(|e| e.at(pi))?;
-                Ok(inferred.with_substitutions(&unification))
+                Ok(inferred.apply(&unification))
             }
 
             _otherwise => Err(TypeError::Disappointed {
@@ -2560,8 +2545,8 @@ impl TypingContext {
                     segs.push(ast::Segment::Expression(typed_expr.tree.into()));
                     substitutions = substitutions.compose(&typed_expr.substitutions);
                     constraints = constraints
-                        .with_substitutions(&substitutions)
-                        .union(typed_expr.constraints.with_substitutions(&substitutions))
+                        .apply(&substitutions)
+                        .union(typed_expr.constraints.apply(&substitutions))
                 }
             }
         }
@@ -2569,14 +2554,12 @@ impl TypingContext {
         let segs = segs
             .into_iter()
             .map(|s| match s {
-                Segment::Expression(expr) => {
-                    Segment::Expression(expr.with_substitutions(&substitutions))
-                }
+                Segment::Expression(expr) => Segment::Expression(expr.apply(&substitutions)),
                 lit => lit,
             })
             .collect();
 
-        constraints = constraints.with_substitutions(&substitutions);
+        constraints = constraints.apply(&substitutions);
         Ok(Typed::computed(
             substitutions,
             constraints,
@@ -2608,7 +2591,7 @@ impl TypingContext {
             let (s_pattern, pattern) = clause_ctx.check_pattern(
                 &clause.pattern,
                 &mut bindings,
-                &scrutinee_type.with_substitutions(&substitutions),
+                &scrutinee_type.apply(&substitutions),
             )?;
             clause_ctx.substitute_mut(&s_pattern);
             for (binding, ty) in bindings {
@@ -2619,15 +2602,15 @@ impl TypingContext {
                 .compose(&consequent.substitutions)
                 .compose(&s_pattern);
             constraints = constraints
-                .with_substitutions(&substitutions)
-                .union(consequent.with_substitutions(&substitutions).constraints);
+                .apply(&substitutions)
+                .union(consequent.apply(&substitutions).constraints);
             typed_match_clauses.push(MatchClause {
                 pattern,
                 consequent: consequent.tree.into(),
             });
         }
 
-        let type_info = pi.with_inferred_type(expected_type.with_substitutions(&substitutions));
+        let type_info = pi.with_inferred_type(expected_type.apply(&substitutions));
         Ok(Typed::computed(
             substitutions,
             constraints,
@@ -2659,16 +2642,16 @@ impl TypingContext {
             .map_err(|e| e.at(pi))?
         };
 
-        let mut first_clause = self.with_substitutions(&substitutions).infer_match_clause(
+        let mut first_clause = self.apply(&substitutions).infer_match_clause(
             &mut substitutions,
             &mut constraints,
             clause,
             &scrutinee.type_info().inferred_type,
         )?;
-        scrutinee = scrutinee.with_substitutions(&substitutions);
+        scrutinee = scrutinee.apply(&substitutions);
 
         while let Some(clause) = match_clauses.next() {
-            let mut clause_ctx = self.with_substitutions(&substitutions);
+            let mut clause_ctx = self.apply(&substitutions);
             let clause = clause_ctx.infer_match_clause(
                 &mut substitutions,
                 &mut constraints,
@@ -2679,17 +2662,17 @@ impl TypingContext {
                 .consequent
                 .type_info()
                 .inferred_type
-                .with_substitutions(&substitutions);
+                .apply(&substitutions);
             let rhs = clause
                 .consequent
                 .type_info()
                 .inferred_type
-                .with_substitutions(&substitutions);
+                .apply(&substitutions);
             let subst = lhs.unified_with(&rhs).map_err(|e| e.at(pi))?;
             substitutions = substitutions.compose(&subst);
-            constraints = constraints.with_substitutions(&substitutions);
-            scrutinee = scrutinee.with_substitutions(&substitutions);
-            first_clause.consequent = first_clause.consequent.with_substitutions(&substitutions);
+            constraints = constraints.apply(&substitutions);
+            scrutinee = scrutinee.apply(&substitutions);
+            first_clause.consequent = first_clause.consequent.apply(&substitutions);
 
             clauses.push(clause);
         }
@@ -2730,9 +2713,9 @@ impl TypingContext {
         *substitutions = substitutions
             .compose(&p_subst)
             .compose(&consequent.substitutions);
-        let consequent = consequent.with_substitutions(&substitutions);
+        let consequent = consequent.apply(&substitutions);
         *constraints = constraints
-            .with_substitutions(&substitutions)
+            .apply(&substitutions)
             .union(consequent.constraints);
 
         Ok(MatchClause {
@@ -2871,10 +2854,10 @@ impl TypingContext {
                         let (subs, argument) = self.check_pattern(
                             pattern,
                             bindings,
-                            &scrutinee.with_substitutions(&substitutions),
+                            &scrutinee.apply(&substitutions),
                         )?;
                         self.substitute_mut(&subs);
-                        arguments.push(argument.with_substitutions(&substitutions));
+                        arguments.push(argument.apply(&substitutions));
                         substitutions = substitutions.compose(&subs);
                     }
 
@@ -3014,13 +2997,13 @@ impl TypingContext {
             Err(TypeError::InternalAssertion("expected a coproduct".to_owned()).at(pi))?
         };
 
-        let constraints = constraints.with_substitutions(&substitutions);
+        let constraints = constraints.apply(&substitutions);
 
         Ok(Typed::computed(
             substitutions,
             constraints,
             Expr::Inject(
-                pi.with_inferred_type(type_constructor.make_spine().with_substitutions(&subs)),
+                pi.with_inferred_type(type_constructor.make_spine().apply(&subs)),
                 Injection {
                     constructor: construct.constructor.clone(),
                     arguments: typed_arguments,
@@ -3040,18 +3023,13 @@ impl TypingContext {
             fields.push((label, typed_field.tree));
             substitutions = substitutions.compose(&typed_field.substitutions);
             constraints = constraints
-                .with_substitutions(&substitutions)
-                .union(typed_field.constraints.with_substitutions(&substitutions));
+                .apply(&substitutions)
+                .union(typed_field.constraints.apply(&substitutions));
         }
 
         let fields = fields
             .iter()
-            .map(|(label, e)| {
-                (
-                    (*label).clone(),
-                    e.with_substitutions(&substitutions).into(),
-                )
-            })
+            .map(|(label, e)| ((*label).clone(), e.apply(&substitutions).into()))
             .collect::<Vec<_>>();
 
         let record_type = RecordType::from_fields(
@@ -3075,12 +3053,8 @@ impl TypingContext {
             .map_err(|e| e.at(pi))?;
 
         let substitutions = substitutions.compose(&subst);
-        let constraints = constraints.with_substitutions(&substitutions);
-        let type_info = pi.with_inferred_type(
-            type_constructor
-                .make_spine()
-                .with_substitutions(&substitutions),
-        );
+        let constraints = constraints.apply(&substitutions);
+        let type_info = pi.with_inferred_type(type_constructor.make_spine().apply(&substitutions));
         Ok(Typed::computed(
             substitutions,
             constraints,
@@ -3140,7 +3114,7 @@ impl TypingContext {
                                 .unified_with(&base_type.make_spine())
                                 .map_err(|e| e.at(pi))?;
 
-                            let base = base.with_substitutions(&unification);
+                            let base = base.apply(&unification);
                             Ok(Typed::computed(
                                 unification,
                                 constraints,
@@ -3215,13 +3189,13 @@ impl TypingContext {
                     let tuple_ty = Type::Tuple(TupleType::from_signature(&elems));
                     let subs = base_type.unified_with(&tuple_ty).map_err(|e| e.at(pi))?;
 
-                    let projected_ty = match tuple_ty.with_substitutions(&subs) {
+                    let projected_ty = match tuple_ty.apply(&subs) {
                         Type::Tuple(tuple) => tuple.elements()[*ordinal].clone(),
                         _ => unreachable!(),
                     };
 
                     let substitutions = substitutions.compose(&subs);
-                    let constraints = constraints.with_substitutions(&substitutions);
+                    let constraints = constraints.apply(&substitutions);
                     Ok(Typed::computed(
                         substitutions,
                         constraints,
@@ -3277,12 +3251,12 @@ impl TypingContext {
             let typed = self.infer_expr(element)?;
             typed_elements.push(typed.tree);
             substitutions = substitutions.compose(&typed.substitutions);
-            constraints = constraints.union(typed.constraints.with_substitutions(&substitutions));
+            constraints = constraints.union(typed.constraints.apply(&substitutions));
         }
 
         let typed_elements = typed_elements
             .iter()
-            .map(|e| e.with_substitutions(&substitutions).into())
+            .map(|e| e.apply(&substitutions).into())
             .collect::<Vec<_>>();
 
         let element_types = typed_elements
@@ -3318,7 +3292,7 @@ impl TypingContext {
                             .tree
                             .type_info()
                             .inferred_type
-                            .unified_with(&codomain.with_substitutions(&typed.substitutions))
+                            .unified_with(&codomain.apply(&typed.substitutions))
                             .map_err(|e| e.at(pi))?;
 
                         let substitutions = typed.substitutions.compose(&s_codomain);
@@ -3327,9 +3301,9 @@ impl TypingContext {
 
                         Ok(Typed::computed(
                             substitutions.clone(),
-                            typed.constraints.with_substitutions(&substitutions),
+                            typed.constraints.apply(&substitutions),
                             Expr::RecursiveLambda(
-                                pi.with_inferred_type(own_ty.with_substitutions(&substitutions)),
+                                pi.with_inferred_type(own_ty.apply(&substitutions)),
                                 SelfReferential {
                                     own_name: rec_lambda.own_name.clone(),
                                     lambda: Lambda {
@@ -3367,24 +3341,21 @@ impl TypingContext {
             .map_err(|e| e.at(pi))?;
 
             let s_function = function.substitutions.compose(&unification);
-            function = function.with_substitutions(&s_function);
+            function = function.apply(&s_function);
             self.substitute_mut(&s_function);
         }
 
         let function_type = &function.tree.type_info().inferred_type;
         if let Type::Arrow { domain, codomain } = &function_type {
-            let argument = self.check_expr(
-                &domain.with_substitutions(&function.substitutions),
-                argument,
-            )?;
+            let argument = self.check_expr(&domain.apply(&function.substitutions), argument)?;
 
             let substitutions = function.substitutions.compose(&argument.substitutions);
-            let codomain = codomain.with_substitutions(&substitutions);
-            let argument = argument.with_substitutions(&substitutions);
+            let codomain = codomain.apply(&substitutions);
+            let argument = argument.apply(&substitutions);
 
             let constraints = function
                 .constraints
-                .with_substitutions(&substitutions)
+                .apply(&substitutions)
                 .union(argument.constraints);
 
             Ok(Typed::computed(
@@ -3411,17 +3382,13 @@ impl TypingContext {
         argument: &namer::Expr,
     ) -> Typing {
         let function = self.infer_expr(function)?;
-        let mut ctx = self.with_substitutions(&function.substitutions);
+        let mut ctx = self.apply(&function.substitutions);
         let mut constraints = function.constraints;
 
         let argument = ctx.infer_expr(argument)?;
         constraints = constraints
-            .with_substitutions(&argument.substitutions)
-            .union(
-                argument
-                    .constraints
-                    .with_substitutions(&function.substitutions),
-            );
+            .apply(&argument.substitutions)
+            .union(argument.constraints.apply(&function.substitutions));
         let return_ty = Type::fresh();
 
         let substitutions = function.substitutions.compose(&argument.substitutions);
@@ -3431,30 +3398,30 @@ impl TypingContext {
                 .tree
                 .type_info()
                 .inferred_type
-                .with_substitutions(&substitutions)
+                .apply(&substitutions)
                 .into(),
             codomain: return_ty.clone().into(),
         };
 
         let substitutions = expected_ty
-            .with_substitutions(&substitutions)
+            .apply(&substitutions)
             .unified_with(
                 &function
                     .tree
                     .type_info()
                     .inferred_type
-                    .with_substitutions(&substitutions),
+                    .apply(&substitutions),
             )
             .map_err(|e| e.at(pi))?
             .compose(&substitutions);
 
         let apply = Apply {
-            function: function.tree.with_substitutions(&substitutions).into(),
-            argument: argument.tree.with_substitutions(&substitutions).into(),
+            function: function.tree.apply(&substitutions).into(),
+            argument: argument.tree.apply(&substitutions).into(),
         };
 
-        let inferred_type = return_ty.with_substitutions(&substitutions);
-        constraints = constraints.with_substitutions(&substitutions);
+        let inferred_type = return_ty.apply(&substitutions);
+        constraints = constraints.apply(&substitutions);
 
         Ok(Typed::computed(
             substitutions,
@@ -3483,25 +3450,22 @@ impl TypingContext {
                     constraints,
                 } = ctx.infer_expr(&lambda.body)?;
 
-                let body_type = body
-                    .type_info()
-                    .inferred_type
-                    .with_substitutions(&substitutions);
+                let body_type = body.type_info().inferred_type.apply(&substitutions);
 
                 let unify_subs = body_type
-                    .unified_with(&codomain.with_substitutions(&substitutions))
+                    .unified_with(&codomain.apply(&substitutions))
                     .map_err(|e| e.at(pi))?;
 
                 substitutions = substitutions.compose(&unify_subs);
 
                 let inferred_type = Type::Arrow {
-                    domain: domain.with_substitutions(&substitutions).into(),
-                    codomain: codomain.with_substitutions(&substitutions).into(),
+                    domain: domain.apply(&substitutions).into(),
+                    codomain: codomain.apply(&substitutions).into(),
                 };
 
-                let body = body.with_substitutions(&substitutions);
+                let body = body.apply(&substitutions);
 
-                let constraints = constraints.with_substitutions(&substitutions);
+                let constraints = constraints.apply(&substitutions);
                 Ok((
                     substitutions,
                     constraints,
@@ -3518,7 +3482,7 @@ impl TypingContext {
     #[instrument]
     fn infer_binding(&mut self, pi: ParseInfo, binding: &namer::Binding) -> Typing {
         let typed_bound = self.infer_expr(&binding.bound)?;
-        let ctx1 = self.with_substitutions(&typed_bound.substitutions);
+        let ctx1 = self.apply(&typed_bound.substitutions);
 
         let bound_type = typed_bound.as_constrained_type().generalize(&ctx1);
 
@@ -3527,12 +3491,12 @@ impl TypingContext {
 
             let substitutions = typed_bound.substitutions.compose(&typed_body.substitutions);
 
-            let bound = typed_bound.tree.with_substitutions(&substitutions);
-            let body = typed_body.tree.with_substitutions(&substitutions);
+            let bound = typed_bound.tree.apply(&substitutions);
+            let body = typed_body.tree.apply(&substitutions);
             let constraints = typed_bound
                 .constraints
-                .with_substitutions(&substitutions)
-                .union(typed_body.constraints.with_substitutions(&substitutions));
+                .apply(&substitutions)
+                .union(typed_body.constraints.apply(&substitutions));
 
             Ok(Typed::computed(
                 substitutions,
@@ -3557,8 +3521,8 @@ impl TypingContext {
         let substitutions = this.substitutions.compose(&and_then.substitutions);
         let constraints = this
             .constraints
-            .with_substitutions(&substitutions)
-            .union(and_then.constraints.with_substitutions(&substitutions));
+            .apply(&substitutions)
+            .union(and_then.constraints.apply(&substitutions));
         Ok(Typed::computed(
             substitutions,
             constraints,
@@ -3595,26 +3559,20 @@ impl TypingContext {
 
         let consequent_type = consequent
             .tree
-            .with_substitutions(&s_branches)
+            .apply(&s_branches)
             .type_info()
             .inferred_type
             .clone();
 
         let substitutions = consequent_type
-            .unified_with(
-                &alternate
-                    .tree
-                    .with_substitutions(&s_branches)
-                    .type_info()
-                    .inferred_type,
-            )
+            .unified_with(&alternate.tree.apply(&s_branches).type_info().inferred_type)
             .map_err(|e| e.at(pi))?;
 
         let substitutions = s_branches.compose(&substitutions);
 
-        let predicate = predicate.with_substitutions(&substitutions);
-        let consequent = consequent.with_substitutions(&substitutions);
-        let alternate = alternate.with_substitutions(&substitutions);
+        let predicate = predicate.apply(&substitutions);
+        let consequent = consequent.apply(&substitutions);
+        let alternate = alternate.apply(&substitutions);
 
         Ok(Typed::computed(
             substitutions,
