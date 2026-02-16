@@ -723,6 +723,24 @@ pub enum TypeError {
 
     #[error("no witness found for constraint {0}")]
     NoWitness(Constraint),
+
+    #[error(
+        "ambiguous coproduct constructor; {constructor} matches {}.",
+        display_list(", ", candidates)
+    )]
+    AmbiguousCoproduct {
+        constructor: QualifiedName,
+        candidates: Vec<QualifiedName>,
+    },
+
+    #[error(
+        "ambiguous record shape; {shape} matches {}.",
+        display_list(", ", candidates)
+    )]
+    AmbiguousRecord {
+        shape: RecordShape,
+        candidates: Vec<QualifiedName>,
+    },
 }
 
 #[derive(Debug)]
@@ -2733,8 +2751,33 @@ impl TypingContext {
         }
     }
 
+    fn resolve_unique_record_type_constructor(
+        &self,
+        pi: ParseInfo,
+        shape: &RecordShape,
+    ) -> Typing<&TypeConstructor> {
+        let candidates = self.types.query_record_type_constructor(shape);
+
+        if candidates.len() != 1 {
+            if candidates.is_empty() {
+                Err(TypeError::NoRecordTypWithShape(shape.clone()).at(pi))?
+            } else {
+                Err(TypeError::AmbiguousRecord {
+                    shape: shape.clone(),
+                    candidates: candidates
+                        .iter()
+                        .map(|c| c.definition().name.clone())
+                        .collect(),
+                }
+                .at(pi))?
+            }
+        } else {
+            Ok(candidates.first().unwrap())
+        }
+    }
+
     #[instrument]
-    fn infer_scrutinee(
+    fn infer_pattern_scrutinee(
         &mut self,
         pattern: &namer::Pattern,
         bindings: &mut Vec<(namer::Identifier, Type)>,
@@ -2742,18 +2785,14 @@ impl TypingContext {
     ) -> Typing<(Substitutions, Pattern)> {
         match pattern {
             namer::Pattern::Coproduct(pi, coproduct) => {
+                // This could be lifted into the pattern match
                 let constructor = coproduct
                     .constructor
                     .try_as_free()
                     .expect("expected Free identifier");
 
                 let inferred = self
-                    .types
-                    .query_coproduct_type_constructors(constructor)?
-                    .first()
-                    .ok_or_else(|| {
-                        TypeError::NoSuchCoproductConstructor(constructor.clone()).at(*pi)
-                    })?
+                    .resolve_unique_coproduct_type_constructor(*pi, constructor)?
                     .instantiate(self)?
                     .make_spine();
 
@@ -2768,20 +2807,16 @@ impl TypingContext {
             namer::Pattern::Struct(pi, record) => {
                 let shape = record.shape();
                 let inferred = self
-                    .types
-                    .query_record_type_constructor(&shape)
-                    .first()
-                    .ok_or_else(|| TypeError::NoRecordTypWithShape(shape))
-                    .map_err(|e| e.at(*pi))?
+                    .resolve_unique_record_type_constructor(*pi, &shape)?
                     .instantiate(self)?
                     .make_spine();
 
-                let substitutions = Substitutions::from(vec![(scrutinee, inferred.clone())]);
+                let subst = Substitutions::from(vec![(scrutinee, inferred.clone())]);
 
-                self.substitute_mut(&substitutions);
+                self.substitute_mut(&subst);
 
                 let (s_pattern, pattern) = self.check_pattern(pattern, bindings, &inferred)?;
-                Ok((s_pattern.compose(&substitutions), pattern))
+                Ok((s_pattern.compose(&subst), pattern))
             }
 
             namer::Pattern::Tuple(pi, tuple) => {
@@ -2832,7 +2867,7 @@ impl TypingContext {
         let normalized_scrutinee = self.normalize_type_application(pi, scrutinee)?;
 
         match (pattern, &normalized_scrutinee) {
-            (_, Type::Variable(p)) => self.infer_scrutinee(pattern, bindings, *p),
+            (_, Type::Variable(p)) => self.infer_pattern_scrutinee(pattern, bindings, *p),
 
             (namer::Pattern::Coproduct(pi, pattern), Type::Coproduct(coproduct)) => {
                 if let namer::Identifier::Free(constructor) = &pattern.constructor
@@ -2943,26 +2978,40 @@ impl TypingContext {
         }
     }
 
+    fn resolve_unique_coproduct_type_constructor(
+        &self,
+        pi: ParseInfo,
+        name: &QualifiedName,
+    ) -> Typing<&TypeConstructor> {
+        let candidates = self.types.query_coproduct_type_constructors(&name)?;
+
+        if candidates.len() != 1 {
+            let constructor = name.clone();
+            if candidates.is_empty() {
+                Err(TypeError::NoSuchCoproductConstructor(constructor).at(pi))?
+            } else {
+                Err(TypeError::AmbiguousCoproduct {
+                    constructor,
+                    candidates: candidates
+                        .iter()
+                        .map(|c| c.definition().name.clone())
+                        .collect(),
+                }
+                .at(pi))?
+            }
+        } else {
+            Ok(candidates.first().unwrap())
+        }
+    }
+
     #[instrument]
     fn infer_inject(&mut self, pi: ParseInfo, construct: &namer::Injection) -> Typing {
         let (substitutions, constraints, typed_arguments, argument_types) =
             self.infer_several(&construct.arguments)?;
 
-        let candidates = self
-            .types
-            .query_coproduct_type_constructors(&construct.constructor)?;
-
-        let type_constructor = candidates
-            // It could go for the first constructor that unifies
-            // but it is probably better to crash here and ask
-            // the user to qualify the name with a <Coproduct name>.<Constructor name>
-            // type of deal
-            .first()
-            .ok_or_else(|| {
-                TypeError::NoSuchCoproductConstructor(construct.constructor.clone()).at(pi)
-            })?;
-
-        let type_constructor = type_constructor.instantiate(self)?;
+        let type_constructor = self
+            .resolve_unique_coproduct_type_constructor(pi, &construct.constructor)?
+            .instantiate(self)?;
 
         let subs = if let Type::Coproduct(coproduct) = type_constructor.structure()? {
             let signature = coproduct.signature(&construct.constructor).ok_or_else(|| {
@@ -2972,7 +3021,7 @@ impl TypingContext {
                 .unified_with(&Type::Tuple(TupleType::from_signature(&argument_types)))
                 .map_err(|e| e.at(pi))?
         } else {
-            Err(TypeError::NoSuchCoproductConstructor(construct.constructor.clone()).at(pi))?
+            Err(TypeError::InternalAssertion("expected a coproduct".to_owned()).at(pi))?
         };
 
         let constraints = constraints.with_substitutions(&substitutions);
@@ -3026,15 +3075,9 @@ impl TypingContext {
                 .collect::<Vec<_>>(),
         );
 
-        let type_constructors = self
-            .types
-            .query_record_type_constructor(&record_type.shape());
-
-        let type_constructor = type_constructors
-            .first()
-            .ok_or_else(|| TypeError::NoSuchRecordType(record_type.clone()).at(pi))?;
-
-        let type_constructor = type_constructor.instantiate(self)?;
+        let type_constructor = self
+            .resolve_unique_record_type_constructor(pi, &record_type.shape())?
+            .instantiate(self)?;
 
         let subst = type_constructor
             .structure()?
@@ -3313,7 +3356,7 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_apply2(
+    fn infer_apply_with_checked_arg(
         &mut self,
         pi: ParseInfo,
         function: &namer::Expr,
