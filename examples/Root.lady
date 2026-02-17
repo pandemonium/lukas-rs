@@ -223,3 +223,10 @@ start := λx.
   let ps = Cons 1 (Cons 2 (Cons 3 Nil)) in
   let qs = Cons "ett" (Cons "två" (Cons "tre" Nil)) in
   print_endline "zipped: `List.zip ps qs`"
+
+  let res =
+    let fac = λx.
+      if x = 0 then 1
+      else x * fac (x - 1)
+    in fac 5
+  in print_endline "result: `res`"

@@ -974,6 +974,8 @@ impl<'a> Parser<'a> {
         let binder = IdentifierPath::new(&binder);
         self.expect(TokenKind::Equals)?;
         let bound = self.parse_block(|parser| parser.parse_sequence())?;
+
+        // Could introduce a little rec keyword
         let bound = if let Expr::Lambda(pi, lambda) = bound {
             Expr::RecursiveLambda(
                 pi,

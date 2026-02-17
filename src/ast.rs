@@ -414,7 +414,6 @@ impl<A, Id> Expr<A, Id> {
             simple => simple,
         };
 
-        // apply rewrite exactly once at this node
         f(rebuilt)
     }
 }
