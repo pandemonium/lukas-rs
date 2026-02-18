@@ -1257,7 +1257,7 @@ impl parser::TypeExpression {
 
 impl parser::Expr {
     pub fn lower_tuples(self) -> parser::Expr {
-        self.map(&|e| match e {
+        self.map(&mut |e| match e {
             parser::Expr::Tuple(a, tuple) => parser::Expr::Tuple(
                 a,
                 parser::Tuple {

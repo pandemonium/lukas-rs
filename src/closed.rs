@@ -1,4 +1,4 @@
-use std::{alloc::Layout, collections::HashMap, rc::Rc};
+use std::{collections::HashMap, rc::Rc};
 
 use crate::{
     ast::{
@@ -6,7 +6,8 @@ use crate::{
         annotation::Annotated,
         namer::{self, QualifiedName, Symbol, TermSymbol},
     },
-    typer::{self, TypeInfo},
+    parser::ParseInfo,
+    typer::{self, Type, TypeInfo},
 };
 
 pub type SymbolTable = namer::SymbolTable<CaptureInfo, QualifiedName, Identifier>;
@@ -34,7 +35,7 @@ pub type StructPattern = ast::pattern::StructPattern<CaptureInfo, Identifier>;
 type Tree<Id> = ast::Tree<CaptureInfo, Id>;
 
 impl typer::SymbolTable {
-    pub fn close_closures(self) -> SymbolTable {
+    pub fn closure_conversion(self) -> SymbolTable {
         let mut symbols = HashMap::with_capacity(self.symbols.len());
 
         for t in self.symbols {
@@ -120,8 +121,32 @@ impl CaptureLayout {
 
 #[derive(Debug, Clone)]
 pub struct CaptureInfo {
-    type_info: TypeInfo,
-    layout: Option<CaptureLayout>,
+    pub type_info: TypeInfo,
+    pub layout: Option<CaptureLayout>,
+}
+
+impl CaptureInfo {
+    pub fn environment_tuple(&self) -> Expr {
+        let ci = ParseInfo::default()
+            .with_inferred_type(Type::fresh())
+            .empty_capture();
+        Expr::Tuple(
+            ci.clone(),
+            Tuple {
+                elements: self.layout.clone().map_or_else(
+                    || vec![],
+                    |l| {
+                        l.by_index
+                            .iter()
+                            .map(|level| {
+                                Expr::Variable(ci.clone(), Identifier::Local(*level)).into()
+                            })
+                            .collect()
+                    },
+                ),
+            },
+        )
+    }
 }
 
 impl TypeInfo {

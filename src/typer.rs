@@ -398,7 +398,7 @@ fn inject_witness(
     witness: &Expr,
     ctx: &TermEnvironment,
 ) -> Expr {
-    tree.map(&|e| match e {
+    tree.map(&mut |e| match e {
         Expr::Variable(a, Identifier::Free(m)) if signature.contains(m.member()) => Expr::Project(
             a,
             Projection {
@@ -442,7 +442,7 @@ fn add_constraint_projections(
 ) -> Result<Expr, TypeError> {
     let signature = constraint.signature(&ctx.types)?;
 
-    let tree = tree.clone().map(&|e| match e {
+    let tree = tree.clone().map(&mut |e| match e {
         Expr::Variable(a, Identifier::Free(m)) if signature.shape.contains(m.member()) => {
             //            println!("add_constraint_projections: projecting {m} from #1");
             Expr::Project(
@@ -508,7 +508,10 @@ fn add_constraint_parameter_slot(expr: &Expr) -> Expr {
                             own_name: Identifier::Bound(0),
                             lambda: Lambda {
                                 parameter: Identifier::Bound(1),
-                                body: expr.clone().map(&|e| e.shift_de_bruijn_levels(0, 2)).into(),
+                                body: expr
+                                    .clone()
+                                    .map(&mut |e| e.shift_de_bruijn_levels(0, 2))
+                                    .into(),
                             },
                         },
                     )
@@ -535,7 +538,7 @@ impl Lambda {
                 Lambda {
                     parameter: Identifier::Bound(1 + first_level),
                     body: Rc::unwrap_or_clone(self.body)
-                        .map(&|e| e.shift_de_bruijn_levels(first_level, 1))
+                        .map(&mut |e| e.shift_de_bruijn_levels(first_level, 1))
                         .into(),
                 },
             )
@@ -861,9 +864,9 @@ impl Typed {
         }
     }
 
-    fn map_tree<F>(self, f: &F) -> Self
+    fn map_tree<F>(self, f: &mut F) -> Self
     where
-        F: Fn(Expr) -> Expr,
+        F: FnMut(Expr) -> Expr,
     {
         Self {
             substitutions: self.substitutions,
@@ -1319,22 +1322,7 @@ impl Type {
             },
         }
     }
-
-    //    pub fn generalize(&self, ctx: &TypingContext) -> TypeScheme {
-    //        let ty_vars = self.variables();
-    //        let ctx_bounds = ctx.free_variables();
-    //        let quantified = ty_vars.difference(&ctx_bounds);
-    //
-    //        TypeScheme {
-    //            quantifiers: quantified.copied().collect(),
-    //            underlying: self.clone(),
-    //            constraints: ConstraintSet::default(),
-    //        }
-    //    }
 }
-
-const BUILTIN_BASE_TYPE_NAMES: [&str; 2] =
-    [BaseType::Int.local_name(), BaseType::Text.local_name()];
 
 #[derive(Copy, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BaseType {
@@ -1345,10 +1333,6 @@ pub enum BaseType {
 }
 
 impl BaseType {
-    pub fn is_name(id: &str) -> bool {
-        BUILTIN_BASE_TYPE_NAMES.contains(&id)
-    }
-
     const fn local_name(&self) -> &str {
         match self {
             Self::Int => "Int",
@@ -2514,7 +2498,7 @@ impl TypingContext {
         let ascribed_tree =
             self.check_expr(&ascribed_type.underlying, &ascription.ascribed_tree)?;
 
-        Ok(ascribed_tree.map_tree(&|tree| {
+        Ok(ascribed_tree.map_tree(&mut |tree| {
             Expr::Ascription(
                 tree.type_info().clone(),
                 TypeAscription {

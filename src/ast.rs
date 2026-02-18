@@ -277,15 +277,15 @@ impl<A, Id> Expr<A, Id> {
         self.map_annotation(&|_| Erased)
     }
 
-    pub fn map<F>(self, f: &F) -> Expr<A, Id>
+    pub fn map<F>(self, f: &mut F) -> Expr<A, Id>
     where
-        F: Fn(Expr<A, Id>) -> Expr<A, Id>,
+        F: FnMut(Expr<A, Id>) -> Expr<A, Id>,
         A: Clone,
         Id: Clone,
     {
-        fn go<A, Id, F>(tree: Tree<A, Id>, f: &F) -> Tree<A, Id>
+        fn go<A, Id, F>(tree: Tree<A, Id>, f: &mut F) -> Tree<A, Id>
         where
-            F: Fn(Expr<A, Id>) -> Expr<A, Id>,
+            F: FnMut(Expr<A, Id>) -> Expr<A, Id>,
             A: Clone,
             Id: Clone,
         {
