@@ -18,8 +18,8 @@ use crate::{
         annotation::Annotated,
         constraints::{Witness, WitnessIndex},
         namer::{
-            self, DependencyMatrix, Identifier, QualifiedName, Symbol, SymbolName, SymbolTable,
-            TermSymbol, TypeDefinition, TypeExpression, TypeSymbol,
+            self, DependencyMatrix, Identifier, QualifiedName, Symbol, SymbolName, TermSymbol,
+            TypeDefinition, TypeExpression, TypeSymbol,
         },
         pattern::{Denotation, Shape},
     },
@@ -28,6 +28,7 @@ use crate::{
 };
 
 type UntypedExpr = namer::Expr;
+pub type SymbolTable = namer::SymbolTable<TypeInfo, QualifiedName, Identifier>;
 pub type Expr = ast::Expr<TypeInfo, namer::Identifier>;
 pub type TypedTree = Rc<Expr>;
 pub type Apply = ast::Apply<TypeInfo, namer::Identifier>;
@@ -65,10 +66,7 @@ where
         .join(sep)
 }
 
-impl<A> SymbolTable<A, namer::QualifiedName, namer::Identifier>
-where
-    A: fmt::Debug,
-{
+impl<A> namer::SymbolTable<A, namer::QualifiedName, namer::Identifier> {
     pub fn terms(
         &self,
         order: Iter<&SymbolName>,
@@ -2502,6 +2500,8 @@ impl TypingContext {
             }
 
             UntypedExpr::Ascription(pi, ascription) => self.infer_ascription(*pi, ascription),
+
+            UntypedExpr::MakeClosure(..) => panic!("Does not type"),
         }
     }
 

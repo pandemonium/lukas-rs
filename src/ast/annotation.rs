@@ -44,6 +44,7 @@ where
                 Expr::If(a, node) => Expr::If(f(a), node.map_annotation(&f)),
                 Expr::Interpolate(a, node) => Expr::Interpolate(f(a), node.map_annotation(&f)),
                 Expr::Ascription(a, node) => Expr::Ascription(f(a), node.map_annotation(&f)),
+                Expr::MakeClosure(a, node) => Expr::MakeClosure(f(a), node.clone()),
             }
         }
 

@@ -4,6 +4,7 @@ pub mod builtin;
 pub mod closed;
 pub mod compiler;
 pub mod interpreter;
+pub mod lambda_lift;
 pub mod lexer;
 pub mod parser;
 pub mod typer;

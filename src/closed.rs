@@ -1,13 +1,15 @@
-use std::{collections::HashMap, rc::Rc};
+use std::{alloc::Layout, collections::HashMap, rc::Rc};
 
 use crate::{
     ast::{
         self,
         annotation::Annotated,
-        namer::{self, QualifiedName},
+        namer::{self, QualifiedName, Symbol, TermSymbol},
     },
     typer::{self, TypeInfo},
 };
+
+pub type SymbolTable = namer::SymbolTable<CaptureInfo, QualifiedName, Identifier>;
 
 pub type Expr = ast::Expr<CaptureInfo, Identifier>;
 pub type SelfReferential = ast::SelfReferential<CaptureInfo, Identifier>;
@@ -31,21 +33,53 @@ pub type TuplePattern = ast::pattern::TuplePattern<CaptureInfo, Identifier>;
 pub type StructPattern = ast::pattern::StructPattern<CaptureInfo, Identifier>;
 type Tree<Id> = ast::Tree<CaptureInfo, Id>;
 
+impl typer::SymbolTable {
+    pub fn close_closures(self) -> SymbolTable {
+        let mut symbols = HashMap::with_capacity(self.symbols.len());
+
+        for t in self.symbols {
+            let (name, symbol) = match t {
+                (name, Symbol::Type(symbol)) => (name, Symbol::Type(symbol)),
+                (name, Symbol::Term(symbol)) => {
+                    let closed = symbol.body.unwrap().close_closures();
+                    let closed = TermSymbol {
+                        name: symbol.name,
+                        body: Some(closed),
+                        type_signature: symbol.type_signature,
+                    };
+                    (name, Symbol::Term(closed))
+                }
+            };
+            symbols.insert(name, symbol);
+        }
+
+        SymbolTable {
+            symbols,
+            module_members: self.module_members,
+            member_modules: self.member_modules,
+            imports: self.imports,
+            constraints: self.constraints,
+            witnesses: self.witnesses,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum Identifier {
     Local(LexicalLevel),
     Captured(CaptureIndex),
     Global(Box<QualifiedName>),
 }
 
-#[derive(Debug, Default)]
-struct CaptureLayout {
+#[derive(Debug, Clone, Default)]
+pub struct CaptureLayout {
     by_level: HashMap<LexicalLevel, CaptureIndex>,
     by_index: Vec<LexicalLevel>,
     next: CaptureIndex,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Hash, Eq)]
-struct LexicalLevel(usize);
+pub struct LexicalLevel(usize);
 
 impl LexicalLevel {
     fn rebase(self, scope: Self) -> Self {
@@ -59,7 +93,7 @@ impl LexicalLevel {
 }
 
 #[derive(Copy, Clone, Debug, Default)]
-struct CaptureIndex(usize);
+pub struct CaptureIndex(usize);
 
 impl CaptureIndex {
     fn update(&mut self) {
@@ -84,8 +118,8 @@ impl CaptureLayout {
     }
 }
 
-#[derive(Debug)]
-struct CaptureInfo {
+#[derive(Debug, Clone)]
+pub struct CaptureInfo {
     type_info: TypeInfo,
     layout: Option<CaptureLayout>,
 }
@@ -165,7 +199,7 @@ impl typer::Pattern {
 }
 
 impl typer::Expr {
-    pub fn closure_conversion(self) -> Expr {
+    pub fn close_closures(self) -> Expr {
         self.rewrite_tree(LexicalLevel(0), &mut CaptureLayout::default())
     }
 

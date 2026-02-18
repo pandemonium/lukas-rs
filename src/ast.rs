@@ -3,7 +3,7 @@ use std::{fmt, marker::PhantomData, rc::Rc};
 use crate::{
     ast::{self, annotation::Annotated, namer::QualifiedName, pattern::MatchClause},
     bridge::Bridge,
-    compiler, parser,
+    compiler, lambda_lift, parser,
     typer::display_list,
 };
 
@@ -244,27 +244,29 @@ pub enum Expr<A, Id> {
     If(A, IfThenElse<A, Id>),
     Interpolate(A, Interpolate<A, Id>),
     Ascription(A, TypeAscription<A, Id>),
+    MakeClosure(A, lambda_lift::ClosureInfo),
 }
 
 impl<A, Id> Expr<A, Id> {
     pub fn annotation(&self) -> &A {
         match self {
-            Expr::Variable(a, ..)
-            | Expr::InvokeBridge(a, ..)
-            | Expr::Constant(a, ..)
-            | Expr::RecursiveLambda(a, ..)
-            | Expr::Lambda(a, ..)
-            | Expr::Apply(a, ..)
-            | Expr::Let(a, ..)
-            | Expr::Record(a, ..)
-            | Expr::Tuple(a, ..)
-            | Expr::Inject(a, ..)
-            | Expr::Project(a, ..)
-            | Expr::Sequence(a, ..)
-            | Expr::Deconstruct(a, ..)
-            | Expr::If(a, ..)
-            | Expr::Interpolate(a, ..)
-            | Expr::Ascription(a, ..) => a,
+            Self::Variable(a, ..)
+            | Self::InvokeBridge(a, ..)
+            | Self::Constant(a, ..)
+            | Self::RecursiveLambda(a, ..)
+            | Self::Lambda(a, ..)
+            | Self::Apply(a, ..)
+            | Self::Let(a, ..)
+            | Self::Record(a, ..)
+            | Self::Tuple(a, ..)
+            | Self::Inject(a, ..)
+            | Self::Project(a, ..)
+            | Self::Sequence(a, ..)
+            | Self::Deconstruct(a, ..)
+            | Self::If(a, ..)
+            | Self::Interpolate(a, ..)
+            | Self::Ascription(a, ..)
+            | Self::MakeClosure(a, ..) => a,
         }
     }
 
@@ -569,6 +571,7 @@ where
             Self::If(_, x) => write!(f, "{x}"),
             Self::Interpolate(_, x) => write!(f, "{x}"),
             Self::Ascription(_, x) => write!(f, "{}::{}", x.ascribed_tree, x.type_signature),
+            Self::MakeClosure(_, x) => write!(f, "mk_clo {x}"),
         }
     }
 }

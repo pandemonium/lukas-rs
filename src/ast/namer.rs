@@ -918,12 +918,6 @@ impl<A> Symbol<A, QualifiedName, Identifier> {
     }
 }
 
-impl<A, GlobalName, LocalId> fmt::Display for Symbol<A, GlobalName, LocalId> {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
-    }
-}
-
 // Why doesn't this have a ParseInfo in it?
 #[derive(Debug, Clone)]
 pub struct TypeSymbol<GlobalName> {
@@ -1372,6 +1366,8 @@ impl parser::Expr {
                 *pi,
                 node.resolve(names, symbols, semantic_scope)?,
             )),
+
+            Self::MakeClosure(pi, node) => Ok(Expr::MakeClosure(*pi, node.clone())),
         }
     }
 }

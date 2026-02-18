@@ -173,6 +173,8 @@ impl Expr {
                 // TODO: The typer could remove these on successful checks
                 the.ascribed_tree.reduce(env)
             }
+
+            Self::MakeClosure(..) => panic!("Does not reduce"),
         }
     }
 }

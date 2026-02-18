@@ -822,6 +822,8 @@ impl Expr {
             },
 
             Self::Ascription(_, the) => Suspension::eval_and(&the.ascribed_tree, environment, k),
+
+            Self::MakeClosure(..) => panic!("Does not eval"),
         }
     }
 }
