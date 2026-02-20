@@ -1,4 +1,4 @@
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, fmt, rc::Rc};
 
 use crate::{
     ast::{
@@ -80,7 +80,7 @@ pub struct CaptureLayout {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Hash, Eq)]
-pub struct LexicalLevel(usize);
+pub struct LexicalLevel(pub usize);
 
 impl LexicalLevel {
     fn rebase(self, scope: Self) -> Self {
@@ -97,19 +97,28 @@ impl LexicalLevel {
 pub struct CaptureIndex(usize);
 
 impl CaptureIndex {
+    pub fn index(&self) -> usize {
+        self.0
+    }
+
     fn update(&mut self) {
         self.0 += 1;
     }
 }
 
 impl CaptureLayout {
+    fn next_capture_index(&mut self) -> CaptureIndex {
+        let slot = self.next;
+        self.next.update();
+        slot
+    }
+
     fn resolve(&mut self, scope: LexicalLevel, level: LexicalLevel) -> Identifier {
         if level.is_outside_of(&scope) {
             let index = self.by_level.get(&level).copied().unwrap_or_else(|| {
-                let slot = self.next;
+                let slot = self.next_capture_index();
                 self.by_level.insert(level, slot);
                 self.by_index.push(level);
-                self.next.update();
                 slot
             });
             Identifier::Captured(index)
@@ -126,24 +135,26 @@ pub struct CaptureInfo {
 }
 
 impl CaptureInfo {
-    pub fn environment_tuple(&self) -> Expr {
-        let ci = ParseInfo::default()
+    fn dummy() -> Self {
+        ParseInfo::default()
             .with_inferred_type(Type::fresh())
-            .empty_capture();
+            .empty_capture()
+    }
+
+    pub fn make_environment_tuple(&self) -> Expr {
+        let ci = Self::dummy();
         Expr::Tuple(
             ci.clone(),
             Tuple {
-                elements: self.layout.clone().map_or_else(
-                    || vec![],
-                    |l| {
-                        l.by_index
-                            .iter()
-                            .map(|level| {
-                                Expr::Variable(ci.clone(), Identifier::Local(*level)).into()
-                            })
-                            .collect()
-                    },
-                ),
+                elements: if let Some(captures) = &self.layout {
+                    captures
+                        .by_index
+                        .iter()
+                        .map(|level| Expr::Variable(ci.clone(), Identifier::Local(*level)).into())
+                        .collect()
+                } else {
+                    vec![]
+                },
             },
         )
     }
@@ -416,5 +427,36 @@ impl typer::Expr {
 
             otherwise => panic!("Bad medicin {otherwise:?}"),
         }
+    }
+}
+
+impl fmt::Display for CaptureInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { type_info, layout } = self;
+        write!(f, "<<capture-info>>")
+    }
+}
+
+impl fmt::Display for Identifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local(lexical_level) => write!(f, "Local({lexical_level})"),
+            Self::Captured(capture_index) => write!(f, "Captured({capture_index})"),
+            Self::Global(qualified_name) => write!(f, "Global({qualified_name})"),
+        }
+    }
+}
+
+impl fmt::Display for LexicalLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(level) = self;
+        write!(f, "{level}")
+    }
+}
+
+impl fmt::Display for CaptureIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(index) = self;
+        write!(f, "{index}")
     }
 }

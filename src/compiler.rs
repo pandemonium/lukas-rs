@@ -85,11 +85,16 @@ impl Compiler {
         self.typecheck_and_initialize(program)
     }
 
+    pub fn compiler_main(&self) -> Compilation<()> {
+        let program = self.parse_compilation_unit()?;
+        self.typecheck_and_compile(program)
+    }
+
     pub fn typecheck_and_initialize(&self, program: CompilationUnit) -> Compilation<Environment> {
         let mut symbols = namer::SymbolTable::import_compilation_unit(program)?;
         symbols.lower_tuples();
 
-        let compilation = symbols.rename_symbols()?;
+        let compilation = symbols.resolve_names()?;
 
         let dependencies = compilation.dependency_matrix();
         let evaluation_order = dependencies.in_resolvable_order();
@@ -110,6 +115,29 @@ impl Compiler {
             }
 
             Ok(Env::from_globals(globals))
+        } else {
+            // Err(CompilationError::Dependencies...)
+            panic!("Bad dependencies")
+        }
+    }
+
+    pub fn typecheck_and_compile(&self, program: CompilationUnit) -> Compilation<()> {
+        let mut symbols = namer::SymbolTable::import_compilation_unit(program)?;
+        symbols.lower_tuples();
+
+        let compilation = symbols.resolve_names()?;
+
+        let dependencies = compilation.dependency_matrix();
+        let evaluation_order = dependencies.in_resolvable_order();
+
+        if dependencies.are_sound() {
+            let program = compilation
+                .elaborate_compilation_unit(evaluation_order.iter())?
+                .closure_conversion()
+                .lambda_lift();
+
+            println!("{program}");
+            Ok(())
         } else {
             panic!("Bad dependencies")
         }

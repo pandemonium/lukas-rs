@@ -5,30 +5,48 @@ use std::{
 };
 
 use crate::{
-    ast::namer::{QualifiedName, Symbol, SymbolName},
-    closed::{self, CaptureIndex, CaptureLayout, Expr},
+    ast::{
+        ProductElement,
+        namer::{QualifiedName, Symbol, SymbolName},
+    },
+    closed::{self, CaptureInfo, CaptureLayout, Expr, Lambda, LexicalLevel, Projection},
     parser::{self, IdentifierPath},
 };
 
 impl closed::SymbolTable {
     pub fn lambda_lift(mut self) -> Program {
-        let start = self
+        let Symbol::Term(start) = self
             .symbols
             .remove(&SymbolName::Term(QualifiedName::from_root_symbol(
                 parser::Identifier::from_str("start"),
             )))
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("Expected to be a term")
+        };
+
+        let mut functions = Vec::default();
 
         for (name, symbol) in self.symbols {
+            let SymbolName::Term(name) = name else {
+                panic!("All terms have term names")
+            };
+
             if let Symbol::Term(term) = symbol {
                 let mut crane = Crane::new(term.name.clone());
                 let lifted = crane.lift_lambdas(term.body.unwrap());
+                functions.extend(lifted.functions);
+                functions.push(LiftedFunction {
+                    name,
+                    code: lifted.body,
+                    layout: CaptureLayout::default(),
+                });
             }
         }
 
         Program {
-            functions: todo!(),
-            start: todo!(),
+            functions,
+            start: start.body.unwrap(),
         }
     }
 }
@@ -39,8 +57,8 @@ struct Crane {
     lifted: Vec<LiftedFunction>,
 }
 
-struct LiftedLambda {
-    lambdas: Vec<LiftedFunction>,
+struct Lifting {
+    functions: Vec<LiftedFunction>,
     body: Expr,
 }
 
@@ -61,37 +79,62 @@ impl Crane {
         )
     }
 
-    fn lift_lambdas(&mut self, body: Expr) -> LiftedLambda {
+    fn lift_lambdas(&mut self, body: Expr) -> Lifting {
         let mut lifted = Vec::default();
         let body = body.map(&mut |e| match e {
-            Expr::Lambda(ci, lambda) => {
+            Expr::Lambda(capture_info, lambda) => {
                 let name = self.fresh_name();
 
-                lifted.push(LiftedFunction {
-                    name: name.clone(),
-                    code: Rc::unwrap_or_clone(lambda.body),
-                    layout: ci.layout.clone().unwrap(),
-                    own_name_slot: None,
-                });
+                lifted.push(LiftedFunction::from_lambda(
+                    capture_info.clone(),
+                    name.clone(),
+                    lambda,
+                ));
 
                 Expr::MakeClosure(
-                    ci.clone(),
+                    capture_info.clone(),
                     ClosureInfo {
-                        environment: ci.environment_tuple().into(),
+                        environment: capture_info.make_environment_tuple().into(),
                         lifted_name: name,
+                        is_recursive: false,
                     },
                 )
             }
 
-            Expr::RecursiveLambda(..) => todo!(),
+            Expr::RecursiveLambda(capture_info, self_ref) => {
+                let name = self.fresh_name();
 
-            Expr::Variable(_, closed::Identifier::Captured(..)) => todo!(),
+                lifted.push(LiftedFunction::from_lambda(
+                    capture_info.clone(),
+                    name.clone(),
+                    self_ref.lambda,
+                ));
+
+                Expr::MakeClosure(
+                    capture_info.clone(),
+                    ClosureInfo {
+                        // how does it inject the self placeholder into this?
+                        environment: capture_info.make_environment_tuple().into(),
+                        lifted_name: name,
+                        is_recursive: true,
+                    },
+                )
+            }
+
+            Expr::Variable(capture_info, closed::Identifier::Captured(capture)) => Expr::Project(
+                capture_info.clone(),
+                Projection {
+                    base: Expr::Variable(capture_info, closed::Identifier::Local(LexicalLevel(0)))
+                        .into(),
+                    select: ProductElement::Ordinal(capture.index()),
+                },
+            ),
 
             otherwise => otherwise,
         });
 
-        LiftedLambda {
-            lambdas: lifted,
+        Lifting {
+            functions: lifted,
             body,
         }
     }
@@ -101,6 +144,7 @@ impl Crane {
 pub struct ClosureInfo {
     pub environment: Box<Expr>,
     pub lifted_name: QualifiedName,
+    pub is_recursive: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -114,11 +158,49 @@ pub struct LiftedFunction {
     name: QualifiedName,
     code: Expr,
     layout: CaptureLayout,
-    own_name_slot: Option<CaptureIndex>,
+}
+
+impl LiftedFunction {
+    fn from_lambda(ci: CaptureInfo, name: QualifiedName, lambda: Lambda) -> Self {
+        Self {
+            name,
+            code: Rc::unwrap_or_clone(lambda.body),
+            layout: ci.layout.clone().unwrap(),
+        }
+    }
 }
 
 impl fmt::Display for ClosureInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "")
+        let Self {
+            environment,
+            lifted_name,
+            is_recursive,
+        } = self;
+        write!(
+            f,
+            "ClosureInfo: {} {lifted_name} [{}] ",
+            *environment,
+            if self.is_recursive { "rec" } else { "" }
+        )
+    }
+}
+
+impl fmt::Display for Program {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { functions, start } = self;
+
+        for function in functions {
+            writeln!(f, "{function}")?;
+        }
+
+        writeln!(f, "start: {start}")
+    }
+}
+
+impl fmt::Display for LiftedFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { name, code, layout } = self;
+        write!(f, "{name} (<<layout-info?>>) {code}")
     }
 }

@@ -1786,7 +1786,7 @@ impl ParserSymbolTable {
     // Move to namer.rs
     // This does not need the symbols in any particular order, so long as all
     // modules are known
-    pub fn rename_symbols(self) -> Naming<NamedSymbolTable> {
+    pub fn resolve_names(self) -> Naming<NamedSymbolTable> {
         Ok(SymbolTable {
             // Any kind of renaming necessary here?
             module_members: self.module_members.clone(),
