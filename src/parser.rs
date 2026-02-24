@@ -281,7 +281,7 @@ impl<'a> Parser<'a> {
         if let Some(caller) = calling_symbol {
             let caller_name = caller.to_string();
             let parts = caller_name.split("::").collect::<Vec<_>>();
-            let step = parts
+            let _step = parts
                 .get(parts.len().saturating_sub(2))
                 .unwrap_or(&caller_name.as_str())
                 .to_string();
@@ -296,13 +296,13 @@ impl<'a> Parser<'a> {
 
             let remains = remains.chars().collect::<Vec<_>>();
 
-            let remains = if remains.len() > REMAINS_COL {
+            let _remains = if remains.len() > REMAINS_COL {
                 &remains[..REMAINS_COL]
             } else {
                 &remains
             };
 
-            let indent = depth * 2;
+            let _indent = depth * 2;
 
             //println!(
             //    "{:<width$}{}{}",

@@ -222,7 +222,7 @@ where
     fn type_scheme(&self) -> TypeScheme {
         let tp = TypeParameter::fresh();
         TypeScheme {
-            quantifiers: vec![tp],
+            quantifiers: vec![tp.clone()],
             underlying: Type::Arrow {
                 domain: Type::Variable(tp).into(),
                 codomain: R::TYPE.into(),

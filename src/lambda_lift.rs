@@ -9,9 +9,7 @@ use crate::{
         Literal, ProductElement,
         namer::{QualifiedName, Symbol, SymbolName},
     },
-    closed::{
-        self, Apply, CaptureInfo, CaptureLayout, Expr, Identifier, Lambda, LexicalLevel, Projection,
-    },
+    closed::{self, Apply, CaptureInfo, Expr, Identifier, Lambda, LexicalLevel, Projection},
     parser::{self, IdentifierPath},
 };
 

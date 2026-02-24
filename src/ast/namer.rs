@@ -17,8 +17,8 @@ use crate::{
     },
     builtin,
     compiler::{Compilation, Compiler, Located, LocatedError},
-    parser::{self, IdentifierPath, ParseInfo},
-    typer::BaseType,
+    parser::{IdentifierPath, ParseInfo},
+    typer::{BaseType, Kind},
 };
 
 pub type Expr = ast::Expr<ParseInfo, Identifier>;
@@ -474,6 +474,7 @@ impl parser::RecordDeclarator {
             }),
             origin: TypeOrigin::UserDefined,
             arity: type_parameters.len(),
+            kind: todo!(),
         }
     }
 }
@@ -493,6 +494,7 @@ impl parser::CoproductDeclarator {
             }),
             origin: TypeOrigin::UserDefined,
             arity: type_parameters.len(),
+            kind: todo!(),
         }
     }
 }
@@ -926,6 +928,7 @@ pub struct TypeSymbol<GlobalName> {
     pub definition: TypeDefinition<GlobalName>,
     pub origin: TypeOrigin,
     pub arity: usize,
+    pub kind: Kind,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -1871,6 +1874,7 @@ impl ParserSymbolTable {
                         }),
                         origin: symbol.origin,
                         arity: symbol.arity,
+                        kind: symbol.kind.clone(),
                     },
 
                     TypeDefinition::Coproduct(coproduct) => TypeSymbol {
@@ -1895,12 +1899,14 @@ impl ParserSymbolTable {
                         }),
                         origin: symbol.origin,
                         arity: symbol.arity,
+                        kind: symbol.kind.clone(),
                     },
 
                     TypeDefinition::Builtin(base_type) => TypeSymbol {
                         definition: TypeDefinition::Builtin(*base_type),
                         origin: symbol.origin,
                         arity: symbol.arity,
+                        kind: Kind::default(),
                     },
                 }
             })),

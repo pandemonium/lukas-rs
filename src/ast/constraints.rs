@@ -76,7 +76,11 @@ impl WitnessIndex {
             .push(witness);
     }
 
-    pub fn resolve_witness(&self, constraint: &Constraint) -> Result<Expr, TypeError> {
+    pub fn resolve_witness(
+        &self,
+        constraint: &Constraint,
+        ctx: &TypeEnvironment,
+    ) -> Result<Expr, TypeError> {
         //println!(
         //    "resolve_witness: {constraint} -- {}",
         //    display_list(
@@ -99,7 +103,7 @@ impl WitnessIndex {
         for witness in candidates {
             let subst = constraint
                 .constraint_type
-                .unified_with(&witness.head.constraint_type);
+                .unified_with(&witness.head.constraint_type, ctx);
 
             if subst.is_err() {
                 continue;
@@ -118,7 +122,7 @@ impl WitnessIndex {
             let solution = witness
                 .premises
                 .iter()
-                .map(|c| self.resolve_witness(c))
+                .map(|c| self.resolve_witness(c, ctx))
                 .collect::<Result<Vec<_>, _>>();
 
             // Compute some honest type info to insert?

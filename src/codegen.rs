@@ -3,9 +3,7 @@ use std::fmt;
 
 use crate::{
     ast::{Literal, ProductElement},
-    closed::{
-        Apply, Binding, Expr, Identifier, IfThenElse, Lambda, LexicalLevel, Projection, Sequence,
-    },
+    closed::{Apply, Binding, Expr, Identifier, IfThenElse, LexicalLevel, Projection, Sequence},
     lambda_lift::{self, ClosureInfo, LiftedFunction},
     typer::{self, BaseType},
 };
@@ -21,7 +19,7 @@ impl typer::Type {
     fn try_as_arrow(&self) -> Option<(&Self, &Self)> {
         match self {
             Self::Arrow { domain, codomain } => Some((domain, codomain)),
-            otherwise => None,
+            _otherwise => None,
         }
     }
 
@@ -35,7 +33,7 @@ impl typer::Type {
             Self::Base(BaseType::Int) => "int64_t".to_owned(),
             Self::Base(BaseType::Text) => "char *".to_owned(),
             Self::Base(BaseType::Bool) => "bool".to_owned(),
-            otherwise => format!("unknown_t /* {} */", self.to_string()),
+            _otherwise => format!("unknown_t /* {} */", self.to_string()),
         }
     }
 }
@@ -70,7 +68,7 @@ impl lambda_lift::Program {
             println!("generate_code: {name} :: {ty}");
 
             match ty.try_as_arrow() {
-                (Some((param, return_ty))) => {
+                Some((param, return_ty)) => {
                     writeln!(
                         out,
                         "{} {} (void *env, {}) \n{{",
@@ -99,18 +97,18 @@ impl lambda_lift::Program {
             Expr::Variable(_, the) => write!(code, "{}", self.compile_var(the)),
             Expr::InvokeBridge(_, the) => write!(code, "{}", the.qualified_name),
             Expr::Constant(_, the) => write!(code, "{}", self.compile_constant(the)),
-            Expr::RecursiveLambda(_, the) => panic!("lambdas are lifted"),
-            Expr::Lambda(_, the) => panic!("lambdas are lifted"),
+            Expr::RecursiveLambda(_, _the) => panic!("lambdas are lifted"),
+            Expr::Lambda(_, _the) => panic!("lambdas are lifted"),
             Expr::Apply(_, the) => self.compile_apply(the, code), // foo(x) or apply(closure, x)
             Expr::Let(_, the) => self.compile_let(the, code),
-            Expr::Tuple(_, the) => todo!(),
-            Expr::Record(_, the) => todo!(),
-            Expr::Inject(_, the) => todo!(),
+            Expr::Tuple(_, _the) => todo!(),
+            Expr::Record(_, _the) => todo!(),
+            Expr::Inject(_, _the) => todo!(),
             Expr::Project(_, the) => self.compile_projection(the, code),
             Expr::Sequence(_, the) => self.compile_sequence(the, code),
-            Expr::Deconstruct(_, the) => todo!(),
+            Expr::Deconstruct(_, _the) => todo!(),
             Expr::If(_, the) => self.compile_if(the, code),
-            Expr::Interpolate(_, the) => todo!(),
+            Expr::Interpolate(_, _the) => todo!(),
             Expr::Ascription(_, the) => self.compile_expr(&the.ascribed_tree, code),
             Expr::MakeClosure(_, the) => self.compile_closure(the, code),
         }
@@ -150,7 +148,7 @@ impl lambda_lift::Program {
         }
     }
 
-    fn compile_closure(&self, the: &ClosureInfo, code: &mut CodeBuffer) -> fmt::Result {
+    fn compile_closure(&self, _the: &ClosureInfo, code: &mut CodeBuffer) -> fmt::Result {
         writeln!(code, "VClo(???)")
     }
 

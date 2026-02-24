@@ -9,15 +9,15 @@ use crate::{
     lexer::Operator,
     parser::{self, ParseInfo},
     rawlambda1,
-    typer::{BaseType, ConstraintSet, Type, TypeParameter, TypeScheme},
+    typer::{BaseType, ConstraintSet, Kind, Type, TypeParameter, TypeScheme},
 };
 
 fn comparison_signature() -> TypeScheme {
     let tp = TypeParameter::fresh();
     TypeScheme {
-        quantifiers: vec![tp],
+        quantifiers: vec![tp.clone()],
         underlying: Type::Arrow {
-            domain: Type::Variable(tp).into(),
+            domain: Type::Variable(tp.clone()).into(),
             codomain: Type::Arrow {
                 domain: Type::Variable(tp).into(),
                 codomain: Type::Base(BaseType::Bool).into(),
@@ -32,11 +32,11 @@ fn comparison_signature() -> TypeScheme {
 fn artithmetic_signature() -> TypeScheme {
     let tp = TypeParameter::fresh();
     TypeScheme {
-        quantifiers: vec![tp],
+        quantifiers: vec![tp.clone()],
         underlying: Type::Arrow {
-            domain: Type::Variable(tp).into(),
+            domain: Type::Variable(tp.clone()).into(),
             codomain: Type::Arrow {
-                domain: Type::Variable(tp).into(),
+                domain: Type::Variable(tp.clone()).into(),
                 codomain: Type::Variable(tp).into(),
             }
             .into(),
@@ -151,21 +151,25 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, parser::Identif
             definition: TypeDefinition::Builtin(BaseType::Int),
             origin: TypeOrigin::Builtin,
             arity: 0,
+            kind: Kind::default(),
         },
         TypeSymbol {
             definition: TypeDefinition::Builtin(BaseType::Text),
             origin: TypeOrigin::Builtin,
             arity: 0,
+            kind: Kind::default(),
         },
         TypeSymbol {
             definition: TypeDefinition::Builtin(BaseType::Bool),
             origin: TypeOrigin::Builtin,
             arity: 0,
+            kind: Kind::default(),
         },
         TypeSymbol {
             definition: TypeDefinition::Builtin(BaseType::Unit),
             origin: TypeOrigin::Builtin,
             arity: 0,
+            kind: Kind::default(),
         },
     ];
 

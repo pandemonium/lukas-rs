@@ -10,7 +10,7 @@ use std::{
 };
 
 use thiserror::Error;
-use tracing::{instrument, trace};
+use tracing::instrument;
 
 use crate::{
     ast::{
@@ -153,7 +153,7 @@ impl namer::TypeSignature {
             .map(|id| (id.clone(), TypeParameter::fresh()))
             .collect::<Vec<_>>();
 
-        let quantifiers = type_params.iter().map(|(_, p)| *p).collect();
+        let quantifiers = type_params.iter().map(|(_, p)| p.clone()).collect();
 
         *type_param_map = type_params.iter().cloned().collect::<HashMap<_, _>>();
 
@@ -373,7 +373,9 @@ fn discharge_ground_constraints(
     let pi = expr.tree.type_info().parse_info;
 
     for c in ground {
-        let witness = witness_index.resolve_witness(c).map_err(|e| e.at(pi))?;
+        let witness = witness_index
+            .resolve_witness(c, &ctx.types)
+            .map_err(|e| e.at(pi))?;
         evidence.push((c, witness));
     }
 
@@ -742,6 +744,19 @@ pub enum TypeError {
         shape: RecordShape,
         candidates: Vec<QualifiedName>,
     },
+
+    #[error("kind mismatch: cannot apply type of kind {function} at type of kind {argument}")]
+    KindMismatchError { function: Kind, argument: Kind },
+
+    #[error(
+        "unification error: kind mismatch: cannot unify {lhs}:{lhs_kind} with {rhs}:{rhs_kind}"
+    )]
+    KindMismatch {
+        lhs: Type,
+        lhs_kind: Kind,
+        rhs: Type,
+        rhs_kind: Kind,
+    },
 }
 
 #[derive(Debug)]
@@ -808,7 +823,7 @@ impl Constrained<Type> {
         Constrained {
             constraints: ConstraintSet::default(),
             underlying: TypeScheme {
-                quantifiers: quantifiers.iter().copied().collect(),
+                quantifiers: quantifiers.iter().cloned().collect(),
                 underlying: self.underlying.clone(),
                 constraints: ConstraintSet::from(quantified.as_slice()),
             },
@@ -818,7 +833,7 @@ impl Constrained<Type> {
     fn free_variables(&self, ctx: &TypingContext) -> HashSet<TypeParameter> {
         let ty_vars = self.underlying.variables();
         let ctx_bounds = ctx.free_variables();
-        ty_vars.difference(&ctx_bounds).copied().collect()
+        ty_vars.difference(&ctx_bounds).cloned().collect()
     }
 }
 
@@ -1046,6 +1061,25 @@ impl CoproductType {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Kind {
+    #[default]
+    Star,
+    Arrow(Box<Kind>, Box<Kind>),
+}
+
+impl Kind {
+    pub fn apply(self, at: Kind) -> Result<Self, TypeError> {
+        match self {
+            Kind::Arrow(k1, k2) if *k1 == at => Ok(*k2),
+            otherwise => Err(TypeError::KindMismatchError {
+                function: otherwise,
+                argument: at,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Type {
     Variable(TypeParameter),
@@ -1065,6 +1099,30 @@ pub enum Type {
 }
 
 impl Type {
+    pub fn kind(&self, ctx: &TypeEnvironment) -> Result<Kind, TypeError> {
+        match self {
+            Self::Variable(tp) => Ok(tp.kind().clone()),
+            Self::Base(..) => Ok(Kind::Star),
+            Self::Arrow { .. } => Ok(Kind::Star),
+            Self::Tuple(..) => Ok(Kind::Star),
+            Self::Record(..) => Ok(Kind::Star),
+            Self::Coproduct(..) => Ok(Kind::Star),
+            Self::Constructor(name) => ctx
+                .lookup(name)
+                .ok_or_else(|| TypeError::UndefinedType(name.clone()))
+                .map(|tc| tc.kind())
+                .cloned(),
+            Self::Apply {
+                constructor,
+                argument,
+            } => {
+                let k1 = constructor.kind(ctx)?;
+                let k2 = argument.kind(ctx)?;
+                k1.apply(k2)
+            }
+        }
+    }
+
     pub fn reify(&self, type_param_map: &[parser::Identifier]) -> parser::TypeExpression {
         let pi = ParseInfo::default();
 
@@ -1073,7 +1131,7 @@ impl Type {
         };
 
         match self {
-            Self::Variable(TypeParameter(p)) => {
+            Self::Variable(TypeParameter(p, _)) => {
                 parser::TypeExpression::Parameter(pi, type_param_map[*p as usize].clone())
             }
             Self::Base(BaseType::Int) => {
@@ -1172,7 +1230,7 @@ impl Type {
         let mut vars = HashSet::default();
         self.walk(&mut |ty| {
             if let Type::Variable(tp) = ty {
-                vars.insert(*tp);
+                vars.insert(tp.clone());
             }
         });
         vars
@@ -1228,21 +1286,34 @@ impl Type {
         }
     }
 
-    pub fn unified_with(&self, rhs: &Self) -> Result<Substitutions, TypeError> {
+    pub fn unified_with(
+        &self,
+        rhs: &Self,
+        ctx: &TypeEnvironment,
+    ) -> Result<Substitutions, TypeError> {
+        let lhs_kind = self.kind(ctx)?;
+        let rhs_kind = rhs.kind(ctx)?;
+        if lhs_kind != rhs_kind {
+            Err(TypeError::KindMismatch {
+                lhs: self.clone(),
+                lhs_kind,
+                rhs: rhs.clone(),
+                rhs_kind,
+            })?
+        }
+
         match (self, rhs) {
             (lhs, rhs) if lhs == rhs => Ok(Substitutions::default()),
 
             (Self::Variable(p), ty) | (ty, Self::Variable(p)) => {
 
-                if matches!(ty, Type::Variable(q) if q == p) {
-                    Ok(Substitutions::default())
-                } else if ty.variables().contains(p) {
+                if ty.variables().contains(p) {
                     Err(TypeError::InfiniteType {
-                        param: *p,
+                        param: p.clone(),
                         ty: ty.clone(),
                     })
                 } else {
-                    Ok(vec![(*p, ty.clone())].into())
+                    Ok(vec![(p.clone(), ty.clone())].into())
                 }
             }
 
@@ -1256,11 +1327,11 @@ impl Type {
                     codomain: rhs_codom,
                 },
             ) => {
-                let domain = lhs_dom.unified_with(rhs_dom)?;
+                let domain = lhs_dom.unified_with(rhs_dom, ctx)?;
                 let codomain = lhs_codom
                     .apply(&domain)
                     .unified_with(
-                        &rhs_codom.apply(&domain)
+                        &rhs_codom.apply(&domain), ctx
                     )?;
                 Ok(domain.compose(&codomain))
             }
@@ -1270,7 +1341,7 @@ impl Type {
 
                 for (lhs, rhs) in lhs.elements().iter().zip(rhs.elements()) {
                     // compose_mut
-                    subs = subs.compose(&lhs.apply(&subs).unified_with(&rhs.apply(&subs))?);
+                    subs = subs.compose(&lhs.apply(&subs).unified_with(&rhs.apply(&subs), ctx)?);
                 }
 
                 Ok(subs)
@@ -1286,7 +1357,7 @@ impl Type {
                     }
 
                     // compose_mut
-                    subs = subs.compose(&lhs.apply(&subs).unified_with(&rhs.apply(&subs))?);
+                    subs = subs.compose(&lhs.apply(&subs).unified_with(&rhs.apply(&subs), ctx)?);
                 }
 
                 Ok(subs)
@@ -1313,8 +1384,8 @@ impl Type {
                     argument: rhs_arg,
                 },
             ) => {
-                let constructor = lhs_con.unified_with(rhs_con)?;
-                let argument = lhs_arg.apply(&constructor).unified_with(&rhs_arg.apply(&constructor))?;
+                let constructor = lhs_con.unified_with(rhs_con, ctx)?;
+                let argument = lhs_arg.apply(&constructor).unified_with(&rhs_arg.apply(&constructor), ctx)?;
                 Ok(constructor.compose(&argument))
             }
 
@@ -1434,7 +1505,7 @@ impl TypeExpression {
 
             Self::Parameter(pi, p) => type_params
                 .get(p)
-                .copied()
+                .cloned()
                 .map(Type::Variable)
                 .ok_or_else(|| TypeError::UnquantifiedTypeParameter(p.clone()).at(*pi)),
 
@@ -1489,7 +1560,7 @@ impl TypeConstructorDefinition {
             Type::Constructor(self.name.clone()),
             |constructor, param| Type::Apply {
                 constructor: constructor.into(),
-                argument: Type::Variable(type_parameters[param]).into(),
+                argument: Type::Variable(type_parameters[param].clone()).into(),
             },
         )
     }
@@ -1516,6 +1587,10 @@ pub enum TypeConstructor {
 impl TypeConstructor {
     fn arity(&self) -> usize {
         self.definition().defining_symbol.arity
+    }
+
+    fn kind(&self) -> &Kind {
+        &self.definition().defining_symbol.kind
     }
 
     fn from_symbol(symbol: &TypeSymbol<namer::QualifiedName>) -> Self {
@@ -1631,7 +1706,7 @@ impl TypeScheme {
     pub fn apply(&self, subst: &Substitutions) -> Self {
         let mut subst = subst.clone();
         for q in &self.quantifiers {
-            subst.remove(*q);
+            subst.remove(q);
         }
         Self {
             quantifiers: self.quantifiers.clone(),
@@ -1643,7 +1718,7 @@ impl TypeScheme {
     fn instantiation_substitutions(&self) -> Substitutions {
         self.quantifiers
             .iter()
-            .map(|tp| (*tp, Type::fresh()))
+            .map(|tp| (tp.clone(), Type::fresh()))
             .collect::<Vec<_>>()
             .into()
     }
@@ -1673,18 +1748,22 @@ impl TypeScheme {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TypeParameter(u32);
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TypeParameter(u32, Kind);
 
 static FRESH_TYPE_ID: AtomicU32 = AtomicU32::new(0);
 
 impl TypeParameter {
     pub fn fresh() -> Self {
-        Self(FRESH_TYPE_ID.fetch_add(1, Ordering::SeqCst))
+        Self::fresh_with_kind(Kind::default())
     }
 
-    pub fn new(p: u32) -> Self {
-        Self(p)
+    pub fn fresh_with_kind(kind: Kind) -> Self {
+        Self(FRESH_TYPE_ID.fetch_add(1, Ordering::SeqCst), kind)
+    }
+
+    pub fn kind(&self) -> &Kind {
+        &self.1
     }
 }
 
@@ -1693,28 +1772,28 @@ impl TypeParameter {
 pub struct Substitutions(Vec<(TypeParameter, Type)>);
 
 impl Substitutions {
-    pub fn substitution(&self, TypeParameter(rhs): &TypeParameter) -> Option<&Type> {
+    pub fn substitution(&self, rhs: &TypeParameter) -> Option<&Type> {
         self.iter()
             .rev()
-            .find_map(|(TypeParameter(lhs), ty)| (lhs == rhs).then_some(ty))
+            .find_map(|(lhs, ty)| (lhs == rhs).then_some(ty))
     }
 
     fn compose(&self, rhs: &Self) -> Self {
         let mut out = Vec::new();
 
         for (param, ty) in rhs.iter() {
-            out.push((*param, ty.apply(self)));
+            out.push((param.clone(), ty.apply(self)));
         }
 
         for (param, ty) in self.iter() {
-            out.push((*param, ty.clone()));
+            out.push((param.clone(), ty.clone()));
         }
 
         Substitutions(out)
     }
 
-    fn remove(&mut self, param: TypeParameter) {
-        self.0.retain(|(tp, ..)| param != *tp);
+    fn remove(&mut self, param: &TypeParameter) {
+        self.0.retain(|(tp, ..)| param != tp);
     }
 }
 
@@ -1981,7 +2060,7 @@ impl TypingContext {
                                 .get(p)
                                 .unwrap_or_else(|| panic!("Unmapped type parameter: {p}"))
                         })
-                        .copied()
+                        .cloned()
                         .zip(arguments.drain(..))
                         .collect::<Vec<_>>(),
                 );
@@ -2157,7 +2236,7 @@ impl TypingContext {
         let rhs = expected_type.apply(&expr.substitutions);
 
         let s_unification = lhs
-            .unified_with(&rhs)
+            .unified_with(&rhs, &self.types)
             .map_err(|e| e.at(expr.tree.annotation().parse_info))?;
 
         let substitutions = expr.substitutions.compose(&s_unification);
@@ -2385,7 +2464,7 @@ impl TypingContext {
                     .tree
                     .type_info()
                     .inferred_type
-                    .unified_with(&normalized_type)
+                    .unified_with(&normalized_type, &self.types)
                     .map_err(|e| e.at(pi))?;
                 Ok(inferred.apply(&unification))
             }
@@ -2503,7 +2582,7 @@ impl TypingContext {
 
         ascribed_type
             .underlying
-            .unified_with(&ascribed_tree.tree.type_info().inferred_type)
+            .unified_with(&ascribed_tree.tree.type_info().inferred_type, &self.types)
             .map_err(|e| e.at(pi))?;
 
         Ok(ascribed_tree.map_tree(&mut |tree| {
@@ -2660,7 +2739,7 @@ impl TypingContext {
                 .type_info()
                 .inferred_type
                 .apply(&substitutions);
-            let subst = lhs.unified_with(&rhs).map_err(|e| e.at(pi))?;
+            let subst = lhs.unified_with(&rhs, &self.types).map_err(|e| e.at(pi))?;
             substitutions = substitutions.compose(&subst);
             constraints = constraints.apply(&substitutions);
             scrutinee = scrutinee.apply(&substitutions);
@@ -2746,7 +2825,7 @@ impl TypingContext {
         &mut self,
         pattern: &namer::Pattern,
         bindings: &mut Vec<(namer::Identifier, Type)>,
-        scrutinee: TypeParameter,
+        scrutinee: &TypeParameter,
     ) -> Typing<(Substitutions, Pattern)> {
         match pattern {
             namer::Pattern::Coproduct(pi, coproduct) => {
@@ -2761,7 +2840,8 @@ impl TypingContext {
                     .instantiate(self)?
                     .make_spine();
 
-                let substitutions = Substitutions::from(vec![(scrutinee, inferred.clone())]);
+                let substitutions =
+                    Substitutions::from(vec![(scrutinee.clone(), inferred.clone())]);
 
                 self.substitute_mut(&substitutions);
 
@@ -2776,7 +2856,7 @@ impl TypingContext {
                     .instantiate(self)?
                     .make_spine();
 
-                let subst = Substitutions::from(vec![(scrutinee, inferred.clone())]);
+                let subst = Substitutions::from(vec![(scrutinee.clone(), inferred.clone())]);
 
                 self.substitute_mut(&subst);
 
@@ -2789,7 +2869,7 @@ impl TypingContext {
                     tuple.elements.iter().map(|_| Type::fresh()).collect(),
                 ));
                 let unification = tuple
-                    .unified_with(&Type::Variable(scrutinee))
+                    .unified_with(&Type::Variable(scrutinee.clone()), &self.types)
                     .map_err(|e| e.at(*pi))?;
 
                 self.substitute_mut(&unification);
@@ -2800,9 +2880,11 @@ impl TypingContext {
             }
 
             namer::Pattern::Literally(pi, pattern) => {
-                let scrutinee = Type::Variable(scrutinee);
+                let scrutinee = Type::Variable(scrutinee.clone());
                 let inferred = pattern.synthesize_type();
-                let s_pattern = inferred.unified_with(&scrutinee).map_err(|e| e.at(*pi))?;
+                let s_pattern = inferred
+                    .unified_with(&scrutinee, &self.types)
+                    .map_err(|e| e.at(*pi))?;
 
                 Ok((
                     s_pattern,
@@ -2811,7 +2893,7 @@ impl TypingContext {
             }
 
             namer::Pattern::Bind(pi, pattern) => {
-                let scrutinee = Type::Variable(scrutinee);
+                let scrutinee = Type::Variable(scrutinee.clone());
                 bindings.push((pattern.clone(), scrutinee.clone()));
                 Ok((
                     Substitutions::default(),
@@ -2832,7 +2914,7 @@ impl TypingContext {
         let normalized_scrutinee = self.normalize_type_application(pi, scrutinee)?;
 
         match (pattern, &normalized_scrutinee) {
-            (_, Type::Variable(p)) => self.infer_pattern_scrutinee(pattern, bindings, *p),
+            (_, Type::Variable(p)) => self.infer_pattern_scrutinee(pattern, bindings, p),
 
             (namer::Pattern::Coproduct(pi, pattern), Type::Coproduct(coproduct)) => {
                 if let namer::Identifier::Free(constructor) = &pattern.constructor
@@ -2923,7 +3005,9 @@ impl TypingContext {
             // Check pattern at ty
             (namer::Pattern::Literally(pi, pattern), ..) => {
                 let inferred = pattern.synthesize_type();
-                let subs = inferred.unified_with(scrutinee).map_err(|e| e.at(*pi))?;
+                let subs = inferred
+                    .unified_with(scrutinee, &self.types)
+                    .map_err(|e| e.at(*pi))?;
 
                 Ok((
                     subs,
@@ -2983,7 +3067,10 @@ impl TypingContext {
                 TypeError::NoSuchCoproductConstructor(construct.constructor.clone()).at(pi)
             })?;
             Type::Tuple(TupleType::from_signature(signature))
-                .unified_with(&Type::Tuple(TupleType::from_signature(&argument_types)))
+                .unified_with(
+                    &Type::Tuple(TupleType::from_signature(&argument_types)),
+                    &self.types,
+                )
                 .map_err(|e| e.at(pi))?
         } else {
             Err(TypeError::InternalAssertion("expected a coproduct".to_owned()).at(pi))?
@@ -3041,7 +3128,7 @@ impl TypingContext {
 
         let subst = type_constructor
             .structure()?
-            .unified_with(&Type::Record(record_type))
+            .unified_with(&Type::Record(record_type), &self.types)
             .map_err(|e| e.at(pi))?;
 
         let substitutions = substitutions.compose(&subst);
@@ -3103,7 +3190,7 @@ impl TypingContext {
                                 record_type.field_type(field_name)
                         {
                             let unification = normalized_base_type
-                                .unified_with(&base_type.make_spine())
+                                .unified_with(&base_type.make_spine(), &self.types)
                                 .map_err(|e| e.at(pi))?;
 
                             let base = base.apply(&unification);
@@ -3180,7 +3267,7 @@ impl TypingContext {
                         elems.push(Type::fresh());
                     }
                     let tuple_ty = Type::Tuple(TupleType::from_signature(&elems));
-                    let subs = base_type.unified_with(&tuple_ty).map_err(|e| e.at(pi))?;
+                    let subs = base_type.unified_with(&tuple_ty, &self.types).map_err(|e| e.at(pi))?;
 
                     let projected_ty = match tuple_ty.apply(&subs) {
                         Type::Tuple(tuple) => tuple.elements()[*ordinal].clone(),
@@ -3285,7 +3372,7 @@ impl TypingContext {
                             .tree
                             .type_info()
                             .inferred_type
-                            .unified_with(&codomain.apply(&typed.substitutions))
+                            .unified_with(&codomain.apply(&typed.substitutions), &ctx.types)
                             .map_err(|e| e.at(pi))?;
 
                         let substitutions = typed.substitutions.compose(&s_codomain);
@@ -3329,7 +3416,7 @@ impl TypingContext {
                 domain: domain.into(),
                 codomain: codomain.into(),
             }
-            .unified_with(function_type)
+            .unified_with(function_type, &self.types)
             .map_err(|e| e.at(pi))?;
 
             let s_function = function.substitutions.compose(&unification);
@@ -3404,6 +3491,7 @@ impl TypingContext {
                     .type_info()
                     .inferred_type
                     .apply(&substitutions),
+                &self.types,
             )
             .map_err(|e| e.at(pi))?
             .compose(&substitutions);
@@ -3445,7 +3533,7 @@ impl TypingContext {
                 let body_type = body.type_info().inferred_type.apply(&substitutions);
 
                 let unify_subs = body_type
-                    .unified_with(&codomain.apply(&substitutions))
+                    .unified_with(&codomain.apply(&substitutions), &ctx.types)
                     .map_err(|e| e.at(pi))?;
 
                 substitutions = substitutions.compose(&unify_subs);
@@ -3536,7 +3624,7 @@ impl TypingContext {
             .tree
             .type_info()
             .inferred_type
-            .unified_with(&Type::Base(BaseType::Bool))
+            .unified_with(&Type::Base(BaseType::Bool), &self.types)
             .map_err(|e| e.at(pi))?;
         let s_predicate = predicate.substitutions.compose(&s_bool_predicate);
 
@@ -3558,7 +3646,10 @@ impl TypingContext {
             .clone();
 
         let substitutions = consequent_type
-            .unified_with(&alternate.tree.apply(&s_branches).type_info().inferred_type)
+            .unified_with(
+                &alternate.tree.apply(&s_branches).type_info().inferred_type,
+                &self.types,
+            )
             .map_err(|e| e.at(pi))?;
 
         let substitutions = s_branches.compose(&substitutions);
@@ -3808,10 +3899,19 @@ impl fmt::Display for TypeInfo {
     }
 }
 
+impl fmt::Display for Kind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Kind::Star => write!(f, "*"),
+            Kind::Arrow(k1, k2) => write!(f, "{k1} -> {k2}"),
+        }
+    }
+}
+
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Variable(TypeParameter(p)) => write!(f, "${p}"),
+            Self::Variable(TypeParameter(p, k)) => write!(f, "${p}:{k}"),
 
             Self::Base(base_type) => write!(f, "{base_type}"),
 

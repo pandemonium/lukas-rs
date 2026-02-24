@@ -461,7 +461,7 @@ impl typer::Expr {
 
 impl fmt::Display for CaptureInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { type_info, layout } = self;
+        let Self { .. } = self;
         write!(f, "<<capture-info>>")
     }
 }
