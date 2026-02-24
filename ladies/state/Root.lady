@@ -1,0 +1,35 @@
+use Stdlib.
+
+increment :: State Int Int :=
+  State.bind (λn.
+    State.bind (λ_.
+      State.pure n
+    ) (State.put (n + 1))
+  ) State.get
+
+double :: State Int Unit :=
+  State.bind (λn.
+    State.put (n + n)
+  ) State.get
+
+program :: State Int Int :=
+  State.bind (λx.
+    State.bind (λ_.
+      increment
+    ) double
+  ) increment
+
+peekAndInc :: State Int Int :=
+  State.bind (λx.
+    State.bind (λ_.
+      State.pure x
+    ) (State.modify (λn. n + 1))
+  ) (State.gets (λn. n))
+
+start := λ_.
+  let eval = State.eval peekAndInc 10 in
+  let exec = State.exec peekAndInc 10 in
+  let run = State.run peekAndInc 10 in
+  print_endline ">>> eval: `eval`"
+  print_endline ">>> exec: `exec`"
+  print_endline ">>> run: `run`"

@@ -6,25 +6,17 @@ use std::{
 
 use crate::{
     ast::{
-        ProductElement,
+        Literal, ProductElement,
         namer::{QualifiedName, Symbol, SymbolName},
     },
-    closed::{self, CaptureInfo, CaptureLayout, Expr, Lambda, LexicalLevel, Projection},
+    closed::{
+        self, Apply, CaptureInfo, CaptureLayout, Expr, Identifier, Lambda, LexicalLevel, Projection,
+    },
     parser::{self, IdentifierPath},
 };
 
 impl closed::SymbolTable {
-    pub fn lambda_lift(mut self) -> Program {
-        let Symbol::Term(start) = self
-            .symbols
-            .remove(&SymbolName::Term(QualifiedName::from_root_symbol(
-                parser::Identifier::from_str("start"),
-            )))
-            .unwrap()
-        else {
-            panic!("Expected to be a term")
-        };
-
+    pub fn lambda_lift(self) -> Program {
         let mut functions = Vec::default();
 
         for (name, symbol) in self.symbols {
@@ -34,19 +26,33 @@ impl closed::SymbolTable {
 
             if let Symbol::Term(term) = symbol {
                 let mut crane = Crane::new(term.name.clone());
+                let capture_info = term.body().annotation().clone();
                 let lifted = crane.lift_lambdas(term.body.unwrap());
                 functions.extend(lifted.functions);
                 functions.push(LiftedFunction {
                     name,
                     code: lifted.body,
-                    layout: CaptureLayout::default(),
+                    capture_info,
                 });
             }
         }
 
         Program {
             functions,
-            start: start.body.unwrap(),
+            start: Expr::Apply(
+                CaptureInfo::dummy(),
+                Apply {
+                    function: Expr::Variable(
+                        CaptureInfo::dummy(),
+                        Identifier::Global(
+                            QualifiedName::from_root_symbol(parser::Identifier::from_str("start"))
+                                .into(),
+                        ),
+                    )
+                    .into(),
+                    argument: Expr::Constant(CaptureInfo::dummy(), Literal::Unit).into(),
+                },
+            ),
         }
     }
 }
@@ -80,12 +86,17 @@ impl Crane {
     }
 
     fn lift_lambdas(&mut self, body: Expr) -> Lifting {
-        let mut lifted = Vec::default();
+        let mut functions = Vec::default();
         let body = body.map(&mut |e| match e {
             Expr::Lambda(capture_info, lambda) => {
                 let name = self.fresh_name();
 
-                lifted.push(LiftedFunction::from_lambda(
+                println!(
+                    "lift_lambdas: {name} has type {}",
+                    capture_info.type_info.inferred_type
+                );
+
+                functions.push(LiftedFunction::from_lambda(
                     capture_info.clone(),
                     name.clone(),
                     lambda,
@@ -101,21 +112,36 @@ impl Crane {
                 )
             }
 
-            Expr::RecursiveLambda(capture_info, self_ref) => {
-                let name = self.fresh_name();
+            Expr::RecursiveLambda(capture_info, mut self_ref) => {
+                let lambda_name = self.fresh_name();
 
-                lifted.push(LiftedFunction::from_lambda(
+                println!(
+                    "lift_lambdas: rec {lambda_name} has type {}",
+                    capture_info.type_info.inferred_type
+                );
+
+                // transform the local own_name into a global
+                self_ref.lambda.body = Rc::unwrap_or_clone(self_ref.lambda.body)
+                    .map(&mut |e| match e {
+                        Expr::Variable(ci, Identifier::Local(LexicalLevel(0))) => {
+                            Expr::Variable(ci, Identifier::Global(lambda_name.clone().into()))
+                        }
+
+                        otherwise => otherwise,
+                    })
+                    .into();
+
+                functions.push(LiftedFunction::from_lambda(
                     capture_info.clone(),
-                    name.clone(),
+                    lambda_name.clone(),
                     self_ref.lambda,
                 ));
 
                 Expr::MakeClosure(
                     capture_info.clone(),
                     ClosureInfo {
-                        // how does it inject the self placeholder into this?
                         environment: capture_info.make_environment_tuple().into(),
-                        lifted_name: name,
+                        lifted_name: lambda_name,
                         is_recursive: true,
                     },
                 )
@@ -133,10 +159,7 @@ impl Crane {
             otherwise => otherwise,
         });
 
-        Lifting {
-            functions: lifted,
-            body,
-        }
+        Lifting { functions, body }
     }
 }
 
@@ -149,23 +172,23 @@ pub struct ClosureInfo {
 
 #[derive(Debug, Clone)]
 pub struct Program {
-    functions: Vec<LiftedFunction>,
-    start: Expr,
+    pub functions: Vec<LiftedFunction>,
+    pub start: Expr,
 }
 
 #[derive(Debug, Clone)]
 pub struct LiftedFunction {
-    name: QualifiedName,
-    code: Expr,
-    layout: CaptureLayout,
+    pub name: QualifiedName,
+    pub code: Expr,
+    pub capture_info: CaptureInfo,
 }
 
 impl LiftedFunction {
-    fn from_lambda(ci: CaptureInfo, name: QualifiedName, lambda: Lambda) -> Self {
+    fn from_lambda(capture_info: CaptureInfo, name: QualifiedName, lambda: Lambda) -> Self {
         Self {
             name,
             code: Rc::unwrap_or_clone(lambda.body),
-            layout: ci.layout.clone().unwrap(),
+            capture_info,
         }
     }
 }
@@ -181,7 +204,7 @@ impl fmt::Display for ClosureInfo {
             f,
             "ClosureInfo: {} {lifted_name} [{}] ",
             *environment,
-            if self.is_recursive { "rec" } else { "" }
+            if *is_recursive { "rec" } else { "" }
         )
     }
 }
@@ -200,7 +223,12 @@ impl fmt::Display for Program {
 
 impl fmt::Display for LiftedFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { name, code, layout } = self;
-        write!(f, "{name} (<<layout-info?>>) {code}")
+        let Self {
+            name,
+            code,
+            capture_info,
+        } = self;
+        let ty = &capture_info.type_info.inferred_type;
+        write!(f, "lifted => {name}::{ty} --- {code}")
     }
 }

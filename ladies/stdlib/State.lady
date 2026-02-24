@@ -1,0 +1,43 @@
+State ::= ∀s α. State (s -> (s, α))
+
+module State:
+  pure :: ∀s α. α -> State s α := λa. State (λs. s, a)
+
+  map :: ∀s α β. (α -> β) -> State s α -> State s β := λg s.
+    deconstruct s into
+      State f ->
+        State (λs0.
+          let t = f s0
+          in t.0, g t.1
+        )
+
+  bind :: ∀s α β. (α -> State s β) -> State s α -> State s β := λk s.
+    deconstruct s into
+      State f ->
+        State (λs0.
+          let t = f s0 in
+          deconstruct k t.1 into
+            State g -> g t.0
+        )
+
+  run :: ∀s α. State s α -> s -> (s, α) := λst s.
+    deconstruct st into
+      State f -> f s
+
+  eval :: ∀s α. State s α -> s -> α :=
+    λst s. (run st s).1
+
+  exec :: ∀s α. State s α -> s -> s :=
+    λst s. (run st s).0
+
+  get :: ∀s α. State s s :=
+    State (λs. s, s)
+
+  gets :: ∀s α. (s -> α) -> State s α := λf.
+    State (λs. s, f s)
+
+  put :: ∀s. s -> State s Unit :=
+    λs. State (λ_. s, ())
+
+  modify :: ∀s. (s -> s) -> State s Unit :=
+    λf. State (λs. f s, ())

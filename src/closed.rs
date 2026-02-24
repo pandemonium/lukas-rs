@@ -135,7 +135,7 @@ pub struct CaptureInfo {
 }
 
 impl CaptureInfo {
-    fn dummy() -> Self {
+    pub fn dummy() -> Self {
         ParseInfo::default()
             .with_inferred_type(Type::fresh())
             .empty_capture()
@@ -177,7 +177,12 @@ impl TypeInfo {
 }
 
 impl typer::Pattern {
-    fn rewrite_tree(self, lambda_level: LexicalLevel, capture_map: &mut CaptureLayout) -> Pattern {
+    fn rewrite_tree(
+        self,
+        lambda_level: LexicalLevel,
+        is_recursive: bool,
+        capture_map: &mut CaptureLayout,
+    ) -> Pattern {
         match self {
             ast::pattern::Pattern::Coproduct(
                 ti,
@@ -191,7 +196,7 @@ impl typer::Pattern {
                     constructor: Identifier::Global(name),
                     arguments: arguments
                         .into_iter()
-                        .map(|e| e.rewrite_tree(lambda_level, capture_map))
+                        .map(|e| e.rewrite_tree(lambda_level, is_recursive, capture_map))
                         .collect(),
                 },
             ),
@@ -202,7 +207,7 @@ impl typer::Pattern {
                     elements: the
                         .elements
                         .into_iter()
-                        .map(|e| e.rewrite_tree(lambda_level, capture_map))
+                        .map(|e| e.rewrite_tree(lambda_level, is_recursive, capture_map))
                         .collect(),
                 },
             ),
@@ -213,7 +218,12 @@ impl typer::Pattern {
                     fields: the
                         .fields
                         .into_iter()
-                        .map(|(label, e)| (label, e.rewrite_tree(lambda_level, capture_map)))
+                        .map(|(label, e)| {
+                            (
+                                label,
+                                e.rewrite_tree(lambda_level, is_recursive, capture_map),
+                            )
+                        })
                         .collect(),
                 },
             ),
@@ -236,19 +246,26 @@ impl typer::Pattern {
 
 impl typer::Expr {
     pub fn close_closures(self) -> Expr {
-        self.rewrite_tree(LexicalLevel(0), &mut CaptureLayout::default())
+        // really: map self name to Global before closing the tree
+        self.rewrite_tree(LexicalLevel(0), false, &mut CaptureLayout::default())
     }
 
     fn go(
         tree: ast::Tree<TypeInfo, namer::Identifier>,
         lambda_level: LexicalLevel,
+        is_recursive: bool,
         capture_map: &mut CaptureLayout,
     ) -> Tree<Identifier> {
         let owned = Rc::unwrap_or_clone(tree);
-        Rc::new(owned.rewrite_tree(lambda_level, capture_map))
+        Rc::new(owned.rewrite_tree(lambda_level, is_recursive, capture_map))
     }
 
-    fn rewrite_tree(self, lambda_level: LexicalLevel, layout: &mut CaptureLayout) -> Expr {
+    fn rewrite_tree(
+        self,
+        lambda_level: LexicalLevel,
+        is_recursive: bool,
+        layout: &mut CaptureLayout,
+    ) -> Expr {
         match self {
             Self::Variable(ti, namer::Identifier::Bound(level)) => Expr::Variable(
                 ti.empty_capture(),
@@ -273,7 +290,7 @@ impl typer::Expr {
                 let mut layout = CaptureLayout::default();
                 let lambda = Lambda {
                     parameter: Identifier::Local(LexicalLevel(1)),
-                    body: Self::go(lambda.body, LexicalLevel(own_name), &mut layout).into(),
+                    body: Self::go(lambda.body, LexicalLevel(own_name), true, &mut layout).into(),
                 };
 
                 Expr::RecursiveLambda(
@@ -295,7 +312,7 @@ impl typer::Expr {
                 let mut layout = CaptureLayout::default();
                 let lambda = Lambda {
                     parameter: Identifier::Local(LexicalLevel(0)),
-                    body: Self::go(body, LexicalLevel(param_level), &mut layout),
+                    body: Self::go(body, LexicalLevel(param_level), false, &mut layout),
                 };
                 Expr::Lambda(ti.with_capture_layout(layout), lambda)
             }
@@ -303,8 +320,8 @@ impl typer::Expr {
             Self::Apply(ti, the) => Expr::Apply(
                 ti.empty_capture(),
                 Apply {
-                    function: Self::go(the.function, lambda_level, layout),
-                    argument: Self::go(the.argument, lambda_level, layout),
+                    function: Self::go(the.function, lambda_level, is_recursive, layout),
+                    argument: Self::go(the.argument, lambda_level, is_recursive, layout),
                 },
             ),
 
@@ -319,8 +336,8 @@ impl typer::Expr {
                 ti.empty_capture(),
                 Binding {
                     binder: Identifier::Local(LexicalLevel(binder_level).rebase(lambda_level)),
-                    bound: Self::go(bound, lambda_level, layout),
-                    body: Self::go(body, lambda_level, layout),
+                    bound: Self::go(bound, lambda_level, is_recursive, layout),
+                    body: Self::go(body, lambda_level, is_recursive, layout),
                 },
             ),
 
@@ -330,7 +347,7 @@ impl typer::Expr {
                     elements: the
                         .elements
                         .into_iter()
-                        .map(|e| Self::go(e, lambda_level, layout))
+                        .map(|e| Self::go(e, lambda_level, is_recursive, layout))
                         .collect(),
                 },
             ),
@@ -341,7 +358,7 @@ impl typer::Expr {
                     fields: the
                         .fields
                         .into_iter()
-                        .map(|(label, e)| (label, Self::go(e, lambda_level, layout)))
+                        .map(|(label, e)| (label, Self::go(e, lambda_level, is_recursive, layout)))
                         .collect(),
                 },
             ),
@@ -353,7 +370,7 @@ impl typer::Expr {
                     arguments: the
                         .arguments
                         .into_iter()
-                        .map(|e| Self::go(e, lambda_level, layout))
+                        .map(|e| Self::go(e, lambda_level, is_recursive, layout))
                         .collect(),
                 },
             ),
@@ -361,7 +378,7 @@ impl typer::Expr {
             Self::Project(ti, the) => Expr::Project(
                 ti.empty_capture(),
                 Projection {
-                    base: Self::go(the.base, lambda_level, layout),
+                    base: Self::go(the.base, lambda_level, is_recursive, layout),
                     select: the.select,
                 },
             ),
@@ -369,21 +386,30 @@ impl typer::Expr {
             Self::Sequence(ti, the) => Expr::Sequence(
                 ti.empty_capture(),
                 Sequence {
-                    this: Self::go(the.this, lambda_level, layout),
-                    and_then: Self::go(the.and_then, lambda_level, layout),
+                    this: Self::go(the.this, lambda_level, is_recursive, layout),
+                    and_then: Self::go(the.and_then, lambda_level, is_recursive, layout),
                 },
             ),
 
             Self::Deconstruct(ti, the) => Expr::Deconstruct(
                 ti.empty_capture(),
                 Deconstruct {
-                    scrutinee: Self::go(the.scrutinee, lambda_level, layout),
+                    scrutinee: Self::go(the.scrutinee, lambda_level, is_recursive, layout),
                     match_clauses: the
                         .match_clauses
                         .into_iter()
                         .map(|clause| MatchClause {
-                            pattern: clause.pattern.rewrite_tree(lambda_level, layout),
-                            consequent: Self::go(clause.consequent, lambda_level, layout),
+                            pattern: clause.pattern.rewrite_tree(
+                                lambda_level,
+                                is_recursive,
+                                layout,
+                            ),
+                            consequent: Self::go(
+                                clause.consequent,
+                                lambda_level,
+                                is_recursive,
+                                layout,
+                            ),
                         })
                         .collect(),
                 },
@@ -392,9 +418,9 @@ impl typer::Expr {
             Self::If(ti, the) => Expr::If(
                 ti.empty_capture(),
                 IfThenElse {
-                    predicate: Self::go(the.predicate, lambda_level, layout),
-                    consequent: Self::go(the.consequent, lambda_level, layout),
-                    alternate: Self::go(the.alternate, lambda_level, layout),
+                    predicate: Self::go(the.predicate, lambda_level, is_recursive, layout),
+                    consequent: Self::go(the.consequent, lambda_level, is_recursive, layout),
+                    alternate: Self::go(the.alternate, lambda_level, is_recursive, layout),
                 },
             ),
 
@@ -407,9 +433,12 @@ impl typer::Expr {
                             ast::Segment::Literal(ti, literal) => {
                                 Segment::Literal(ti.empty_capture(), literal)
                             }
-                            ast::Segment::Expression(expr) => {
-                                Segment::Expression(Self::go(expr, lambda_level, layout))
-                            }
+                            ast::Segment::Expression(expr) => Segment::Expression(Self::go(
+                                expr,
+                                lambda_level,
+                                is_recursive,
+                                layout,
+                            )),
                         })
                         .collect(),
                 ),
@@ -418,7 +447,7 @@ impl typer::Expr {
             Self::Ascription(ti, the) => Expr::Ascription(
                 ti.empty_capture(),
                 TypeAscription {
-                    ascribed_tree: Self::go(the.ascribed_tree, lambda_level, layout),
+                    ascribed_tree: Self::go(the.ascribed_tree, lambda_level, is_recursive, layout),
                     type_signature: the
                         .type_signature
                         .map_annotation(&|ti| ti.clone().empty_capture()),

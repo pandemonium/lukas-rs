@@ -1,8 +1,13 @@
-bar := λy.
-  y * y
+bar := λx y.
+  if x = y
+    then bar (x * y) 1
+    else 1
 
 foo := λx.
-  print_endline "foo: hi! `bar x`; `bar 27`."
+  let p = bar 2 x in
+  let q = bar 27 x in
+  print_endline (show p)
+  print_endline (show q)
 
-start := λx.
+start  := λx.
   foo 2

@@ -1127,6 +1127,8 @@ impl Type {
     where
         F: FnMut(&Type),
     {
+        f(self);
+
         match self {
             Self::Arrow { domain, codomain } => {
                 f(domain);
@@ -2271,6 +2273,8 @@ impl TypingContext {
                 |ctx| {
                     let body = ctx.check_expr(codomain, &lambda.body)?;
 
+                    ctx.substitute_mut(&body.substitutions);
+
                     let type_info = pi.with_inferred_type(expected_type.apply(&body.substitutions));
                     Ok(Typed::computed(
                         body.substitutions,
@@ -2297,8 +2301,6 @@ impl TypingContext {
         expected_type: &Type,
         record: &namer::Record,
     ) -> Typing {
-        println!("check_record: {expected_type} {record}");
-
         let normalized_type = self.normalize_type_application(pi, expected_type)?;
 
         match normalized_type {
@@ -2383,7 +2385,7 @@ impl TypingContext {
                     .tree
                     .type_info()
                     .inferred_type
-                    .unified_with(expected_type)
+                    .unified_with(&normalized_type)
                     .map_err(|e| e.at(pi))?;
                 Ok(inferred.apply(&unification))
             }
@@ -2491,12 +2493,18 @@ impl TypingContext {
 
     #[instrument]
     fn infer_ascription(&mut self, pi: ParseInfo, ascription: &namer::TypeAscription) -> Typing {
+        // What is a good way to deal with a "current set" of alpha type parameters?
         let ascribed_scheme = ascription
             .type_signature
             .type_scheme(&mut HashMap::default(), self)?;
         let ascribed_type = ascribed_scheme.instantiate();
         let ascribed_tree =
             self.check_expr(&ascribed_type.underlying, &ascription.ascribed_tree)?;
+
+        ascribed_type
+            .underlying
+            .unified_with(&ascribed_tree.tree.type_info().inferred_type)
+            .map_err(|e| e.at(pi))?;
 
         Ok(ascribed_tree.map_tree(&mut |tree| {
             Expr::Ascription(
@@ -3143,7 +3151,8 @@ impl TypingContext {
             },
 
             ProductElement::Ordinal(ordinal) => match normalized_base_type {
-                Type::Tuple(tuple) if tuple.is_fully_typed() => {
+                // Why is_fully_typed?
+                Type::Tuple(tuple) /*if tuple.is_fully_typed()*/ => {
                     if let Some(element) = tuple.elements().get(*ordinal) {
                         Ok(Typed::computed(
                             substitutions,
@@ -3281,8 +3290,7 @@ impl TypingContext {
 
                         let substitutions = typed.substitutions.compose(&s_codomain);
 
-                        ctx.substitute_mut(&substitutions);
-
+                        let tree = typed.tree.apply(&substitutions);
                         Ok(Typed::computed(
                             substitutions.clone(),
                             typed.constraints.apply(&substitutions),
@@ -3292,7 +3300,7 @@ impl TypingContext {
                                     own_name: rec_lambda.own_name.clone(),
                                     lambda: Lambda {
                                         parameter: rec_lambda.lambda.parameter.clone(),
-                                        body: typed.tree.into(),
+                                        body: tree.into(),
                                     },
                                 },
                             ),
@@ -3366,6 +3374,7 @@ impl TypingContext {
         argument: &namer::Expr,
     ) -> Typing {
         let function = self.infer_expr(function)?;
+
         let mut ctx = self.apply(&function.substitutions);
         let mut constraints = function.constraints;
 
@@ -3423,7 +3432,6 @@ impl TypingContext {
         let domain = Type::fresh();
         let codomain = Type::fresh();
 
-        trace!("lambda-domain {domain}, codomain {codomain}");
         self.bind_term_and_then(
             lambda.parameter.clone(),
             TypeScheme::from_constant(domain.clone()),
@@ -3450,6 +3458,7 @@ impl TypingContext {
                 let body = body.apply(&substitutions);
 
                 let constraints = constraints.apply(&substitutions);
+
                 Ok((
                     substitutions,
                     constraints,

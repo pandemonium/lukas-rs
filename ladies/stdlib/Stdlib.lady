@@ -1,3 +1,6 @@
+use Prelude.
+use State.
+
 List ::= ∀α. Nil | Cons α (List α)
 
 module List:
@@ -84,13 +87,3 @@ module Result:
 
   map :: ∀α β e. (α -> β) -> Result α e -> Result β e :=
     λf ra. result Fault (compose Return f) ra
-
-
-id :: ∀α. α -> α :=
-  λx. x
-
-flip :: ∀α β r. (α -> β -> r) -> β -> α -> r :=
-  λf b a. f a b
-
-compose :: ∀α β γ. (β -> γ) -> (α -> β) -> α -> γ :=
-  λg f a. g (f a)

@@ -2,6 +2,7 @@ pub mod ast;
 pub mod bridge;
 pub mod builtin;
 pub mod closed;
+pub mod codegen;
 pub mod compiler;
 pub mod interpreter;
 pub mod lambda_lift;

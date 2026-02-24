@@ -8,6 +8,7 @@ use crate::{
         self, ROOT_MODULE_NAME,
         namer::{self, NameError},
     },
+    codegen::CodeBuffer,
     interpreter::{
         self, Environment, RuntimeError,
         cek::{Env, Globals},
@@ -136,7 +137,12 @@ impl Compiler {
                 .closure_conversion()
                 .lambda_lift();
 
-            println!("{program}");
+            //            println!("program {program:?}");
+            let mut code = CodeBuffer::default();
+
+            program.generate_code(&mut code).unwrap();
+            println!("/* generated_code.c */\n{}", code);
+
             Ok(())
         } else {
             panic!("Bad dependencies")

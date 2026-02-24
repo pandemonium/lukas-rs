@@ -571,7 +571,7 @@ where
             Self::If(_, x) => write!(f, "{x}"),
             Self::Interpolate(_, x) => write!(f, "{x}"),
             Self::Ascription(_, x) => write!(f, "{}::{}", x.ascribed_tree, x.type_signature),
-            Self::MakeClosure(_, x) => write!(f, "mk_clo {x}"),
+            Self::MakeClosure(_, x) => write!(f, "mk_clo {x}."),
         }
     }
 }
