@@ -286,7 +286,6 @@ impl namer::NamedSymbolTable {
                         type_constructor.defining_context().clone(),
                         method_id.as_str(),
                     );
-                    println!("elaborate_constraints: bind {name} to {scheme}");
                     ctx.bind_free_term(name, scheme);
                 }
             }
@@ -379,9 +378,14 @@ fn discharge_ground_constraints(
     let pi = expr.tree.type_info().parse_info;
 
     for c in ground {
+        //        println!("discharge: constraint {c}");
+
         let witness = witness_index
             .resolve_witness(c, &ctx.types)
             .map_err(|e| e.at(pi))?;
+
+        //        println!("discharge: constraint {c} -- witness {witness}");
+
         evidence.push((c, witness));
     }
 
@@ -960,7 +964,13 @@ impl Constraint {
         let constructor = ctx.types.lookup(&expr.class).ok_or_else(|| {
             TypeError::UndefinedSignature(expr.class.clone()).at(ParseInfo::default())
         })?;
-        let constraint_type = constructor.definition().make_spine_at(types);
+        let arguments = expr
+            .parameters
+            .iter()
+            .map(|te| te.synthesize_type(types, ctx))
+            .collect::<Typing<Vec<_>>>()?;
+
+        let constraint_type = constructor.definition().apply_at(&arguments);
         Ok(Self { constraint_type })
     }
 
@@ -1389,6 +1399,7 @@ impl Type {
             }
 
             (lhs, rhs) => {
+//                panic!("{lhs} != {rhs}");
                 //panic!("unification failed: lhs {lhs} rhs {rhs}");
                 Err(TypeError::UnificationImpossible { lhs: lhs.clone(), rhs: rhs.clone() })
             },
@@ -1566,6 +1577,16 @@ impl TypeConstructorDefinition {
         self.make_spine_at(&self.instantiated_params)
     }
 
+    pub fn apply_at(&self, arguments: &[Type]) -> Type {
+        arguments.iter().fold(
+            Type::Constructor(self.name.clone()),
+            |constructor, argument| Type::Apply {
+                constructor: constructor.into(),
+                argument: argument.clone().into(),
+            },
+        )
+    }
+
     pub fn make_spine_at(
         &self,
         type_parameters: &HashMap<parser::Identifier, MetaVariable>,
@@ -1597,6 +1618,9 @@ pub struct PolyRecordType(Vec<(parser::Identifier, TypeScheme)>);
 
 impl PolyRecordType {
     pub fn from_fields(fields: &[(parser::Identifier, TypeScheme)]) -> Self {
+        let mut fields = fields.to_vec();
+        fields.sort_by(|(t, _), (u, _)| t.cmp(u));
+
         Self(fields.to_vec())
     }
 
@@ -2439,8 +2463,6 @@ impl TypingContext {
         expected_type: &Type,
         lambda: &namer::Lambda,
     ) -> Typing {
-        println!("check_lambda: expected type {expected_type}");
-
         let normalized_type = self
             .expand_type_constructor(pi, expected_type)?
             .unwrap_or_else(|| TypeStructure::Monotype(expected_type.clone()));
@@ -2491,23 +2513,27 @@ impl TypingContext {
                 let mut typed_fields = Vec::with_capacity(record_type.len());
                 let mut expected_types = Vec::with_capacity(record_type.len());
 
-                for ((name, expr), (_, expected_type)) in
+                for ((name, expr), (_, expected_scheme)) in
                     record.fields.iter().zip(record_type.fields())
                 {
-                    let expected_type = expected_type.instantiate();
-                    let typed = self.check_expr(&expected_type.underlying, expr)?;
-                    expected_types.push((name.clone(), expected_type.underlying));
+                    let expected_field_type = expected_scheme.instantiate();
+                    // This, I think, checks against the expanded type when it should have a spine
+                    let typed = self.check_expr(&expected_field_type.underlying, expr)?;
+                    expected_types.push((name.clone(), expected_field_type.underlying));
                     subst = subst.compose(&typed.substitutions);
                     constraints = constraints
                         .apply(&subst)
                         .union(typed.constraints.apply(&subst))
-                        .union(expected_type.constraints);
+                        .union(expected_field_type.constraints);
                     typed_fields.push((name.clone(), typed.tree.into()));
                 }
 
-                let type_info = pi
-                    .with_inferred_type(Type::Record(RecordType::from_fields(&expected_types)))
-                    .apply(&subst);
+                // This is wrong - it must be a spine
+                //let type_info = pi
+                //    .with_inferred_type(Type::Record(RecordType::from_fields(&expected_types)))
+                //    .apply(&subst);
+
+                let type_info = pi.with_inferred_type(expected_type.clone());
 
                 Ok(Typed::computed(
                     subst,

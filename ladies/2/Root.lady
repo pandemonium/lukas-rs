@@ -1,0 +1,40 @@
+Sum ::=
+  { X :: Int
+    Y :: Int
+  }
+
+PolySum ::= ∀α.
+  { Z :: α
+  }
+
+Perhaps ::= ∀α. This α | Nada
+
+signature Monoid ::= ∀α.
+  { mempty :: α
+    mappend :: α -> α -> α
+  }
+
+witness Monoid (PolySum Int) :=
+  { mempty  := { Z := 0 }
+    mappend := λx y. { Z := x.Z + y.Z }
+  }
+
+foo :: ∀α. Perhaps α -> Unit := λx.
+  print_endline "foo: x `x`"
+
+bar :: Sum -> Unit := λx.
+  print_endline "bar: x `x.X * x.Y`"
+
+quux := λx.
+  print_endline "quux: x `x.Z`"
+
+sum :: ∀α. Monoid (PolySum α) |- PolySum α -> PolySum α -> Unit := λp q.
+  print_endline "sum: p + q `mappend p q`"
+
+start := λ_.
+  print_endline "Hi, mom"
+  foo (This 427)
+  foo (Nada)
+  bar { X := 427; Y := 2 }
+  quux { Z := 47 }
+  sum { Z := 1 } { Z := 2 }

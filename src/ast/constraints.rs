@@ -5,7 +5,7 @@ use crate::{
     parser::ParseInfo,
     typer::{
         Apply, Constraint, Expr, RecordShape, Substitutions, Type, TypeEnvironment, TypeError,
-        TypeStructure, Typing, TypingContext,
+        TypeStructure, Typing, TypingContext, display_list,
     },
 };
 
@@ -100,7 +100,7 @@ impl WitnessIndex {
             .get(constraint.name())
             .ok_or_else(|| TypeError::NoWitness(constraint.clone()))?;
 
-        //println!("resolve_witness: candidates {candidates:?}");
+        //        println!("resolve_witness: candidates {candidates:?}");
 
         for witness in candidates {
             let subst = constraint

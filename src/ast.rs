@@ -969,6 +969,7 @@ where
         let Self {
             universal_quantifiers,
             body,
+            constraints,
             ..
         } = self;
         if !universal_quantifiers.is_empty() {
@@ -979,7 +980,30 @@ where
             write!(f, ". ")?;
         }
 
+        if !constraints.is_empty() {
+            write!(f, "{} |- ", display_list(" + ", constraints))?;
+        }
+
         write!(f, "{body}")?;
+
+        Ok(())
+    }
+}
+
+impl<A, TypeId> fmt::Display for ConstraintExpression<A, TypeId>
+where
+    TypeId: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            class, parameters, ..
+        } = self;
+
+        write!(f, "{class}")?;
+
+        if !parameters.is_empty() {
+            write!(f, " {}", display_list(" ", parameters))?;
+        }
 
         Ok(())
     }
