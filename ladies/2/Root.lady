@@ -9,8 +9,19 @@ PolySum ::= ∀α.
 
 Perhaps ::= ∀α. This α | Nada
 
+signature CoShow ::= ∀t.
+  { coshow :: ∀a. (a -> t) -> a -> Text
+  }
+
+witness CoShow Text :=
+  { coshow := λf x. f x
+  }
+
+use_coshow :: ∀t a. CoShow t |- (a -> t) -> a -> Text :=
+  λf x. coshow f x
+
 signature Monoid ::= ∀α.
-  { mempty :: α
+  { mempty  :: α
     mappend :: α -> α -> α
   }
 
@@ -38,3 +49,5 @@ start := λ_.
   bar { X := 427; Y := 2 }
   quux { Z := 47 }
   sum { Z := 1 } { Z := 2 }
+  let text = use_coshow (λa. "coshow: `a`.") 427
+  in print_endline text

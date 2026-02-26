@@ -59,7 +59,7 @@ impl typer::SymbolTable {
             module_members: self.module_members,
             member_modules: self.member_modules,
             imports: self.imports,
-            constraints: self.constraints,
+            signatures: self.signatures,
             witnesses: self.witnesses,
         }
     }

@@ -516,7 +516,7 @@ pub struct SymbolTable<A, GlobalName, LocalId> {
     pub symbols: HashMap<SymbolName, Symbol<A, GlobalName, LocalId>>,
     pub imports: Vec<parser::IdentifierPath>,
 
-    pub constraints: HashSet<QualifiedName>,
+    pub signatures: HashSet<QualifiedName>,
     pub witnesses: HashSet<QualifiedName>,
 }
 
@@ -527,7 +527,7 @@ impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
             member_modules: HashMap::default(),
             symbols: HashMap::default(),
             imports: Vec::default(),
-            constraints: HashSet::default(),
+            signatures: HashSet::default(),
             witnesses: HashSet::default(),
         }
     }
@@ -756,8 +756,8 @@ impl ParserSymbolTable {
                     self.add_use_declaration(compiler, &module_path, decl)?
                 }
 
-                Declaration::Constraint(_, decl) => {
-                    self.add_constraint_declaration(&module_path, decl)
+                Declaration::Signature(_, decl) => {
+                    self.add_signature_declaration(&module_path, decl)
                 }
 
                 Declaration::Witness(_, decl) => {
@@ -794,10 +794,10 @@ impl ParserSymbolTable {
         self.witnesses.insert(name);
     }
 
-    fn add_constraint_declaration(
+    fn add_signature_declaration(
         &mut self,
         module_path: &IdentifierPath,
-        decl: ast::ConstraintDeclaration<ParseInfo>,
+        decl: ast::SignatureDeclaration<ParseInfo>,
     ) {
         let name = QualifiedName::new(module_path.clone(), decl.name.as_str());
         self.add_module_type_member(module_path.clone(), decl.name);
@@ -808,7 +808,7 @@ impl ParserSymbolTable {
             name.clone(),
             decl.declarator.as_type_symbol(&decl.type_parameters, &name),
         );
-        self.constraints.insert(name);
+        self.signatures.insert(name);
     }
 
     fn add_use_declaration(
@@ -1832,7 +1832,7 @@ impl ParserSymbolTable {
                 .collect::<Naming<_>>()?,
             imports: self.imports,
             // Any kind of renaming necessary here?
-            constraints: self.constraints.clone(),
+            signatures: self.signatures.clone(),
             // Any kind of renaming necessary here?
             witnesses: self.witnesses.clone(),
         })

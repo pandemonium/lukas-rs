@@ -115,7 +115,7 @@ impl<A> namer::SymbolTable<A, namer::QualifiedName, namer::Identifier> {
         }
 
         // Also add constraint methods
-        for constraint_name in &self.constraints {
+        for constraint_name in &self.signatures {
             let constraint = self
                 .symbols
                 .get(&SymbolName::Type(constraint_name.clone()))
@@ -197,7 +197,7 @@ impl namer::NamedSymbolTable {
             member_modules: self.member_modules,
             symbols,
             imports: self.imports,
-            constraints: self.constraints,
+            signatures: self.signatures,
             witnesses: self.witnesses,
         })
     }
@@ -265,7 +265,7 @@ impl namer::NamedSymbolTable {
     }
 
     fn insert_constraint_method_placeholders(&self, ctx: &mut TypingContext) -> Typing<()> {
-        for c in &self.constraints {
+        for c in &self.signatures {
             let type_constructor = ctx
                 .types
                 .lookup(c)

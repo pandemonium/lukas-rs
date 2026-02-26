@@ -28,12 +28,12 @@ pub enum Declaration<A> {
     Module(A, ModuleDeclaration<A>),
     Type(A, TypeDeclaration<A>),
     Use(A, UseDeclaration<A>),
-    Constraint(A, ConstraintDeclaration<A>),
+    Signature(A, SignatureDeclaration<A>),
     Witness(A, WitnessDeclaration<A>),
 }
 
 #[derive(Debug)]
-pub struct ConstraintDeclaration<A> {
+pub struct SignatureDeclaration<A> {
     pub name: parser::Identifier,
     pub type_parameters: Vec<TypeVariable>,
     pub declarator: RecordDeclarator<A>,
@@ -97,10 +97,11 @@ pub struct TypeVariable {
 
 impl TypeVariable {
     pub fn star(name: parser::Identifier) -> Self {
-        Self {
-            name,
-            kind: Kind::default(),
-        }
+        Self::with_kind(name, Kind::default())
+    }
+
+    pub fn with_kind(name: parser::Identifier, kind: Kind) -> Self {
+        Self { name, kind }
     }
 }
 
@@ -777,13 +778,13 @@ where
             Self::Module(_, decl) => write!(f, "module {decl}"),
             Self::Type(_, decl) => write!(f, "type {decl}"),
             Self::Use(_, decl) => write!(f, "use {decl}"),
-            Self::Constraint(_, decl) => write!(f, "constraint {decl}"),
+            Self::Signature(_, decl) => write!(f, "constraint {decl}"),
             Self::Witness(_, decl) => write!(f, "witness {decl}"),
         }
     }
 }
 
-impl<A> fmt::Display for ConstraintDeclaration<A>
+impl<A> fmt::Display for SignatureDeclaration<A>
 where
     A: fmt::Display,
 {

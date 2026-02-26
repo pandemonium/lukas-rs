@@ -5,8 +5,8 @@ use thiserror::Error;
 
 use crate::{
     ast::{
-        self, ApplyTypeExpr, ArrowTypeExpr, ConstraintDeclaration, CoproductConstructor,
-        Declaration, FieldDeclarator, ModuleDeclaration, ModuleDeclarator, Tree, TupleTypeExpr,
+        self, ApplyTypeExpr, ArrowTypeExpr, CoproductConstructor, Declaration, FieldDeclarator,
+        Kind, ModuleDeclaration, ModuleDeclarator, SignatureDeclaration, Tree, TupleTypeExpr,
         TypeDeclaration, TypeDeclarator, TypeVariable, UseDeclaration, ValueDeclaration,
         ValueDeclarator, WitnessDeclaration, namer::QualifiedName,
     },
@@ -614,9 +614,9 @@ impl<'a> Parser<'a> {
                 // constraint <id> <::=>
                 self.advance(3);
 
-                Ok(Declaration::Constraint(
+                Ok(Declaration::Signature(
                     ParseInfo::from_position(*position),
-                    ConstraintDeclaration {
+                    SignatureDeclaration {
                         name: Identifier::from_str(name),
                         type_parameters: self.parse_forall_clause()?,
                         declarator: if let TypeDeclarator::Record(_, record) =
@@ -676,10 +676,17 @@ impl<'a> Parser<'a> {
 
             let mut params = vec![];
             while self.peek()?.is_identifier() {
-                params.push(
-                    self.identifier()
-                        .map(|(_, image)| TypeVariable::star(Identifier { image }))?,
-                );
+                let id = self.identifier();
+
+                params.push(if matches!(self.peek()?.kind, TokenKind::Colon) {
+                    // :
+                    self.advance(1);
+
+                    let kind = self.parse_kind_specifier()?;
+                    id.map(|(_, image)| TypeVariable::with_kind(Identifier { image }, kind))?
+                } else {
+                    id.map(|(_, image)| TypeVariable::star(Identifier { image }))?
+                });
             }
 
             if params.is_empty() {
@@ -691,6 +698,92 @@ impl<'a> Parser<'a> {
             Ok(params)
         } else {
             Ok(vec![])
+        }
+    }
+
+    fn parse_kind_specifier(&mut self) -> Result<Kind> {
+        let prefix = self.parse_kind_spec_prefix()?;
+        self.parse_kind_spec_infix(prefix)
+    }
+
+    fn parse_kind_spec_prefix(&mut self) -> Result<Kind> {
+        match self.remains() {
+            [
+                Token {
+                    kind: TokenKind::LeftParen,
+                    ..
+                },
+                ..,
+            ] => {
+                // (
+                self.advance(1);
+
+                let kind = self.parse_kind_specifier()?;
+                self.expect(TokenKind::RightParen)?;
+
+                Ok(kind)
+            }
+
+            [
+                Token {
+                    kind: TokenKind::Star,
+                    ..
+                },
+                ..,
+            ] => {
+                // *
+                self.advance(1);
+
+                Ok(Kind::Star)
+            }
+
+            otherwise => panic!("{otherwise:?}"),
+        }
+    }
+
+    fn parse_kind_spec_infix(&mut self, prefix: Kind) -> Result<Kind> {
+        match self.remains() {
+            [
+                Token {
+                    kind: TokenKind::Arrow,
+                    ..
+                },
+                Token {
+                    kind: TokenKind::Star,
+                    ..
+                },
+                ..,
+            ] => {
+                // -> *
+                self.advance(2);
+                self.parse_kind_spec_infix(Kind::Arrow(prefix.into(), Kind::Star.into()))
+            }
+
+            [
+                Token {
+                    kind: TokenKind::Arrow,
+                    ..
+                },
+                Token {
+                    kind: TokenKind::LeftParen,
+                    ..
+                },
+                ..,
+            ] => {
+                // -> (
+                self.advance(2);
+
+                let kind = Kind::Arrow(prefix.into(), self.parse_kind_specifier()?.into());
+                self.expect(TokenKind::RightParen)?;
+
+                if self.peek()?.kind == TokenKind::Arrow {
+                    self.parse_kind_spec_infix(kind)
+                } else {
+                    Ok(kind)
+                }
+            }
+
+            _otherwise => Ok(prefix),
         }
     }
 
@@ -2026,7 +2119,10 @@ fn unspine_tuple_pattern(elements: Vec<Pattern>) -> Vec<Pattern> {
 
 impl TypeExpression {
     fn is_applicable(&self) -> bool {
-        matches!(self, Self::Constructor(..) | Self::Apply(..))
+        matches!(
+            self,
+            Self::Parameter(..) | Self::Constructor(..) | Self::Apply(..)
+        )
     }
 }
 
