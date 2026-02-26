@@ -1,6 +1,6 @@
 use crate::{
     ast::{
-        BUILTIN_MODULE_NAME, STDLIB_MODULE_NAME,
+        BUILTIN_MODULE_NAME, Kind, STDLIB_MODULE_NAME,
         namer::{Symbol, TypeDefinition, TypeOrigin, TypeSymbol},
     },
     bridge::{External, Lambda1, Lambda2, PartialRawLambda2, RawLambda1},
@@ -9,11 +9,11 @@ use crate::{
     lexer::Operator,
     parser::{self, ParseInfo},
     rawlambda1,
-    typer::{BaseType, ConstraintSet, Kind, Type, TypeParameter, TypeScheme},
+    typer::{BaseType, ConstraintSet, MetaVariable, Type, TypeScheme},
 };
 
 fn comparison_signature() -> TypeScheme {
-    let tp = TypeParameter::fresh();
+    let tp = MetaVariable::fresh();
     TypeScheme {
         quantifiers: vec![tp.clone()],
         underlying: Type::Arrow {
@@ -30,7 +30,7 @@ fn comparison_signature() -> TypeScheme {
 }
 
 fn artithmetic_signature() -> TypeScheme {
-    let tp = TypeParameter::fresh();
+    let tp = MetaVariable::fresh();
     TypeScheme {
         quantifiers: vec![tp.clone()],
         underlying: Type::Arrow {

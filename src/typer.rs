@@ -14,7 +14,7 @@ use tracing::instrument;
 
 use crate::{
     ast::{
-        self, ApplyTypeExpr, ArrowTypeExpr, Literal, ProductElement, Tree, TupleTypeExpr,
+        self, ApplyTypeExpr, ArrowTypeExpr, Kind, Literal, ProductElement, Tree, TupleTypeExpr,
         annotation::Annotated,
         constraints::{Witness, WitnessIndex},
         namer::{
@@ -144,28 +144,37 @@ impl<A> namer::SymbolTable<A, namer::QualifiedName, namer::Identifier> {
 impl namer::TypeSignature {
     pub fn type_scheme(
         &self,
-        type_param_map: &mut HashMap<parser::Identifier, TypeParameter>,
+        context_type_param_map: &HashMap<parser::Identifier, MetaVariable>,
         ctx: &TypingContext,
     ) -> Typing<TypeScheme> {
         let type_params = self
             .universal_quantifiers
             .iter()
-            .map(|id| (id.clone(), TypeParameter::fresh()))
+            .map(|id| {
+                (
+                    id.name.clone(),
+                    MetaVariable::fresh_with_kind(id.kind.clone()),
+                )
+            })
             .collect::<Vec<_>>();
 
         let quantifiers = type_params.iter().map(|(_, p)| p.clone()).collect();
 
-        *type_param_map = type_params.iter().cloned().collect::<HashMap<_, _>>();
+        let type_param_map = context_type_param_map
+            .iter()
+            .map(|(p, q)| (p.clone(), q.clone()))
+            .chain(type_params.iter().cloned())
+            .collect::<HashMap<_, _>>();
 
         let constraints = self
             .constraints
             .iter()
-            .map(|c| Constraint::from_constraint_expr(type_param_map, c, ctx))
+            .map(|c| Constraint::from_constraint_expr(&type_param_map, c, ctx))
             .collect::<Typing<Vec<_>>>()?;
 
         Ok(TypeScheme {
             quantifiers,
-            underlying: self.body.synthesize_type(type_param_map, ctx)?,
+            underlying: self.body.synthesize_type(&type_param_map, ctx)?,
             constraints: ConstraintSet::from(constraints.as_slice()),
         })
     }
@@ -268,20 +277,17 @@ impl namer::NamedSymbolTable {
                 [Constraint::from_type_constructor(&type_constructor)].as_slice(),
             );
 
-            if let Type::Record(RecordType(shape)) = type_constructor.structure()? {
-                for (method_id, ty) in shape {
-                    let scheme = Constrained {
-                        constraints: constraints.clone(),
-                        underlying: ty.clone(),
-                    }
-                    .generalize(ctx);
+            if let TypeStructure::PolyRecord(record_type) = type_constructor.structure()? {
+                for (method_id, scheme) in record_type.fields() {
+                    let mut scheme = scheme.clone();
+                    scheme.constraints = scheme.constraints.union(constraints.clone());
 
                     let name = QualifiedName::new(
                         type_constructor.defining_context().clone(),
                         method_id.as_str(),
                     );
                     println!("elaborate_constraints: bind {name} to {scheme}");
-                    ctx.bind_free_term(name, scheme.underlying);
+                    ctx.bind_free_term(name, scheme);
                 }
             }
         }
@@ -343,7 +349,7 @@ fn elaborate_constraints_from_signature(
     signature: &ast::TypeSignature<ParseInfo, QualifiedName>,
     ctx: &mut TypingContext,
 ) -> Typing<()> {
-    let scheme = signature.type_scheme(&mut HashMap::default(), ctx)?;
+    let scheme = signature.type_scheme(&HashMap::default(), ctx)?;
     for c in scheme.constraints.iter() {
         abstract_constraint(c, &mut expr.tree, ctx)?;
     }
@@ -639,7 +645,7 @@ pub enum TypeError {
     UnificationImpossible { lhs: Type, rhs: Type },
 
     #[error("infinite type\ntype variable: {param}\noccurs in: {ty}")]
-    InfiniteType { param: TypeParameter, ty: Type },
+    InfiniteType { param: MetaVariable, ty: Type },
 
     #[error(
         "bad projection\nfrom type: {inferred_base_type}\n{} does not have a member: {}",
@@ -830,7 +836,7 @@ impl Constrained<Type> {
         }
     }
 
-    fn free_variables(&self, ctx: &TypingContext) -> HashSet<TypeParameter> {
+    fn free_variables(&self, ctx: &TypingContext) -> HashSet<MetaVariable> {
         let ty_vars = self.underlying.variables();
         let ctx_bounds = ctx.free_variables();
         ty_vars.difference(&ctx_bounds).cloned().collect()
@@ -947,7 +953,7 @@ impl Type {
 
 impl Constraint {
     pub fn from_constraint_expr(
-        types: &HashMap<parser::Identifier, TypeParameter>,
+        types: &HashMap<parser::Identifier, MetaVariable>,
         expr: &namer::ConstraintExpression,
         ctx: &TypingContext,
     ) -> Typing<Constraint> {
@@ -976,7 +982,7 @@ impl Constraint {
         }
     }
 
-    fn variables(&self) -> HashSet<TypeParameter> {
+    fn variables(&self) -> HashSet<MetaVariable> {
         self.constraint_type.variables()
     }
 
@@ -1061,13 +1067,6 @@ impl CoproductType {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Kind {
-    #[default]
-    Star,
-    Arrow(Box<Kind>, Box<Kind>),
-}
-
 impl Kind {
     pub fn apply(self, at: Kind) -> Result<Self, TypeError> {
         match self {
@@ -1082,7 +1081,7 @@ impl Kind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Type {
-    Variable(TypeParameter),
+    Variable(MetaVariable),
     Base(BaseType),
     Arrow {
         domain: Box<Type>,
@@ -1131,7 +1130,7 @@ impl Type {
         };
 
         match self {
-            Self::Variable(TypeParameter(p, _)) => {
+            Self::Variable(MetaVariable(p, _)) => {
                 parser::TypeExpression::Parameter(pi, type_param_map[*p as usize].clone())
             }
             Self::Base(BaseType::Int) => {
@@ -1174,7 +1173,7 @@ impl Type {
     }
 
     pub fn fresh() -> Self {
-        Self::Variable(TypeParameter::fresh())
+        Self::Variable(MetaVariable::fresh())
     }
 
     pub fn is_base(&self) -> bool {
@@ -1226,7 +1225,7 @@ impl Type {
         }
     }
 
-    pub fn variables(&self) -> HashSet<TypeParameter> {
+    pub fn variables(&self) -> HashSet<MetaVariable> {
         let mut vars = HashSet::default();
         self.walk(&mut |ty| {
             if let Type::Variable(tp) = ty {
@@ -1444,18 +1443,33 @@ impl TupleType {
 impl RecordSymbol {
     fn synthesize_type(
         &self,
-        type_params: &HashMap<parser::Identifier, TypeParameter>,
+        type_params: &HashMap<parser::Identifier, MetaVariable>,
         ctx: &TypingContext,
-    ) -> Typing<Type> {
-        Ok(Type::Record(RecordType::from_fields(
+    ) -> Typing<TypeStructure> {
+        //        Ok(Type::Record(RecordType::from_fields(
+        //            &self
+        //                .fields
+        //                .iter()
+        //                .map(|field| {
+        //                    // all fields must synthesize in their own type_params
+        //                    // -- but when are these instantiated?
+        //
+        //                    field
+        //                        .type_signature
+        //                        .synthesize_type(type_params, ctx)
+        //                        .map(|ty| (field.name.clone(), ty))
+        //                })
+        //                .collect::<Typing<Vec<_>>>()?,
+        //        )))
+
+        Ok(TypeStructure::PolyRecord(PolyRecordType::from_fields(
             &self
                 .fields
                 .iter()
-                .map(|field| {
-                    field
-                        .type_signature
-                        .synthesize_type(type_params, ctx)
-                        .map(|ty| (field.name.clone(), ty))
+                .map(|f| {
+                    f.type_signature
+                        .type_scheme(type_params, ctx)
+                        .map(|scheme| (f.name.clone(), scheme))
                 })
                 .collect::<Typing<Vec<_>>>()?,
         )))
@@ -1465,7 +1479,7 @@ impl RecordSymbol {
 impl CoproductSymbol {
     pub fn synthesize_type(
         &self,
-        type_params: &HashMap<parser::Identifier, TypeParameter>,
+        type_params: &HashMap<parser::Identifier, MetaVariable>,
         ctx: &TypingContext,
     ) -> Typing<Type> {
         Ok(Type::Coproduct(CoproductType::from_constructors(
@@ -1487,7 +1501,7 @@ impl CoproductSymbol {
 impl TypeExpression {
     fn synthesize_type(
         &self,
-        type_params: &HashMap<parser::Identifier, TypeParameter>,
+        type_params: &HashMap<parser::Identifier, MetaVariable>,
         ctx: &TypingContext,
     ) -> Typing<Type> {
         match self {
@@ -1537,13 +1551,13 @@ impl TypeExpression {
 #[derive(Debug, Clone)]
 pub struct ElaboratedTypeConstructor {
     pub definition: TypeConstructorDefinition,
-    pub structure: Type,
+    pub structure: TypeStructure,
 }
 
 #[derive(Debug, Clone)]
 pub struct TypeConstructorDefinition {
     pub name: namer::QualifiedName,
-    pub instantiated_params: HashMap<parser::Identifier, TypeParameter>,
+    pub instantiated_params: HashMap<parser::Identifier, MetaVariable>,
     pub defining_symbol: TypeSymbol<namer::QualifiedName>,
 }
 
@@ -1554,13 +1568,13 @@ impl TypeConstructorDefinition {
 
     pub fn make_spine_at(
         &self,
-        type_parameters: &HashMap<parser::Identifier, TypeParameter>,
+        type_parameters: &HashMap<parser::Identifier, MetaVariable>,
     ) -> Type {
         self.defining_symbol.type_parameters().iter().fold(
             Type::Constructor(self.name.clone()),
             |constructor, param| Type::Apply {
                 constructor: constructor.into(),
-                argument: Type::Variable(type_parameters[param].clone()).into(),
+                argument: Type::Variable(type_parameters[&param.name].clone()).into(),
             },
         )
     }
@@ -1575,6 +1589,75 @@ impl TypeConstructorDefinition {
 
     fn head(&self) -> Type {
         Type::Constructor(self.name.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PolyRecordType(Vec<(parser::Identifier, TypeScheme)>);
+
+impl PolyRecordType {
+    pub fn from_fields(fields: &[(parser::Identifier, TypeScheme)]) -> Self {
+        Self(fields.to_vec())
+    }
+
+    pub fn shape(&self) -> RecordShape {
+        RecordShape(self.0.iter().map(|(label, _)| label).cloned().collect())
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn fields(&self) -> impl Iterator<Item = &(parser::Identifier, TypeScheme)> {
+        self.0.iter()
+    }
+
+    pub fn field_info(&self, field_name: &parser::Identifier) -> Option<(usize, &TypeScheme)> {
+        self.0
+            .iter()
+            .enumerate()
+            .find_map(|(index, (name, scheme))| (name == field_name).then_some((index, scheme)))
+    }
+
+    pub fn apply(&self, subst: &Substitutions) -> Self {
+        Self(
+            self.0
+                .iter()
+                .map(|(label, scheme)| (label.clone(), scheme.apply(subst)))
+                .collect(),
+        )
+    }
+
+    pub fn materialize_type(&self) -> Type {
+        Type::Record(RecordType::from_fields(
+            &self
+                .0
+                .iter()
+                .map(|(label, scheme)| (label.clone(), scheme.instantiate().underlying.clone()))
+                .collect::<Vec<_>>(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TypeStructure {
+    Monotype(Type),
+    PolyRecord(PolyRecordType),
+}
+
+impl TypeStructure {
+    fn apply(&self, subst: &Substitutions) -> Self {
+        match self {
+            Self::Monotype(ty) => Self::Monotype(ty.apply(subst)),
+            Self::PolyRecord(shape) => Self::PolyRecord(shape.apply(subst)),
+        }
+    }
+
+    fn materialize_monotype(&self) -> Type {
+        match self {
+            Self::Monotype(monotype) => monotype.clone(),
+            Self::PolyRecord(record) => record.materialize_type(),
+        }
     }
 }
 
@@ -1601,7 +1684,7 @@ impl TypeConstructor {
                     instantiated_params: HashMap::default(),
                     defining_symbol: symbol.clone(),
                 },
-                structure: Type::Base(*base_type),
+                structure: TypeStructure::Monotype(Type::Base(*base_type)),
             })
         } else {
             Self::Unelaborated(TypeConstructorDefinition {
@@ -1648,7 +1731,7 @@ impl TypeConstructor {
         }
     }
 
-    pub fn structure(&self) -> Typing<&Type> {
+    pub fn structure(&self) -> Typing<&TypeStructure> {
         if let Self::Elaborated(c) = self {
             Ok(&c.structure)
         } else {
@@ -1673,31 +1756,38 @@ impl TypeConstructor {
 
 fn fresh_type_parameters(
     symbol: &TypeSymbol<QualifiedName>,
-) -> HashMap<parser::Identifier, TypeParameter> {
+) -> HashMap<parser::Identifier, MetaVariable> {
     symbol
         .type_parameters()
         .iter()
-        .map(|tp| (tp.clone(), TypeParameter::fresh()))
+        .map(|tv| {
+            (
+                tv.name.clone(),
+                MetaVariable::fresh_with_kind(tv.kind.clone()),
+            )
+        })
         .collect()
 }
 
 impl TypeDefinition<QualifiedName> {
     pub fn synthesize_type(
         &self,
-        type_param_map: &HashMap<parser::Identifier, TypeParameter>,
+        type_param_map: &HashMap<parser::Identifier, MetaVariable>,
         ctx: &TypingContext,
-    ) -> Typing<Type> {
+    ) -> Typing<TypeStructure> {
         match self {
             Self::Record(record) => record.synthesize_type(type_param_map, ctx),
-            Self::Coproduct(coproduct) => coproduct.synthesize_type(type_param_map, ctx),
-            Self::Builtin(base_type) => Ok(Type::Base(*base_type)),
+            Self::Coproduct(coproduct) => Ok(TypeStructure::Monotype(
+                coproduct.synthesize_type(type_param_map, ctx)?,
+            )),
+            Self::Builtin(base_type) => Ok(TypeStructure::Monotype(Type::Base(*base_type))),
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct TypeScheme {
-    pub quantifiers: Vec<TypeParameter>,
+    pub quantifiers: Vec<MetaVariable>,
     pub underlying: Type,
     pub constraints: ConstraintSet,
 }
@@ -1739,7 +1829,7 @@ impl TypeScheme {
         }
     }
 
-    pub fn free_variables(&self) -> HashSet<TypeParameter> {
+    pub fn free_variables(&self) -> HashSet<MetaVariable> {
         let mut vars = self.underlying.variables();
         for q in &self.quantifiers {
             vars.remove(q);
@@ -1749,11 +1839,11 @@ impl TypeScheme {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TypeParameter(u32, Kind);
+pub struct MetaVariable(u32, Kind);
 
 static FRESH_TYPE_ID: AtomicU32 = AtomicU32::new(0);
 
-impl TypeParameter {
+impl MetaVariable {
     pub fn fresh() -> Self {
         Self::fresh_with_kind(Kind::default())
     }
@@ -1769,10 +1859,10 @@ impl TypeParameter {
 
 //pub struct Substitutions(Vec<(TypeParamter, Type)>);
 #[derive(Debug, Default, Clone)]
-pub struct Substitutions(Vec<(TypeParameter, Type)>);
+pub struct Substitutions(Vec<(MetaVariable, Type)>);
 
 impl Substitutions {
-    pub fn substitution(&self, rhs: &TypeParameter) -> Option<&Type> {
+    pub fn substitution(&self, rhs: &MetaVariable) -> Option<&Type> {
         self.iter()
             .rev()
             .find_map(|(lhs, ty)| (lhs == rhs).then_some(ty))
@@ -1792,7 +1882,7 @@ impl Substitutions {
         Substitutions(out)
     }
 
-    fn remove(&mut self, param: &TypeParameter) {
+    fn remove(&mut self, param: &MetaVariable) {
         self.0.retain(|(tp, ..)| param != tp);
     }
 }
@@ -1815,14 +1905,14 @@ impl fmt::Display for Substitutions {
     }
 }
 
-impl From<Vec<(TypeParameter, Type)>> for Substitutions {
-    fn from(value: Vec<(TypeParameter, Type)>) -> Self {
+impl From<Vec<(MetaVariable, Type)>> for Substitutions {
+    fn from(value: Vec<(MetaVariable, Type)>) -> Self {
         Self(value)
     }
 }
 
 impl Deref for Substitutions {
-    type Target = [(TypeParameter, Type)];
+    type Target = [(MetaVariable, Type)];
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -1847,7 +1937,7 @@ impl TermEnvironment {
         }
     }
 
-    pub fn free_variables(&self) -> HashSet<TypeParameter> {
+    pub fn free_variables(&self) -> HashSet<MetaVariable> {
         self.bound
             .iter()
             .flat_map(|ts| ts.free_variables())
@@ -1904,17 +1994,14 @@ struct RecordShapeIndex {
 }
 
 impl RecordShapeIndex {
-    fn insert(&mut self, record_type: &RecordType, name: namer::QualifiedName) {
-        for field_name in record_type.fields() {
+    fn insert(&mut self, record: RecordShape, name: namer::QualifiedName) {
+        for field_name in record.fields() {
             self.field_names
-                .entry(field_name.0.clone())
+                .entry(field_name.clone())
                 .or_default()
                 .push(name.clone());
         }
-        self.shape_name
-            .entry(record_type.shape())
-            .or_default()
-            .push(name);
+        self.shape_name.entry(record).or_default().push(name);
     }
 
     fn type_constructor_names_by_shape(
@@ -2013,11 +2100,16 @@ pub struct TypingContext {
 }
 
 impl TypingContext {
-    pub fn normalize_type_application(&self, pi: ParseInfo, ty: &Type) -> Typing<Type> {
+    pub fn expand_type_constructor(
+        &self,
+        pi: ParseInfo,
+        ty: &Type,
+    ) -> Typing<Option<TypeStructure>> {
         if let Type::Constructor { .. } | Type::Apply { .. } = ty {
             self.reduce_applied_constructor(pi, ty, &mut vec![])
+                .map(Some)
         } else {
-            Ok(ty.clone())
+            Ok(None)
         }
     }
 
@@ -2026,7 +2118,7 @@ impl TypingContext {
         pi: ParseInfo,
         applied: &Type,
         arguments: &mut Vec<Type>,
-    ) -> Typing<Type> {
+    ) -> Typing<TypeStructure> {
         match applied {
             Type::Constructor(name) => {
                 let constructor = self
@@ -2054,11 +2146,11 @@ impl TypingContext {
                         .defining_symbol
                         .type_parameters()
                         .iter()
-                        .map(|p| {
+                        .map(|tv| {
                             definition
                                 .instantiated_params
-                                .get(p)
-                                .unwrap_or_else(|| panic!("Unmapped type parameter: {p}"))
+                                .get(&tv.name)
+                                .unwrap_or_else(|| panic!("Unmapped type parameter: {tv}"))
                         })
                         .cloned()
                         .zip(arguments.drain(..))
@@ -2076,7 +2168,10 @@ impl TypingContext {
                 self.reduce_applied_constructor(pi, constructor, arguments)
             }
 
-            _ => Ok(applied.clone()),
+            _ => {
+                println!("reduce_applied_constructor: fallback with {applied}");
+                Ok(TypeStructure::Monotype(applied.clone()))
+            }
         }
     }
 
@@ -2122,12 +2217,12 @@ impl TypingContext {
         for constructor in self.types.bindings.values() {
             if let TypeConstructor::Elaborated(constructor) = constructor {
                 match &constructor.structure {
-                    Type::Record(shape) => self
+                    TypeStructure::PolyRecord(record_type) => self
                         .types
                         .record_shapes
-                        .insert(shape, constructor.definition.name.clone()),
+                        .insert(record_type.shape(), constructor.definition.name.clone()),
 
-                    Type::Coproduct(coproduct) => {
+                    TypeStructure::Monotype(Type::Coproduct(coproduct)) => {
                         for (constructor_name, _) in &coproduct.0 {
                             self.types.coproduct_constructors.insert(
                                 constructor_name.clone(),
@@ -2255,9 +2350,9 @@ impl TypingContext {
         expected_type: &Type,
         construct: &namer::Injection,
     ) -> Typing {
-        let normalized_type = self.normalize_type_application(pi, expected_type)?;
+        let normalized_type = self.expand_type_constructor(pi, expected_type)?;
 
-        if let Type::Coproduct(coproduct) = &normalized_type {
+        if let Some(TypeStructure::Monotype(Type::Coproduct(coproduct))) = &normalized_type {
             let signature = coproduct.signature(&construct.constructor).ok_or_else(|| {
                 TypeError::NoSuchCoproductConstructor(construct.constructor.clone()).at(pi)
             })?;
@@ -2299,8 +2394,8 @@ impl TypingContext {
         expected_type: &Type,
         rec: &namer::SelfReferential,
     ) -> Typing {
-        let normalized_type = self.normalize_type_application(pi, expected_type)?;
-        if let Type::Arrow { domain, codomain } = &normalized_type {
+        let normalized_type = self.expand_type_constructor(pi, expected_type)?;
+        if let Some(TypeStructure::Monotype(Type::Arrow { domain, codomain })) = &normalized_type {
             self.bind_term_and_then(
                 rec.own_name.clone(),
                 TypeScheme::from_constant(expected_type.clone()),
@@ -2344,8 +2439,13 @@ impl TypingContext {
         expected_type: &Type,
         lambda: &namer::Lambda,
     ) -> Typing {
-        let normalized_type = self.normalize_type_application(pi, expected_type)?;
-        if let Type::Arrow { domain, codomain } = &normalized_type {
+        println!("check_lambda: expected type {expected_type}");
+
+        let normalized_type = self
+            .expand_type_constructor(pi, expected_type)?
+            .unwrap_or_else(|| TypeStructure::Monotype(expected_type.clone()));
+
+        if let TypeStructure::Monotype(Type::Arrow { domain, codomain }) = &normalized_type {
             self.bind_term_and_then(
                 lambda.parameter.clone(),
                 TypeScheme::from_constant(*domain.clone()),
@@ -2369,7 +2469,7 @@ impl TypingContext {
                 },
             )
         } else {
-            todo!()
+            panic!("{normalized_type:?}")
         }
     }
 
@@ -2380,21 +2480,28 @@ impl TypingContext {
         expected_type: &Type,
         record: &namer::Record,
     ) -> Typing {
-        let normalized_type = self.normalize_type_application(pi, expected_type)?;
+        let normalized_type = self
+            .expand_type_constructor(pi, expected_type)?
+            .unwrap_or_else(|| TypeStructure::Monotype(expected_type.clone()));
 
         match normalized_type {
-            Type::Record(RecordType(expected_types)) => {
+            TypeStructure::PolyRecord(record_type) => {
                 let mut constraints = ConstraintSet::default();
                 let mut subst = Substitutions::default();
-                let mut typed_fields = Vec::with_capacity(expected_types.len());
+                let mut typed_fields = Vec::with_capacity(record_type.len());
+                let mut expected_types = Vec::with_capacity(record_type.len());
 
-                for ((name, expr), (_, expected_type)) in record.fields.iter().zip(&expected_types)
+                for ((name, expr), (_, expected_type)) in
+                    record.fields.iter().zip(record_type.fields())
                 {
-                    let typed = self.check_expr(expected_type, expr)?;
+                    let expected_type = expected_type.instantiate();
+                    let typed = self.check_expr(&expected_type.underlying, expr)?;
+                    expected_types.push((name.clone(), expected_type.underlying));
                     subst = subst.compose(&typed.substitutions);
                     constraints = constraints
                         .apply(&subst)
-                        .union(typed.constraints.apply(&subst));
+                        .union(typed.constraints.apply(&subst))
+                        .union(expected_type.constraints);
                     typed_fields.push((name.clone(), typed.tree.into()));
                 }
 
@@ -2414,10 +2521,9 @@ impl TypingContext {
                 ))
             }
 
-            Type::Variable(..) => {
-                todo!()
-            }
-
+            //TypeStructure::Monotype(Type::Variable(..)) => {
+            //    todo!()
+            //}
             _otherwise => Err(TypeError::Disappointed {
                 expected: expected_type.clone(),
                 from: namer::Expr::Record(pi, record.clone()),
@@ -2429,10 +2535,12 @@ impl TypingContext {
     #[instrument]
     fn check_tuple(&mut self, pi: ParseInfo, expected_type: &Type, tuple: &namer::Tuple) -> Typing {
         let mut constraints = ConstraintSet::default();
-        let normalized_type = self.normalize_type_application(pi, expected_type)?;
+        let normalized_type = self
+            .expand_type_constructor(pi, expected_type)?
+            .unwrap_or_else(|| TypeStructure::Monotype(expected_type.clone()));
 
         match normalized_type {
-            Type::Tuple(TupleType(elements)) => {
+            TypeStructure::Monotype(Type::Tuple(TupleType(elements))) => {
                 let mut typed_elements = Vec::with_capacity(elements.len());
                 let mut substitutions = Substitutions::default();
 
@@ -2458,13 +2566,13 @@ impl TypingContext {
                 ))
             }
 
-            Type::Variable(..) => {
+            TypeStructure::Monotype(ty @ Type::Variable(..)) => {
                 let inferred = self.infer_expr(&namer::Expr::Tuple(pi, tuple.clone()))?;
                 let unification = inferred
                     .tree
                     .type_info()
                     .inferred_type
-                    .unified_with(&normalized_type, &self.types)
+                    .unified_with(&ty, &self.types)
                     .map_err(|e| e.at(pi))?;
                 Ok(inferred.apply(&unification))
             }
@@ -2575,7 +2683,7 @@ impl TypingContext {
         // What is a good way to deal with a "current set" of alpha type parameters?
         let ascribed_scheme = ascription
             .type_signature
-            .type_scheme(&mut HashMap::default(), self)?;
+            .type_scheme(&HashMap::default(), self)?;
         let ascribed_type = ascribed_scheme.instantiate();
         let ascribed_tree =
             self.check_expr(&ascribed_type.underlying, &ascription.ascribed_tree)?;
@@ -2825,7 +2933,7 @@ impl TypingContext {
         &mut self,
         pattern: &namer::Pattern,
         bindings: &mut Vec<(namer::Identifier, Type)>,
-        scrutinee: &TypeParameter,
+        scrutinee: &MetaVariable,
     ) -> Typing<(Substitutions, Pattern)> {
         match pattern {
             namer::Pattern::Coproduct(pi, coproduct) => {
@@ -2911,12 +3019,19 @@ impl TypingContext {
         scrutinee: &Type,
     ) -> Typing<(Substitutions, Pattern)> {
         let pi = *pattern.annotation();
-        let normalized_scrutinee = self.normalize_type_application(pi, scrutinee)?;
+        let normalized_scrutinee = self
+            .expand_type_constructor(pi, scrutinee)?
+            .unwrap_or_else(|| TypeStructure::Monotype(scrutinee.clone()));
 
         match (pattern, &normalized_scrutinee) {
-            (_, Type::Variable(p)) => self.infer_pattern_scrutinee(pattern, bindings, p),
+            (_, TypeStructure::Monotype(Type::Variable(p))) => {
+                self.infer_pattern_scrutinee(pattern, bindings, p)
+            }
 
-            (namer::Pattern::Coproduct(pi, pattern), Type::Coproduct(coproduct)) => {
+            (
+                namer::Pattern::Coproduct(pi, pattern),
+                TypeStructure::Monotype(Type::Coproduct(coproduct)),
+            ) => {
                 if let namer::Identifier::Free(constructor) = &pattern.constructor
                     && let Some(signature) = coproduct.signature(constructor)
                     && pattern.arguments.len() == signature.len()
@@ -2950,16 +3065,16 @@ impl TypingContext {
                 }
             }
 
-            (namer::Pattern::Tuple(pi, pattern), Type::Tuple(tuple))
+            (namer::Pattern::Tuple(pi, pattern), TypeStructure::Monotype(Type::Tuple(tuple)))
                 if pattern.elements.len() == tuple.arity() =>
             {
                 let mut elements = Vec::with_capacity(tuple.arity());
                 let mut substitutions = Substitutions::default();
 
                 for (pattern, scrutinee) in pattern.elements.iter().zip(tuple.elements()) {
-                    let (subs, element) = self.check_pattern(pattern, bindings, scrutinee)?;
+                    let (subst, element) = self.check_pattern(pattern, bindings, scrutinee)?;
                     elements.push(element);
-                    substitutions = substitutions.compose(&subs);
+                    substitutions = substitutions.compose(&subst);
                 }
 
                 Ok((
@@ -2971,26 +3086,27 @@ impl TypingContext {
                 ))
             }
 
-            (namer::Pattern::Struct(pi, pattern), Type::Record(record))
-                if pattern.fields.len() == record.arity() =>
+            (namer::Pattern::Struct(pi, pattern), TypeStructure::PolyRecord(record))
+                if pattern.fields.len() == record.len() =>
             {
-                let mut arguments = Vec::with_capacity(record.arity());
+                let mut arguments = Vec::with_capacity(record.len());
                 let mut substitutions = Substitutions::default();
 
                 for ((pattern_field, pattern), (scrutinee_field, scrutinee)) in
-                    (pattern.fields).iter().zip(record.fields().iter())
+                    (pattern.fields).iter().zip(record.fields())
                 {
                     if pattern_field != scrutinee_field {
                         Err(TypeError::BadRecordPatternField {
-                            record_type: scrutinee.clone(),
+                            record_type: scrutinee.instantiate().underlying,
                             field: pattern_field.clone(),
                         }
                         .at(*pi))?;
                     }
 
-                    let (subs, pattern) = self.check_pattern(pattern, bindings, scrutinee)?;
+                    let (subst, pattern) =
+                        self.check_pattern(pattern, bindings, &scrutinee.instantiate().underlying)?;
                     arguments.push((pattern_field.clone(), pattern));
-                    substitutions = substitutions.compose(&subs);
+                    substitutions = substitutions.compose(&subst);
                 }
 
                 Ok((
@@ -3062,7 +3178,9 @@ impl TypingContext {
             .resolve_unique_coproduct_type_constructor(pi, &construct.constructor)?
             .instantiate(self)?;
 
-        let subs = if let Type::Coproduct(coproduct) = type_constructor.structure()? {
+        let subst = if let TypeStructure::Monotype(Type::Coproduct(coproduct)) =
+            type_constructor.structure()?
+        {
             let signature = coproduct.signature(&construct.constructor).ok_or_else(|| {
                 TypeError::NoSuchCoproductConstructor(construct.constructor.clone()).at(pi)
             })?;
@@ -3082,7 +3200,7 @@ impl TypingContext {
             substitutions,
             constraints,
             Expr::Inject(
-                pi.with_inferred_type(type_constructor.make_spine().apply(&subs)),
+                pi.with_inferred_type(type_constructor.make_spine().apply(&subst)),
                 Injection {
                     constructor: construct.constructor.clone(),
                     arguments: typed_arguments,
@@ -3128,6 +3246,7 @@ impl TypingContext {
 
         let subst = type_constructor
             .structure()?
+            .materialize_monotype()
             .unified_with(&Type::Record(record_type), &self.types)
             .map_err(|e| e.at(pi))?;
 
@@ -3149,22 +3268,25 @@ impl TypingContext {
             constraints,
         } = self.infer_expr(&projection.base)?;
         let base_type = &base.type_info().inferred_type;
-        let normalized_base_type = self.normalize_type_application(pi, base_type)?;
+        let expanded_base_type = self
+            .expand_type_constructor(pi, base_type)?
+            .unwrap_or_else(|| TypeStructure::Monotype(base_type.clone()));
 
         match &projection.select {
-            ProductElement::Name(field_name) => match normalized_base_type {
-                Type::Record(record) => {
-                    if let Some((field_index, (_, field_type))) = record
+            ProductElement::Name(field_name) => match expanded_base_type {
+                TypeStructure::PolyRecord(record) => {
+                    if let Some((field_index, (_, field_scheme))) = record
                         .0
                         .iter()
                         .enumerate()
                         .find(|(_, (label, _))| label == field_name)
                     {
+                        let field_type = field_scheme.instantiate();
                         Ok(Typed::computed(
                             substitutions,
-                            constraints,
+                            constraints.union(field_type.constraints),
                             Expr::Project(
-                                pi.with_inferred_type(field_type.clone()),
+                                pi.with_inferred_type(field_type.underlying),
                                 Projection {
                                     base: base.into(),
                                     select: ProductElement::Ordinal(field_index),
@@ -3180,25 +3302,26 @@ impl TypingContext {
                     }
                 }
 
-                Type::Variable(..) => {
+                TypeStructure::Monotype(base_type @ Type::Variable(..)) => {
                     let candidates = self.types.query_record_type_from_field(field_name);
                     if candidates.len() == 1 {
-                        let base_type = candidates[0].instantiate(self)?;
-                        let structure = base_type.structure()?;
-                        if let Type::Record(record_type) = structure
-                            && let Some((field_index, field_type)) =
-                                record_type.field_type(field_name)
+                        let base_type_constructor = candidates[0].instantiate(self)?;
+                        let structure = base_type_constructor.structure()?;
+                        if let TypeStructure::PolyRecord(record_type) = structure
+                            && let Some((field_index, field_scheme)) =
+                                record_type.field_info(field_name)
                         {
-                            let unification = normalized_base_type
-                                .unified_with(&base_type.make_spine(), &self.types)
+                            let unification = base_type
+                                .unified_with(&base_type_constructor.make_spine(), &self.types)
                                 .map_err(|e| e.at(pi))?;
+                            let field_type = field_scheme.instantiate();
 
                             let base = base.apply(&unification);
                             Ok(Typed::computed(
                                 unification,
-                                constraints,
+                                constraints.union(field_type.constraints),
                                 Expr::Project(
-                                    pi.with_inferred_type(field_type.clone()),
+                                    pi.with_inferred_type(field_type.underlying),
                                     Projection {
                                         base: base.into(),
                                         select: ProductElement::Ordinal(field_index),
@@ -3208,14 +3331,14 @@ impl TypingContext {
                         } else {
                             Err(TypeError::BadProjection {
                                 projection: projection.clone(),
-                                inferred_base_type: structure.clone(),
+                                inferred_base_type: structure.materialize_monotype(),
                             }
                             .at(pi))
                         }
                     } else if candidates.is_empty() {
                         Err(TypeError::BadProjection {
                             projection: projection.clone(),
-                            inferred_base_type: normalized_base_type.clone(),
+                            inferred_base_type: base_type,
                         }
                         .at(pi))
                     } else {
@@ -3223,7 +3346,7 @@ impl TypingContext {
                             projection: projection.clone(),
                             choices: candidates
                                 .iter()
-                                .map(|tc| tc.structure().cloned())
+                                .map(|tc| tc.structure().map(|s| s.materialize_monotype()))
                                 .collect::<Typing<_>>()?,
                         }
                         .at(pi))
@@ -3237,9 +3360,8 @@ impl TypingContext {
                 .at(pi)),
             },
 
-            ProductElement::Ordinal(ordinal) => match normalized_base_type {
-                // Why is_fully_typed?
-                Type::Tuple(tuple) /*if tuple.is_fully_typed()*/ => {
+            ProductElement::Ordinal(ordinal) => match expanded_base_type {
+                TypeStructure::Monotype(Type::Tuple(tuple)) => {
                     if let Some(element) = tuple.elements().get(*ordinal) {
                         Ok(Typed::computed(
                             substitutions,
@@ -3261,13 +3383,15 @@ impl TypingContext {
                     }
                 }
 
-                Type::Variable(..) => {
+                TypeStructure::Monotype(Type::Variable(..)) => {
                     let mut elems = Vec::with_capacity(ordinal + 1);
                     for _ in 0..=*ordinal {
                         elems.push(Type::fresh());
                     }
                     let tuple_ty = Type::Tuple(TupleType::from_signature(&elems));
-                    let subs = base_type.unified_with(&tuple_ty, &self.types).map_err(|e| e.at(pi))?;
+                    let subs = base_type
+                        .unified_with(&tuple_ty, &self.types)
+                        .map_err(|e| e.at(pi))?;
 
                     let projected_ty = match tuple_ty.apply(&subs) {
                         Type::Tuple(tuple) => tuple.elements()[*ordinal].clone(),
@@ -3675,7 +3799,7 @@ impl TypingContext {
         ))
     }
 
-    fn free_variables(&self) -> HashSet<TypeParameter> {
+    fn free_variables(&self) -> HashSet<MetaVariable> {
         self.terms.free_variables()
     }
 }
@@ -3718,9 +3842,15 @@ impl Denotation {
 // todo: move to pattern.rs
 impl Shape {
     fn covers(&self, pi: ParseInfo, scrutinee: &Type, ctx: &TypingContext) -> Typing<bool> {
-        let scrutinee = ctx.normalize_type_application(pi, scrutinee)?;
+        let scrutinee = ctx
+            .expand_type_constructor(pi, scrutinee)?
+            .unwrap_or_else(|| TypeStructure::Monotype(scrutinee.clone()));
+
         match (self, scrutinee) {
-            (Self::Coproduct(denotations), Type::Coproduct(CoproductType(constructors))) => {
+            (
+                Self::Coproduct(denotations),
+                TypeStructure::Monotype(Type::Coproduct(CoproductType(constructors))),
+            ) => {
                 let mut covers = true;
 
                 'outer: for (constructor, arguments) in constructors {
@@ -3730,7 +3860,10 @@ impl Shape {
                     }
 
                     for (denotation, scrutinee) in denotations[&constructor].iter().zip(arguments) {
-                        let scrutinee = ctx.normalize_type_application(pi, &scrutinee)?;
+                        //let scrutinee = ctx
+                        //    .expand_type_constructor(pi, &scrutinee)?
+                        //    .unwrap_or_else(|| TypeStructure::Monotype(scrutinee.clone()));
+
                         covers &= denotation.covers(pi, &scrutinee, ctx)?;
                         if !covers {
                             break 'outer;
@@ -3741,11 +3874,14 @@ impl Shape {
                 Ok(covers)
             }
 
-            (Self::Struct(denotations), Type::Record(RecordType(fields))) => {
+            (Self::Struct(denotations), TypeStructure::PolyRecord(record_type)) => {
                 let mut covers = true;
-                for (field, scrutinee) in &fields {
-                    let scrutinee = ctx.normalize_type_application(pi, scrutinee)?;
-                    covers &= denotations[field].covers(pi, &scrutinee, ctx)?;
+                for (field, scrutinee) in record_type.fields() {
+                    let scrutinee = scrutinee.instantiate();
+                    //let scrutinee = ctx
+                    //    .expand_type_constructor(pi, &scrutinee.underlying)?
+                    //    .unwrap_or_else(|| TypeStructure::Monotype(scrutinee.underlying.clone()));
+                    covers &= denotations[field].covers(pi, &scrutinee.underlying, ctx)?;
                     if !covers {
                         break;
                     }
@@ -3754,10 +3890,10 @@ impl Shape {
                 Ok(covers)
             }
 
-            (Self::Tuple(denotations), Type::Tuple(TupleType(types))) => {
+            (Self::Tuple(denotations), TypeStructure::Monotype(Type::Tuple(TupleType(types)))) => {
                 let mut covers = true;
                 for (denotation, scrutinee) in denotations.iter().zip(types) {
-                    let scrutinee = ctx.normalize_type_application(pi, &scrutinee)?;
+                    //let scrutinee = ctx.expand_type_constructor(pi, &scrutinee)?;
                     covers &= denotation.covers(pi, &scrutinee, ctx)?;
                     if !covers {
                         break;
@@ -3911,7 +4047,7 @@ impl fmt::Display for Kind {
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Variable(TypeParameter(p, k)) => write!(f, "${p}:{k}"),
+            Self::Variable(MetaVariable(p, k)) => write!(f, "${p}:{k}"),
 
             Self::Base(base_type) => write!(f, "{base_type}"),
 
@@ -4022,7 +4158,7 @@ impl fmt::Display for TypeScheme {
     }
 }
 
-impl fmt::Display for TypeParameter {
+impl fmt::Display for MetaVariable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "${}", self.0)
     }
@@ -4046,6 +4182,21 @@ impl fmt::Display for TypeConstructor {
                 }
 
                 write!(f, " ::= {}", constructor.structure)
+            }
+        }
+    }
+}
+
+impl fmt::Display for TypeStructure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Monotype(ty) => write!(f, "{ty}"),
+            Self::PolyRecord(record) => {
+                write!(f, "{{ ")?;
+                for (label, scheme) in record.fields() {
+                    writeln!(f, "{label} :: {scheme}")?;
+                }
+                writeln!(f, "}}")
             }
         }
     }

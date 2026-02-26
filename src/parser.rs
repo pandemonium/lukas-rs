@@ -7,8 +7,8 @@ use crate::{
     ast::{
         self, ApplyTypeExpr, ArrowTypeExpr, ConstraintDeclaration, CoproductConstructor,
         Declaration, FieldDeclarator, ModuleDeclaration, ModuleDeclarator, Tree, TupleTypeExpr,
-        TypeDeclaration, TypeDeclarator, UseDeclaration, ValueDeclaration, ValueDeclarator,
-        WitnessDeclaration, namer::QualifiedName,
+        TypeDeclaration, TypeDeclarator, TypeVariable, UseDeclaration, ValueDeclaration,
+        ValueDeclarator, WitnessDeclaration, namer::QualifiedName,
     },
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
 };
@@ -667,7 +667,7 @@ impl<'a> Parser<'a> {
     // preceed with parse_block, but it has to lookahead to see
     // that there is a forall in there, or it will erroneously
     // consume the type body block tokens.
-    fn parse_forall_clause(&mut self) -> Result<Vec<Identifier>> {
+    fn parse_forall_clause(&mut self) -> Result<Vec<TypeVariable>> {
         let _t = self.trace();
 
         if self.peek()?.is_keyword(Keyword::Forall) {
@@ -676,7 +676,10 @@ impl<'a> Parser<'a> {
 
             let mut params = vec![];
             while self.peek()?.is_identifier() {
-                params.push(self.identifier().map(|(_, id)| Identifier { image: id })?);
+                params.push(
+                    self.identifier()
+                        .map(|(_, image)| TypeVariable::star(Identifier { image }))?,
+                );
             }
 
             if params.is_empty() {
@@ -781,7 +784,7 @@ impl<'a> Parser<'a> {
 
         let (_, label) = self.identifier()?;
         self.expect(TokenKind::TypeAscribe)?;
-        let type_signature = self.parse_type_expression(0)?;
+        let type_signature = self.parse_type_signature()?;
         Ok(FieldDeclarator {
             // It could really keep this Identifier instead of cloning it
             name: Identifier::from_str(&label),

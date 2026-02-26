@@ -5,7 +5,7 @@ use crate::{
     parser::ParseInfo,
     typer::{
         Apply, Constraint, Expr, RecordShape, Substitutions, Type, TypeEnvironment, TypeError,
-        Typing, TypingContext,
+        TypeStructure, Typing, TypingContext,
     },
 };
 
@@ -20,7 +20,9 @@ impl Constraint {
             .lookup(self.name())
             .ok_or_else(|| TypeError::UndefinedSignature(self.name().clone()))?;
 
-        if let Type::Record(record) = type_constructor.structure().map_err(|e| *e.error)? {
+        if let TypeStructure::PolyRecord(record) =
+            type_constructor.structure().map_err(|e| *e.error)?
+        {
             Ok(ConstraintSignature {
                 name: self.name().clone(),
                 shape: record.shape(),
@@ -44,7 +46,7 @@ impl Witness {
         witness: namer::TypeSignature,
         ctx: &TypingContext,
     ) -> Typing<Self> {
-        let witness_signature = witness.type_scheme(&mut HashMap::default(), ctx)?;
+        let witness_signature = witness.type_scheme(&HashMap::default(), ctx)?;
         let witness_type = witness_signature.instantiate();
 
         Ok(Self {

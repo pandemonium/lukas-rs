@@ -1,0 +1,4 @@
+signature Monad ::= ∀ (M : * -> *).
+  { pure :: ∀α. α -> M α
+    bind :: ∀α β. (α -> M β) -> M α -> M β
+  }

@@ -13,12 +13,13 @@ use thiserror::Error;
 use crate::{
     ast::{
         self, ApplyTypeExpr, ArrowTypeExpr, BUILTIN_MODULE_NAME, CompilationUnit, Declaration,
-        ModuleDeclarator, ProductElement, STDLIB_MODULE_NAME, TupleTypeExpr, pattern::TuplePattern,
+        Kind, ModuleDeclarator, ProductElement, STDLIB_MODULE_NAME, TupleTypeExpr, TypeVariable,
+        pattern::TuplePattern,
     },
     builtin,
     compiler::{Compilation, Compiler, Located, LocatedError},
-    parser::{IdentifierPath, ParseInfo},
-    typer::{BaseType, Kind},
+    parser::{self, IdentifierPath, ParseInfo},
+    typer::BaseType,
 };
 
 pub type Expr = ast::Expr<ParseInfo, Identifier>;
@@ -456,13 +457,13 @@ impl parser::IdentifierPath {
 impl parser::RecordDeclarator {
     fn as_type_symbol(
         &self,
-        type_parameters: &[parser::Identifier],
+        type_parameters: &[TypeVariable],
         name: &QualifiedName,
     ) -> TypeSymbol<IdentifierPath> {
         TypeSymbol {
             definition: TypeDefinition::Record(RecordSymbol {
                 name: name.clone(),
-                type_parameters: type_parameters.to_owned(),
+                type_parameters: type_parameters.to_vec(),
                 fields: self
                     .fields
                     .iter()
@@ -474,27 +475,33 @@ impl parser::RecordDeclarator {
             }),
             origin: TypeOrigin::UserDefined,
             arity: type_parameters.len(),
-            kind: todo!(),
+            kind: compute_type_constructor_kind(type_parameters),
         }
     }
+}
+
+fn compute_type_constructor_kind(type_parameters: &[TypeVariable]) -> Kind {
+    type_parameters.iter().rfold(Kind::Star, |z, tv| {
+        Kind::Arrow(tv.kind.clone().into(), z.into())
+    })
 }
 
 impl parser::CoproductDeclarator {
     fn as_type_symbol(
         &self,
-        type_parameters: Vec<parser::Identifier>,
+        type_parameters: &[TypeVariable],
         name: &QualifiedName,
         constructors: Vec<ConstructorSymbol<IdentifierPath>>,
     ) -> TypeSymbol<IdentifierPath> {
         TypeSymbol {
             definition: TypeDefinition::Coproduct(CoproductSymbol {
                 name: name.clone(),
-                type_parameters: type_parameters.clone(),
+                type_parameters: type_parameters.to_vec(),
                 constructors,
             }),
             origin: TypeOrigin::UserDefined,
             arity: type_parameters.len(),
-            kind: todo!(),
+            kind: compute_type_constructor_kind(type_parameters),
         }
     }
 }
@@ -685,7 +692,7 @@ impl ParserSymbolTable {
 
                     self.add_type_symbol(
                         name.clone(),
-                        coproduct.as_type_symbol(type_parameters, &name, constructors),
+                        coproduct.as_type_symbol(&type_parameters, &name, constructors),
                     );
                 }
             };
@@ -967,7 +974,7 @@ impl TypeSymbol<QualifiedName> {
         }
     }
 
-    pub fn type_parameters(&self) -> &[parser::Identifier] {
+    pub fn type_parameters(&self) -> &[TypeVariable] {
         match &self.definition {
             TypeDefinition::Record(sym) => &sym.type_parameters,
             TypeDefinition::Coproduct(sym) => &sym.type_parameters,
@@ -979,29 +986,20 @@ impl TypeSymbol<QualifiedName> {
 #[derive(Debug, Clone)]
 pub struct RecordSymbol<GlobalName> {
     pub name: QualifiedName,
-    pub type_parameters: Vec<parser::Identifier>,
+    pub type_parameters: Vec<TypeVariable>,
     pub fields: Vec<FieldSymbol<GlobalName>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FieldSymbol<GlobalName> {
     pub name: parser::Identifier,
-    pub type_signature: ast::TypeExpression<ParseInfo, GlobalName>,
-}
-
-impl RecordSymbol<QualifiedName> {
-    pub fn free_variables(&self) -> HashSet<&QualifiedName> {
-        self.fields
-            .iter()
-            .flat_map(|field| field.type_signature.free_variables())
-            .collect()
-    }
+    pub type_signature: ast::TypeSignature<ParseInfo, GlobalName>,
 }
 
 #[derive(Debug, Clone)]
 pub struct CoproductSymbol<GlobalName> {
     pub name: QualifiedName,
-    pub type_parameters: Vec<parser::Identifier>,
+    pub type_parameters: Vec<TypeVariable>,
     pub constructors: Vec<ConstructorSymbol<GlobalName>>,
 }
 
@@ -1015,7 +1013,7 @@ impl ConstructorSymbol<parser::IdentifierPath> {
     fn make_applied_type_constructor(
         &self,
         pi: ParseInfo,
-        type_parameters: &[parser::Identifier],
+        type_parameters: &[TypeVariable],
         type_constructor_name: &QualifiedName,
     ) -> parser::TypeExpression {
         type_parameters.iter().cloned().fold(
@@ -1028,7 +1026,7 @@ impl ConstructorSymbol<parser::IdentifierPath> {
                     pi,
                     ApplyTypeExpr {
                         function: function.into(),
-                        argument: parser::TypeExpression::Parameter(pi, argument).into(),
+                        argument: parser::TypeExpression::Parameter(pi, argument.name).into(),
                         phase: PhantomData,
                     },
                 )
@@ -1039,7 +1037,7 @@ impl ConstructorSymbol<parser::IdentifierPath> {
     fn as_constructor_term_symbol(
         &self,
         pi: ParseInfo,
-        type_parameters: &[parser::Identifier],
+        type_parameters: &[TypeVariable],
         type_constructor_name: &QualifiedName,
     ) -> TermSymbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath> {
         let type_signature = self.make_type_signature(pi, type_parameters, type_constructor_name);
@@ -1054,7 +1052,7 @@ impl ConstructorSymbol<parser::IdentifierPath> {
     fn make_type_signature(
         &self,
         pi: ParseInfo,
-        type_parameters: &[parser::Identifier],
+        type_parameters: &[TypeVariable],
         type_constructor_name: &QualifiedName,
     ) -> parser::TypeSignature {
         parser::TypeSignature {
@@ -1199,6 +1197,31 @@ impl parser::ConstraintExpression {
                 .iter()
                 .map(|te| te.resolve_names(symbols, pi, semantic_scope))
                 .collect::<Naming<_>>()?,
+        })
+    }
+}
+
+impl parser::TypeSignature {
+    pub fn resolve_names(
+        &self,
+        symbols: &ParserSymbolTable,
+        pi: ParseInfo,
+        semantic_scope: &parser::IdentifierPath,
+    ) -> Naming<TypeSignature> {
+        let Self {
+            universal_quantifiers,
+            constraints,
+            body,
+            ..
+        } = self;
+        Ok(TypeSignature {
+            universal_quantifiers: universal_quantifiers.clone(),
+            constraints: constraints
+                .iter()
+                .map(|ce| ce.resolve_names(symbols, pi, &semantic_scope))
+                .collect::<Naming<_>>()?,
+            body: body.resolve_names(symbols, pi, &semantic_scope)?,
+            phase: PhantomData,
         })
     }
 }
@@ -1818,16 +1841,7 @@ impl ParserSymbolTable {
     fn rename_symbol(&self, pi: ParseInfo, symbol: &ParserSymbol) -> Naming<NamedSymbol> {
         match symbol {
             Symbol::Term(symbol) => Ok(Symbol::Term(if let Some(ts) = &symbol.type_signature {
-                let type_signature = TypeSignature {
-                    universal_quantifiers: ts.universal_quantifiers.clone(),
-                    constraints: ts
-                        .constraints
-                        .iter()
-                        .map(|ce| ce.resolve_names(self, pi, &symbol.name.module))
-                        .collect::<Naming<_>>()?,
-                    body: ts.body.resolve_names(self, pi, &symbol.name.module)?,
-                    phase: PhantomData,
-                };
+                let type_signature = ts.resolve_names(self, pi, &symbol.name.module)?;
 
                 TermSymbol {
                     name: symbol.name.clone(),

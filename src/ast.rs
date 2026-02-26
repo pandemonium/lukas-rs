@@ -35,7 +35,7 @@ pub enum Declaration<A> {
 #[derive(Debug)]
 pub struct ConstraintDeclaration<A> {
     pub name: parser::Identifier,
-    pub type_parameters: Vec<parser::Identifier>,
+    pub type_parameters: Vec<TypeVariable>,
     pub declarator: RecordDeclarator<A>,
 }
 
@@ -78,7 +78,8 @@ pub enum ModuleDeclarator<A> {
 #[derive(Debug)]
 pub struct TypeDeclaration<A> {
     pub name: parser::Identifier,
-    pub type_parameters: Vec<parser::Identifier>,
+    // This must be something else. TypeParameter is taken, perhaps that gets a new name. MetaVariable? TypeVariable?
+    pub type_parameters: Vec<TypeVariable>,
     pub declarator: TypeDeclarator<A>,
 }
 
@@ -86,6 +87,28 @@ pub struct TypeDeclaration<A> {
 pub enum TypeDeclarator<A> {
     Record(A, RecordDeclarator<A>),
     Coproduct(A, CoproductDeclarator<A>),
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct TypeVariable {
+    pub name: parser::Identifier,
+    pub kind: Kind,
+}
+
+impl TypeVariable {
+    pub fn star(name: parser::Identifier) -> Self {
+        Self {
+            name,
+            kind: Kind::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Kind {
+    #[default]
+    Star,
+    Arrow(Box<Kind>, Box<Kind>),
 }
 
 #[derive(Debug)]
@@ -107,7 +130,7 @@ pub struct CoproductConstructor<A> {
 #[derive(Debug)]
 pub struct FieldDeclarator<A> {
     pub name: parser::Identifier,
-    pub type_signature: TypeExpression<A, parser::IdentifierPath>,
+    pub type_signature: TypeSignature<A, parser::IdentifierPath>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,7 +160,7 @@ impl<A, TypeId> ConstraintExpression<A, TypeId> {
 
 #[derive(Debug, Clone)]
 pub struct TypeSignature<A, TypeId> {
-    pub universal_quantifiers: Vec<parser::Identifier>,
+    pub universal_quantifiers: Vec<TypeVariable>,
     pub constraints: Vec<ConstraintExpression<A, TypeId>>,
     pub body: TypeExpression<A, TypeId>,
     pub phase: PhantomData<A>,
@@ -776,6 +799,13 @@ where
             "∀{}. {name} ::= {declarator}",
             display_list(" ", type_parameters)
         )
+    }
+}
+
+impl fmt::Display for TypeVariable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { name, kind } = self;
+        write!(f, "{name}:{kind}")
     }
 }
 

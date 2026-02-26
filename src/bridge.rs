@@ -4,7 +4,7 @@ use crate::{
     ast::namer::{self, QualifiedName, TermSymbol},
     interpreter::{Interpretation, Literal, RuntimeError, cek::Val},
     parser::{self, ParseInfo},
-    typer::{BaseType, ConstraintSet, Type, TypeParameter, TypeScheme},
+    typer::{BaseType, ConstraintSet, MetaVariable, Type, TypeScheme},
 };
 
 #[derive(Clone)]
@@ -220,7 +220,7 @@ where
     }
 
     fn type_scheme(&self) -> TypeScheme {
-        let tp = TypeParameter::fresh();
+        let tp = MetaVariable::fresh();
         TypeScheme {
             quantifiers: vec![tp.clone()],
             underlying: Type::Arrow {
