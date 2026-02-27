@@ -1,0 +1,64 @@
+use Stdlib.
+
+Perhaps ::= ∀α. This α | Nope
+
+witness Functor List :=
+  { fmap := λf fa.
+      print_endline "List.fmap: `fa`"
+      List.map f fa
+  }
+
+witness Functor Perhaps :=
+  { fmap := λf fa.
+      print_endline "Perhaps.fmap: `fa`"
+      deconstruct fa into
+        This a -> This (f a)
+      | Nope   -> Nope
+  }
+
+witness Monad Perhaps :=
+  { bind := λf ma.
+      deconstruct ma into
+        This a -> f a
+      | Nope   -> Nope
+  }
+
+signature CoShow ::= ∀t.
+  { coshow :: ∀a. (a -> t) -> a -> Text
+  }
+
+witness CoShow Text :=
+  { coshow := λf x. f x
+  }
+
+use_coshow :: ∀t a. CoShow t |- (a -> t) -> a -> Text :=
+  λf x. coshow f x
+
+Sum ::= { X :: Int }
+mksum := λx. { X := x }
+
+use_fmap_as_value :: Int -> Unit :=
+  λx.
+    let f = fmap in
+    let y  = f (λn. n * 3) (This x) in
+    let xs = List.tabulate 10 id in
+    let zs = f (λn. n * 3) xs in
+    print_endline "done"
+
+start :: Int -> Unit := λ_.
+  let s1 = use_coshow (λn. "int: `n`.") 427 in
+  let s2 = use_coshow (λs. "sum: `s.X`.") (mksum 5) in
+  print_endline s1
+  print_endline s2
+
+  let xs = List.tabulate 10 id in
+  print_endline "xs: `fmap (λz. 3 * z) xs`"
+
+  let x = 427 in
+  let y = fmap (λn. n * 3) (This x) in
+  print_endline "y is `fmap show y`."
+
+  print_endline "This `bind (λn. This (n * 3)) (This 3)`"
+  print_endline "Nope `bind (λn. Nope) (This 3)`"
+
+  print_endline "This `fmap (const "hej") (This 3)`."

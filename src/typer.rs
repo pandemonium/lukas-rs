@@ -277,16 +277,26 @@ impl namer::NamedSymbolTable {
                 [Constraint::from_type_constructor(&type_constructor)].as_slice(),
             );
 
-            if let TypeStructure::PolyRecord(record_type) = type_constructor.structure()? {
+            let structure = type_constructor.structure();
+
+            println!("insert_constraint_method_placeholders: {c} structure {structure:?}");
+
+            if let TypeStructure::PolyRecord(record_type) = structure? {
                 for (method_id, scheme) in record_type.fields() {
                     let mut scheme = scheme.clone();
-                    scheme.constraints = scheme.constraints.union(constraints.clone());
-
                     let name = QualifiedName::new(
                         type_constructor.defining_context().clone(),
                         method_id.as_str(),
                     );
-                    ctx.bind_free_term(name, scheme);
+
+                    let constrained = Constrained {
+                        constraints: scheme.constraints.union(constraints.clone()),
+                        underlying: scheme.underlying,
+                    };
+                    let scheme = constrained.generalize(ctx);
+
+                    println!(">>> placeholder {name} :: {scheme}");
+                    ctx.bind_free_term(name, scheme.underlying);
                 }
             }
         }
@@ -378,13 +388,9 @@ fn discharge_ground_constraints(
     let pi = expr.tree.type_info().parse_info;
 
     for c in ground {
-        //        println!("discharge: constraint {c}");
-
         let witness = witness_index
             .resolve_witness(c, &ctx.types)
             .map_err(|e| e.at(pi))?;
-
-        //        println!("discharge: constraint {c} -- witness {witness}");
 
         evidence.push((c, witness));
     }
@@ -393,7 +399,7 @@ fn discharge_ground_constraints(
 
     for (constraint, evidence) in evidence {
         let signature = constraint.signature(&ctx.types).map_err(|e| e.at(pi))?;
-        tree = inject_witness(tree, &signature.shape, constraint, &evidence, &ctx.terms);
+        tree = inject_witness(tree, &signature.interface, constraint, &evidence, &ctx);
     }
 
     Ok(Typed::computed(
@@ -408,23 +414,38 @@ fn inject_witness(
     signature: &RecordShape,
     constraint: &Constraint,
     witness: &Expr,
-    ctx: &TermEnvironment,
+    ctx: &TypingContext,
 ) -> Expr {
     tree.map(&mut |e| match e {
-        Expr::Variable(a, Identifier::Free(m)) if signature.contains(m.member()) => Expr::Project(
-            a,
-            Projection {
-                base: witness.clone().into(),
-                // This must be the field index
-                select: ProductElement::Ordinal(signature.index_of(m.member()).unwrap()),
-            },
-        ),
+        Expr::Variable(type_info, ref term_id @ Identifier::Free(ref m))
+            if signature.contains(m.member()) =>
+        {
+            let method_scheme = ctx.terms.lookup(term_id).expect("expr.typed").instantiate();
+            let use_site_subst = method_scheme
+                .underlying
+                .unified_with(&type_info.inferred_type, &ctx.types)
+                .expect("expr.typed");
+            let use_site_constraints = method_scheme.constraints.apply(&use_site_subst);
 
-        Expr::Variable(a, term_id @ Identifier::Free(..)) => {
-            let scheme = ctx.lookup(&term_id).unwrap();
-            //println!(
-            //    "insert_witness: {term_id} {constraint} constraints `{}`",
-            //    scheme.constraints
+            let suitable_injection_site = use_site_constraints.iter().any(|c| c == constraint);
+
+            if suitable_injection_site {
+                Expr::Project(
+                    type_info,
+                    Projection {
+                        base: witness.clone().into(),
+                        // This must be the field index
+                        select: ProductElement::Ordinal(signature.index_of(m.member()).unwrap()),
+                    },
+                )
+            } else {
+                Expr::Variable(type_info, Identifier::Free(m.clone()))
+            }
+        }
+
+        Expr::Variable(type_info, term_id @ Identifier::Free(..)) => {
+            let scheme = ctx.terms.lookup(&term_id).unwrap();
+
             //);
             if scheme
                 .constraints
@@ -432,14 +453,14 @@ fn inject_witness(
                 .any(|c| c.name() == constraint.name())
             {
                 Expr::Apply(
-                    a.clone(),
+                    type_info.clone(),
                     Apply {
-                        function: Expr::Variable(a, term_id).into(),
+                        function: Expr::Variable(type_info, term_id).into(),
                         argument: witness.clone().into(),
                     },
                 )
             } else {
-                Expr::Variable(a, term_id)
+                Expr::Variable(type_info, term_id)
             }
         }
 
@@ -455,13 +476,14 @@ fn add_constraint_projections(
     let signature = constraint.signature(&ctx.types)?;
 
     let tree = tree.clone().map(&mut |e| match e {
-        Expr::Variable(a, Identifier::Free(m)) if signature.shape.contains(m.member()) => {
-            //            println!("add_constraint_projections: projecting {m} from #1");
+        Expr::Variable(a, Identifier::Free(m)) if signature.interface.contains(m.member()) => {
             Expr::Project(
                 a.clone(),
                 Projection {
                     base: Expr::Variable(a.clone(), Identifier::Bound(1)).into(),
-                    select: ProductElement::Ordinal(signature.shape.index_of(m.member()).unwrap()),
+                    select: ProductElement::Ordinal(
+                        signature.interface.index_of(m.member()).unwrap(),
+                    ),
                 },
             )
         }
@@ -841,7 +863,8 @@ impl Constrained<Type> {
     }
 
     fn free_variables(&self, ctx: &TypingContext) -> HashSet<MetaVariable> {
-        let ty_vars = self.underlying.variables();
+        let mut ty_vars = self.underlying.variables();
+        ty_vars.extend(self.constraints.variables());
         let ctx_bounds = ctx.free_variables();
         ty_vars.difference(&ctx_bounds).cloned().collect()
     }
@@ -927,6 +950,10 @@ impl ConstraintSet {
     pub fn iter(&self) -> impl Iterator<Item = &Constraint> {
         self.0.iter()
     }
+
+    pub fn variables(&self) -> HashSet<MetaVariable> {
+        self.0.iter().flat_map(|tv| tv.variables()).collect()
+    }
 }
 
 impl From<&[Constraint]> for ConstraintSet {
@@ -992,12 +1019,13 @@ impl Constraint {
         }
     }
 
-    fn variables(&self) -> HashSet<MetaVariable> {
+    pub fn variables(&self) -> HashSet<MetaVariable> {
         self.constraint_type.variables()
     }
 
     fn is_ground(&self) -> bool {
-        self.variables().is_empty()
+        let variables = self.variables();
+        variables.is_empty()
     }
 }
 
@@ -1184,6 +1212,10 @@ impl Type {
 
     pub fn fresh() -> Self {
         Self::Variable(MetaVariable::fresh())
+    }
+
+    pub fn fresh_with_kind(kind: Kind) -> Self {
+        Self::Variable(MetaVariable::fresh_with_kind(kind))
     }
 
     pub fn is_base(&self) -> bool {
@@ -1832,7 +1864,7 @@ impl TypeScheme {
     fn instantiation_substitutions(&self) -> Substitutions {
         self.quantifiers
             .iter()
-            .map(|tp| (tp.clone(), Type::fresh()))
+            .map(|tp| (tp.clone(), Type::fresh_with_kind(tp.kind().clone())))
             .collect::<Vec<_>>()
             .into()
     }

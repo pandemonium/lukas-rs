@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
 use crate::{
     ast::namer::{self, Identifier, QualifiedName},
@@ -11,7 +11,7 @@ use crate::{
 
 pub struct ConstraintSignature {
     pub name: QualifiedName,
-    pub shape: RecordShape,
+    pub interface: RecordShape,
 }
 
 impl Constraint {
@@ -25,7 +25,7 @@ impl Constraint {
         {
             Ok(ConstraintSignature {
                 name: self.name().clone(),
-                shape: record.shape(),
+                interface: record.shape(),
             })
         } else {
             Err(TypeError::InternalAssertion("expected a record".to_owned()))
@@ -83,24 +83,10 @@ impl WitnessIndex {
         constraint: &Constraint,
         ctx: &TypeEnvironment,
     ) -> Result<Expr, TypeError> {
-        //println!(
-        //    "resolve_witness: {constraint} -- {}",
-        //    display_list(
-        //        ", ",
-        //        &self
-        //            .store
-        //            .iter()
-        //            .map(|(p, q)| format!("{p} -> {q:?}"))
-        //            .collect::<Vec<_>>()
-        //    )
-        //);
-
         let candidates = self
             .store
             .get(constraint.name())
             .ok_or_else(|| TypeError::NoWitness(constraint.clone()))?;
-
-        //        println!("resolve_witness: candidates {candidates:?}");
 
         for witness in candidates {
             let subst = constraint
@@ -152,5 +138,20 @@ impl WitnessIndex {
         }
 
         Err(TypeError::NoWitness(constraint.clone()))
+    }
+}
+
+impl fmt::Display for Witness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            head,
+            premises,
+            name,
+        } = self;
+        write!(
+            f,
+            "witness {name} {} |- {head}",
+            display_list(" + ", premises)
+        )
     }
 }

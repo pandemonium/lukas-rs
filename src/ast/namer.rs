@@ -760,10 +760,7 @@ impl ParserSymbolTable {
                     self.add_signature_declaration(&module_path, decl)
                 }
 
-                Declaration::Witness(_, decl) => {
-                    println!("add_module_contents: witness {decl}");
-                    self.add_witness_declaration(&module_path, decl)
-                }
+                Declaration::Witness(_, decl) => self.add_witness_declaration(&module_path, decl),
             };
         }
 
