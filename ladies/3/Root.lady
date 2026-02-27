@@ -1,28 +1,5 @@
 use Stdlib.
 
-Perhaps ::= ∀α. This α | Nope
-
-witness Functor List :=
-  { fmap := λf fa.
-      print_endline "List.fmap: `fa`"
-      List.map f fa
-  }
-
-witness Functor Perhaps :=
-  { fmap := λf fa.
-      print_endline "Perhaps.fmap: `fa`"
-      deconstruct fa into
-        This a -> This (f a)
-      | Nope   -> Nope
-  }
-
-witness Monad Perhaps :=
-  { bind := λf ma.
-      deconstruct ma into
-        This a -> f a
-      | Nope   -> Nope
-  }
-
 signature CoShow ::= ∀t.
   { coshow :: ∀a. (a -> t) -> a -> Text
   }

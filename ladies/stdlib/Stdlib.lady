@@ -4,6 +4,16 @@ use Control.
 
 List ::= ∀α. Nil | Cons α (List α)
 
+witness Functor List :=
+  { fmap := λf fa.
+      List.map f fa
+  }
+
+witness Foldable List :=
+  { fold_left  := List.fold_left
+    fold_right := List.fold_right
+  }
+
 module List:
   head :: ∀α. List α -> Perhaps α :=
     λxs. deconstruct xs into Cons a tail -> This a | otherwise -> Nope
@@ -65,6 +75,20 @@ module List:
 
 
 Perhaps ::= ∀α. Nope | This α
+
+witness Functor Perhaps :=
+  { fmap := λf fa.
+      deconstruct fa into
+        This a -> This (f a)
+      | Nope   -> Nope
+  }
+
+witness Monad Perhaps :=
+  { bind := λf ma.
+      deconstruct ma into
+        This a -> f a
+      | Nope   -> Nope
+  }
 
 module Perhaps:
   perhaps :: ∀α z. z -> (α -> z) -> Perhaps α -> z :=

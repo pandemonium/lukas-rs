@@ -789,6 +789,17 @@ pub enum TypeError {
         rhs: Type,
         rhs_kind: Kind,
     },
+
+    // This could be improved!
+    #[error(
+        "record shape missmatch, missing: {} (and superfluous: {}).",
+        display_list(", ", missing),
+        display_list(", ", superfluous)
+    )]
+    BadRecordLiteral {
+        missing: Vec<parser::Identifier>,
+        superfluous: Vec<parser::Identifier>,
+    },
 }
 
 #[derive(Debug)]
@@ -2545,11 +2556,23 @@ impl TypingContext {
                 let mut typed_fields = Vec::with_capacity(record_type.len());
                 let mut expected_types = Vec::with_capacity(record_type.len());
 
+                if record.fields.len() != record_type.len() {
+                    let lhs = record.fields.iter().map(|(l, _)| l).collect::<HashSet<_>>();
+                    let rhs = record_type.fields().map(|(l, _)| l).collect::<HashSet<_>>();
+
+                    let missing_bindings = rhs.difference(&lhs);
+                    let extra_bindings = lhs.difference(&rhs);
+                    Err(TypeError::BadRecordLiteral {
+                        missing: missing_bindings.copied().cloned().collect(),
+                        superfluous: extra_bindings.copied().cloned().collect(),
+                    }
+                    .at(pi))?;
+                }
+
                 for ((name, expr), (_, expected_scheme)) in
                     record.fields.iter().zip(record_type.fields())
                 {
                     let expected_field_type = expected_scheme.instantiate();
-                    // This, I think, checks against the expanded type when it should have a spine
                     let typed = self.check_expr(&expected_field_type.underlying, expr)?;
                     expected_types.push((name.clone(), expected_field_type.underlying));
                     subst = subst.compose(&typed.substitutions);

@@ -9,3 +9,8 @@ signature Applicative ::= ∀f : * -> *.
 signature Monad ::= ∀m : * -> *.
   { bind :: ∀α β. (α -> m β) -> m α -> m β
   }
+
+signature Foldable ::= ∀f : * -> *.
+  { fold_right :: ∀α β. (α -> β -> β) -> β -> f α -> β
+    fold_left  :: ∀α β. (β -> α -> β) -> β -> f α -> β
+  }
