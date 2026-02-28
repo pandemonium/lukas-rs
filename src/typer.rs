@@ -14,45 +14,36 @@ use tracing::instrument;
 
 use crate::{
     ast::{
-        self, ApplyTypeExpr, ArrowTypeExpr, Kind, Literal, ProductElement, Tree, TupleTypeExpr,
+        self, Apply, ApplyTypeExpr, ArrowTypeExpr, Binding, Deconstruct, IfThenElse, Injection,
+        Kind, Lambda, Literal, ProductElement, Projection, Record, Segment, SelfReferential,
+        Sequence, Tree, Tuple, TupleTypeExpr, TypeAscription, TypeExpression,
         annotation::Annotated,
         constraints::{Witness, WitnessIndex},
         namer::{
-            self, DependencyMatrix, Identifier, QualifiedName, Symbol, SymbolName, TermSymbol,
-            TypeDefinition, TypeExpression, TypeSymbol,
+            self, CoproductSymbol, DependencyMatrix, Identifier, Named, QualifiedName,
+            RecordSymbol, Symbol, SymbolName, TermSymbol, TypeDefinition, TypeSymbol,
         },
-        pattern::{Denotation, Shape},
+        pattern::{
+            ConstructorPattern, Denotation, MatchClause, Pattern, Shape, StructPattern,
+            TuplePattern,
+        },
     },
     compiler::{Located, LocatedError},
-    parser::{self, ParseInfo},
+    parser::{self, IdentifierPath, ParseInfo, Parsed},
+    phase,
 };
 
-type UntypedExpr = namer::Expr;
+pub struct Types;
+
+impl phase::Phase for Types {
+    type Annotation = TypeInfo;
+    type TermId = Identifier;
+    type TypeId = QualifiedName;
+}
+
 pub type SymbolTable = namer::SymbolTable<TypeInfo, QualifiedName, Identifier>;
-pub type Expr = ast::Expr<TypeInfo, namer::Identifier>;
-pub type TypedTree = Rc<Expr>;
-pub type Apply = ast::Apply<TypeInfo, namer::Identifier>;
-pub type SelfReferential = ast::SelfReferential<TypeInfo, namer::Identifier>;
-pub type Lambda = ast::Lambda<TypeInfo, namer::Identifier>;
-pub type Binding = ast::Binding<TypeInfo, namer::Identifier>;
-pub type Tuple = ast::Tuple<TypeInfo, namer::Identifier>;
-pub type Injection = ast::Injection<TypeInfo, namer::Identifier>;
-pub type Record = ast::Record<TypeInfo, namer::Identifier>;
-pub type Projection = ast::Projection<TypeInfo, namer::Identifier>;
-pub type Sequence = ast::Sequence<TypeInfo, namer::Identifier>;
-pub type Deconstruct = ast::Deconstruct<TypeInfo, namer::Identifier>;
-pub type IfThenElse = ast::IfThenElse<TypeInfo, namer::Identifier>;
-pub type Interpolate = ast::Interpolate<TypeInfo, namer::Identifier>;
-pub type Segment = ast::Segment<TypeInfo, namer::Identifier>;
-pub type MatchClause = ast::pattern::MatchClause<TypeInfo, namer::Identifier>;
-pub type Pattern = ast::pattern::Pattern<TypeInfo, namer::Identifier>;
-pub type ConstructorPattern = ast::pattern::ConstructorPattern<TypeInfo, namer::Identifier>;
-pub type StructPattern = ast::pattern::StructPattern<TypeInfo, namer::Identifier>;
-pub type TuplePattern = ast::pattern::TuplePattern<TypeInfo, namer::Identifier>;
-pub type TypeAscription = ast::TypeAscription<TypeInfo, namer::Identifier>;
-pub type TypeSignature = ast::TypeSignature<TypeInfo, namer::QualifiedName>;
-pub type RecordSymbol = namer::RecordSymbol<namer::QualifiedName>;
-pub type CoproductSymbol = namer::CoproductSymbol<namer::QualifiedName>;
+type UntypedExpr = phase::Expr<Named>;
+pub type Expr = phase::Expr<Types>;
 
 type TypedSymbolTable = namer::SymbolTable<TypeInfo, namer::QualifiedName, namer::Identifier>;
 
@@ -141,7 +132,7 @@ impl<A> namer::SymbolTable<A, namer::QualifiedName, namer::Identifier> {
     }
 }
 
-impl namer::TypeSignature {
+impl phase::TypeSignature<Named> {
     pub fn type_scheme(
         &self,
         context_type_param_map: &HashMap<parser::Identifier, MetaVariable>,
@@ -283,7 +274,7 @@ impl namer::NamedSymbolTable {
 
             if let TypeStructure::PolyRecord(record_type) = structure? {
                 for (method_id, scheme) in record_type.fields() {
-                    let mut scheme = scheme.clone();
+                    let scheme = scheme.clone();
                     let name = QualifiedName::new(
                         type_constructor.defining_context().clone(),
                         method_id.as_str(),
@@ -559,7 +550,7 @@ fn add_constraint_parameter_slot(expr: &Expr) -> Expr {
     }
 }
 
-impl Lambda {
+impl phase::Lambda<Types> {
     fn prepend_parameter(self) -> Self {
         let Identifier::Bound(first_level) = self.parameter else {
             panic!("expected locally bound")
@@ -624,13 +615,13 @@ impl Expr {
 
             Self::Deconstruct(
                 a,
-                ast::Deconstruct {
+                Deconstruct {
                     scrutinee,
                     match_clauses,
                 },
             ) => Self::Deconstruct(
                 a,
-                ast::Deconstruct {
+                Deconstruct {
                     scrutinee,
                     match_clauses: match_clauses
                         .into_iter()
@@ -678,14 +669,14 @@ pub enum TypeError {
         projection.base, projection.select
     )]
     BadProjection {
-        projection: namer::Projection,
+        projection: phase::Projection<Named>,
         inferred_base_type: Type,
     },
 
     #[error("Ambiguous base type projecting field {} from {} with choices {}",
         projection.select, projection.base, display_list(", ", choices))]
     AmbiguousRecordProjection {
-        projection: namer::Projection,
+        projection: phase::Projection<Named>,
         choices: Vec<Type>,
     },
 
@@ -739,10 +730,12 @@ pub enum TypeError {
     },
 
     #[error("{clause} is not useful")]
-    UselessMatchClause { clause: MatchClause },
+    UselessMatchClause { clause: phase::MatchClause<Types> },
 
     #[error("all of {} is not covered", deconstruct.scrutinee)]
-    MatchNotExhaustive { deconstruct: Deconstruct },
+    MatchNotExhaustive {
+        deconstruct: phase::Deconstruct<Types>,
+    },
 
     #[error("Bad specialization: {0}")]
     BadSpecialization(Specialization),
@@ -996,7 +989,7 @@ impl Type {
 impl Constraint {
     pub fn from_constraint_expr(
         types: &HashMap<parser::Identifier, MetaVariable>,
-        expr: &namer::ConstraintExpression,
+        expr: &phase::ConstraintExpression<Named>,
         ctx: &TypingContext,
     ) -> Typing<Constraint> {
         let constructor = ctx.types.lookup(&expr.class).ok_or_else(|| {
@@ -1062,21 +1055,6 @@ impl RecordType {
                 .map(|(id, t)| (id.clone(), t.apply(subs)))
                 .collect(),
         )
-    }
-
-    fn arity(&self) -> usize {
-        self.0.len()
-    }
-
-    fn fields(&self) -> &[(parser::Identifier, Type)] {
-        &self.0
-    }
-
-    fn field_type(&self, field_name: &parser::Identifier) -> Option<(usize, &Type)> {
-        self.0
-            .iter()
-            .enumerate()
-            .find_map(|(index, (name, ty))| (name == field_name).then_some((index, ty)))
     }
 }
 
@@ -1171,30 +1149,29 @@ impl Type {
         }
     }
 
-    pub fn reify(&self, type_param_map: &[parser::Identifier]) -> parser::TypeExpression {
+    pub fn reify(&self, type_param_map: &[parser::Identifier]) -> phase::TypeExpression<Parsed> {
         let pi = ParseInfo::default();
 
-        let reified_name = |qn: &QualifiedName| {
-            parser::IdentifierPath::new(&qn.clone().into_identifier_path().tail[0])
-        };
+        let reified_name =
+            |qn: &QualifiedName| IdentifierPath::new(&qn.clone().into_identifier_path().tail[0]);
 
         match self {
             Self::Variable(MetaVariable(p, _)) => {
-                parser::TypeExpression::Parameter(pi, type_param_map[*p as usize].clone())
+                TypeExpression::Parameter(pi, type_param_map[*p as usize].clone())
             }
             Self::Base(BaseType::Int) => {
-                parser::TypeExpression::Constructor(pi, parser::IdentifierPath::new("Int"))
+                TypeExpression::Constructor(pi, IdentifierPath::new("Int"))
             }
             Self::Base(BaseType::Text) => {
-                parser::TypeExpression::Constructor(pi, parser::IdentifierPath::new("Text"))
+                TypeExpression::Constructor(pi, IdentifierPath::new("Text"))
             }
             Self::Base(BaseType::Bool) => {
-                parser::TypeExpression::Constructor(pi, parser::IdentifierPath::new("Bool"))
+                TypeExpression::Constructor(pi, IdentifierPath::new("Bool"))
             }
             Self::Base(BaseType::Unit) => {
-                parser::TypeExpression::Constructor(pi, parser::IdentifierPath::new("Unit"))
+                TypeExpression::Constructor(pi, IdentifierPath::new("Unit"))
             }
-            Self::Arrow { domain, codomain } => parser::TypeExpression::Arrow(
+            Self::Arrow { domain, codomain } => TypeExpression::Arrow(
                 pi,
                 ArrowTypeExpr {
                     domain: domain.reify(type_param_map).into(),
@@ -1205,12 +1182,12 @@ impl Type {
             Self::Record(..) => todo!(),
             Self::Coproduct(..) => todo!(),
             Self::Constructor(qualified_name) => {
-                parser::TypeExpression::Constructor(pi, reified_name(qualified_name))
+                TypeExpression::Constructor(pi, reified_name(qualified_name))
             }
             Self::Apply {
                 constructor,
                 argument,
-            } => parser::TypeExpression::Apply(
+            } => TypeExpression::Apply(
                 pi,
                 ApplyTypeExpr {
                     function: constructor.reify(type_param_map).into(),
@@ -1494,28 +1471,12 @@ impl TupleType {
     }
 }
 
-impl RecordSymbol {
+impl RecordSymbol<QualifiedName> {
     fn synthesize_type(
         &self,
         type_params: &HashMap<parser::Identifier, MetaVariable>,
         ctx: &TypingContext,
     ) -> Typing<TypeStructure> {
-        //        Ok(Type::Record(RecordType::from_fields(
-        //            &self
-        //                .fields
-        //                .iter()
-        //                .map(|field| {
-        //                    // all fields must synthesize in their own type_params
-        //                    // -- but when are these instantiated?
-        //
-        //                    field
-        //                        .type_signature
-        //                        .synthesize_type(type_params, ctx)
-        //                        .map(|ty| (field.name.clone(), ty))
-        //                })
-        //                .collect::<Typing<Vec<_>>>()?,
-        //        )))
-
         Ok(TypeStructure::PolyRecord(PolyRecordType::from_fields(
             &self
                 .fields
@@ -1530,7 +1491,7 @@ impl RecordSymbol {
     }
 }
 
-impl CoproductSymbol {
+impl CoproductSymbol<QualifiedName> {
     pub fn synthesize_type(
         &self,
         type_params: &HashMap<parser::Identifier, MetaVariable>,
@@ -1552,7 +1513,7 @@ impl CoproductSymbol {
     }
 }
 
-impl TypeExpression {
+impl phase::TypeExpression<Named> {
     fn synthesize_type(
         &self,
         type_params: &HashMap<parser::Identifier, MetaVariable>,
@@ -2013,7 +1974,7 @@ impl TermEnvironment {
     }
 }
 
-impl namer::StructPattern {
+impl phase::StructPattern<Named> {
     fn shape(&self) -> RecordShape {
         RecordShape(self.fields.iter().map(|(l, ..)| l.clone()).collect())
     }
@@ -2415,7 +2376,7 @@ impl TypingContext {
         &mut self,
         pi: ParseInfo,
         expected_type: &Type,
-        construct: &namer::Injection,
+        construct: &phase::Injection<Named>,
     ) -> Typing {
         let normalized_type = self.expand_type_constructor(pi, expected_type)?;
 
@@ -2459,7 +2420,7 @@ impl TypingContext {
         &mut self,
         pi: ParseInfo,
         expected_type: &Type,
-        rec: &namer::SelfReferential,
+        rec: &phase::SelfReferential<Named>,
     ) -> Typing {
         let normalized_type = self.expand_type_constructor(pi, expected_type)?;
         if let Some(TypeStructure::Monotype(Type::Arrow { domain, codomain })) = &normalized_type {
@@ -2504,7 +2465,7 @@ impl TypingContext {
         &mut self,
         pi: ParseInfo,
         expected_type: &Type,
-        lambda: &namer::Lambda,
+        lambda: &phase::Lambda<Named>,
     ) -> Typing {
         let normalized_type = self
             .expand_type_constructor(pi, expected_type)?
@@ -2543,7 +2504,7 @@ impl TypingContext {
         &mut self,
         pi: ParseInfo,
         expected_type: &Type,
-        record: &namer::Record,
+        record: &phase::Record<Named>,
     ) -> Typing {
         let normalized_type = self
             .expand_type_constructor(pi, expected_type)?
@@ -2614,7 +2575,12 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn check_tuple(&mut self, pi: ParseInfo, expected_type: &Type, tuple: &namer::Tuple) -> Typing {
+    fn check_tuple(
+        &mut self,
+        pi: ParseInfo,
+        expected_type: &Type,
+        tuple: &phase::Tuple<Named>,
+    ) -> Typing {
         let mut constraints = ConstraintSet::default();
         let normalized_type = self
             .expand_type_constructor(pi, expected_type)?
@@ -2760,7 +2726,11 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_ascription(&mut self, pi: ParseInfo, ascription: &namer::TypeAscription) -> Typing {
+    fn infer_ascription(
+        &mut self,
+        pi: ParseInfo,
+        ascription: &phase::TypeAscription<Named>,
+    ) -> Typing {
         // What is a good way to deal with a "current set" of alpha type parameters?
         let ascribed_scheme = ascription
             .type_signature
@@ -2789,18 +2759,18 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_interpolation(&mut self, pi: ParseInfo, segments: &[namer::Segment]) -> Typing {
+    fn infer_interpolation(&mut self, pi: ParseInfo, segments: &[phase::Segment<Named>]) -> Typing {
         let mut segs = vec![];
         let mut substitutions = Substitutions::default();
         let mut constraints = ConstraintSet::default();
 
         for segment in segments {
             match segment {
-                ast::Segment::Literal(pi, literal) => segs.push(Segment::Literal(
+                Segment::Literal(pi, literal) => segs.push(Segment::Literal(
                     (*pi).with_inferred_type(literal.synthesize_type()),
                     literal.clone(),
                 )),
-                ast::Segment::Expression(expr) => {
+                Segment::Expression(expr) => {
                     let typed_expr = self.infer_expr(expr)?;
                     segs.push(ast::Segment::Expression(typed_expr.tree.into()));
                     substitutions = substitutions.compose(&typed_expr.substitutions);
@@ -2835,7 +2805,7 @@ impl TypingContext {
         &mut self,
         pi: ParseInfo,
         expected_type: &Type,
-        deconstruct: &namer::Deconstruct,
+        deconstruct: &phase::Deconstruct<Named>,
     ) -> Typing {
         let Typed {
             mut substitutions,
@@ -2885,7 +2855,11 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_deconstruction(&mut self, pi: ParseInfo, deconstruct: &namer::Deconstruct) -> Typing {
+    fn infer_deconstruction(
+        &mut self,
+        pi: ParseInfo,
+        deconstruct: &phase::Deconstruct<Named>,
+    ) -> Typing {
         let Typed {
             mut substitutions,
             tree: mut scrutinee,
@@ -2958,9 +2932,9 @@ impl TypingContext {
         &mut self,
         substitutions: &mut Substitutions,
         constraints: &mut ConstraintSet,
-        clause: &namer::MatchClause,
+        clause: &phase::MatchClause<Named>,
         scrutinee: &Type,
-    ) -> Typing<MatchClause> {
+    ) -> Typing<phase::MatchClause<Types>> {
         let mut bindings = Vec::default();
         let (p_subst, pattern) = self.check_pattern(&clause.pattern, &mut bindings, &scrutinee)?;
         self.substitute_mut(&p_subst);
@@ -3012,12 +2986,12 @@ impl TypingContext {
     #[instrument]
     fn infer_pattern_scrutinee(
         &mut self,
-        pattern: &namer::Pattern,
+        pattern: &phase::Pattern<Named>,
         bindings: &mut Vec<(namer::Identifier, Type)>,
         scrutinee: &MetaVariable,
-    ) -> Typing<(Substitutions, Pattern)> {
+    ) -> Typing<(Substitutions, phase::Pattern<Types>)> {
         match pattern {
-            namer::Pattern::Coproduct(pi, coproduct) => {
+            Pattern::Coproduct(pi, coproduct) => {
                 // This could be lifted into the pattern match
                 let constructor = coproduct
                     .constructor
@@ -3038,7 +3012,7 @@ impl TypingContext {
                 Ok((s_pattern.compose(&substitutions), pattern))
             }
 
-            namer::Pattern::Struct(pi, record) => {
+            Pattern::Struct(pi, record) => {
                 let shape = record.shape();
                 let inferred = self
                     .resolve_unique_record_type_constructor(*pi, &shape)?
@@ -3053,7 +3027,7 @@ impl TypingContext {
                 Ok((s_pattern.compose(&subst), pattern))
             }
 
-            namer::Pattern::Tuple(pi, tuple) => {
+            Pattern::Tuple(pi, tuple) => {
                 let tuple = Type::Tuple(TupleType(
                     tuple.elements.iter().map(|_| Type::fresh()).collect(),
                 ));
@@ -3068,7 +3042,7 @@ impl TypingContext {
                 Ok((s_pattern.compose(&unification), pattern))
             }
 
-            namer::Pattern::Literally(pi, pattern) => {
+            Pattern::Literally(pi, pattern) => {
                 let scrutinee = Type::Variable(scrutinee.clone());
                 let inferred = pattern.synthesize_type();
                 let s_pattern = inferred
@@ -3081,7 +3055,7 @@ impl TypingContext {
                 ))
             }
 
-            namer::Pattern::Bind(pi, pattern) => {
+            Pattern::Bind(pi, pattern) => {
                 let scrutinee = Type::Variable(scrutinee.clone());
                 bindings.push((pattern.clone(), scrutinee.clone()));
                 Ok((
@@ -3095,10 +3069,10 @@ impl TypingContext {
     #[instrument]
     fn check_pattern(
         &mut self,
-        pattern: &namer::Pattern,
+        pattern: &phase::Pattern<Named>,
         bindings: &mut Vec<(namer::Identifier, Type)>,
         scrutinee: &Type,
-    ) -> Typing<(Substitutions, Pattern)> {
+    ) -> Typing<(Substitutions, phase::Pattern<Types>)> {
         let pi = *pattern.annotation();
         let normalized_scrutinee = self
             .expand_type_constructor(pi, scrutinee)?
@@ -3110,7 +3084,7 @@ impl TypingContext {
             }
 
             (
-                namer::Pattern::Coproduct(pi, pattern),
+                Pattern::Coproduct(pi, pattern),
                 TypeStructure::Monotype(Type::Coproduct(coproduct)),
             ) => {
                 if let namer::Identifier::Free(constructor) = &pattern.constructor
@@ -3146,7 +3120,7 @@ impl TypingContext {
                 }
             }
 
-            (namer::Pattern::Tuple(pi, pattern), TypeStructure::Monotype(Type::Tuple(tuple)))
+            (Pattern::Tuple(pi, pattern), TypeStructure::Monotype(Type::Tuple(tuple)))
                 if pattern.elements.len() == tuple.arity() =>
             {
                 let mut elements = Vec::with_capacity(tuple.arity());
@@ -3167,7 +3141,7 @@ impl TypingContext {
                 ))
             }
 
-            (namer::Pattern::Struct(pi, pattern), TypeStructure::PolyRecord(record))
+            (Pattern::Struct(pi, pattern), TypeStructure::PolyRecord(record))
                 if pattern.fields.len() == record.len() =>
             {
                 let mut arguments = Vec::with_capacity(record.len());
@@ -3200,7 +3174,7 @@ impl TypingContext {
             }
 
             // Check pattern at ty
-            (namer::Pattern::Literally(pi, pattern), ..) => {
+            (Pattern::Literally(pi, pattern), ..) => {
                 let inferred = pattern.synthesize_type();
                 let subs = inferred
                     .unified_with(scrutinee, &self.types)
@@ -3212,7 +3186,7 @@ impl TypingContext {
                 ))
             }
 
-            (namer::Pattern::Bind(pi, pattern), ..) => {
+            (Pattern::Bind(pi, pattern), ..) => {
                 bindings.push((pattern.clone(), scrutinee.clone()));
                 Ok((
                     Substitutions::default(),
@@ -3251,7 +3225,7 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_inject(&mut self, pi: ParseInfo, construct: &namer::Injection) -> Typing {
+    fn infer_inject(&mut self, pi: ParseInfo, construct: &phase::Injection<Named>) -> Typing {
         let (substitutions, constraints, typed_arguments, argument_types) =
             self.infer_several(&construct.arguments)?;
 
@@ -3291,7 +3265,7 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_record(&mut self, pi: ParseInfo, record: &namer::Record) -> Typing {
+    fn infer_record(&mut self, pi: ParseInfo, record: &phase::Record<Named>) -> Typing {
         let mut substitutions = Substitutions::default();
         let mut fields = Vec::with_capacity(record.fields.len());
         let mut constraints = ConstraintSet::default();
@@ -3342,7 +3316,7 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_projection(&mut self, pi: ParseInfo, projection: &namer::Projection) -> Typing {
+    fn infer_projection(&mut self, pi: ParseInfo, projection: &phase::Projection<Named>) -> Typing {
         let Typed {
             substitutions,
             tree: base,
@@ -3504,7 +3478,7 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_tuple(&mut self, pi: ParseInfo, tuple: &namer::Tuple) -> Typing {
+    fn infer_tuple(&mut self, pi: ParseInfo, tuple: &phase::Tuple<Named>) -> Typing {
         let (substitutions, constraints, elements, element_types) =
             self.infer_several(&tuple.elements)?;
 
@@ -3556,7 +3530,7 @@ impl TypingContext {
     fn infer_recursive_lambda(
         &mut self,
         pi: ParseInfo,
-        rec_lambda: &namer::SelfReferential,
+        rec_lambda: &phase::SelfReferential<Named>,
     ) -> Typing {
         let domain = Type::fresh();
         let codomain = Type::fresh();
@@ -3604,11 +3578,11 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_apply_with_checked_arg(
+    fn _infer_apply_with_checked_arg(
         &mut self,
         pi: ParseInfo,
-        function: &namer::Expr,
-        argument: &namer::Expr,
+        function: &phase::Expr<Named>,
+        argument: &phase::Expr<Named>,
     ) -> Typing {
         let mut function = self.infer_expr(function)?;
         let function_type = &function.tree.type_info().inferred_type;
@@ -3662,8 +3636,8 @@ impl TypingContext {
     fn infer_apply(
         &mut self,
         pi: ParseInfo,
-        function: &namer::Expr,
-        argument: &namer::Expr,
+        function: &phase::Expr<Named>,
+        argument: &phase::Expr<Named>,
     ) -> Typing {
         let function = self.infer_expr(function)?;
 
@@ -3720,8 +3694,8 @@ impl TypingContext {
     fn infer_lambda(
         &mut self,
         pi: ParseInfo,
-        lambda: &namer::Lambda,
-    ) -> Typing<(Substitutions, ConstraintSet, TypeInfo, Lambda)> {
+        lambda: &phase::Lambda<Named>,
+    ) -> Typing<(Substitutions, ConstraintSet, TypeInfo, phase::Lambda<Types>)> {
         let domain = Type::fresh();
         let codomain = Type::fresh();
 
@@ -3766,7 +3740,7 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_binding(&mut self, pi: ParseInfo, binding: &namer::Binding) -> Typing {
+    fn infer_binding(&mut self, pi: ParseInfo, binding: &phase::Binding<Named>) -> Typing {
         let typed_bound = self.infer_expr(&binding.bound)?;
         let ctx1 = self.apply(&typed_bound.substitutions);
 
@@ -3800,7 +3774,7 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_sequence(&mut self, sequence: &namer::Sequence) -> Typing {
+    fn infer_sequence(&mut self, sequence: &phase::Sequence<Named>) -> Typing {
         let this = self.infer_expr(&sequence.this)?;
         self.substitute_mut(&this.substitutions);
         let and_then = self.infer_expr(&sequence.and_then)?;
@@ -3823,7 +3797,11 @@ impl TypingContext {
     }
 
     #[instrument]
-    fn infer_if_then_else(&mut self, pi: ParseInfo, if_then_else: &namer::IfThenElse) -> Typing {
+    fn infer_if_then_else(
+        &mut self,
+        pi: ParseInfo,
+        if_then_else: &phase::IfThenElse<Named>,
+    ) -> Typing {
         let predicate = self.infer_expr(&if_then_else.predicate)?;
         let s_bool_predicate = predicate
             .tree
@@ -3989,7 +3967,7 @@ impl Shape {
 }
 
 // todo: move to pattern.rs
-impl Pattern {
+impl phase::Pattern<Types> {
     fn denotation(&self) -> Denotation {
         match self {
             Pattern::Coproduct(_, pattern) => {
@@ -4083,7 +4061,7 @@ impl MatchSpace {
         self.covered.normalize().covers(pi, scrutinee, ctx)
     }
 
-    pub fn join(&mut self, p: &Pattern) -> bool {
+    pub fn join(&mut self, p: &phase::Pattern<Types>) -> bool {
         let new_coverage = p
             .denotation()
             .join(&self.covered)

@@ -1,0 +1,11 @@
+signature Foo :=
+  { bar :: Int -> Text
+    baz :: Text -> Unit
+  }
+
+witness Foo :=
+  { bar := λi. "`i`"
+  }
+
+start := λ_.
+  print_endline "hi, mom"

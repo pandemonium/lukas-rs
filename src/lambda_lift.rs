@@ -6,11 +6,12 @@ use std::{
 
 use crate::{
     ast::{
-        Literal, ProductElement,
+        Apply, Literal, ProductElement, Projection,
         namer::{QualifiedName, Symbol, SymbolName},
     },
-    closed::{self, Apply, CaptureInfo, Expr, Identifier, Lambda, LexicalLevel, Projection},
+    closed::{self, CaptureInfo, Closed, Expr, Identifier, LexicalLevel},
     parser::{self, IdentifierPath},
+    phase,
 };
 
 impl closed::SymbolTable {
@@ -182,7 +183,11 @@ pub struct LiftedFunction {
 }
 
 impl LiftedFunction {
-    fn from_lambda(capture_info: CaptureInfo, name: QualifiedName, lambda: Lambda) -> Self {
+    fn from_lambda(
+        capture_info: CaptureInfo,
+        name: QualifiedName,
+        lambda: phase::Lambda<Closed>,
+    ) -> Self {
         Self {
             name,
             code: Rc::unwrap_or_clone(lambda.body),

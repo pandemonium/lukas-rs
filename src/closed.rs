@@ -2,36 +2,28 @@ use std::{collections::HashMap, fmt, rc::Rc};
 
 use crate::{
     ast::{
-        self,
+        self, Apply, Binding, Deconstruct, IfThenElse, Injection, Lambda, Projection, Record,
+        Segment, SelfReferential, Sequence, Tuple, TypeAscription,
         annotation::Annotated,
         namer::{self, QualifiedName, Symbol, TermSymbol},
+        pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern},
     },
     parser::ParseInfo,
-    typer::{self, Type, TypeInfo},
+    phase,
+    typer::{self, Type, TypeInfo, Types},
 };
+
+pub struct Closed;
+
+impl phase::Phase for Closed {
+    type Annotation = CaptureInfo;
+    type TermId = Identifier;
+    type TypeId = QualifiedName;
+}
 
 pub type SymbolTable = namer::SymbolTable<CaptureInfo, QualifiedName, Identifier>;
 
 pub type Expr = ast::Expr<CaptureInfo, Identifier>;
-pub type SelfReferential = ast::SelfReferential<CaptureInfo, Identifier>;
-pub type Lambda = ast::Lambda<CaptureInfo, Identifier>;
-pub type Apply = ast::Apply<CaptureInfo, Identifier>;
-pub type Binding = ast::Binding<CaptureInfo, Identifier>;
-pub type Tuple = ast::Tuple<CaptureInfo, Identifier>;
-pub type Record = ast::Record<CaptureInfo, Identifier>;
-pub type Injection = ast::Injection<CaptureInfo, Identifier>;
-pub type Projection = ast::Projection<CaptureInfo, Identifier>;
-pub type Sequence = ast::Sequence<CaptureInfo, Identifier>;
-pub type MatchClause = ast::pattern::MatchClause<CaptureInfo, Identifier>;
-pub type Deconstruct = ast::Deconstruct<CaptureInfo, Identifier>;
-pub type IfThenElse = ast::IfThenElse<CaptureInfo, Identifier>;
-pub type Interpolate = ast::Interpolate<CaptureInfo, Identifier>;
-pub type Segment = ast::Segment<CaptureInfo, Identifier>;
-pub type TypeAscription = ast::TypeAscription<CaptureInfo, Identifier>;
-pub type Pattern = ast::pattern::Pattern<CaptureInfo, Identifier>;
-pub type ConstructorPattern = ast::pattern::ConstructorPattern<CaptureInfo, Identifier>;
-pub type TuplePattern = ast::pattern::TuplePattern<CaptureInfo, Identifier>;
-pub type StructPattern = ast::pattern::StructPattern<CaptureInfo, Identifier>;
 type Tree<Id> = ast::Tree<CaptureInfo, Id>;
 
 impl typer::SymbolTable {
@@ -176,17 +168,17 @@ impl TypeInfo {
     }
 }
 
-impl typer::Pattern {
+impl phase::Pattern<Types> {
     fn rewrite_tree(
         self,
         lambda_level: LexicalLevel,
         is_recursive: bool,
         capture_map: &mut CaptureLayout,
-    ) -> Pattern {
+    ) -> phase::Pattern<Closed> {
         match self {
-            ast::pattern::Pattern::Coproduct(
+            Pattern::Coproduct(
                 ti,
-                ast::pattern::ConstructorPattern {
+                ConstructorPattern {
                     constructor: namer::Identifier::Free(name),
                     arguments,
                 },
@@ -201,7 +193,7 @@ impl typer::Pattern {
                 },
             ),
 
-            ast::pattern::Pattern::Tuple(ti, the) => Pattern::Tuple(
+            Pattern::Tuple(ti, the) => Pattern::Tuple(
                 ti.empty_capture(),
                 TuplePattern {
                     elements: the
@@ -212,7 +204,7 @@ impl typer::Pattern {
                 },
             ),
 
-            ast::pattern::Pattern::Struct(ti, the) => Pattern::Struct(
+            Pattern::Struct(ti, the) => Pattern::Struct(
                 ti.empty_capture(),
                 StructPattern {
                     fields: the
@@ -228,23 +220,19 @@ impl typer::Pattern {
                 },
             ),
 
-            ast::pattern::Pattern::Literally(ti, the) => {
-                Pattern::Literally(ti.empty_capture(), the)
-            }
+            Pattern::Literally(ti, the) => Pattern::Literally(ti.empty_capture(), the),
 
-            ast::pattern::Pattern::Bind(ti, namer::Identifier::Bound(binding_level)) => {
-                Pattern::Bind(
-                    ti.empty_capture(),
-                    Identifier::Local(LexicalLevel(binding_level).rebase(lambda_level)),
-                )
-            }
+            Pattern::Bind(ti, namer::Identifier::Bound(binding_level)) => Pattern::Bind(
+                ti.empty_capture(),
+                Identifier::Local(LexicalLevel(binding_level).rebase(lambda_level)),
+            ),
 
             otherwise => panic!("illegal AST {otherwise:?}"),
         }
     }
 }
 
-impl typer::Expr {
+impl phase::Expr<Types> {
     pub fn close_closures(self) -> Expr {
         // really: map self name to Global before closing the tree
         self.rewrite_tree(LexicalLevel(0), false, &mut CaptureLayout::default())
@@ -282,7 +270,7 @@ impl typer::Expr {
 
             Self::RecursiveLambda(
                 ti,
-                typer::SelfReferential {
+                SelfReferential {
                     own_name: namer::Identifier::Bound(own_name),
                     lambda,
                 },
@@ -304,7 +292,7 @@ impl typer::Expr {
 
             Self::Lambda(
                 ti,
-                typer::Lambda {
+                Lambda {
                     parameter: namer::Identifier::Bound(param_level),
                     body,
                 },

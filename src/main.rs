@@ -68,7 +68,7 @@ where
 }
 
 fn main() {
-    Registry::default().with(TreeLayer).init();
+    //    Registry::default().with(TreeLayer).init();
     info!("Marmelade Compiler v420");
 
     let compiler = compiler::Compiler::parse();

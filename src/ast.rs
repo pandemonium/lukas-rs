@@ -9,6 +9,7 @@ use crate::{
 
 pub mod annotation;
 pub mod constraints;
+pub mod desugar;
 pub mod namer;
 pub mod pattern;
 

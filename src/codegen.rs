@@ -2,20 +2,24 @@ use fmt::Write;
 use std::fmt;
 
 use crate::{
-    ast::{Literal, ProductElement},
-    closed::{Apply, Binding, Expr, Identifier, IfThenElse, LexicalLevel, Projection, Sequence},
+    ast::{Binding, Literal, ProductElement, namer::QualifiedName},
+    closed::{self, CaptureInfo, Closed, Identifier, LexicalLevel},
     lambda_lift::{self, ClosureInfo, LiftedFunction},
+    phase,
     typer::{self, BaseType},
 };
 
-impl typer::Type {
-    fn return_type(&self) -> (Option<&Self>, &Self) {
-        match self {
-            Self::Arrow { domain, codomain } if codomain.is_arrow() => (Some(domain), codomain),
-            otherwise => (None, otherwise),
-        }
-    }
+pub struct Codegen;
 
+impl phase::Phase for Codegen {
+    type Annotation = CaptureInfo;
+    type TermId = closed::Identifier;
+    type TypeId = QualifiedName;
+}
+
+type Expr = phase::Expr<Codegen>;
+
+impl typer::Type {
     fn try_as_arrow(&self) -> Option<(&Self, &Self)> {
         match self {
             Self::Arrow { domain, codomain } => Some((domain, codomain)),
@@ -114,7 +118,11 @@ impl lambda_lift::Program {
         }
     }
 
-    fn compile_projection(&self, the: &Projection, code: &mut CodeBuffer) -> fmt::Result {
+    fn compile_projection(
+        &self,
+        the: &phase::Projection<Closed>,
+        code: &mut CodeBuffer,
+    ) -> fmt::Result {
         self.compile_expr(&the.base, code)?;
         write!(code, "->")?;
         match &the.select {
@@ -123,7 +131,7 @@ impl lambda_lift::Program {
         }
     }
 
-    fn compile_apply(&self, the: &Apply, code: &mut CodeBuffer) -> fmt::Result {
+    fn compile_apply(&self, the: &phase::Apply<Closed>, code: &mut CodeBuffer) -> fmt::Result {
         match &*the.function {
             Expr::Variable(_, name) => {
                 write!(
@@ -152,7 +160,11 @@ impl lambda_lift::Program {
         writeln!(code, "VClo(???)")
     }
 
-    fn compile_sequence(&self, the: &Sequence, code: &mut CodeBuffer) -> fmt::Result {
+    fn compile_sequence(
+        &self,
+        the: &phase::Sequence<Closed>,
+        code: &mut CodeBuffer,
+    ) -> fmt::Result {
         write!(code, "(")?;
         self.compile_expr(&the.this, code)?;
         write!(code, ", ")?;
@@ -160,7 +172,7 @@ impl lambda_lift::Program {
         write!(code, ")")
     }
 
-    fn compile_if(&self, the: &IfThenElse, code: &mut CodeBuffer) -> fmt::Result {
+    fn compile_if(&self, the: &phase::IfThenElse<Closed>, code: &mut CodeBuffer) -> fmt::Result {
         write!(code, "if (")?;
         self.compile_expr(&the.predicate, code)?;
         writeln!(code, ") {{\n")?;
@@ -193,7 +205,7 @@ impl lambda_lift::Program {
             binder,
             bound,
             body,
-        }: &Binding,
+        }: &phase::Binding<Closed>,
         code: &mut CodeBuffer,
     ) -> fmt::Result {
         let bound_ty = bound.annotation().type_info.inferred_type.c_type_name();

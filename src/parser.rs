@@ -5,42 +5,31 @@ use thiserror::Error;
 
 use crate::{
     ast::{
-        self, ApplyTypeExpr, ArrowTypeExpr, CoproductConstructor, Declaration, FieldDeclarator,
-        Kind, ModuleDeclaration, ModuleDeclarator, SignatureDeclaration, Tree, TupleTypeExpr,
-        TypeDeclaration, TypeDeclarator, TypeVariable, UseDeclaration, ValueDeclaration,
-        ValueDeclarator, WitnessDeclaration, namer::QualifiedName,
+        self, Apply, ApplyTypeExpr, ArrowTypeExpr, Binding, ConstraintExpression, Declaration,
+        Deconstruct, FieldDeclarator, IfThenElse, Interpolate, Kind, Lambda, ModuleDeclaration,
+        ModuleDeclarator, Projection, Record, SelfReferential, Sequence, SignatureDeclaration,
+        Tree, Tuple, TupleTypeExpr, TypeAscription, TypeDeclaration, TypeDeclarator,
+        TypeExpression, TypeSignature, TypeVariable, UseDeclaration, ValueDeclaration,
+        ValueDeclarator, WitnessDeclaration,
+        namer::QualifiedName,
+        pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern},
     },
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
+    phase,
 };
 
-pub type Expr = ast::Expr<ParseInfo, IdentifierPath>;
-pub type SelfReferential = ast::SelfReferential<ParseInfo, IdentifierPath>;
-pub type Lambda = ast::Lambda<ParseInfo, IdentifierPath>;
-pub type Apply = ast::Apply<ParseInfo, IdentifierPath>;
-pub type Binding = ast::Binding<ParseInfo, IdentifierPath>;
-pub type Record = ast::Record<ParseInfo, IdentifierPath>;
-pub type Tuple = ast::Tuple<ParseInfo, IdentifierPath>;
-pub type Projection = ast::Projection<ParseInfo, IdentifierPath>;
-pub type Injection = ast::Injection<ParseInfo, IdentifierPath>;
-pub type Sequence = ast::Sequence<ParseInfo, IdentifierPath>;
-pub type Deconstruct = ast::Deconstruct<ParseInfo, IdentifierPath>;
-pub type IfThenElse = ast::IfThenElse<ParseInfo, IdentifierPath>;
-pub type Interpolate = ast::Interpolate<ParseInfo, IdentifierPath>;
-pub type TypeAscription = ast::TypeAscription<ParseInfo, IdentifierPath>;
-pub type RecordDeclarator = ast::RecordDeclarator<ParseInfo>;
-pub type CoproductDeclarator = ast::CoproductDeclarator<ParseInfo>;
+pub struct Parsed;
 
-pub type Segment = ast::Sequence<ParseInfo, IdentifierPath>;
-pub type Pattern = ast::pattern::Pattern<ParseInfo, IdentifierPath>;
-pub type MatchClause = ast::pattern::MatchClause<ParseInfo, IdentifierPath>;
+impl phase::Phase for Parsed {
+    type Annotation = ParseInfo;
+    type TermId = IdentifierPath;
+    type TypeId = IdentifierPath;
+}
 
-pub type ConstructorPattern = ast::pattern::ConstructorPattern<ParseInfo, IdentifierPath>;
-pub type TuplePattern = ast::pattern::TuplePattern<ParseInfo, IdentifierPath>;
-pub type StructPattern = ast::pattern::StructPattern<ParseInfo, IdentifierPath>;
-pub type TypeExpression = ast::TypeExpression<ParseInfo, IdentifierPath>;
-pub type TypeSignature = ast::TypeSignature<ParseInfo, IdentifierPath>;
-
-pub type ConstraintExpression = ast::ConstraintExpression<ParseInfo, IdentifierPath>;
+pub type Expr = phase::Expr<Parsed>;
+type RecordDeclarator = ast::RecordDeclarator<ParseInfo>;
+type CoproductDeclarator = ast::CoproductDeclarator<ParseInfo>;
+type CoproductConstructor = ast::CoproductConstructor<ParseInfo>;
 
 impl<Id> ast::Expr<ParseInfo, Id> {
     pub fn parse_info(&self) -> &ParseInfo {
@@ -212,7 +201,7 @@ fn stack_depth() -> usize {
     STACK_DEPTH.with(|d| d.get())
 }
 
-impl Interpolate {
+impl phase::Interpolate<Parsed> {
     pub fn begin(pi: ParseInfo, prelude: Literal) -> Self {
         Self(vec![ast::Segment::Literal(pi, prelude.into())])
     }
@@ -789,7 +778,7 @@ impl<'a> Parser<'a> {
 
     fn parse_value_declarator(
         &mut self,
-        type_signature: Option<TypeSignature>,
+        type_signature: Option<phase::TypeSignature<Parsed>>,
         own_name: IdentifierPath,
     ) -> Result<ValueDeclarator<ParseInfo>> {
         let _t = self.trace();
@@ -885,14 +874,17 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_type_expression(&mut self, precedence: usize) -> Result<TypeExpression> {
+    fn parse_type_expression(
+        &mut self,
+        precedence: usize,
+    ) -> Result<phase::TypeExpression<Parsed>> {
         let _t = self.trace();
 
         let prefix = self.parse_type_expr_prefix()?;
         self.parse_type_expr_infix(prefix, precedence)
     }
 
-    fn parse_type_expr_prefix(&mut self) -> Result<TypeExpression> {
+    fn parse_type_expr_prefix(&mut self) -> Result<phase::TypeExpression<Parsed>> {
         let _t = self.trace();
 
         match self.remains() {
@@ -922,7 +914,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn peek_type_expr_operator(&self, lhs: &TypeExpression) -> Option<TypeExprOperator> {
+    fn peek_type_expr_operator(
+        &self,
+        lhs: &phase::TypeExpression<Parsed>,
+    ) -> Option<TypeExprOperator> {
         match self.remains() {
             [
                 Token {
@@ -975,9 +970,9 @@ impl<'a> Parser<'a> {
 
     fn parse_type_expr_infix(
         &mut self,
-        lhs: TypeExpression,
+        lhs: phase::TypeExpression<Parsed>,
         context_precedence: usize,
-    ) -> Result<TypeExpression> {
+    ) -> Result<phase::TypeExpression<Parsed>> {
         let _t = self.trace();
 
         let operator = match self.peek_type_expr_operator(&lhs) {
@@ -1651,7 +1646,7 @@ impl<'a> Parser<'a> {
         )
     }
 
-    fn parse_type_signature(&mut self) -> Result<TypeSignature> {
+    fn parse_type_signature(&mut self) -> Result<phase::TypeSignature<Parsed>> {
         let _t = self.trace();
 
         let universal_quantifiers = self.parse_forall_clause()?;
@@ -1670,7 +1665,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_constraint_clause(&mut self) -> Result<Vec<ConstraintExpression>> {
+    fn parse_constraint_clause(&mut self) -> Result<Vec<phase::ConstraintExpression<Parsed>>> {
         let _t = self.trace();
 
         // Foo bar + Baz quux Int |-
@@ -1698,7 +1693,7 @@ impl<'a> Parser<'a> {
             })
     }
 
-    fn parse_type_constraint(&mut self) -> Result<ConstraintExpression> {
+    fn parse_type_constraint(&mut self) -> Result<phase::ConstraintExpression<Parsed>> {
         let _t = self.trace();
 
         let (pos, id) = self.identifier()?;
@@ -1770,7 +1765,7 @@ impl<'a> Parser<'a> {
         Ok(CoproductDeclarator { constructors })
     }
 
-    fn parse_coproduct_constructor(&mut self) -> Result<CoproductConstructor<ParseInfo>> {
+    fn parse_coproduct_constructor(&mut self) -> Result<CoproductConstructor> {
         let _t = self.trace();
 
         let (_, id) = self.identifier()?;
@@ -1859,7 +1854,7 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn parse_match_clause(&mut self) -> Result<MatchClause> {
+    fn parse_match_clause(&mut self) -> Result<phase::MatchClause<Parsed>> {
         let _t = self.trace();
 
         let pattern = self.parse_pattern()?;
@@ -1872,14 +1867,14 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_pattern(&mut self) -> Result<Pattern> {
+    fn parse_pattern(&mut self) -> Result<phase::Pattern<Parsed>> {
         let _t = self.trace();
 
         let prefix = self.parse_pattern_prefix()?;
         self.parse_pattern_infix(prefix)
     }
 
-    fn parse_pattern_prefix(&mut self) -> Result<Pattern> {
+    fn parse_pattern_prefix(&mut self) -> Result<phase::Pattern<Parsed>> {
         let _t = self.trace();
 
         // 1. Coproduct: Constructor pat1 pat2 pat3
@@ -1924,7 +1919,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_pattern_infix(&mut self, lhs: Pattern) -> Result<Pattern> {
+    fn parse_pattern_infix(
+        &mut self,
+        lhs: phase::Pattern<Parsed>,
+    ) -> Result<phase::Pattern<Parsed>> {
         let _t = self.trace();
 
         match self.remains() {
@@ -1944,7 +1942,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_constructor_pattern(&mut self) -> Result<Pattern> {
+    fn parse_constructor_pattern(&mut self) -> Result<phase::Pattern<Parsed>> {
         let _t = self.trace();
 
         // There are nullary constructors
@@ -1971,7 +1969,7 @@ impl<'a> Parser<'a> {
         &mut self,
         position: SourceLocation,
         literal: &Literal,
-    ) -> Result<Pattern> {
+    ) -> Result<phase::Pattern<Parsed>> {
         let _t = self.trace();
 
         // the literal
@@ -1982,7 +1980,7 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn parse_pattern_binder(&mut self) -> Result<Pattern> {
+    fn parse_pattern_binder(&mut self) -> Result<phase::Pattern<Parsed>> {
         let _t = self.trace();
 
         let (pos, id) = self.identifier()?;
@@ -1992,7 +1990,7 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn parse_struct_pattern(&mut self) -> Result<Pattern> {
+    fn parse_struct_pattern(&mut self) -> Result<phase::Pattern<Parsed>> {
         let _t = self.trace();
 
         // {
@@ -2016,7 +2014,7 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn parse_struct_pattern_field(&mut self) -> Result<(Identifier, Pattern)> {
+    fn parse_struct_pattern_field(&mut self) -> Result<(Identifier, phase::Pattern<Parsed>)> {
         let _t = self.trace();
 
         let (_pos, label) = self.identifier()?;
@@ -2068,8 +2066,8 @@ fn is_capital_case(id: &str) -> bool {
     id.chars().next().is_some_and(|c| c.is_uppercase())
 }
 
-impl Pattern {
-    pub fn normalize(&self) -> Pattern {
+impl phase::Pattern<Parsed> {
+    pub fn normalize(&self) -> phase::Pattern<Parsed> {
         match self {
             Self::Coproduct(
                 pi,
@@ -2107,7 +2105,7 @@ impl Pattern {
     }
 }
 
-fn unspine_tuple_pattern(elements: Vec<Pattern>) -> Vec<Pattern> {
+fn unspine_tuple_pattern(elements: Vec<phase::Pattern<Parsed>>) -> Vec<phase::Pattern<Parsed>> {
     elements
         .into_iter()
         .flat_map(|p| match p {
@@ -2117,7 +2115,7 @@ fn unspine_tuple_pattern(elements: Vec<Pattern>) -> Vec<Pattern> {
         .collect()
 }
 
-impl TypeExpression {
+impl phase::TypeExpression<Parsed> {
     fn is_applicable(&self) -> bool {
         matches!(
             self,

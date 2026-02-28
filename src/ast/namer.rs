@@ -12,38 +12,30 @@ use thiserror::Error;
 
 use crate::{
     ast::{
-        self, ApplyTypeExpr, ArrowTypeExpr, BUILTIN_MODULE_NAME, CompilationUnit, Declaration,
-        Kind, ModuleDeclarator, ProductElement, STDLIB_MODULE_NAME, TupleTypeExpr, TypeVariable,
-        pattern::TuplePattern,
+        self, Apply, ApplyTypeExpr, ArrowTypeExpr, BUILTIN_MODULE_NAME, Binding, CompilationUnit,
+        ConstraintExpression, CoproductDeclarator, Declaration, Deconstruct, IfThenElse, Injection,
+        Kind, Lambda, ModuleDeclarator, ProductElement, Projection, Record, RecordDeclarator,
+        STDLIB_MODULE_NAME, SelfReferential, Sequence, Tuple, TupleTypeExpr, TypeAscription,
+        TypeExpression, TypeSignature, TypeVariable,
+        desugar::Desugared,
+        pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern},
     },
     builtin,
     compiler::{Compilation, Compiler, Located, LocatedError},
-    parser::{self, IdentifierPath, ParseInfo},
+    parser::{self, IdentifierPath, ParseInfo, Parsed},
+    phase,
     typer::BaseType,
 };
 
-pub type Expr = ast::Expr<ParseInfo, Identifier>;
-pub type SelfReferential = ast::SelfReferential<ParseInfo, Identifier>;
-pub type Lambda = ast::Lambda<ParseInfo, Identifier>;
-pub type Apply = ast::Apply<ParseInfo, Identifier>;
-pub type Binding = ast::Binding<ParseInfo, Identifier>;
-pub type Record = ast::Record<ParseInfo, Identifier>;
-pub type Tuple = ast::Tuple<ParseInfo, Identifier>;
-pub type Projection = ast::Projection<ParseInfo, Identifier>;
-pub type Injection = ast::Injection<ParseInfo, Identifier>;
-pub type Sequence = ast::Sequence<ParseInfo, Identifier>;
-pub type Deconstruct = ast::Deconstruct<ParseInfo, Identifier>;
-pub type IfThenElse = ast::IfThenElse<ParseInfo, Identifier>;
-pub type Interpolate = ast::Interpolate<ParseInfo, Identifier>;
-pub type Segment = ast::Segment<ParseInfo, Identifier>;
-pub type MatchClause = ast::pattern::MatchClause<ParseInfo, Identifier>;
-pub type Pattern = ast::pattern::Pattern<ParseInfo, Identifier>;
-pub type ConstructorPattern = ast::pattern::ConstructorPattern<ParseInfo, Identifier>;
-pub type StructPattern = ast::pattern::StructPattern<ParseInfo, Identifier>;
-pub type TypeExpression = ast::TypeExpression<ParseInfo, QualifiedName>;
-pub type TypeSignature = ast::TypeSignature<ParseInfo, QualifiedName>;
-pub type TypeAscription = ast::TypeAscription<ParseInfo, Identifier>;
-pub type ConstraintExpression = ast::ConstraintExpression<ParseInfo, QualifiedName>;
+pub struct Named;
+
+impl phase::Phase for Named {
+    type Annotation = ParseInfo;
+    type TermId = Identifier;
+    type TypeId = QualifiedName;
+}
+
+pub type Expr = phase::Expr<Named>;
 
 type ParserSymbolTable = SymbolTable<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
 type ParserSymbol = Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>;
@@ -173,7 +165,7 @@ impl<A> ast::Expr<A, Identifier> {
     }
 }
 
-impl TypeExpression {
+impl TypeExpression<ParseInfo, QualifiedName> {
     pub fn free_variables(&self) -> HashSet<&QualifiedName> {
         let mut free = HashSet::default();
         self.gather_free_variables(&mut free);
@@ -454,7 +446,7 @@ impl parser::IdentifierPath {
     }
 }
 
-impl parser::RecordDeclarator {
+impl RecordDeclarator<ParseInfo> {
     fn as_type_symbol(
         &self,
         type_parameters: &[TypeVariable],
@@ -486,7 +478,7 @@ fn compute_type_constructor_kind(type_parameters: &[TypeVariable]) -> Kind {
     })
 }
 
-impl parser::CoproductDeclarator {
+impl CoproductDeclarator<ParseInfo> {
     fn as_type_symbol(
         &self,
         type_parameters: &[TypeVariable],
@@ -1012,18 +1004,15 @@ impl ConstructorSymbol<parser::IdentifierPath> {
         pi: ParseInfo,
         type_parameters: &[TypeVariable],
         type_constructor_name: &QualifiedName,
-    ) -> parser::TypeExpression {
+    ) -> phase::TypeExpression<Parsed> {
         type_parameters.iter().cloned().fold(
-            parser::TypeExpression::Constructor(
-                pi,
-                type_constructor_name.clone().into_identifier_path(),
-            ),
+            TypeExpression::Constructor(pi, type_constructor_name.clone().into_identifier_path()),
             |function, argument| {
-                parser::TypeExpression::Apply(
+                TypeExpression::Apply(
                     pi,
                     ApplyTypeExpr {
                         function: function.into(),
-                        argument: parser::TypeExpression::Parameter(pi, argument.name).into(),
+                        argument: TypeExpression::Parameter(pi, argument.name).into(),
                         phase: PhantomData,
                     },
                 )
@@ -1051,14 +1040,14 @@ impl ConstructorSymbol<parser::IdentifierPath> {
         pi: ParseInfo,
         type_parameters: &[TypeVariable],
         type_constructor_name: &QualifiedName,
-    ) -> parser::TypeSignature {
-        parser::TypeSignature {
+    ) -> phase::TypeSignature<Parsed> {
+        TypeSignature {
             universal_quantifiers: type_parameters.to_vec(),
             constraints: Vec::default(),
             body: self.signature.iter().cloned().rfold(
                 self.make_applied_type_constructor(pi, type_parameters, type_constructor_name),
                 |rhs, lhs| {
-                    parser::TypeExpression::Arrow(
+                    TypeExpression::Arrow(
                         pi,
                         ArrowTypeExpr {
                             domain: lhs.into(),
@@ -1071,7 +1060,8 @@ impl ConstructorSymbol<parser::IdentifierPath> {
         }
     }
 
-    pub fn make_curried_constructor_term(&self, pi: ParseInfo) -> parser::Expr {
+    // These things are also phase like. What are they?
+    pub fn make_curried_constructor_term(&self, pi: ParseInfo) -> phase::Expr<Parsed> {
         let terms = 0..self.signature.len();
         let construct = parser::Expr::Inject(
             pi,
@@ -1088,9 +1078,9 @@ impl ConstructorSymbol<parser::IdentifierPath> {
         );
 
         terms.rfold(construct, |z, i| {
-            parser::Expr::Lambda(
+            ast::Expr::Lambda(
                 pi,
-                parser::Lambda {
+                Lambda {
                     parameter: parser::IdentifierPath::new(&format!("p{i}")),
                     body: z.into(),
                 },
@@ -1174,13 +1164,13 @@ impl DeBruijn {
     }
 }
 
-impl parser::ConstraintExpression {
+impl phase::ConstraintExpression<Desugared> {
     pub fn resolve_names(
         &self,
         symbols: &ParserSymbolTable,
         pi: ParseInfo,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<ConstraintExpression> {
+    ) -> Naming<ConstraintExpression<ParseInfo, QualifiedName>> {
         let Self {
             annotation,
             class,
@@ -1198,13 +1188,13 @@ impl parser::ConstraintExpression {
     }
 }
 
-impl parser::TypeSignature {
+impl phase::TypeSignature<Desugared> {
     pub fn resolve_names(
         &self,
         symbols: &ParserSymbolTable,
         pi: ParseInfo,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<TypeSignature> {
+    ) -> Naming<TypeSignature<ParseInfo, QualifiedName>> {
         let Self {
             universal_quantifiers,
             constraints,
@@ -1223,13 +1213,13 @@ impl parser::TypeSignature {
     }
 }
 
-impl parser::TypeExpression {
+impl phase::TypeExpression<Desugared> {
     pub fn resolve_names(
         &self,
         symbols: &ParserSymbolTable,
         pi: ParseInfo,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<TypeExpression> {
+    ) -> Naming<TypeExpression<ParseInfo, QualifiedName>> {
         match self {
             Self::Constructor(a, name) => Ok(TypeExpression::Constructor(*a, {
                 symbols.resolve_type_name(name, pi, semantic_scope)?
@@ -1285,7 +1275,7 @@ impl parser::Expr {
         self.map(&mut |e| match e {
             parser::Expr::Tuple(a, tuple) => parser::Expr::Tuple(
                 a,
-                parser::Tuple {
+                Tuple {
                     elements: unspine_tuple(tuple.elements),
                 },
             ),
@@ -1424,14 +1414,14 @@ fn project_base(pi: &ParseInfo, base: Identifier, projection_path: &[String]) ->
         })
 }
 
-impl parser::SelfReferential {
+impl phase::SelfReferential<Desugared> {
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         pi: ParseInfo,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<SelfReferential> {
+    ) -> Naming<phase::SelfReferential<Named>> {
         if let Some(own_name) = self.own_name.try_as_simple() {
             names.bind_and_then(own_name.clone(), |names, own_name| {
                 Ok(SelfReferential {
@@ -1445,14 +1435,14 @@ impl parser::SelfReferential {
     }
 }
 
-impl parser::Lambda {
+impl phase::Lambda<Parsed> {
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         pi: ParseInfo,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<Lambda> {
+    ) -> Naming<phase::Lambda<Named>> {
         if let Some(parameter) = self.parameter.try_as_simple() {
             names.bind_and_then(parameter, |names, parameter| {
                 Ok(Lambda {
@@ -1466,13 +1456,13 @@ impl parser::Lambda {
     }
 }
 
-impl parser::Apply {
+impl phase::Apply<Parsed> {
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<Apply> {
+    ) -> Naming<phase::Apply<Named>> {
         Ok(Apply {
             function: self
                 .function
@@ -1486,14 +1476,14 @@ impl parser::Apply {
     }
 }
 
-impl parser::Binding {
+impl phase::Binding<Desugared> {
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         pi: ParseInfo,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<Binding> {
+    ) -> Naming<phase::Binding<Named>> {
         if let Some(binder) = self.binder.try_as_simple() {
             let bound = Rc::new(self.bound.resolve(names, symbols, semantic_scope)?);
             names.bind_and_then(binder, |names, binder| {
@@ -1509,13 +1499,13 @@ impl parser::Binding {
     }
 }
 
-impl parser::Record {
+impl phase::Record<Desugared> {
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<Record> {
+    ) -> Naming<phase::Record<Named>> {
         Ok(Record {
             fields: self
                 .fields
@@ -1529,13 +1519,13 @@ impl parser::Record {
     }
 }
 
-impl parser::Tuple {
+impl phase::Tuple<Desugared> {
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<Tuple> {
+    ) -> Naming<phase::Tuple<Named>> {
         Ok(Tuple {
             elements: self
                 .elements
@@ -1546,13 +1536,13 @@ impl parser::Tuple {
     }
 }
 
-impl parser::Injection {
+impl phase::Injection<Desugared> {
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<Injection> {
+    ) -> Naming<phase::Injection<Named>> {
         Ok(Injection {
             constructor: self.constructor.clone(),
             arguments: self
@@ -1564,13 +1554,13 @@ impl parser::Injection {
     }
 }
 
-impl parser::Projection {
+impl phase::Projection<Desugared> {
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<Projection> {
+    ) -> Naming<phase::Projection<Named>> {
         Ok(Projection {
             base: self
                 .base
@@ -1581,13 +1571,13 @@ impl parser::Projection {
     }
 }
 
-impl parser::Sequence {
+impl phase::Sequence<Desugared> {
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<Sequence> {
+    ) -> Naming<phase::Sequence<Named>> {
         Ok(Sequence {
             this: self
                 .this
@@ -1601,13 +1591,13 @@ impl parser::Sequence {
     }
 }
 
-impl parser::Deconstruct {
+impl phase::Deconstruct<Desugared> {
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<Deconstruct> {
+    ) -> Naming<phase::Deconstruct<Named>> {
         Ok(Deconstruct {
             scrutinee: self
                 .scrutinee
@@ -1622,13 +1612,13 @@ impl parser::Deconstruct {
     }
 }
 
-impl parser::IfThenElse {
+impl phase::IfThenElse<Desugared> {
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<IfThenElse> {
+    ) -> Naming<phase::IfThenElse<Named>> {
         Ok(IfThenElse {
             predicate: self
                 .predicate
@@ -1646,13 +1636,13 @@ impl parser::IfThenElse {
     }
 }
 
-impl parser::Interpolate {
+impl phase::Interpolate<Desugared> {
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<Interpolate> {
+    ) -> Naming<phase::Interpolate<Named>> {
         let Self(segments) = self;
         Ok(ast::Interpolate(
             segments
@@ -1671,14 +1661,14 @@ impl parser::Interpolate {
     }
 }
 
-impl parser::TypeAscription {
+impl phase::TypeAscription<Desugared> {
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<TypeAscription> {
-        let ast::TypeSignature {
+    ) -> Naming<phase::TypeAscription<Named>> {
+        let TypeSignature {
             universal_quantifiers,
             constraints,
             body,
@@ -1704,13 +1694,13 @@ impl parser::TypeAscription {
     }
 }
 
-impl parser::MatchClause {
+impl phase::MatchClause<Desugared> {
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Naming<MatchClause> {
+    ) -> Naming<phase::MatchClause<Named>> {
         let Self {
             pattern,
             consequent,
@@ -1727,15 +1717,15 @@ impl parser::MatchClause {
     }
 }
 
-impl parser::Pattern {
+impl phase::Pattern<Desugared> {
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &parser::IdentifierPath,
-    ) -> Pattern {
+    ) -> phase::Pattern<Named> {
         match self {
-            parser::Pattern::Coproduct(a, pattern) => Pattern::Coproduct(
+            Pattern::Coproduct(a, pattern) => Pattern::Coproduct(
                 *a,
                 ConstructorPattern {
                     constructor: Identifier::Free(
@@ -1753,7 +1743,7 @@ impl parser::Pattern {
                 },
             ),
 
-            parser::Pattern::Tuple(a, pattern) => Pattern::Tuple(
+            Pattern::Tuple(a, pattern) => Pattern::Tuple(
                 *a,
                 TuplePattern {
                     elements: pattern
@@ -1764,7 +1754,7 @@ impl parser::Pattern {
                 },
             ),
 
-            parser::Pattern::Struct(a, pattern) => Pattern::Struct(
+            Pattern::Struct(a, pattern) => Pattern::Struct(
                 *a,
                 StructPattern {
                     fields: pattern
@@ -1780,9 +1770,9 @@ impl parser::Pattern {
                 },
             ),
 
-            parser::Pattern::Literally(a, pattern) => Pattern::Literally(*a, pattern.clone()),
+            Pattern::Literally(a, pattern) => Pattern::Literally(*a, pattern.clone()),
 
-            parser::Pattern::Bind(a, pattern) => {
+            Pattern::Bind(a, pattern) => {
                 if let Some(id) = pattern.try_as_simple() {
                     Pattern::Bind(*a, Identifier::Bound(names.bind(id)))
                 } else {
@@ -1813,9 +1803,7 @@ impl ParserSymbolTable {
     // modules are known
     pub fn resolve_names(self) -> Naming<NamedSymbolTable> {
         Ok(SymbolTable {
-            // Any kind of renaming necessary here?
             module_members: self.module_members.clone(),
-            // Any kind of renaming necessary here?
             member_modules: self.member_modules.clone(),
             symbols: self
                 .symbols
@@ -1828,9 +1816,7 @@ impl ParserSymbolTable {
                 })
                 .collect::<Naming<_>>()?,
             imports: self.imports,
-            // Any kind of renaming necessary here?
             signatures: self.signatures.clone(),
-            // Any kind of renaming necessary here?
             witnesses: self.witnesses.clone(),
         })
     }

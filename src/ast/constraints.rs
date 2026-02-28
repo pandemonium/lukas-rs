@@ -1,11 +1,15 @@
 use std::{collections::HashMap, fmt};
 
 use crate::{
-    ast::namer::{self, Identifier, QualifiedName},
+    ast::{
+        Apply, Expr,
+        namer::{Identifier, Named, QualifiedName},
+    },
     parser::ParseInfo,
+    phase,
     typer::{
-        Apply, Constraint, Expr, RecordShape, Substitutions, Type, TypeEnvironment, TypeError,
-        TypeStructure, Typing, TypingContext, display_list,
+        Constraint, RecordShape, Substitutions, Type, TypeEnvironment, TypeError, TypeStructure,
+        Types, Typing, TypingContext, display_list,
     },
 };
 
@@ -43,7 +47,7 @@ pub struct Witness {
 impl Witness {
     pub fn from_type_signature(
         name: QualifiedName,
-        witness: namer::TypeSignature,
+        witness: phase::TypeSignature<Named>,
         ctx: &TypingContext,
     ) -> Typing<Self> {
         let witness_signature = witness.type_scheme(&HashMap::default(), ctx)?;
@@ -82,7 +86,7 @@ impl WitnessIndex {
         &self,
         constraint: &Constraint,
         ctx: &TypeEnvironment,
-    ) -> Result<Expr, TypeError> {
+    ) -> Result<phase::Expr<Types>, TypeError> {
         let candidates = self
             .store
             .get(constraint.name())

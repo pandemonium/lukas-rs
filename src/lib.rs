@@ -8,4 +8,5 @@ pub mod interpreter;
 pub mod lambda_lift;
 pub mod lexer;
 pub mod parser;
+pub mod phase;
 pub mod typer;
