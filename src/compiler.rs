@@ -141,7 +141,7 @@ impl Compiler {
             let mut code = CodeBuffer::default();
 
             program.generate_code(&mut code).unwrap();
-            println!("/* generated_code.c */\n{}", code);
+            //println!("/* generated_code.c */\n{}", code);
 
             Ok(())
         } else {
@@ -179,13 +179,21 @@ impl Compiler {
 }
 
 fn load_and_parse_module(source_path: PathBuf) -> Compilation<Vec<ast::Declaration<ParseInfo>>> {
-    println!("load_and_parse_module: {:?}", source_path);
-    let source = fs::read_to_string(source_path)?.chars().collect::<Vec<_>>();
+    let source = fs::read_to_string(&source_path)?
+        .chars()
+        .collect::<Vec<_>>();
 
     let mut lexer = LexicalAnalyzer::default();
     let tokens = lexer.tokenize(&source);
 
     let mut parser = parser::Parser::from_tokens(tokens);
 
-    Ok(parser.parse_declaration_list()?)
+    let declarations = parser.parse_declaration_list()?;
+
+    println!(
+        "load_and_parse_module: {source_path:?} last known location {}",
+        parser.remains()[0].location()
+    );
+
+    Ok(declarations)
 }

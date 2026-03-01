@@ -16,6 +16,7 @@ use crate::{
     },
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
     phase,
+    typer::display_list,
 };
 
 pub struct Parsed;
@@ -246,7 +247,7 @@ impl<'a> Parser<'a> {
         Self { remains, offset: 0 }
     }
 
-    fn remains(&self) -> &'a [Token] {
+    pub fn remains(&self) -> &'a [Token] {
         &self.remains[self.offset..]
     }
 
@@ -270,7 +271,7 @@ impl<'a> Parser<'a> {
         if let Some(caller) = calling_symbol {
             let caller_name = caller.to_string();
             let parts = caller_name.split("::").collect::<Vec<_>>();
-            let _step = parts
+            let step = parts
                 .get(parts.len().saturating_sub(2))
                 .unwrap_or(&caller_name.as_str())
                 .to_string();
@@ -285,13 +286,13 @@ impl<'a> Parser<'a> {
 
             let remains = remains.chars().collect::<Vec<_>>();
 
-            let _remains = if remains.len() > REMAINS_COL {
+            let remains = if remains.len() > REMAINS_COL {
                 &remains[..REMAINS_COL]
             } else {
                 &remains
             };
 
-            let _indent = depth * 2;
+            let indent = depth * 2;
 
             //println!(
             //    "{:<width$}{}{}",
@@ -1163,38 +1164,73 @@ impl<'a> Parser<'a> {
         Ok(lambda)
     }
 
+    fn is_expr_start(&self, t: &TokenKind) -> bool {
+        matches!(
+            t,
+            TokenKind::Literal(..)
+                | TokenKind::Identifier(..)
+                | TokenKind::LeftBrace
+                | TokenKind::LeftParen
+                | TokenKind::Keyword(
+                    Keyword::Lambda | Keyword::Let | Keyword::Deconstruct | Keyword::If
+                )
+                | TokenKind::Interpolate(Interpolation::Interlude(..))
+        )
+    }
+
+    fn is_toplevel_start(&self, remains: &[Token]) -> bool {
+        match remains {
+            [
+                t,
+                Token {
+                    kind: TokenKind::Assign | TokenKind::TypeAscribe | TokenKind::TypeAssign,
+                    ..
+                },
+                ..,
+            ] if t.is_identifier() => true,
+            _ => false,
+        }
+    }
+
     fn parse_sequence(&mut self) -> Result<Expr> {
         let _t = self.trace();
 
         let prefix = self.parse_expression(0)?;
 
+        //println!(
+        //    "parse_sequence: prefix {prefix} --- remains {}",
+        //    display_list(" ", &self.remains().iter().take(5).collect::<Vec<_>>())
+        //);
+
         match self.remains() {
-            [t, u, v, ..]
-                if t.is_sequence_separator()
-                    && Self::is_expr_prefix(&u.kind)
-                    && Self::is_expr_prefix(&v.kind) =>
+            remains @ [t, u, ..]
+                if (t.is_sequence_separator() || t.is_dedent())
+                    && self.is_expr_start(&u.kind)
+                    && u.location().is_same_block(&prefix.parse_info().location)
+                    && !self.is_toplevel_start(&remains[1..]) =>
             {
-                self.consume()?;
+                // <NL> or ;
+                self.advance(1);
                 self.parse_subsequent(prefix)
             }
 
-            // If the previous expression ends in a Dedent "back to" sequence level
-            [t, u, ..]
-                if t.is_dedent()
-                    && Self::is_expr_prefix(&u.kind)
-                    && u.location().is_same_block(&prefix.parse_info().location) =>
+            // if ; then we cannot look at the column
+            remains @ [t, u, ..]
+                if (t.is_sequence_separator() || t.is_dedent())
+                    && self.is_expr_start(&u.kind)
+//                    && u.location().is_same_block(&prefix.parse_info().location)
+                    && !self.is_toplevel_start(&remains[1..]) =>
             {
-                println!("parse_sequence(2)");
-                self.consume()?;
+                // <NL> or ;
+                self.advance(1);
                 self.parse_subsequent(prefix)
             }
 
-            [t, u, ..]
-                if Self::is_expr_prefix(&t.kind)
+            remains @ [t, u, ..]
+                if self.is_expr_start(&t.kind)
                     && t.location().is_same_block(&prefix.parse_info().location)
-                    && u.kind != TokenKind::End =>
+                    && !self.is_toplevel_start(&remains) =>
             {
-                println!("parse_sequence(3)");
                 self.parse_subsequent(prefix)
             }
 
@@ -1331,6 +1367,7 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Into),
             TokenKind::Keyword(Keyword::Then),
             TokenKind::Keyword(Keyword::Else),
+            TokenKind::Keyword(Keyword::Signature),
             TokenKind::End,
         ];
 
@@ -1685,7 +1722,7 @@ impl<'a> Parser<'a> {
     fn has_type_constraints(&mut self) -> bool {
         self.remains()
             .iter()
-            .position(|t| t.kind == TokenKind::Assign)
+            .position(|t| matches!(t.kind, TokenKind::Assign | TokenKind::Layout(..)))
             .is_some_and(|p| {
                 self.remains()[..p]
                     .iter()

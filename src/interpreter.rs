@@ -310,7 +310,7 @@ impl fmt::Display for Val {
         match self {
             Self::Constant(x) => write!(f, "{x}"),
 
-            Self::Closure(x) => write!(f, "`{}`", x.borrow()),
+            Self::Closure(x) => write!(f, "`{}`", x.borrow().capture.global_count()),
 
             Self::RecursiveClosure { name, inner } => {
                 if let Some(inner) = inner.upgrade() {

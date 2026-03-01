@@ -15,6 +15,6 @@ type Expr = phase::Expr<Desugared>;
 
 impl phase::Expr<Parsed> {
     pub fn desugar(&self) -> Expr {
-        todo!()
+        self.clone()
     }
 }

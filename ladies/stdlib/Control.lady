@@ -1,3 +1,8 @@
+signature Monoid ::= ∀α.
+  { mempty  :: α
+    mappend :: α -> α -> α
+  }
+
 signature Functor ::= ∀f : * -> *.
   { fmap :: ∀α β. (α -> β) -> f α -> f β
   }
@@ -7,10 +12,15 @@ signature Applicative ::= ∀f : * -> *.
   }
 
 signature Monad ::= ∀m : * -> *.
-  { bind :: ∀α β. (α -> m β) -> m α -> m β
+  { pure :: ∀α. α -> m α
+    bind :: ∀α β. (α -> m β) -> m α -> m β
   }
+
 
 signature Foldable ::= ∀f : * -> *.
   { fold_right :: ∀α β. (α -> β -> β) -> β -> f α -> β
     fold_left  :: ∀α β. (β -> α -> β) -> β -> f α -> β
   }
+
+fold_map :: ∀t : * -> * α m. Monoid m + Foldable t |- (α -> m) -> t α -> m := λf.
+  fold_right (compose mappend f) mempty

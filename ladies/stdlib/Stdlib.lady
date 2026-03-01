@@ -5,13 +5,17 @@ use Control.
 List ::= ∀α. Nil | Cons α (List α)
 
 witness Functor List :=
-  { fmap := λf fa.
-      List.map f fa
+  { fmap := λf. List.map f
   }
 
 witness Foldable List :=
-  { fold_left  := List.fold_left
-    fold_right := List.fold_right
+  { fold_left  := λf. List.fold_left f
+    fold_right := λf. List.fold_right f
+  }
+
+witness Monad List :=
+  { pure := λx. Cons x Nil
+    bind := λf. List.bind f
   }
 
 module List:
@@ -84,7 +88,8 @@ witness Functor Perhaps :=
   }
 
 witness Monad Perhaps :=
-  { bind := λf ma.
+  { pure := This
+    bind := λf ma.
       deconstruct ma into
         This a -> f a
       | Nope   -> Nope

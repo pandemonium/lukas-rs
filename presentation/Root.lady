@@ -76,7 +76,9 @@ dollars :: Text :=
 print_scientific_fact := lambda icewalls.
   print_endline if icewalls
     then "Earth has an interesting shape"
-    else "Our princess is in another castle"
+    else
+      "Our princess is in another castle"
+  print_endline "... now what?"
 
 compute_earthiness := λr.
   let π = 3 in 4/3 * π * r * r * r

@@ -270,8 +270,6 @@ impl namer::NamedSymbolTable {
 
             let structure = type_constructor.structure();
 
-            println!("insert_constraint_method_placeholders: {c} structure {structure:?}");
-
             if let TypeStructure::PolyRecord(record_type) = structure? {
                 for (method_id, scheme) in record_type.fields() {
                     let scheme = scheme.clone();

@@ -1,11 +1,16 @@
-signature Foo :=
-  { bar :: Int -> Text
-    baz :: Text -> Unit
+use Stdlib.
+
+witness Monoid Int :=
+  { mempty  := 0
+    mappend := λp q. p + q
   }
 
-witness Foo :=
-  { bar := λi. "`i`"
-  }
+sum_list :: List Int -> Int :=
+  λxs.
+    print_endline "sum_list: hi!"
+    fold_map (λx. print_endline "sum_list: Hmm"; x) xs
 
 start := λ_.
-  print_endline "hi, mom"
+  print_endline "start: hi!"
+  let xs = List.tabulate 43 id in
+  print_endline "hi, mom: `sum_list xs`"

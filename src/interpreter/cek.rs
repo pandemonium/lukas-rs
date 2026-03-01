@@ -89,6 +89,10 @@ impl Globals {
         let Self(m) = self;
         m.iter()
     }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -98,6 +102,14 @@ pub struct Env {
 }
 
 impl Env {
+    pub fn global_count(&self) -> usize {
+        self.globals.len()
+    }
+
+    pub fn local_count(&self) -> usize {
+        self.locals.borrow().len()
+    }
+
     pub fn from_globals(globals: Globals) -> Self {
         Self {
             globals: Rc::new(globals),
@@ -228,6 +240,7 @@ impl fmt::Display for Env {
     }
 }
 
+#[derive(Debug)]
 enum AndThen {
     EvalArgument {
         argument: Tree,
@@ -303,12 +316,14 @@ enum AndThen {
     Hcf,
 }
 
+#[derive(Debug)]
 enum Suspension {
     Suspend(Suspended),
     Done(Val),
     Diverged(RuntimeError),
 }
 
+#[derive(Debug)]
 enum Suspended {
     Eval {
         expression: Tree,
