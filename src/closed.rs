@@ -26,8 +26,8 @@ pub type SymbolTable = namer::SymbolTable<CaptureInfo, QualifiedName, Identifier
 pub type Expr = ast::Expr<CaptureInfo, Identifier>;
 type Tree<Id> = ast::Tree<CaptureInfo, Id>;
 
-impl typer::SymbolTable {
-    pub fn closure_conversion(self) -> SymbolTable {
+impl phase::SymbolTable<Types> {
+    pub fn closure_conversion(self) -> phase::SymbolTable<Closed> {
         let mut symbols = HashMap::with_capacity(self.symbols.len());
 
         for t in self.symbols {

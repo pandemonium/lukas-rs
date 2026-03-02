@@ -1,6 +1,6 @@
 // Think about this module and where it lives. Maybe in compiler.rs or phase.rs or something?
 
-use crate::ast;
+use crate::ast::{self, namer};
 
 pub trait Phase {
     type Annotation;
@@ -40,3 +40,6 @@ pub type TypeSignature<P> = ast::TypeSignature<<P as Phase>::Annotation, <P as P
 
 pub type ConstraintExpression<P> =
     ast::ConstraintExpression<<P as Phase>::Annotation, <P as Phase>::TypeId>;
+
+pub type SymbolTable<P> =
+    namer::SymbolTable<<P as Phase>::Annotation, <P as Phase>::TypeId, <P as Phase>::TermId>;

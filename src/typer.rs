@@ -171,11 +171,11 @@ impl phase::TypeSignature<Named> {
     }
 }
 
-impl namer::NamedSymbolTable {
+impl phase::SymbolTable<Named> {
     pub fn elaborate_compilation_unit(
         mut self,
         evaluation_order: Iter<&SymbolName>,
-    ) -> Typing<TypedSymbolTable> {
+    ) -> Typing<phase::SymbolTable<Types>> {
         let mut ctx = self.elaborate_types()?;
 
         self.elaborate_constraints(&mut ctx)?;
@@ -245,6 +245,7 @@ impl namer::NamedSymbolTable {
                 TypeConstructor::from_symbol(symbol),
             );
         }
+
         ctx.elaborate_type_constructors()?;
 
         Ok(ctx)

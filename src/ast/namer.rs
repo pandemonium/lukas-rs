@@ -525,7 +525,7 @@ impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
     }
 }
 
-impl ParserSymbolTable {
+impl phase::SymbolTable<Parsed> {
     // This ought to give a Result so that we can know what it failed to do
     fn resolve_free_term_name(
         &self,
@@ -1270,19 +1270,7 @@ impl phase::TypeExpression<Desugared> {
     }
 }
 
-impl parser::Expr {
-    pub fn lower_tuples(self) -> parser::Expr {
-        self.map(&mut |e| match e {
-            parser::Expr::Tuple(a, tuple) => parser::Expr::Tuple(
-                a,
-                Tuple {
-                    elements: unspine_tuple(tuple.elements),
-                },
-            ),
-            otherwise => otherwise,
-        })
-    }
-
+impl phase::Expr<Parsed> {
     pub fn resolve_names(
         &self,
         symbols: &ParserSymbolTable,
@@ -1298,23 +1286,7 @@ impl parser::Expr {
         semantic_scope: &parser::IdentifierPath,
     ) -> Naming<Expr> {
         match self {
-            Self::Variable(pi, identifier_path) => {
-                // head is locally bound and tail projects off of it
-                if let Some(bound) =
-                    names.try_resolve_bound(&parser::Identifier::from_str(&identifier_path.head))
-                {
-                    Ok(project_base(pi, bound, &identifier_path.tail))
-
-                // identier_path is a free term
-                // Module1.ModuleN.term.projection1.projectionN
-                } else if let Some(path) =
-                    symbols.resolve_free_term_name(identifier_path, semantic_scope)
-                {
-                    Ok(path.into_projection(*pi))
-                } else {
-                    Err(NameError::UnknownName(identifier_path.clone()).at(*pi))
-                }
-            }
+            Self::Variable(pi, name) => resolve_name(*pi, names, symbols, semantic_scope, name),
 
             Self::InvokeBridge(pi, bridge) => Ok(Expr::InvokeBridge(*pi, bridge.clone())),
 
@@ -1387,25 +1359,34 @@ impl parser::Expr {
     }
 }
 
-fn unspine_tuple(
-    elements: Vec<ast::Tree<ParseInfo, IdentifierPath>>,
-) -> Vec<ast::Tree<ParseInfo, IdentifierPath>> {
-    elements
-        .into_iter()
-        .flat_map(|e| match (*e).clone() {
-            // This is probably not correct - it flattens too much
-            parser::Expr::Tuple(_, tuple) => unspine_tuple(tuple.elements.to_vec()),
-            atom => vec![atom.into()],
-        })
-        .collect()
+fn resolve_name(
+    pi: ParseInfo,
+    names: &mut DeBruijn,
+    symbols: &SymbolTable<ParseInfo, IdentifierPath, IdentifierPath>,
+    semantic_scope: &IdentifierPath,
+    identifier_path: &IdentifierPath,
+) -> Naming<Expr> {
+    // head is locally bound and tail projects off of it
+    if let Some(bound) =
+        names.try_resolve_bound(&parser::Identifier::from_str(&identifier_path.head))
+    {
+        Ok(project_base(pi, bound, &identifier_path.tail))
+
+    // identier_path is a free term
+    // Module1.ModuleN.term.projection1.projectionN
+    } else if let Some(path) = symbols.resolve_free_term_name(identifier_path, semantic_scope) {
+        Ok(path.into_projection(pi))
+    } else {
+        Err(NameError::UnknownName(identifier_path.clone()).at(pi))
+    }
 }
 
-fn project_base(pi: &ParseInfo, base: Identifier, projection_path: &[String]) -> Expr {
+fn project_base(pi: ParseInfo, base: Identifier, projection_path: &[String]) -> Expr {
     projection_path
         .iter()
-        .fold(Expr::Variable(*pi, base), |base, member| {
+        .fold(Expr::Variable(pi, base), |base, member| {
             Expr::Project(
-                *pi,
+                pi,
                 Projection {
                     base: base.into(),
                     select: ProductElement::Name(parser::Identifier::from_str(member)),
@@ -1785,23 +1766,11 @@ impl phase::Pattern<Desugared> {
     }
 }
 
-impl ParserSymbolTable {
-    pub fn lower_tuples(&mut self) {
-        for symbol in self.symbols.values_mut() {
-            if let Symbol::Term(symbol) = symbol {
-                let body = symbol
-                    .body
-                    .take()
-                    .expect("Internal Assertion - expected a symbol body.");
-                symbol.body = body.lower_tuples().into();
-            }
-        }
-    }
-
+impl phase::SymbolTable<Parsed> {
     // Move to namer.rs
     // This does not need the symbols in any particular order, so long as all
     // modules are known
-    pub fn resolve_names(self) -> Naming<NamedSymbolTable> {
+    pub fn resolve_names(self) -> Naming<phase::SymbolTable<Named>> {
         Ok(SymbolTable {
             module_members: self.module_members.clone(),
             member_modules: self.member_modules.clone(),

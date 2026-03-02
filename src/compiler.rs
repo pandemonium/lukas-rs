@@ -14,7 +14,8 @@ use crate::{
         cek::{Env, Globals},
     },
     lexer::LexicalAnalyzer,
-    parser::{self, ParseError, ParseInfo},
+    parser::{self, ParseError, ParseInfo, Parsed},
+    phase,
     typer::TypeError,
 };
 
@@ -92,18 +93,16 @@ impl Compiler {
     }
 
     pub fn typecheck_and_initialize(&self, program: CompilationUnit) -> Compilation<Environment> {
-        let mut symbols = namer::SymbolTable::import_compilation_unit(program)?;
-        symbols.lower_tuples();
+        let symbols = phase::SymbolTable::<Parsed>::import_compilation_unit(program)?;
+        let resolved_symbols = symbols.desugar().resolve_names()?;
 
-        let compilation = symbols.resolve_names()?;
-
-        let dependencies = compilation.dependency_matrix();
+        let dependencies = resolved_symbols.dependency_matrix();
         let evaluation_order = dependencies.in_resolvable_order();
 
         if dependencies.are_sound() {
             let mut globals = Globals::default();
 
-            for symbol in compilation
+            for symbol in resolved_symbols
                 .elaborate_compilation_unit(evaluation_order.iter())?
                 .terms(evaluation_order.iter())
             {
@@ -124,7 +123,7 @@ impl Compiler {
 
     pub fn typecheck_and_compile(&self, program: CompilationUnit) -> Compilation<()> {
         let mut symbols = namer::SymbolTable::import_compilation_unit(program)?;
-        symbols.lower_tuples();
+        symbols.desugar_expressions();
 
         let compilation = symbols.resolve_names()?;
 
