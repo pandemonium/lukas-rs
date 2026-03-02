@@ -43,3 +43,5 @@ pub type ConstraintExpression<P> =
 
 pub type SymbolTable<P> =
     namer::SymbolTable<<P as Phase>::Annotation, <P as Phase>::TypeId, <P as Phase>::TermId>;
+pub type Symbol<P> =
+    namer::Symbol<<P as Phase>::Annotation, <P as Phase>::TypeId, <P as Phase>::TermId>;

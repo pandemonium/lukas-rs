@@ -7,7 +7,8 @@ use crate::{
     interpreter::{Literal, cek::Val},
     lambda1, lambda2,
     lexer::Operator,
-    parser::{self, ParseInfo},
+    parser::{self, ParseInfo, Parsed},
+    phase::Phase,
     rawlambda1,
     typer::{BaseType, ConstraintSet, MetaVariable, Type, TypeScheme},
 };
@@ -64,7 +65,7 @@ fn mk_artithmetic_op(
     }
 }
 
-pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>> {
+pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phase>::TermId>> {
     let builtins = parser::IdentifierPath::new(BUILTIN_MODULE_NAME);
     let stdlib = parser::IdentifierPath::new(STDLIB_MODULE_NAME);
 

@@ -10,7 +10,7 @@ use crate::{
     },
     parser::ParseInfo,
     phase,
-    typer::{self, Type, TypeInfo, Types},
+    typer::{Type, TypeInfo, Types},
 };
 
 pub struct Closed;
@@ -34,10 +34,10 @@ impl phase::SymbolTable<Types> {
             let (name, symbol) = match t {
                 (name, Symbol::Type(symbol)) => (name, Symbol::Type(symbol)),
                 (name, Symbol::Term(symbol)) => {
-                    let closed = symbol.body.unwrap().close_closures();
+                    let closed = symbol.body.close_closures();
                     let closed = TermSymbol {
                         name: symbol.name,
-                        body: Some(closed),
+                        body: closed,
                         type_signature: symbol.type_signature,
                     };
                     (name, Symbol::Term(closed))

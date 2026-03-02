@@ -300,7 +300,7 @@ impl phase::SymbolTable<Named> {
         witnesses: &mut WitnessIndex,
         ctx: &mut TypingContext,
     ) -> Typing<TermSymbol<TypeInfo, QualifiedName, Identifier>> {
-        let mut expr = ctx.infer_expr(symbol.body())?;
+        let mut expr = ctx.infer_expr(&symbol.body)?;
         let qualified_name = symbol.name.clone();
 
         expr = discharge_ground_constraints(&expr, witnesses, ctx)?;
@@ -2806,6 +2806,8 @@ impl TypingContext {
         expected_type: &Type,
         deconstruct: &phase::Deconstruct<Named>,
     ) -> Typing {
+        println!("check_deconstruction: for {deconstruct}");
+
         let Typed {
             mut substitutions,
             tree: scrutinee,
@@ -2813,6 +2815,7 @@ impl TypingContext {
         } = self.infer_expr(&deconstruct.scrutinee)?;
         let scrutinee_type = &scrutinee.type_info().inferred_type;
         let mut typed_match_clauses = Vec::with_capacity(deconstruct.match_clauses.len());
+        let mut space = MatchSpace::default();
 
         for clause in &deconstruct.match_clauses {
             let mut clause_ctx = self.clone();
@@ -2833,24 +2836,46 @@ impl TypingContext {
             constraints = constraints
                 .apply(&substitutions)
                 .union(consequent.apply(&substitutions).constraints);
-            typed_match_clauses.push(MatchClause {
-                pattern,
-                consequent: consequent.tree.into(),
-            });
+
+            if !space.join(&pattern) {
+                let parse_info = pattern.annotation().parse_info;
+                Err(TypeError::UselessMatchClause {
+                    clause: MatchClause {
+                        pattern,
+                        consequent: consequent.tree.into(),
+                    },
+                }
+                .at(parse_info))?;
+            } else {
+                typed_match_clauses.push(MatchClause {
+                    pattern,
+                    consequent: consequent.tree.into(),
+                });
+            }
         }
 
-        let type_info = pi.with_inferred_type(expected_type.apply(&substitutions));
-        Ok(Typed::computed(
-            substitutions,
-            constraints,
-            Expr::Deconstruct(
-                type_info,
-                Deconstruct {
+        if !space.is_exhaustive(pi, &scrutinee_type.apply(&substitutions), self)? {
+            Err(TypeError::MatchNotExhaustive {
+                deconstruct: Deconstruct {
                     scrutinee: scrutinee.into(),
                     match_clauses: typed_match_clauses,
                 },
-            ),
-        ))
+            }
+            .at(pi))
+        } else {
+            let type_info = pi.with_inferred_type(expected_type.apply(&substitutions));
+            Ok(Typed::computed(
+                substitutions,
+                constraints,
+                Expr::Deconstruct(
+                    type_info,
+                    Deconstruct {
+                        scrutinee: scrutinee.into(),
+                        match_clauses: typed_match_clauses,
+                    },
+                ),
+            ))
+        }
     }
 
     #[instrument]
@@ -3904,6 +3929,8 @@ impl Shape {
             .expand_type_constructor(pi, scrutinee)?
             .unwrap_or_else(|| TypeStructure::Monotype(scrutinee.clone()));
 
+        println!("covers: scrutinee {scrutinee}");
+
         match (self, scrutinee) {
             (
                 Self::Coproduct(denotations),
@@ -3918,10 +3945,6 @@ impl Shape {
                     }
 
                     for (denotation, scrutinee) in denotations[&constructor].iter().zip(arguments) {
-                        //let scrutinee = ctx
-                        //    .expand_type_constructor(pi, &scrutinee)?
-                        //    .unwrap_or_else(|| TypeStructure::Monotype(scrutinee.clone()));
-
                         covers &= denotation.covers(pi, &scrutinee, ctx)?;
                         if !covers {
                             break 'outer;
@@ -3936,9 +3959,6 @@ impl Shape {
                 let mut covers = true;
                 for (field, scrutinee) in record_type.fields() {
                     let scrutinee = scrutinee.instantiate();
-                    //let scrutinee = ctx
-                    //    .expand_type_constructor(pi, &scrutinee.underlying)?
-                    //    .unwrap_or_else(|| TypeStructure::Monotype(scrutinee.underlying.clone()));
                     covers &= denotations[field].covers(pi, &scrutinee.underlying, ctx)?;
                     if !covers {
                         break;

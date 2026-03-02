@@ -1,9 +1,13 @@
 use std::{fmt, rc::Rc};
 
 use crate::{
-    ast::namer::{self, QualifiedName, TermSymbol},
+    ast::{
+        Expr,
+        namer::{self, QualifiedName, TermSymbol},
+    },
     interpreter::{Interpretation, Literal, RuntimeError, cek::Val},
-    parser::{self, ParseInfo},
+    parser::{self, ParseInfo, Parsed},
+    phase::Phase,
     typer::{BaseType, ConstraintSet, MetaVariable, Type, TypeScheme},
 };
 
@@ -71,18 +75,15 @@ pub trait External {
     fn into_symbol(
         self,
         module: &parser::IdentifierPath,
-    ) -> TermSymbol<ParseInfo, parser::IdentifierPath, parser::IdentifierPath>
+    ) -> TermSymbol<ParseInfo, parser::IdentifierPath, <Parsed as Phase>::TermId>
     where
         Self: Sized + 'static,
     {
         TermSymbol {
             name: QualifiedName::new(module.clone(), self.name()),
             type_signature: None, // Some(self.type_signature()), (reify the type_scheme!)
-            body: parser::Expr::InvokeBridge(
-                ParseInfo::default(),
-                Bridge::for_external(self, module),
-            )
-            .into(),
+            body: Expr::InvokeBridge(ParseInfo::default(), Bridge::for_external(self, module))
+                .into(),
         }
     }
 }

@@ -33,6 +33,43 @@ impl<A, Id> Pattern<A, Id> {
             | Self::Bind(a, _) => a,
         }
     }
+
+    pub fn map_id<F, B>(self, f: &F) -> Pattern<A, B>
+    where
+        F: Fn(Id) -> B,
+    {
+        match self {
+            Self::Coproduct(a, the) => Pattern::Coproduct(
+                a,
+                ConstructorPattern {
+                    constructor: f(the.constructor),
+                    arguments: the.arguments.into_iter().map(|p| p.map_id(f)).collect(),
+                },
+            ),
+
+            Self::Tuple(a, the) => Pattern::Tuple(
+                a,
+                TuplePattern {
+                    elements: the.elements.into_iter().map(|p| p.map_id(f)).collect(),
+                },
+            ),
+
+            Self::Struct(a, the) => Pattern::Struct(
+                a,
+                StructPattern {
+                    fields: the
+                        .fields
+                        .into_iter()
+                        .map(|(label, p)| (label, p.map_id(f)))
+                        .collect(),
+                },
+            ),
+
+            Self::Literally(a, the) => Pattern::Literally(a, the),
+
+            Self::Bind(a, the) => Pattern::Bind(a, f(the)),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

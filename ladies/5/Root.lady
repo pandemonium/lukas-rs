@@ -1,0 +1,13 @@
+use Stdlib.
+
+Foo ::=
+  { Name :: Text
+    Age  :: Int
+  }
+
+start :: Int -> Unit := λ_.
+  let { Name : name; Age : age } = { Name := "Patrik Andersson"; Age := 47 } in
+  print_endline "The name `name` and `age` år."
+
+  let This x = (Nope :: Perhaps Int) in
+  print_endline "X `x`."

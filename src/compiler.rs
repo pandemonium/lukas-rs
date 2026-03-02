@@ -106,7 +106,7 @@ impl Compiler {
                 .elaborate_compilation_unit(evaluation_order.iter())?
                 .terms(evaluation_order.iter())
             {
-                let value = Rc::new(symbol.body().erase_annotation())
+                let value = Rc::new(symbol.body.erase_annotation())
                     .interpret(Env::from_globals(globals.clone()))
                     //.reduce(&Env::from_globals(globals.clone()))
                     .expect("successful static init");
@@ -122,8 +122,8 @@ impl Compiler {
     }
 
     pub fn typecheck_and_compile(&self, program: CompilationUnit) -> Compilation<()> {
-        let mut symbols = namer::SymbolTable::import_compilation_unit(program)?;
-        symbols.desugar_expressions();
+        let symbols = namer::SymbolTable::import_compilation_unit(program)?;
+        let symbols = symbols.desugar_expressions();
 
         let compilation = symbols.resolve_names()?;
 

@@ -1,9 +1,15 @@
 use std::{fmt, marker::PhantomData, rc::Rc};
 
 use crate::{
-    ast::{self, annotation::Annotated, namer::QualifiedName, pattern::MatchClause},
+    ast::{
+        self,
+        annotation::Annotated,
+        namer::QualifiedName,
+        pattern::{MatchClause, Pattern},
+    },
     bridge::Bridge,
-    compiler, lambda_lift, parser,
+    compiler, lambda_lift,
+    parser::{self, IdentifierPath},
     typer::display_list,
 };
 
@@ -33,6 +39,51 @@ pub enum Declaration<A> {
     Witness(A, WitnessDeclaration<A>),
 }
 
+#[derive(Debug, Clone)]
+pub struct IdentifierPattern<A>(Pattern<A, IdentifierPath>);
+
+impl<A> IdentifierPattern<A>
+where
+    A: Copy,
+{
+    pub fn from_atom(a: A, image: &str) -> Self {
+        Self::from_path(a, IdentifierPath::new(image))
+    }
+
+    pub fn from_path(a: A, path: IdentifierPath) -> Self {
+        Self(Pattern::Bind(a, path))
+    }
+
+    pub fn with_appended_path_segment(&self, segment: &str) -> Self {
+        let Self(Pattern::Bind(a, path)) = self else {
+            panic!("malaise")
+        };
+        Self::from_path(*a, path.clone().with_suffix(segment))
+    }
+
+    pub fn into_pattern(self) -> Pattern<A, IdentifierPath> {
+        self.0
+    }
+
+    pub fn try_into_simple_bind(self) -> Option<IdentifierPath> {
+        if let Pattern::Bind(_, id) = self.0 {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_simple_bind(&self) -> bool {
+        matches!(self, Self(Pattern::Bind(..)))
+    }
+}
+
+impl<A> From<Pattern<A, IdentifierPath>> for IdentifierPattern<A> {
+    fn from(value: Pattern<A, IdentifierPath>) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(Debug)]
 pub struct SignatureDeclaration<A> {
     pub name: parser::Identifier,
@@ -43,7 +94,7 @@ pub struct SignatureDeclaration<A> {
 #[derive(Debug)]
 pub struct WitnessDeclaration<A> {
     pub type_signature: TypeSignature<A, parser::IdentifierPath>,
-    pub implementation: ast::Expr<A, parser::IdentifierPath>,
+    pub implementation: ast::Expr<A, IdentifierPattern<A>>,
 }
 
 #[derive(Debug)]
@@ -61,7 +112,7 @@ pub struct ValueDeclaration<A> {
 #[derive(Debug)]
 pub struct ValueDeclarator<A> {
     pub type_signature: Option<TypeSignature<A, parser::IdentifierPath>>,
-    pub body: ast::Expr<A, parser::IdentifierPath>,
+    pub body: ast::Expr<A, IdentifierPattern<A>>,
 }
 
 #[derive(Debug)]
@@ -801,6 +852,16 @@ where
             "∀{}. {name} ::= {declarator}",
             display_list(" ", type_parameters)
         )
+    }
+}
+
+impl<A> fmt::Display for IdentifierPattern<A>
+where
+    A: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(p) = self;
+        write!(f, "{p}")
     }
 }
 

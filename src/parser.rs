@@ -6,24 +6,23 @@ use thiserror::Error;
 use crate::{
     ast::{
         self, Apply, ApplyTypeExpr, ArrowTypeExpr, Binding, ConstraintExpression, Declaration,
-        Deconstruct, FieldDeclarator, IfThenElse, Interpolate, Kind, Lambda, ModuleDeclaration,
-        ModuleDeclarator, Projection, Record, SelfReferential, Sequence, SignatureDeclaration,
-        Tree, Tuple, TupleTypeExpr, TypeAscription, TypeDeclaration, TypeDeclarator,
-        TypeExpression, TypeSignature, TypeVariable, UseDeclaration, ValueDeclaration,
-        ValueDeclarator, WitnessDeclaration,
+        Deconstruct, FieldDeclarator, IdentifierPattern, IfThenElse, Interpolate, Kind, Lambda,
+        ModuleDeclaration, ModuleDeclarator, Projection, Record, SelfReferential, Sequence,
+        SignatureDeclaration, Tree, Tuple, TupleTypeExpr, TypeAscription, TypeDeclaration,
+        TypeDeclarator, TypeExpression, TypeSignature, TypeVariable, UseDeclaration,
+        ValueDeclaration, ValueDeclarator, WitnessDeclaration,
         namer::QualifiedName,
         pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern},
     },
     lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
     phase,
-    typer::display_list,
 };
 
 pub struct Parsed;
 
 impl phase::Phase for Parsed {
     type Annotation = ParseInfo;
-    type TermId = IdentifierPath;
+    type TermId = IdentifierPattern<ParseInfo>;
     type TypeId = IdentifierPath;
 }
 
@@ -790,7 +789,13 @@ impl<'a> Parser<'a> {
                 .parse_block(|parser| parser.parse_sequence())
                 .map(|body| {
                     if let Expr::Lambda(pi, lambda) = body {
-                        Expr::RecursiveLambda(pi, SelfReferential { own_name, lambda })
+                        Expr::RecursiveLambda(
+                            pi,
+                            SelfReferential {
+                                own_name: IdentifierPattern::from_path(pi, own_name),
+                                lambda,
+                            },
+                        )
                     } else {
                         body
                     }
@@ -1062,8 +1067,14 @@ impl<'a> Parser<'a> {
         let _t = self.trace();
 
         let location = *self.expect(TokenKind::Keyword(Keyword::Let))?.location();
-        let (.., binder) = self.identifier()?;
-        let binder = IdentifierPath::new(&binder);
+        //        let (binder_location, binder) = self.identifier()?;
+
+        // TODO: verify function
+        //        let binder = IdentifierPath::new(&binder);
+        //let binder =
+        //    IdentifierPattern::from_path(ParseInfo::from_position(binder_location), binder);
+        let binder = self.parse_pattern().map(IdentifierPattern::from)?;
+
         self.expect(TokenKind::Equals)?;
         let bound = self.parse_block(|parser| parser.parse_sequence())?;
 
@@ -1072,7 +1083,7 @@ impl<'a> Parser<'a> {
             Expr::RecursiveLambda(
                 pi,
                 SelfReferential {
-                    own_name: binder.clone(),
+                    own_name: binder.clone().into(),
                     lambda,
                 },
             )
@@ -1122,7 +1133,9 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn parse_field_init(&mut self) -> Result<(Identifier, Tree<ParseInfo, IdentifierPath>)> {
+    fn parse_field_init(
+        &mut self,
+    ) -> Result<(Identifier, Tree<ParseInfo, IdentifierPattern<ParseInfo>>)> {
         let _t = self.trace();
 
         let (_, label) = self.identifier()?;
@@ -1152,10 +1165,11 @@ impl<'a> Parser<'a> {
         let body = self.parse_block(|parser| parser.parse_sequence())?;
 
         let lambda = params.into_iter().rfold(body, |body, (pos, param)| {
+            let parse_info = ParseInfo::from_position(pos);
             Expr::Lambda(
-                ParseInfo::from_position(pos),
+                parse_info,
                 Lambda {
-                    parameter: IdentifierPath::new(&param),
+                    parameter: IdentifierPattern::from_atom(parse_info, &param),
                     body: body.into(),
                 },
             )
@@ -1472,9 +1486,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_variable(&mut self, id: &str, position: &SourceLocation) -> Result<Expr> {
+        let parse_info = ParseInfo::from_position(*position);
         Ok(Expr::Variable(
-            ParseInfo::from_position(*position),
-            IdentifierPath::new(id),
+            parse_info,
+            IdentifierPattern::from_atom(parse_info, id),
         ))
     }
 
@@ -1572,7 +1587,7 @@ impl<'a> Parser<'a> {
         if let Expr::Variable(pi, id) = &lhs
             && !matches!(self.peek()?.kind, TokenKind::Literal(..))
         {
-            self.parse_identifier_path_expr(*pi, id.clone())
+            self.parse_identifier_path_expr(*pi, id)
         } else {
             self.parse_projection(lhs)
         }
@@ -1606,11 +1621,18 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_identifier_path_expr(&mut self, pi: ParseInfo, lhs: IdentifierPath) -> Result<Expr> {
+    fn parse_identifier_path_expr(
+        &mut self,
+        pi: ParseInfo,
+        lhs: &IdentifierPattern<ParseInfo>,
+    ) -> Result<Expr> {
         let _t = self.trace();
 
         let (_, rhs) = self.identifier()?;
-        Ok(Expr::Variable(pi, lhs.with_suffix(rhs.as_str())))
+        Ok(Expr::Variable(
+            pi,
+            lhs.with_appended_path_segment(rhs.as_str()),
+        ))
     }
 
     fn parse_projection(&mut self, lhs: Expr) -> Result<Expr> {
@@ -1658,12 +1680,13 @@ impl<'a> Parser<'a> {
     ) -> Result<Expr> {
         let _t = self.trace();
 
+        let parse_info = ParseInfo::from_position(*lhs.position());
         let apply_lhs = Expr::Apply(
-            ParseInfo::from_position(*lhs.position()),
+            parse_info,
             Apply {
                 function: Expr::Variable(
                     ParseInfo::from_position(operator_position),
-                    IdentifierPath::new(operator.name()),
+                    IdentifierPattern::from_atom(parse_info, operator.name()),
                 )
                 .into(),
                 argument: lhs.into(),
@@ -1891,27 +1914,30 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn parse_match_clause(&mut self) -> Result<phase::MatchClause<Parsed>> {
+    fn parse_match_clause(
+        &mut self,
+    ) -> Result<MatchClause<ParseInfo, IdentifierPattern<ParseInfo>>> {
         let _t = self.trace();
 
         let pattern = self.parse_pattern()?;
 
         self.expect(TokenKind::Arrow)?;
         let consequent = self.parse_block(|parser| parser.parse_sequence())?;
+        let parse_info = *pattern.annotation();
         Ok(MatchClause {
-            pattern,
+            pattern: pattern.map_id(&|id| IdentifierPattern::from_path(parse_info, id)),
             consequent: consequent.into(),
         })
     }
 
-    fn parse_pattern(&mut self) -> Result<phase::Pattern<Parsed>> {
+    fn parse_pattern(&mut self) -> Result<Pattern<ParseInfo, IdentifierPath>> {
         let _t = self.trace();
 
         let prefix = self.parse_pattern_prefix()?;
         self.parse_pattern_infix(prefix)
     }
 
-    fn parse_pattern_prefix(&mut self) -> Result<phase::Pattern<Parsed>> {
+    fn parse_pattern_prefix(&mut self) -> Result<Pattern<ParseInfo, IdentifierPath>> {
         let _t = self.trace();
 
         // 1. Coproduct: Constructor pat1 pat2 pat3
@@ -1958,8 +1984,8 @@ impl<'a> Parser<'a> {
 
     fn parse_pattern_infix(
         &mut self,
-        lhs: phase::Pattern<Parsed>,
-    ) -> Result<phase::Pattern<Parsed>> {
+        lhs: Pattern<ParseInfo, IdentifierPath>,
+    ) -> Result<Pattern<ParseInfo, IdentifierPath>> {
         let _t = self.trace();
 
         match self.remains() {
@@ -1979,7 +2005,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_constructor_pattern(&mut self) -> Result<phase::Pattern<Parsed>> {
+    fn parse_constructor_pattern(&mut self) -> Result<Pattern<ParseInfo, IdentifierPath>> {
         let _t = self.trace();
 
         // There are nullary constructors
@@ -1988,7 +2014,7 @@ impl<'a> Parser<'a> {
 
         while !matches!(
             self.peek()?.kind,
-            TokenKind::Arrow | TokenKind::Comma | TokenKind::RightBrace
+            TokenKind::Arrow | TokenKind::Comma | TokenKind::RightBrace | TokenKind::Equals
         ) {
             arguments.push(self.parse_pattern_prefix()?);
         }
@@ -2006,7 +2032,7 @@ impl<'a> Parser<'a> {
         &mut self,
         position: SourceLocation,
         literal: &Literal,
-    ) -> Result<phase::Pattern<Parsed>> {
+    ) -> Result<Pattern<ParseInfo, IdentifierPath>> {
         let _t = self.trace();
 
         // the literal
@@ -2017,7 +2043,7 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn parse_pattern_binder(&mut self) -> Result<phase::Pattern<Parsed>> {
+    fn parse_pattern_binder(&mut self) -> Result<Pattern<ParseInfo, IdentifierPath>> {
         let _t = self.trace();
 
         let (pos, id) = self.identifier()?;
@@ -2027,7 +2053,7 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn parse_struct_pattern(&mut self) -> Result<phase::Pattern<Parsed>> {
+    fn parse_struct_pattern(&mut self) -> Result<Pattern<ParseInfo, IdentifierPath>> {
         let _t = self.trace();
 
         // {
@@ -2051,7 +2077,9 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn parse_struct_pattern_field(&mut self) -> Result<(Identifier, phase::Pattern<Parsed>)> {
+    fn parse_struct_pattern_field(
+        &mut self,
+    ) -> Result<(Identifier, Pattern<ParseInfo, IdentifierPath>)> {
         let _t = self.trace();
 
         let (_pos, label) = self.identifier()?;
@@ -2103,8 +2131,8 @@ fn is_capital_case(id: &str) -> bool {
     id.chars().next().is_some_and(|c| c.is_uppercase())
 }
 
-impl phase::Pattern<Parsed> {
-    pub fn normalize(&self) -> phase::Pattern<Parsed> {
+impl Pattern<ParseInfo, IdentifierPath> {
+    pub fn normalize(&self) -> Pattern<ParseInfo, IdentifierPath> {
         match self {
             Self::Coproduct(
                 pi,
@@ -2142,7 +2170,9 @@ impl phase::Pattern<Parsed> {
     }
 }
 
-fn unspine_tuple_pattern(elements: Vec<phase::Pattern<Parsed>>) -> Vec<phase::Pattern<Parsed>> {
+fn unspine_tuple_pattern(
+    elements: Vec<Pattern<ParseInfo, IdentifierPath>>,
+) -> Vec<Pattern<ParseInfo, IdentifierPath>> {
     elements
         .into_iter()
         .flat_map(|p| match p {

@@ -25,8 +25,8 @@ impl closed::SymbolTable {
 
             if let Symbol::Term(term) = symbol {
                 let mut crane = Crane::new(term.name.clone());
-                let capture_info = term.body().annotation().clone();
-                let lifted = crane.lift_lambdas(term.body.unwrap());
+                let capture_info = term.body.annotation().clone();
+                let lifted = crane.lift_lambdas(term.body);
                 functions.extend(lifted.functions);
                 functions.push(LiftedFunction {
                     name,
