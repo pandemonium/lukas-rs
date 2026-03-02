@@ -2737,12 +2737,12 @@ impl TypingContext {
         let ascribed_tree =
             self.check_expr(&ascribed_type.underlying, &ascription.ascribed_tree)?;
 
-        ascribed_type
+        let subst = ascribed_type
             .underlying
             .unified_with(&ascribed_tree.tree.type_info().inferred_type, &self.types)
             .map_err(|e| e.at(pi))?;
 
-        Ok(ascribed_tree.map_tree(&mut |tree| {
+        Ok(ascribed_tree.apply(&subst).map_tree(&mut |tree| {
             Expr::Ascription(
                 tree.type_info().clone(),
                 TypeAscription {

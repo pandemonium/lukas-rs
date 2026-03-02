@@ -6,11 +6,9 @@ witness Monoid Int :=
   }
 
 sum_list :: List Int -> Int :=
-  λxs.
-    print_endline "sum_list: hi!"
-    fold_map (λx. print_endline "sum_list: Hmm"; x) xs
+  λys.
+    fold_map id ys
 
 start := λ_.
-  print_endline "start: hi!"
-  let xs = List.tabulate 43 id in
+  let xs = List.tabulate 44 id in
   print_endline "hi, mom: `sum_list xs`"
