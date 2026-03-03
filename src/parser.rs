@@ -1151,16 +1151,7 @@ impl<'a> Parser<'a> {
 
         self.expect(TokenKind::Keyword(Keyword::Lambda))?;
 
-        let mut params = vec![];
-        while self.peek()?.is_identifier() {
-            params.push(self.identifier()?);
-        }
-
-        if params.is_empty() {
-            Err(ParseError::ExpectedIdentifier(self.peek()?.clone()))?;
-        }
-
-        self.expect(TokenKind::Period)?;
+        let params = self.parse_parameter_list()?;
 
         let body = self.parse_block(|parser| parser.parse_sequence())?;
 
@@ -1169,13 +1160,52 @@ impl<'a> Parser<'a> {
             Expr::Lambda(
                 parse_info,
                 Lambda {
-                    parameter: IdentifierPattern::from_atom(parse_info, &param),
+                    parameter: param.into(),
                     body: body.into(),
                 },
             )
         });
 
         Ok(lambda)
+    }
+
+    fn parse_parameter_list(
+        &mut self,
+    ) -> Result<Vec<(SourceLocation, Pattern<ParseInfo, IdentifierPath>)>> {
+        let mut params = vec![];
+
+        loop {
+            match self.peek()?.clone() {
+                Token {
+                    kind: TokenKind::LeftParen,
+                    position,
+                } => {
+                    // (
+                    self.advance(1);
+                    params.push((position, self.parse_pattern()?));
+                    self.expect(TokenKind::RightParen)?;
+                }
+
+                Token {
+                    kind: TokenKind::Identifier(id),
+                    position,
+                } => {
+                    self.advance(1);
+                    params.push((
+                        position,
+                        Pattern::Bind(ParseInfo::from_position(position), IdentifierPath::new(&id)),
+                    ));
+                }
+
+                _otherwise => break,
+            }
+        }
+
+        if params.is_empty() {
+            Err(ParseError::ExpectedIdentifier(self.peek()?.clone()))?;
+        }
+        self.expect(TokenKind::Period)?;
+        Ok(params)
     }
 
     fn is_expr_start(&self, t: &TokenKind) -> bool {
@@ -2014,7 +2044,11 @@ impl<'a> Parser<'a> {
 
         while !matches!(
             self.peek()?.kind,
-            TokenKind::Arrow | TokenKind::Comma | TokenKind::RightBrace | TokenKind::Equals
+            TokenKind::Arrow
+                | TokenKind::Comma
+                | TokenKind::RightBrace
+                | TokenKind::Equals
+                | TokenKind::RightParen
         ) {
             arguments.push(self.parse_pattern_prefix()?);
         }

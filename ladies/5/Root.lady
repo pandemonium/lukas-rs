@@ -7,6 +7,9 @@ Foo ::= forall a.
 
 Quux ::= forall a. MkQuux Text a
 
+use_quux :: forall a. Int -> Quux a -> Text -> Unit := λx (MkQuux name age) y.
+  print_endline "`x`. The name `name` and `age` `y`."
+
 start :: Int -> Unit := λ_.
   let x = { Name := "Patrik Andersson"; Age := 47 } in
   let { Name : name; Age : age } = x in
@@ -23,3 +26,5 @@ start :: Int -> Unit := λ_.
 
   let MkQuux name { Name: name2; Age: age } = MkQuux "Patrik Andersson" { Name := "Efraim Fralla"; Age := 427 } in
   print_endline "5. name `name` age `age` name2 `name2`"
+
+  use_quux 6 quux "år"
