@@ -2890,6 +2890,7 @@ impl TypingContext {
             mut constraints,
         } = self.infer_expr(&deconstruct.scrutinee)?;
 
+        let scrutinee_type = &scrutinee.type_info().inferred_type;
         let mut clauses = Vec::with_capacity(deconstruct.match_clauses.len());
         let mut match_clauses = deconstruct.match_clauses.iter();
 
@@ -2937,19 +2938,40 @@ impl TypingContext {
 
         let type_info =
             pi.with_inferred_type(first_clause.consequent.type_info().inferred_type.clone());
+
         clauses.insert(0, first_clause);
 
-        Ok(Typed::computed(
-            substitutions,
-            constraints,
-            Expr::Deconstruct(
-                type_info,
-                Deconstruct {
-                    scrutinee: scrutinee.into(),
-                    match_clauses: clauses,
+        let mut match_space = MatchSpace::default();
+        for clause in &clauses {
+            if !match_space.join(&clause.pattern) {
+                Err(TypeError::UselessMatchClause {
+                    clause: clause.clone(),
+                }
+                .at(clause.pattern.annotation().parse_info))?;
+            }
+        }
+
+        if !match_space.is_exhaustive(pi, &scrutinee.type_info().inferred_type, self)? {
+            Err(TypeError::MatchNotExhaustive {
+                deconstruct: Deconstruct {
+                    scrutinee: scrutinee.clone().into(),
+                    match_clauses: clauses.clone(),
                 },
-            ),
-        ))
+            }
+            .at(pi))
+        } else {
+            Ok(Typed::computed(
+                substitutions,
+                constraints,
+                Expr::Deconstruct(
+                    type_info,
+                    Deconstruct {
+                        scrutinee: scrutinee.into(),
+                        match_clauses: clauses,
+                    },
+                ),
+            ))
+        }
     }
 
     fn infer_match_clause(
@@ -4077,6 +4099,7 @@ impl MatchSpace {
         scrutinee: &Type,
         ctx: &TypingContext,
     ) -> Typing<bool> {
+        println!("is_exhausive: covered {:?}", self.covered);
         self.covered.normalize().covers(pi, scrutinee, ctx)
     }
 

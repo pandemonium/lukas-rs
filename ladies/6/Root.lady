@@ -1,0 +1,11 @@
+IntOption ::= Some Int | None
+
+Record ::=
+  { i :: Int
+    t :: Text
+  }
+
+start :: Int -> Unit := lambda _.
+  let o = Some 1 in
+  deconstruct o into
+    Some x -> print_endline "x: `x`."

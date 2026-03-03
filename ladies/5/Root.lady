@@ -1,13 +1,25 @@
 use Stdlib.
 
-Foo ::=
+Foo ::= forall a.
   { Name :: Text
-    Age  :: Int
+    Age  :: a
   }
 
-start :: Int -> Unit := λ_.
-  let { Name : name; Age : age } = { Name := "Patrik Andersson"; Age := 47 } in
-  print_endline "The name `name` and `age` år."
+Quux ::= forall a. MkQuux Text a
 
-  let This x = (Nope :: Perhaps Int) in
-  print_endline "X `x`."
+start :: Int -> Unit := λ_.
+  let x = { Name := "Patrik Andersson"; Age := 47 } in
+  let { Name : name; Age : age } = x in
+  print_endline "1. The name `name` and `age` år."
+
+  let p, q = 47, "Patrik Andersson" in
+  print_endline "2. The name `q` and `p` år."
+
+  let MkQuux name age = MkQuux "Patrik Andersson" 47 in
+  print_endline "3. The name `name` and `age` år."
+
+  let quux = MkQuux "Patrik Andersson" 47 in
+  print_endline "4. The value is `quux`."
+
+  let MkQuux name { Name: name2; Age: age } = MkQuux "Patrik Andersson" { Name := "Efraim Fralla"; Age := 427 } in
+  print_endline "5. name `name` age `age` name2 `name2`"
