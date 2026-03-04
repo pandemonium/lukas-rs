@@ -8,8 +8,13 @@ signature Functor ::= ∀f : * -> *.
   }
 
 signature Applicative ::= ∀f : * -> *.
-  { pure :: ∀α. α -> f α
+  { pure  :: ∀α. α -> f α
+    apply :: ∀α β. f (α -> β) -> f α -> f β
   }
+
+liftA2 :: ∀f : *->* α β γ. Applicative f |- (α -> β -> γ) -> f α -> f β -> f γ :=
+  λh fa fb.
+    apply (apply (pure h) fa) fb
 
 signature Monad ::= ∀m : * -> *.
   { pure :: ∀α. α -> m α
@@ -23,3 +28,12 @@ signature Foldable ::= ∀f : * -> *.
 
 fold_map :: ∀t : *->* α m. Monoid m + Foldable t |- (α -> m) -> t α -> m := λf.
   fold_right (compose mappend f) mempty
+
+signature Traversable ::= ∀t : *->*.
+  { traverse :: ∀f : *->* α β. Applicative f |- (α -> f β) -> t α -> f (t β)
+  }
+
+sequence :: ∀t : *->* f : *->* α.  Traversable t + Applicative f |- t (f α) -> f (t α) :=
+  λtfa.
+    print_endline "sequence: looping..."
+    traverse id tfa

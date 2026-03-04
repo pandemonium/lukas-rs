@@ -199,38 +199,81 @@ impl phase::SymbolTable<Named> {
         symbols: &mut HashMap<SymbolName, Symbol<TypeInfo, QualifiedName, Identifier>>,
         mut ctx: TypingContext,
     ) -> Typing<()> {
-        let mut witness_index = WitnessIndex::default();
+        let witness_index = self.register_witnesses(&ctx)?;
 
-        let is_untyped = |id: &&&SymbolName| match id {
-            // Some term symbols are already
-            SymbolName::Type(name) => !ctx.types.bindings.contains_key(name),
-            SymbolName::Term(name) => !ctx.terms.free.contains_key(name),
-        };
+        let witnessed_order = witness_index
+            .dependency_matrix(&ctx.types)
+            .map_err(|e| e.at(ParseInfo::default()))?;
 
-        for (id, symbol) in evaluation_order
-            .filter(is_untyped)
-            .map(|&id| {
-                self.symbols
-                    .get(id)
-                    .map(|symbol| (id, symbol))
-                    // This is really an internal error
-                    .ok_or_else(|| TypeError::UndefinedSymbol(id.clone()).at(ParseInfo::default()))
-            })
-            .collect::<Typing<Vec<_>>>()?
+        println!("elaborate_terms: witness_matrix {witnessed_order}");
+
+        let mut symbol_order = self.dependency_matrix();
+        symbol_order.merge(witnessed_order.map(|id| SymbolName::Term(id)));
+        let evaluation_order = symbol_order.in_resolvable_order();
+
+        let mut typed_terms = Vec::with_capacity(evaluation_order.len());
+        for name in evaluation_order {
+            if let SymbolName::Term(term_name) = name
+                // signature method placeholders are already typed
+                && !ctx.terms.free.contains_key(term_name)
+                && let Symbol::Term(symbol) = &self.symbols[name]
+            {
+                typed_terms.push((symbol, self.type_term(symbol, &mut ctx)?))
+            }
+
+            if let SymbolName::Type(..) = name
+                && let Symbol::Type(symbol) = &self.symbols[name]
+            {
+                symbols.insert(name.clone(), Symbol::Type(symbol.clone()));
+            }
+        }
+
+        for (
+            symbol,
+            Typed {
+                constraints, tree, ..
+            },
+        ) in typed_terms
         {
-            let symbol = match symbol {
-                namer::Symbol::Term(symbol) => namer::Symbol::Term(self.elaborate_term(
-                    symbol,
-                    &mut witness_index,
-                    &mut ctx,
-                )?),
-                namer::Symbol::Type(symbol) => namer::Symbol::Type(symbol.clone()),
-            };
+            let pi = tree.annotation().parse_info;
+            let (non_ground_constraints, mut expr) =
+                discharge_ground_constraints(tree, constraints, &witness_index, &ctx)
+                    .map_err(|e| e.at(pi))?;
 
-            symbols.insert(id.clone(), symbol);
+            for c in non_ground_constraints.iter() {
+                abstract_constraint(c, &mut expr, &ctx)?;
+            }
+
+            symbols.insert(
+                SymbolName::Term(symbol.name.clone()),
+                Symbol::Term(TermSymbol {
+                    name: symbol.name.clone(),
+                    type_signature: symbol.type_signature.clone(),
+                    body: expr.into(),
+                }),
+            );
         }
 
         Ok(())
+    }
+
+    fn register_witnesses(&self, ctx: &TypingContext) -> Typing<WitnessIndex> {
+        let mut witness_index = WitnessIndex::default();
+
+        for witness_name in &self.witnesses {
+            let Symbol::Term(symbol) = &self.symbols[&SymbolName::Term(witness_name.clone())]
+            else {
+                panic!("non-term witness")
+            };
+
+            witness_index.register(Witness::from_type_signature(
+                witness_name.clone(),
+                symbol.type_signature.clone().unwrap(),
+                ctx,
+            )?);
+        }
+
+        Ok(witness_index)
     }
 
     fn elaborate_types(&self) -> Typing<TypingContext> {
@@ -294,70 +337,29 @@ impl phase::SymbolTable<Named> {
         Ok(())
     }
 
-    fn elaborate_term(
+    fn type_term(
         &self,
         symbol: &TermSymbol<ParseInfo, namer::QualifiedName, Identifier>,
-        witnesses: &mut WitnessIndex,
         ctx: &mut TypingContext,
-    ) -> Typing<TermSymbol<TypeInfo, QualifiedName, Identifier>> {
-        let mut expr = ctx.infer_expr(&symbol.body)?;
+    ) -> Typing<Typed> {
+        let expr = ctx.infer_expr(&symbol.body)?;
         let qualified_name = symbol.name.clone();
 
-        expr = discharge_ground_constraints(&expr, witnesses, ctx)?;
-
-        if let Some(signature) = &symbol.type_signature {
-            elaborate_constraints_from_signature(&qualified_name, &mut expr, signature, ctx)?;
+        let scheme = if let Some(signature) = &symbol.type_signature {
+            signature.type_scheme(&HashMap::default(), ctx)?
         } else {
-            elaborate_inferred_constraints(&qualified_name, &mut expr, ctx)?;
-        }
+            let inferred_type = &expr.as_constrained_type();
+            inferred_type.generalize(ctx).underlying
+        };
 
-        if self.witnesses.contains(&qualified_name) {
-            witnesses.register(Witness::from_type_signature(
-                qualified_name.clone(),
-                symbol.type_signature.clone().unwrap(),
-                ctx,
-            )?);
-        }
+        println!(">>> {} :: {}", qualified_name, scheme);
+        ctx.bind_free_term(qualified_name.clone(), scheme.clone());
 
-        Ok(TermSymbol {
-            name: symbol.name.clone(),
-            type_signature: symbol.type_signature.clone(),
-            body: expr.tree.into(),
-        })
+        Ok(expr)
     }
 }
 
-fn elaborate_inferred_constraints(
-    qualified_name: &QualifiedName,
-    expr: &mut Typed,
-    ctx: &mut TypingContext,
-) -> Typing<()> {
-    let inferred_type = &expr.as_constrained_type();
-    let scheme = inferred_type.generalize(ctx);
-    for c in scheme.underlying.constraints.iter() {
-        abstract_constraint(c, &mut expr.tree, ctx)?;
-    }
-    println!(">>> {} :: {}", qualified_name, scheme.underlying);
-    ctx.bind_free_term(qualified_name.clone(), scheme.clone().underlying);
-    Ok(())
-}
-
-fn elaborate_constraints_from_signature(
-    qualified_name: &QualifiedName,
-    expr: &mut Typed,
-    signature: &ast::TypeSignature<ParseInfo, QualifiedName>,
-    ctx: &mut TypingContext,
-) -> Typing<()> {
-    let scheme = signature.type_scheme(&HashMap::default(), ctx)?;
-    for c in scheme.constraints.iter() {
-        abstract_constraint(c, &mut expr.tree, ctx)?;
-    }
-    println!(">>> {} :: {}", qualified_name, scheme);
-    ctx.bind_free_term(qualified_name.clone(), scheme);
-    Ok(())
-}
-
-fn abstract_constraint(c: &Constraint, tree: &mut Expr, ctx: &mut TypingContext) -> Typing<()> {
+fn abstract_constraint(c: &Constraint, tree: &mut Expr, ctx: &TypingContext) -> Typing<()> {
     *tree = add_constraint_parameter_slot(tree);
     *tree =
         add_constraint_projections(tree, c, ctx).map_err(|e| e.at(tree.type_info().parse_info))?;
@@ -365,38 +367,25 @@ fn abstract_constraint(c: &Constraint, tree: &mut Expr, ctx: &mut TypingContext)
 }
 
 fn discharge_ground_constraints(
-    expr: &Typed,
+    mut tree: Expr,
+    constraints: ConstraintSet,
     witness_index: &WitnessIndex,
     ctx: &TypingContext,
-) -> Typing<Typed> {
-    let (ground, non_ground) = expr
-        .constraints
+) -> Result<(ConstraintSet, Expr), TypeError> {
+    let (ground, non_ground) = constraints.iter().partition::<Vec<_>, _>(|c| c.is_ground());
+
+    let evidence = ground
         .iter()
-        .partition::<Vec<_>, _>(|c| c.is_ground());
-
-    let mut evidence = Vec::with_capacity(ground.len());
-    let pi = expr.tree.type_info().parse_info;
-
-    for c in ground {
-        let witness = witness_index
-            .resolve_witness(c, &ctx.types)
-            .map_err(|e| e.at(pi))?;
-
-        evidence.push((c, witness));
-    }
-
-    let mut tree = expr.tree.clone();
+        .map(|c| witness_index.resolve_witness(c, &ctx.types).map(|w| (c, w)))
+        .collect::<Result<Vec<_>, TypeError>>()?;
 
     for (constraint, evidence) in evidence {
-        let signature = constraint.signature(&ctx.types).map_err(|e| e.at(pi))?;
+        println!("dischage_ground_constraints: constraint {constraint} evicence {evidence}");
+        let signature = constraint.signature(&ctx.types)?;
         tree = inject_witness(tree, &signature.interface, constraint, &evidence, &ctx);
     }
 
-    Ok(Typed::computed(
-        expr.substitutions.clone(),
-        ConstraintSet::from(non_ground.as_slice()),
-        tree,
-    ))
+    Ok((ConstraintSet::from(non_ground.as_slice()), tree))
 }
 
 fn inject_witness(
@@ -434,6 +423,7 @@ fn inject_witness(
         }
 
         Expr::Variable(type_info, term_id @ Identifier::Free(..)) => {
+            println!("inject_witness: term_id {term_id}.");
             let scheme = ctx.terms.lookup(&term_id).unwrap();
 
             //);
@@ -2364,8 +2354,6 @@ impl TypingContext {
         let substitutions = expr.substitutions.compose(&s_unification);
         let constraints = expr.constraints.apply(&substitutions);
 
-        self.substitute_mut(&substitutions);
-
         let expr = expr.tree.apply(&substitutions);
         Ok(Typed::computed(substitutions, constraints, expr))
     }
@@ -2806,8 +2794,6 @@ impl TypingContext {
         expected_type: &Type,
         deconstruct: &phase::Deconstruct<Named>,
     ) -> Typing {
-        println!("check_deconstruction: for {deconstruct}");
-
         let Typed {
             mut substitutions,
             tree: scrutinee,
@@ -2983,7 +2969,7 @@ impl TypingContext {
     ) -> Typing<phase::MatchClause<Types>> {
         let mut bindings = Vec::default();
         let (p_subst, pattern) = self.check_pattern(&clause.pattern, &mut bindings, &scrutinee)?;
-        self.substitute_mut(&p_subst);
+        //self.substitute_mut(&p_subst);
 
         for (binding, ty) in bindings {
             self.bind_term(binding, TypeScheme::from_constant(ty));
@@ -3951,8 +3937,6 @@ impl Shape {
             .expand_type_constructor(pi, scrutinee)?
             .unwrap_or_else(|| TypeStructure::Monotype(scrutinee.clone()));
 
-        println!("covers: scrutinee {scrutinee}");
-
         match (self, scrutinee) {
             (
                 Self::Coproduct(denotations),
@@ -4099,7 +4083,6 @@ impl MatchSpace {
         scrutinee: &Type,
         ctx: &TypingContext,
     ) -> Typing<bool> {
-        println!("is_exhausive: covered {:?}", self.covered);
         self.covered.normalize().covers(pi, scrutinee, ctx)
     }
 

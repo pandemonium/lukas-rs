@@ -5,7 +5,7 @@ use Control.
 List ::= ∀α. Nil | Cons α (List α)
 
 witness Functor List :=
-  { fmap := λf. List.map f
+  { fmap := λf fa. List.map f fa
   }
 
 witness Foldable List :=
@@ -16,6 +16,22 @@ witness Foldable List :=
 witness Monad List :=
   { pure := λx. Cons x Nil
     bind := λf. List.bind f
+  }
+
+witness Applicative List :=
+  { pure  := λa. Cons a Nil
+    apply := λff fa.
+      List.bind (λf. List.map f fa) ff
+  }
+
+witness Traversable List :=
+  { traverse := λf xs.
+      print_endline "traverse: looping..."
+      deconstruct xs into
+        Nil -> pure Nil
+      | Cons a tail ->
+        print_endline "traverse: looping..."
+        liftA2 Cons (f a) (traverse f tail)
   }
 
 module List:
@@ -93,6 +109,11 @@ witness Monad Perhaps :=
       deconstruct ma into
         This a -> f a
       | Nope   -> Nope
+  }
+
+witness Applicative Perhaps :=
+  { pure  := λx. This x
+    apply := λap fa. Perhaps.bind (λf. Perhaps.map f fa) ap
   }
 
 module Perhaps:

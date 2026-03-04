@@ -104,6 +104,8 @@ impl Compiler {
 
             for symbol in resolved_symbols
                 .elaborate_compilation_unit(evaluation_order.iter())?
+                // Should compute a new evaluation_order before .terms
+                // -- one that takes witness premises into account
                 .terms(evaluation_order.iter())
             {
                 let value = Rc::new(symbol.body.erase_annotation())

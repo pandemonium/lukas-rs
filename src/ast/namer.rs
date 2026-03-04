@@ -23,7 +23,7 @@ use crate::{
     compiler::{Compilation, Compiler, Located, LocatedError},
     parser::{self, IdentifierPath, ParseInfo, Parsed},
     phase::{self, Phase},
-    typer::BaseType,
+    typer::{BaseType, display_list},
 };
 
 pub struct Named;
@@ -317,8 +317,31 @@ impl<Id> DependencyMatrix<Id>
 where
     Id: Eq + Hash + fmt::Display + fmt::Debug,
 {
+    pub fn merge(&mut self, rhs: DependencyMatrix<Id>) {
+        let Self { graph, witnesses } = rhs;
+        for (k, v) in graph {
+            self.add_edge(k, v);
+        }
+        self.witnesses.extend(witnesses);
+    }
+
+    pub fn map<F, B>(self, f: F) -> DependencyMatrix<B>
+    where
+        F: Fn(Id) -> B,
+        B: Hash + Eq,
+    {
+        let Self { graph, witnesses } = self;
+        DependencyMatrix {
+            graph: graph
+                .into_iter()
+                .map(|(k, v)| (f(k), v.into_iter().map(&f).collect()))
+                .collect(),
+            witnesses: witnesses.into_iter().map(f).collect(),
+        }
+    }
+
     pub fn add_edge(&mut self, node: Id, vertices: Vec<Id>) {
-        self.graph.insert(node, vertices);
+        self.graph.entry(node).or_default().extend(vertices);
     }
 
     pub fn add_witness(&mut self, witness: Id) {
@@ -1916,5 +1939,24 @@ impl fmt::Display for SymbolName {
             Self::Type(id) => write!(f, "{id}"),
             Self::Term(id) => write!(f, "{id}"),
         }
+    }
+}
+
+impl<Id> fmt::Display for DependencyMatrix<Id>
+where
+    Id: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { graph, witnesses } = self;
+        write!(f, "graph: ")?;
+        for (k, v) in graph {
+            write!(f, "{k} -> {}; ", display_list(", ", v))?;
+        }
+        writeln!(f, ".")?;
+        write!(
+            f,
+            "witnesses: {}",
+            display_list(", ", &witnesses.iter().collect::<Vec<_>>())
+        )
     }
 }

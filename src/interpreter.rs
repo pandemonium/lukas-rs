@@ -9,7 +9,7 @@ use crate::{
         pattern::Pattern,
     },
     interpreter::cek::{Closure, Val, VariantVal},
-    typer,
+    typer::{self, display_list},
 };
 
 pub mod cek;
@@ -108,7 +108,7 @@ impl Expr {
                 (Val::Product(values), ProductElement::Ordinal(index)) => {
                     Ok(values[*index].clone())
                 }
-                (base, select) => panic!("projection off of {base:?} with {select:?}"),
+                (base, select) => panic!("projection off of {base} with {select:?}"),
             },
 
             Self::Sequence(_, the) => {
@@ -314,14 +314,19 @@ impl fmt::Display for Val {
 
             Self::RecursiveClosure { name, inner } => {
                 if let Some(inner) = inner.upgrade() {
-                    write!(f, "/{name}/ {}", inner.borrow())
+                    write!(f, "/{name}/ {}", inner.borrow().capture.global_count())
                 } else {
                     write!(f, "/{name}/ {{ Val since dropped }}")
                 }
             }
 
             Self::PartiallyAppliedBridge { bridge, arguments } => {
-                write!(f, "{} {:?}", bridge.qualified_name(), arguments)
+                write!(
+                    f,
+                    "{} {}",
+                    bridge.qualified_name(),
+                    display_list(", ", arguments)
+                )
             }
 
             Self::Product(elements) => {

@@ -3,26 +3,20 @@ State ::= ∀s α. State (s -> (s, α))
 module State:
   pure :: ∀s α. α -> State s α := λa. State (λs. s, a)
 
-  map :: ∀s α β. (α -> β) -> State s α -> State s β := λg s.
-    deconstruct s into
-      State f ->
-        State (λs0.
-          let t = f s0
-          in t.0, g t.1
-        )
+  map :: ∀s α β. (α -> β) -> State s α -> State s β := λg (State f).
+    State (λs0.
+      let s, a = f s0
+      in s, g a
+    )
 
-  bind :: ∀s α β. (α -> State s β) -> State s α -> State s β := λk s.
-    deconstruct s into
-      State f ->
-        State (λs0.
-          let t = f s0 in
-          deconstruct k t.1 into
-            State g -> g t.0
-        )
+  bind :: ∀s α β. (α -> State s β) -> State s α -> State s β := λk (State f).
+    State (λs0.
+      let s, a = f s0 in
+      let State g = k a in
+      g s
+    )
 
-  run :: ∀s α. State s α -> s -> (s, α) := λst s.
-    deconstruct st into
-      State f -> f s
+  run :: ∀s α. State s α -> s -> (s, α) := λ(State f) s. f s
 
   eval :: ∀s α. State s α -> s -> α :=
     λst s. (run st s).1

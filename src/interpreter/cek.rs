@@ -61,13 +61,6 @@ impl Closure {
     }
 }
 
-impl fmt::Display for Closure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { capture, body } = self;
-        write!(f, "[ {capture} ]: {body}")
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct Globals(HashMap<QualifiedName, Val>);
 
@@ -81,6 +74,7 @@ impl Globals {
     }
 
     pub fn define(&mut self, name: QualifiedName, val: Val) {
+        println!("define: {name}");
         let Self(m) = self;
         m.insert(name, val);
     }
@@ -210,36 +204,6 @@ impl Env {
     }
 }
 
-impl fmt::Display for Env {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let local_prefix = {
-            self.locals
-                .borrow()
-                .iter()
-                .take(5)
-                .map(|x| x.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-
-        let static_prefix = self
-            .globals
-            .bindings()
-            .take(5)
-            .map(|(path, value)| format!("{path}: {value}"))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        write!(f, "static: {static_prefix}; bound: {local_prefix}")?;
-
-        if self.locals.borrow().len() > 5 {
-            write!(f, ", ...")
-        } else {
-            Ok(())
-        }
-    }
-}
-
 #[derive(Debug)]
 enum AndThen {
     EvalArgument {
@@ -339,6 +303,7 @@ enum Suspended {
 impl Suspension {
     fn run(mut self) -> Interpretation<Val> {
         loop {
+            println!("run: looping...");
             match self {
                 Self::Suspend(..) => self = self.resume(),
                 Self::Done(value) => break Ok(value),
@@ -665,6 +630,7 @@ impl Expr {
     }
 
     fn eval(self: Tree, environment: Env, k: AndThen) -> Suspension {
+        println!("eval: {self:?}");
         match self.as_ref() {
             Self::Variable(_, the) => {
                 let value = match the {
@@ -839,6 +805,43 @@ impl Expr {
             Self::Ascription(_, the) => Suspension::eval_and(&the.ascribed_tree, environment, k),
 
             Self::MakeClosure(..) => panic!("Does not eval"),
+        }
+    }
+}
+
+impl fmt::Display for Closure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { capture, body } = self;
+        write!(f, "[ {capture} ]: {body}")
+    }
+}
+
+impl fmt::Display for Env {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let local_prefix = {
+            self.locals
+                .borrow()
+                .iter()
+                .take(5)
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let static_prefix = self
+            .globals
+            .bindings()
+            .take(5)
+            .map(|(path, value)| format!("{path}: {value}"))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        write!(f, "static: {static_prefix}; bound: {local_prefix}")?;
+
+        if self.locals.borrow().len() > 5 {
+            write!(f, ", ...")
+        } else {
+            Ok(())
         }
     }
 }

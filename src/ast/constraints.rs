@@ -1,15 +1,18 @@
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt, panic,
+};
 
 use crate::{
     ast::{
         Apply, Expr,
-        namer::{Identifier, Named, QualifiedName},
+        namer::{self, DependencyMatrix, Identifier, Named, QualifiedName, TermSymbol},
     },
     parser::ParseInfo,
     phase,
     typer::{
-        Constraint, RecordShape, Substitutions, Type, TypeEnvironment, TypeError, TypeStructure,
-        Types, Typing, TypingContext, display_list,
+        Constraint, RecordShape, Substitutions, Type, TypeEnvironment, TypeError, TypeInfo,
+        TypeStructure, Types, Typing, TypingContext, display_list,
     },
 };
 
@@ -76,10 +79,118 @@ pub struct WitnessIndex {
 
 impl WitnessIndex {
     pub fn register(&mut self, witness: Witness) {
+        println!("register: {} :: {}", witness.name, witness.head);
+
         self.store
             .entry(witness.head.name().clone())
             .or_default()
             .push(witness);
+    }
+
+    pub fn dependency_matrix(
+        &self,
+        ctx: &TypeEnvironment,
+    ) -> Result<DependencyMatrix<QualifiedName>, TypeError> {
+        let mut graph = HashMap::default();
+        let mut deps = DependencyMatrix::default();
+
+        for witness in self.store.values().flatten() {
+            match self.resolve_witness_dependencies(witness, &mut graph, ctx) {
+                Ok(()) => println!("resolve: {witness}"),
+                Err(e) => println!("resolve: {e}"),
+            }
+        }
+
+        for (k, v) in graph {
+            println!(
+                "resolve: {k} -> {}",
+                display_list(", ", &v.iter().collect::<Vec<_>>())
+            );
+            deps.add_edge(k, v.into_iter().collect());
+        }
+
+        Ok(deps)
+    }
+
+    fn resolve_witness_dependencies(
+        &self,
+        witness: &Witness,
+        graph: &mut HashMap<QualifiedName, HashSet<QualifiedName>>,
+        ctx: &TypeEnvironment,
+    ) -> Result<(), TypeError> {
+        self.resolve_constraint_witness_dependencies(&witness.head, &witness.name, graph, ctx)?;
+        Ok(())
+    }
+
+    fn resolve_term_witness_dependencies(
+        &self,
+        term: TermSymbol<TypeInfo, QualifiedName, namer::Identifier>,
+    ) -> Result<(), TypeError> {
+        todo!()
+    }
+
+    fn resolve_constraint_witness_dependencies(
+        &self,
+        constraint: &Constraint,
+        source: &QualifiedName,
+        graph: &mut HashMap<QualifiedName, HashSet<QualifiedName>>,
+        ctx: &TypeEnvironment,
+    ) -> Result<QualifiedName, TypeError> {
+        let candidates = self
+            .store
+            .get(&constraint.name())
+            .ok_or_else(|| TypeError::NoWitness(constraint.clone()))?;
+
+        for witness in candidates {
+            let subst = constraint
+                .constraint_type
+                .unified_with(&witness.head.constraint_type, ctx);
+
+            if subst.is_err() {
+                continue;
+            }
+
+            let subst = subst?;
+            let witness = witness.apply(&subst);
+
+            let mut graph_candidate = HashMap::default();
+
+            println!(
+                "resolve_and_record: {} has {} premises.",
+                witness.name,
+                display_list(", ", &witness.premises)
+            );
+
+            let solution = witness
+                .premises
+                .iter()
+                .map(|c| {
+                    self.resolve_constraint_witness_dependencies(
+                        c,
+                        &witness.name,
+                        &mut graph_candidate,
+                        ctx,
+                    )
+                })
+                .collect::<Result<Vec<_>, TypeError>>();
+
+            if let Ok(solution) = solution {
+                println!(
+                    "resolve_and_record: witness {} solution {} source {source}.",
+                    witness.name,
+                    display_list(", ", &solution)
+                );
+
+                for (k, v) in graph_candidate {
+                    graph.entry(k).or_default().extend(v);
+                }
+
+                graph.entry(source.clone()).or_default().extend(solution);
+                return Ok(witness.name);
+            }
+        }
+
+        Err(TypeError::NoWitness(constraint.clone()))
     }
 
     pub fn resolve_witness(
@@ -141,6 +252,7 @@ impl WitnessIndex {
             }
         }
 
+        println!("resolve_witness: index {self:?}");
         Err(TypeError::NoWitness(constraint.clone()))
     }
 }
