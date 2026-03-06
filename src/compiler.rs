@@ -103,7 +103,7 @@ impl Compiler {
             let mut globals = Globals::default();
 
             for symbol in resolved_symbols
-                .elaborate_compilation_unit(evaluation_order.iter())?
+                .elaborate_compilation_unit()?
                 // Should compute a new evaluation_order before .terms
                 // -- one that takes witness premises into account
                 .terms(evaluation_order.iter())
@@ -134,7 +134,7 @@ impl Compiler {
 
         if dependencies.are_sound() {
             let program = compilation
-                .elaborate_compilation_unit(evaluation_order.iter())?
+                .elaborate_compilation_unit()?
                 .closure_conversion()
                 .lambda_lift();
 

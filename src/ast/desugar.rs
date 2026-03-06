@@ -205,7 +205,7 @@ impl phase::Expr<Parsed> {
                     type_signature: the.type_signature,
                 },
             ),
-            ast::Expr::MakeClosure(a, the) => panic!("illegal AST form"),
+            ast::Expr::MakeClosure(..) => panic!("illegal AST form"),
         }
     }
 

@@ -37,7 +37,6 @@ impl phase::Phase for Named {
 pub type Expr = phase::Expr<Named>;
 
 type ParserSymbolTable = SymbolTable<ParseInfo, IdentifierPath, IdentifierPath>;
-type ParserSymbol = Symbol<ParseInfo, IdentifierPath, IdentifierPath>;
 pub type NamedSymbolTable = SymbolTable<ParseInfo, QualifiedName, Identifier>;
 pub type NamedSymbol = Symbol<ParseInfo, QualifiedName, Identifier>;
 

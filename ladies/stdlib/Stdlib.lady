@@ -26,7 +26,7 @@ witness Applicative List :=
 
 witness Traversable List :=
   { traverse := λf xs.
-      print_endline "traverse: looping..."
+      print_endline "traverse: list looping..."
       deconstruct xs into
         Nil -> pure Nil
       | Cons a tail ->

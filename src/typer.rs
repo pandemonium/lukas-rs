@@ -172,16 +172,12 @@ impl phase::TypeSignature<Named> {
 }
 
 impl phase::SymbolTable<Named> {
-    pub fn elaborate_compilation_unit(
-        mut self,
-        evaluation_order: Iter<&SymbolName>,
-    ) -> Typing<phase::SymbolTable<Types>> {
+    pub fn elaborate_compilation_unit(mut self) -> Typing<phase::SymbolTable<Types>> {
         let mut ctx = self.elaborate_types()?;
 
         self.elaborate_constraints(&mut ctx)?;
 
-        let mut symbols = HashMap::default();
-        self.elaborate_terms(evaluation_order, &mut symbols, ctx)?;
+        let symbols = self.elaborate_terms(ctx)?;
 
         Ok(SymbolTable {
             module_members: self.module_members,
@@ -195,38 +191,17 @@ impl phase::SymbolTable<Named> {
 
     fn elaborate_terms(
         &self,
-        evaluation_order: Iter<&SymbolName>,
-        symbols: &mut HashMap<SymbolName, Symbol<TypeInfo, QualifiedName, Identifier>>,
         mut ctx: TypingContext,
-    ) -> Typing<()> {
+    ) -> Typing<HashMap<SymbolName, Symbol<TypeInfo, QualifiedName, Identifier>>> {
+        let mut symbols = HashMap::with_capacity(self.symbols.len());
         let witness_index = self.register_witnesses(&ctx)?;
-
-        let witnessed_order = witness_index
+        let witness_deps = witness_index
             .dependency_matrix(&ctx.types)
             .map_err(|e| e.at(ParseInfo::default()))?;
 
-        println!("elaborate_terms: witness_matrix {witnessed_order}");
-
-        let mut symbol_order = self.dependency_matrix();
-        symbol_order.merge(witnessed_order.map(|id| SymbolName::Term(id)));
-        let evaluation_order = symbol_order.in_resolvable_order();
-
-        let mut typed_terms = Vec::with_capacity(evaluation_order.len());
-        for name in evaluation_order {
-            if let SymbolName::Term(term_name) = name
-                // signature method placeholders are already typed
-                && !ctx.terms.free.contains_key(term_name)
-                && let Symbol::Term(symbol) = &self.symbols[name]
-            {
-                typed_terms.push((symbol, self.type_term(symbol, &mut ctx)?))
-            }
-
-            if let SymbolName::Type(..) = name
-                && let Symbol::Type(symbol) = &self.symbols[name]
-            {
-                symbols.insert(name.clone(), Symbol::Type(symbol.clone()));
-            }
-        }
+        let mut deps = self.dependency_matrix();
+        deps.merge(witness_deps.map(SymbolName::Term));
+        let typed_terms = self.type_terms(&mut symbols, deps.in_resolvable_order(), &mut ctx)?;
 
         for (
             symbol,
@@ -236,13 +211,8 @@ impl phase::SymbolTable<Named> {
         ) in typed_terms
         {
             let pi = tree.annotation().parse_info;
-            let (non_ground_constraints, mut expr) =
-                discharge_ground_constraints(tree, constraints, &witness_index, &ctx)
-                    .map_err(|e| e.at(pi))?;
-
-            for c in non_ground_constraints.iter() {
-                abstract_constraint(c, &mut expr, &ctx)?;
-            }
+            let expr = elaborate_term_constraints(&witness_index, constraints, tree, &ctx)
+                .map_err(|e| e.at(pi))?;
 
             symbols.insert(
                 SymbolName::Term(symbol.name.clone()),
@@ -254,7 +224,34 @@ impl phase::SymbolTable<Named> {
             );
         }
 
-        Ok(())
+        Ok(symbols)
+    }
+
+    fn type_terms(
+        &self,
+        symbols: &mut HashMap<SymbolName, Symbol<TypeInfo, QualifiedName, Identifier>>,
+        evaluation_order: Vec<&SymbolName>,
+        ctx: &mut TypingContext,
+    ) -> Typing<Vec<(&TermSymbol<ParseInfo, QualifiedName, Identifier>, Typed)>> {
+        let mut typed_terms = Vec::with_capacity(evaluation_order.len());
+        for name in evaluation_order {
+            // Rewrite in terms of a match instead?
+            if let SymbolName::Term(term_name) = name
+                // signature method placeholders are already typed
+                && !ctx.terms.free.contains_key(term_name)
+                && let Symbol::Term(symbol) = &self.symbols[name]
+            {
+                //                println!("@@@ {} := {:?}", symbol.name, symbol.body);
+                typed_terms.push((symbol, self.type_term(symbol, ctx)?))
+            }
+
+            if let SymbolName::Type(..) = name
+                && let Symbol::Type(symbol) = &self.symbols[name]
+            {
+                symbols.insert(name.clone(), Symbol::Type(symbol.clone()));
+            }
+        }
+        Ok(typed_terms)
     }
 
     fn register_witnesses(&self, ctx: &TypingContext) -> Typing<WitnessIndex> {
@@ -359,10 +356,30 @@ impl phase::SymbolTable<Named> {
     }
 }
 
-fn abstract_constraint(c: &Constraint, tree: &mut Expr, ctx: &TypingContext) -> Typing<()> {
+fn elaborate_term_constraints(
+    witness_index: &WitnessIndex,
+    constraints: ConstraintSet,
+    tree: ast::Expr<TypeInfo, Identifier>,
+    ctx: &TypingContext,
+) -> Result<ast::Expr<TypeInfo, Identifier>, TypeError> {
+    let pi = tree.annotation().parse_info;
+    let (non_ground_constraints, mut expr) =
+        discharge_ground_constraints(tree, constraints, witness_index, ctx)?;
+
+    for c in non_ground_constraints.iter() {
+        abstract_constraint(c, &mut expr, ctx)?;
+    }
+
+    Ok(expr)
+}
+
+fn abstract_constraint(
+    c: &Constraint,
+    tree: &mut Expr,
+    ctx: &TypingContext,
+) -> Result<(), TypeError> {
     *tree = add_constraint_parameter_slot(tree);
-    *tree =
-        add_constraint_projections(tree, c, ctx).map_err(|e| e.at(tree.type_info().parse_info))?;
+    *tree = add_constraint_projections(tree, c, ctx)?;
     Ok(())
 }
 
@@ -382,7 +399,7 @@ fn discharge_ground_constraints(
     for (constraint, evidence) in evidence {
         println!("dischage_ground_constraints: constraint {constraint} evicence {evidence}");
         let signature = constraint.signature(&ctx.types)?;
-        tree = inject_witness(tree, &signature.interface, constraint, &evidence, &ctx);
+        tree = inject_witness(tree, &signature.vtable, constraint, &evidence, &ctx);
     }
 
     Ok((ConstraintSet::from(non_ground.as_slice()), tree))
@@ -390,14 +407,14 @@ fn discharge_ground_constraints(
 
 fn inject_witness(
     tree: Expr,
-    signature: &RecordShape,
+    vtable: &RecordShape,
     constraint: &Constraint,
     witness: &Expr,
     ctx: &TypingContext,
 ) -> Expr {
     tree.map(&mut |e| match e {
         Expr::Variable(type_info, ref term_id @ Identifier::Free(ref m))
-            if signature.contains(m.member()) =>
+            if vtable.contains(m.member()) =>
         {
             let method_scheme = ctx.terms.lookup(term_id).expect("expr.typed").instantiate();
             let use_site_subst = method_scheme
@@ -414,7 +431,7 @@ fn inject_witness(
                     Projection {
                         base: witness.clone().into(),
                         // This must be the field index
-                        select: ProductElement::Ordinal(signature.index_of(m.member()).unwrap()),
+                        select: ProductElement::Ordinal(vtable.index_of(m.member()).unwrap()),
                     },
                 )
             } else {
@@ -456,14 +473,12 @@ fn add_constraint_projections(
     let signature = constraint.signature(&ctx.types)?;
 
     let tree = tree.clone().map(&mut |e| match e {
-        Expr::Variable(a, Identifier::Free(m)) if signature.interface.contains(m.member()) => {
+        Expr::Variable(a, Identifier::Free(m)) if signature.vtable.contains(m.member()) => {
             Expr::Project(
                 a.clone(),
                 Projection {
                     base: Expr::Variable(a.clone(), Identifier::Bound(1)).into(),
-                    select: ProductElement::Ordinal(
-                        signature.interface.index_of(m.member()).unwrap(),
-                    ),
+                    select: ProductElement::Ordinal(signature.vtable.index_of(m.member()).unwrap()),
                 },
             )
         }

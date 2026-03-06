@@ -74,7 +74,6 @@ impl Globals {
     }
 
     pub fn define(&mut self, name: QualifiedName, val: Val) {
-        println!("define: {name}");
         let Self(m) = self;
         m.insert(name, val);
     }
@@ -303,7 +302,6 @@ enum Suspended {
 impl Suspension {
     fn run(mut self) -> Interpretation<Val> {
         loop {
-            println!("run: looping...");
             match self {
                 Self::Suspend(..) => self = self.resume(),
                 Self::Done(value) => break Ok(value),
@@ -630,7 +628,6 @@ impl Expr {
     }
 
     fn eval(self: Tree, environment: Env, k: AndThen) -> Suspension {
-        println!("eval: {self:?}");
         match self.as_ref() {
             Self::Variable(_, the) => {
                 let value = match the {

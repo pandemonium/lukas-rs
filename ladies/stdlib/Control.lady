@@ -35,5 +35,5 @@ signature Traversable ::= ∀t : *->*.
 
 sequence :: ∀t : *->* f : *->* α.  Traversable t + Applicative f |- t (f α) -> f (t α) :=
   λtfa.
-    print_endline "sequence: looping..."
-    traverse id tfa
+    print_endline "sequence: tfa `tfa`."
+    traverse (λx. print_endline "tr: `x`."; x) tfa

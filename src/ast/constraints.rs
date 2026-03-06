@@ -1,24 +1,24 @@
 use std::{
     collections::{HashMap, HashSet},
-    fmt, panic,
+    fmt,
 };
 
 use crate::{
     ast::{
         Apply, Expr,
-        namer::{self, DependencyMatrix, Identifier, Named, QualifiedName, TermSymbol},
+        namer::{DependencyMatrix, Identifier, Named, QualifiedName},
     },
     parser::ParseInfo,
     phase,
     typer::{
-        Constraint, RecordShape, Substitutions, Type, TypeEnvironment, TypeError, TypeInfo,
-        TypeStructure, Types, Typing, TypingContext, display_list,
+        Constraint, RecordShape, Substitutions, Type, TypeEnvironment, TypeError, TypeStructure,
+        Types, Typing, TypingContext, display_list,
     },
 };
 
 pub struct ConstraintSignature {
     pub name: QualifiedName,
-    pub interface: RecordShape,
+    pub vtable: RecordShape,
 }
 
 impl Constraint {
@@ -32,7 +32,7 @@ impl Constraint {
         {
             Ok(ConstraintSignature {
                 name: self.name().clone(),
-                interface: record.shape(),
+                vtable: record.shape(),
             })
         } else {
             Err(TypeError::InternalAssertion("expected a record".to_owned()))
@@ -120,13 +120,6 @@ impl WitnessIndex {
     ) -> Result<(), TypeError> {
         self.resolve_constraint_witness_dependencies(&witness.head, &witness.name, graph, ctx)?;
         Ok(())
-    }
-
-    fn resolve_term_witness_dependencies(
-        &self,
-        term: TermSymbol<TypeInfo, QualifiedName, namer::Identifier>,
-    ) -> Result<(), TypeError> {
-        todo!()
     }
 
     fn resolve_constraint_witness_dependencies(
