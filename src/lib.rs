@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod bridge;
 pub mod builtin;
+pub mod chez;
 pub mod closed;
 pub mod codegen;
 pub mod compiler;
