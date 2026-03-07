@@ -3170,12 +3170,6 @@ impl TypingContext {
             (Pattern::Tuple(pi, pattern), TypeStructure::Monotype(Type::Tuple(tuple)))
                 if pattern.elements.len() == tuple.arity() =>
             {
-                println!(
-                    "check_pattern: pattern-len {}, tuple-arity {}",
-                    pattern.elements.len(),
-                    tuple.arity()
-                );
-
                 let mut elements = Vec::with_capacity(tuple.arity());
                 let mut substitutions = Substitutions::default();
 

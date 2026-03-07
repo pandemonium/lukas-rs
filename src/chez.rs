@@ -267,12 +267,11 @@ impl phase::Expr<Erased> {
             }
 
             ast::Expr::Sequence(_, the) => {
-                write!(code, "(")?;
+                writeln!(code, "(begin ")?;
                 the.this.emit(code)?;
-                writeln!(code, ")")?;
-                write!(code, "(")?;
+                writeln!(code, "")?;
                 the.and_then.emit(code)?;
-                writeln!(code, ")")?;
+                writeln!(code, ")")?
             }
 
             ast::Expr::Deconstruct(_, the) => the.emit(code)?,

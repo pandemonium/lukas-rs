@@ -6,5 +6,8 @@ fn main() {
     info!("Marmelade Compiler v420");
 
     let compiler = compiler::Compiler::parse();
-    compiler.compiler_main().unwrap()
+    match compiler.compiler_main() {
+        Ok(..) => (),
+        Err(e) => println!("$$$$ {e}"),
+    }
 }

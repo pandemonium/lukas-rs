@@ -128,7 +128,6 @@ impl Compiler {
         let resolved_symbols = symbols.desugar().resolve_names()?;
 
         let dependencies = resolved_symbols.dependency_matrix();
-        let evaluation_order = dependencies.in_resolvable_order();
 
         if dependencies.are_sound() {
             //            let program = compilation
