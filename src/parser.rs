@@ -1073,7 +1073,10 @@ impl<'a> Parser<'a> {
         //        let binder = IdentifierPath::new(&binder);
         //let binder =
         //    IdentifierPattern::from_path(ParseInfo::from_position(binder_location), binder);
-        let binder = self.parse_pattern().map(IdentifierPattern::from)?;
+        let binder = self
+            .parse_pattern()
+            .map(|p| p.normalize())
+            .map(IdentifierPattern::from)?;
 
         self.expect(TokenKind::Equals)?;
         let bound = self.parse_block(|parser| parser.parse_sequence())?;
@@ -1182,7 +1185,7 @@ impl<'a> Parser<'a> {
                 } => {
                     // (
                     self.advance(1);
-                    params.push((position, self.parse_pattern()?));
+                    params.push((position, self.parse_pattern()?.normalize()));
                     self.expect(TokenKind::RightParen)?;
                 }
 
@@ -1949,7 +1952,7 @@ impl<'a> Parser<'a> {
     ) -> Result<MatchClause<ParseInfo, IdentifierPattern<ParseInfo>>> {
         let _t = self.trace();
 
-        let pattern = self.parse_pattern()?;
+        let pattern = self.parse_pattern()?.normalize();
 
         self.expect(TokenKind::Arrow)?;
         let consequent = self.parse_block(|parser| parser.parse_sequence())?;
@@ -2002,6 +2005,20 @@ impl<'a> Parser<'a> {
 
             [
                 Token {
+                    kind: TokenKind::LeftParen,
+                    ..
+                },
+                ..,
+            ] => {
+                // (
+                self.advance(1);
+
+                let pattern = self.parse_pattern()?.normalize();
+                self.expect(TokenKind::RightParen)?;
+                Ok(pattern)
+            }
+            [
+                Token {
                     kind: TokenKind::Literal(literal),
                     position,
                 },
@@ -2022,7 +2039,7 @@ impl<'a> Parser<'a> {
             [t, ..] if t.kind == TokenKind::Comma => {
                 // ,
                 self.advance(1);
-                let rhs = self.parse_pattern()?;
+                let rhs = self.parse_pattern_prefix()?;
                 self.parse_pattern_infix(Pattern::Tuple(
                     ParseInfo::from_position(*t.location()),
                     TuplePattern {
@@ -2118,7 +2135,7 @@ impl<'a> Parser<'a> {
 
         let (_pos, label) = self.identifier()?;
         self.expect(TokenKind::Colon)?;
-        let pattern = self.parse_pattern()?;
+        let pattern = self.parse_pattern()?.normalize();
         Ok((Identifier::from_str(&label), pattern))
     }
 
@@ -2210,7 +2227,7 @@ fn unspine_tuple_pattern(
     elements
         .into_iter()
         .flat_map(|p| match p {
-            Pattern::Tuple(_, pattern) => pattern.elements,
+            Pattern::Tuple(_, pattern) => unspine_tuple_pattern(pattern.elements),
             atom => vec![atom],
         })
         .collect()

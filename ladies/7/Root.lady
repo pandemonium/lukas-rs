@@ -1,9 +1,6 @@
 Maybe ::= forall a. Just a | Nothing
 
-factorial := lambda x.
-  if x = 1 then 1 else x * factorial (x - 1)
-
 start := lambda z.
-  deconstruct Just (2, z) into
-    Just (x, y) -> x * y
-  | Nothing -> 1
+  deconstruct Just (1, z, 3, 4) into
+    Just (a, b, c, d) -> (a * b + c) / d
+  | Nothing -> 7

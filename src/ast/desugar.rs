@@ -245,7 +245,6 @@ where
     elements
         .into_iter()
         .flat_map(|e| match (*e).clone() {
-            // This is probably not correct - it flattens too much
             ast::Expr::Tuple(_, tuple) => unspine_tuple(tuple.elements.to_vec()),
             atom => vec![atom.into()],
         })
