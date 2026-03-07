@@ -251,8 +251,8 @@ impl NameExpr {
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct QualifiedName {
-    module: IdentifierPath,
-    member: parser::Identifier,
+    pub module: IdentifierPath,
+    pub member: parser::Identifier,
 }
 
 impl QualifiedName {

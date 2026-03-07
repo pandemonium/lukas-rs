@@ -125,24 +125,23 @@ impl Compiler {
 
     pub fn typecheck_and_compile(&self, program: CompilationUnit) -> Compilation<()> {
         let symbols = namer::SymbolTable::import_compilation_unit(program)?;
-        let symbols = symbols.desugar_expressions();
+        let resolved_symbols = symbols.desugar().resolve_names()?;
 
-        let compilation = symbols.resolve_names()?;
-
-        let dependencies = compilation.dependency_matrix();
+        let dependencies = resolved_symbols.dependency_matrix();
         let evaluation_order = dependencies.in_resolvable_order();
 
         if dependencies.are_sound() {
-            let program = compilation
-                .elaborate_compilation_unit()?
-                .closure_conversion()
-                .lambda_lift();
+            //            let program = compilation
+            //                .elaborate_compilation_unit()?
+            //                .closure_conversion()
+            //                .lambda_lift();
 
-            //            println!("program {program:?}");
+            let program = resolved_symbols.elaborate_compilation_unit()?;
+
             let mut code = CodeBuffer::default();
+            program.emit_scheme_code(&mut code).unwrap();
 
-            program.generate_code(&mut code).unwrap();
-            //println!("/* generated_code.c */\n{}", code);
+            println!("/* generated_code.ss */\n{}", code);
 
             Ok(())
         } else {

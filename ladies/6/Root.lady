@@ -5,7 +5,8 @@ Record ::=
     t :: Text
   }
 
-start :: Int -> Unit := lambda _.
+start :: Int -> Int := lambda _.
   let o = Some 1 in
   deconstruct o into
-    Some x -> print_endline "x: `x`."
+    Some x -> x
+  | None -> 0
