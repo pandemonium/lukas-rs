@@ -1481,6 +1481,7 @@ impl phase::Binding<Desugared> {
             names.bind_and_then(binder, |names, binder| {
                 Ok(Binding {
                     binder,
+                    operator: self.operator,
                     bound: Rc::clone(&bound),
                     body: self.body.resolve(names, symbols, semantic_scope)?.into(),
                 })

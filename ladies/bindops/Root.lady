@@ -1,0 +1,10 @@
+use Stdlib.
+
+start := lambda _.
+  let x =
+    This 10
+  in
+    print_endline "Hi `x`"
+    11
+
+  print_endline "Hi?"

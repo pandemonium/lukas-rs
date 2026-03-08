@@ -317,6 +317,7 @@ impl phase::Expr<Types> {
                 ti,
                 ast::Binding {
                     binder: namer::Identifier::Bound(binder_level),
+                    operator,
                     bound,
                     body,
                 },
@@ -324,6 +325,7 @@ impl phase::Expr<Types> {
                 ti.empty_capture(),
                 Binding {
                     binder: Identifier::Local(LexicalLevel(binder_level).rebase(lambda_level)),
+                    operator,
                     bound: Self::go(bound, lambda_level, is_recursive, layout),
                     body: Self::go(body, lambda_level, is_recursive, layout),
                 },

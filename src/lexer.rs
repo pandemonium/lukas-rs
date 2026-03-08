@@ -21,6 +21,21 @@ impl LexicalAnalyzer {
                 [c, remains @ ..] if is_special_symbol(*c) => {
                     self.emit(1, TokenKind::decode_reserved_words(c.to_string()), remains)
                 }
+                ['l', 'e', 't', '*', remains @ ..] => self.emit(
+                    4,
+                    TokenKind::Keyword(Keyword::Let(BindingOperator::Monadic)),
+                    remains,
+                ),
+                ['l', 'e', 't', '+', remains @ ..] => self.emit(
+                    4,
+                    TokenKind::Keyword(Keyword::Let(BindingOperator::Applicative)),
+                    remains,
+                ),
+                ['l', 'e', 't', remains @ ..] => self.emit(
+                    3,
+                    TokenKind::Keyword(Keyword::Let(BindingOperator::Identity)),
+                    remains,
+                ),
                 prefix @ [c, ..] if is_identifier_prefix(*c) => self.scan_identifier(prefix),
                 prefix @ [c, ..] if is_number_prefix(*c) => self.scan_number(prefix),
                 ['"', remains @ ..] => self.scan_text_literal(remains),
@@ -525,9 +540,16 @@ pub enum Layout {
     Newline,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum BindingOperator {
+    Identity,
+    Monadic,
+    Applicative,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Keyword {
-    Let,
+    Let(BindingOperator),
     In,
 
     If,
@@ -560,7 +582,6 @@ pub enum Keyword {
 impl Keyword {
     fn try_from_identifier(id: &str) -> Option<Self> {
         match id {
-            "let" => Some(Self::Let),
             "in" => Some(Self::In),
             "if" => Some(Self::If),
             "then" => Some(Self::Then),
@@ -761,7 +782,7 @@ impl fmt::Display for Operator {
 impl fmt::Display for Keyword {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Let => write!(f, "Let"),
+            Self::Let(op) => write!(f, "Let{op}"),
             Self::In => write!(f, "In"),
             Self::If => write!(f, "If"),
             Self::Then => write!(f, "Then"),
@@ -782,6 +803,16 @@ impl fmt::Display for Keyword {
             Self::Where => write!(f, "Where"),
             Self::Signature => write!(f, "Signature"),
             Self::Witness => write!(f, "Witness"),
+        }
+    }
+}
+
+impl fmt::Display for BindingOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Identity => write!(f, ""),
+            Self::Monadic => write!(f, "*"),
+            Self::Applicative => write!(f, "+"),
         }
     }
 }

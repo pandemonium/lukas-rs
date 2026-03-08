@@ -166,7 +166,7 @@ impl Uncurry {
 }
 
 fn map_builtin_name(name: &QualifiedName) -> &'static str {
-    let QualifiedName { module, member } = name;
+    let QualifiedName { member, .. } = name;
     match member.as_str() {
         "print_endline" => "print-endline",
         "show" => "show",
@@ -179,7 +179,7 @@ fn map_builtin_name(name: &QualifiedName) -> &'static str {
         "<" => "<",
         ">" => ">",
         "and" => "and",
-        "xor" => "logxor",
+        "xor" => "bool-xor",
         "or" => "or",
         ">=" => ">=",
         "<=" => "<=",

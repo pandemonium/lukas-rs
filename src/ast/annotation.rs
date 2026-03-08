@@ -135,11 +135,13 @@ where
     {
         let Binding {
             binder,
+            operator,
             bound,
             body,
         } = self;
         Binding {
             binder: binder.clone(),
+            operator: *operator,
             bound: bound.map_annotation(f),
             body: body.map_annotation(f),
         }

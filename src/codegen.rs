@@ -211,6 +211,7 @@ impl lambda_lift::Program {
             binder,
             bound,
             body,
+            ..
         }: &phase::Binding<Closed>,
         code: &mut CodeBuffer,
     ) -> fmt::Result {

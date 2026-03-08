@@ -5,11 +5,12 @@ use std::{
 
 use crate::{
     ast::{
-        self, Apply, Binding, Deconstruct, IfThenElse, Injection, Interpolate, Lambda, Projection,
-        Record, SelfReferential, Sequence, Tree, Tuple, TypeAscription,
+        self, Apply, Binding, Deconstruct, IdentifierPattern, IfThenElse, Injection, Interpolate,
+        Lambda, Projection, Record, SelfReferential, Sequence, Tree, Tuple, TypeAscription,
         namer::{Symbol, SymbolTable, TermSymbol},
         pattern::MatchClause,
     },
+    lexer::BindingOperator,
     parser::{IdentifierPath, ParseInfo, Parsed},
     phase::{self, Phase},
 };
@@ -47,6 +48,79 @@ impl phase::Expr<Parsed> {
         })
     }
 
+    pub fn lower_binding_operators(self) -> phase::Expr<Parsed> {
+        self.map(&mut |e| match e {
+            ast::Expr::Let(a, binding) => match binding.operator {
+                BindingOperator::Identity => ast::Expr::Let(a, binding),
+                BindingOperator::Monadic => {
+                    /* let* x = foo in bar x
+                     *
+                     * bind (lambda x. bar x) foo
+                     *
+                     */
+                    let lambda = ast::Expr::Lambda(
+                        a,
+                        Lambda {
+                            parameter: binding.binder,
+                            body: binding.body,
+                        },
+                    );
+                    let apply = ast::Expr::Apply(
+                        a,
+                        Apply {
+                            function: ast::Expr::Variable(
+                                a,
+                                IdentifierPattern::from_atom(a, "bind"),
+                            )
+                            .into(),
+                            argument: lambda.into(),
+                        },
+                    );
+                    ast::Expr::Apply(
+                        a,
+                        Apply {
+                            function: apply.into(),
+                            argument: binding.bound,
+                        },
+                    )
+                }
+                BindingOperator::Applicative => {
+                    /* let+ x = foo in bar x
+                     *
+                     * map (lambda x. bar x) foo
+                     *
+                     */
+                    let lambda = ast::Expr::Lambda(
+                        a,
+                        Lambda {
+                            parameter: binding.binder,
+                            body: binding.body,
+                        },
+                    );
+                    let apply = ast::Expr::Apply(
+                        a,
+                        Apply {
+                            function: ast::Expr::Variable(
+                                a,
+                                IdentifierPattern::from_atom(a, "fmap"),
+                            )
+                            .into(),
+                            argument: lambda.into(),
+                        },
+                    );
+                    ast::Expr::Apply(
+                        a,
+                        Apply {
+                            function: apply.into(),
+                            argument: binding.bound,
+                        },
+                    )
+                }
+            },
+            otherwise => otherwise,
+        })
+    }
+
     fn recurse(
         tree: Tree<ParseInfo, <Parsed as Phase>::TermId>,
     ) -> Tree<ParseInfo, <Desugared as Phase>::TermId> {
@@ -54,6 +128,8 @@ impl phase::Expr<Parsed> {
         Rc::new(owned.lower_inline_patterns())
     }
 
+    // It cannot be map because it changes the Id type and map
+    // does not have that capability at this point.
     pub fn lower_inline_patterns(self) -> phase::Expr<Desugared> {
         match self {
             ast::Expr::Variable(a, the) => Expr::Variable(
@@ -100,7 +176,6 @@ impl phase::Expr<Parsed> {
             ),
             ast::Expr::Let(a, the) => {
                 if !the.binder.is_simple_bind() {
-                    println!("lower_inline_patterns: lowering!");
                     Expr::Deconstruct(
                         a,
                         Deconstruct {
@@ -116,6 +191,7 @@ impl phase::Expr<Parsed> {
                         a,
                         Binding {
                             binder: the.binder.try_into_simple_bind().unwrap(),
+                            operator: the.operator,
                             bound: Self::recurse(the.bound),
                             body: Self::recurse(the.body),
                         },
@@ -210,7 +286,10 @@ impl phase::Expr<Parsed> {
     }
 
     pub fn desugar(&self) -> Expr {
-        self.clone().lower_tuples().lower_inline_patterns()
+        self.clone()
+            .lower_tuples()
+            .lower_binding_operators()
+            .lower_inline_patterns()
     }
 
     fn insert_deconstruction_shim(

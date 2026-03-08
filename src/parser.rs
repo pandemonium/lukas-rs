@@ -14,7 +14,10 @@ use crate::{
         namer::QualifiedName,
         pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern},
     },
-    lexer::{Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token, TokenKind},
+    lexer::{
+        BindingOperator, Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token,
+        TokenKind,
+    },
     phase,
 };
 
@@ -1063,16 +1066,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_local_binding(&mut self) -> Result<Expr> {
+    fn parse_local_binding(&mut self, binding_operator: BindingOperator) -> Result<Expr> {
         let _t = self.trace();
 
-        let location = *self.expect(TokenKind::Keyword(Keyword::Let))?.location();
-        //        let (binder_location, binder) = self.identifier()?;
-
-        // TODO: verify function
-        //        let binder = IdentifierPath::new(&binder);
-        //let binder =
-        //    IdentifierPattern::from_path(ParseInfo::from_position(binder_location), binder);
+        let let_token = self.consume()?;
+        let position = let_token.position;
         let binder = self
             .parse_pattern()
             .map(|p| p.normalize())
@@ -1102,9 +1100,10 @@ impl<'a> Parser<'a> {
         }
         let body = self.parse_block(|parser| parser.parse_sequence())?;
         Ok(Expr::Let(
-            ParseInfo { location },
+            ParseInfo { location: position },
             Binding {
                 binder,
+                operator: binding_operator,
                 bound: bound.into(),
                 body: body.into(),
             },
@@ -1219,7 +1218,7 @@ impl<'a> Parser<'a> {
                 | TokenKind::LeftBrace
                 | TokenKind::LeftParen
                 | TokenKind::Keyword(
-                    Keyword::Lambda | Keyword::Let | Keyword::Deconstruct | Keyword::If
+                    Keyword::Lambda | Keyword::Let(..) | Keyword::Deconstruct | Keyword::If
                 )
                 | TokenKind::Interpolate(Interpolation::Interlude(..))
         )
@@ -1342,7 +1341,13 @@ impl<'a> Parser<'a> {
 
             [t, ..] if t.is_keyword(Keyword::Lambda) => self.parse_lambda(),
 
-            [t, ..] if t.is_keyword(Keyword::Let) => self.parse_local_binding(),
+            [
+                Token {
+                    kind: TokenKind::Keyword(Keyword::Let(op)),
+                    ..
+                },
+                ..,
+            ] => self.parse_local_binding(*op),
 
             [t, ..] if t.is_keyword(Keyword::Deconstruct) => self.parse_deconstruct_into(),
 
@@ -1409,7 +1414,9 @@ impl<'a> Parser<'a> {
             TokenKind::Assign,
             TokenKind::TypeAssign,
             TokenKind::Layout(Layout::Dedent),
-            TokenKind::Keyword(Keyword::Let),
+            TokenKind::Keyword(Keyword::Let(BindingOperator::Applicative)),
+            TokenKind::Keyword(Keyword::Let(BindingOperator::Monadic)),
+            TokenKind::Keyword(Keyword::Let(BindingOperator::Identity)),
             TokenKind::Keyword(Keyword::In),
             TokenKind::Keyword(Keyword::Into),
             TokenKind::Keyword(Keyword::Then),

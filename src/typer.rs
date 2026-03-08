@@ -45,8 +45,6 @@ pub type SymbolTable = namer::SymbolTable<TypeInfo, QualifiedName, Identifier>;
 type UntypedExpr = phase::Expr<Named>;
 pub type Expr = phase::Expr<Types>;
 
-type TypedSymbolTable = namer::SymbolTable<TypeInfo, namer::QualifiedName, namer::Identifier>;
-
 pub fn display_list<A>(sep: &str, xs: &[A]) -> String
 where
     A: fmt::Display,
@@ -362,7 +360,6 @@ fn elaborate_term_constraints(
     tree: ast::Expr<TypeInfo, Identifier>,
     ctx: &TypingContext,
 ) -> Result<ast::Expr<TypeInfo, Identifier>, TypeError> {
-    let pi = tree.annotation().parse_info;
     let (non_ground_constraints, mut expr) =
         discharge_ground_constraints(tree, constraints, witness_index, ctx)?;
 
@@ -397,7 +394,6 @@ fn discharge_ground_constraints(
         .collect::<Result<Vec<_>, TypeError>>()?;
 
     for (constraint, evidence) in evidence {
-        println!("dischage_ground_constraints: constraint {constraint} evicence {evidence}");
         let signature = constraint.signature(&ctx.types)?;
         tree = inject_witness(tree, &signature.vtable, constraint, &evidence, &ctx);
     }
@@ -440,7 +436,6 @@ fn inject_witness(
         }
 
         Expr::Variable(type_info, term_id @ Identifier::Free(..)) => {
-            println!("inject_witness: term_id {term_id}.");
             let scheme = ctx.terms.lookup(&term_id).unwrap();
 
             //);
@@ -605,6 +600,7 @@ impl Expr {
                 a,
                 Binding {
                     binder: Identifier::Bound(l),
+                    operator,
                     bound,
                     body,
                 },
@@ -612,6 +608,7 @@ impl Expr {
                 a.clone(),
                 Binding {
                     binder: Identifier::Bound(delta + l),
+                    operator,
                     bound,
                     body,
                 },
@@ -2891,7 +2888,6 @@ impl TypingContext {
             mut constraints,
         } = self.infer_expr(&deconstruct.scrutinee)?;
 
-        let scrutinee_type = &scrutinee.type_info().inferred_type;
         let mut clauses = Vec::with_capacity(deconstruct.match_clauses.len());
         let mut match_clauses = deconstruct.match_clauses.iter();
 
@@ -3241,7 +3237,7 @@ impl TypingContext {
                 ))
             }
 
-            (pattern, ty) => {
+            (pattern, _) => {
                 panic!("Type error. Illegal pattern. `{pattern}` `{normalized_scrutinee}`",)
             }
         }
@@ -3814,6 +3810,7 @@ impl TypingContext {
                     pi.with_inferred_type(body.type_info().inferred_type.clone()),
                     Binding {
                         binder: binding.binder.clone(),
+                        operator: binding.operator,
                         bound: bound.into(),
                         body: body.into(),
                     },

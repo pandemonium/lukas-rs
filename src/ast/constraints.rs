@@ -79,8 +79,6 @@ pub struct WitnessIndex {
 
 impl WitnessIndex {
     pub fn register(&mut self, witness: Witness) {
-        println!("register: {} :: {}", witness.name, witness.head);
-
         self.store
             .entry(witness.head.name().clone())
             .or_default()
@@ -141,11 +139,11 @@ impl WitnessIndex {
 
             let mut graph_candidate = HashMap::default();
 
-            println!(
-                "resolve_and_record: {} has {} premises.",
-                witness.name,
-                display_list(", ", &witness.premises)
-            );
+            //println!(
+            //    "resolve_and_record: {} has {} premises.",
+            //    witness.name,
+            //    display_list(", ", &witness.premises)
+            //);
 
             let solution = witness
                 .premises
@@ -161,11 +159,11 @@ impl WitnessIndex {
                 .collect::<Result<Vec<_>, TypeError>>();
 
             if let Ok(solution) = solution {
-                println!(
-                    "resolve_and_record: witness {} solution {} source {source}.",
-                    witness.name,
-                    display_list(", ", &solution)
-                );
+                //println!(
+                //    "resolve_and_record: witness {} solution {} source {source}.",
+                //    witness.name,
+                //    display_list(", ", &solution)
+                //);
 
                 for (k, v) in graph_candidate {
                     graph.entry(k).or_default().extend(v);

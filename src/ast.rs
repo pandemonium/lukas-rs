@@ -9,6 +9,7 @@ use crate::{
     },
     bridge::Bridge,
     compiler, lambda_lift,
+    lexer::BindingOperator,
     parser::{self, IdentifierPath},
     typer::display_list,
 };
@@ -401,6 +402,7 @@ impl<A, Id> Expr<A, Id> {
                 a,
                 Binding {
                     binder: the.binder,
+                    operator: the.operator,
                     bound: go(the.bound, f),
                     body: go(the.body, f),
                 },
@@ -557,6 +559,7 @@ pub enum Literal {
 #[derive(Debug, Clone)]
 pub struct Binding<A, Id> {
     pub binder: Id,
+    pub operator: BindingOperator,
     pub bound: Tree<A, Id>,
     pub body: Tree<A, Id>,
 }
