@@ -8,6 +8,7 @@ use crate::{
         self, ROOT_MODULE_NAME,
         namer::{self, NameError},
     },
+    chez,
     codegen::CodeBuffer,
     interpreter::{
         self, Environment, RuntimeError,
@@ -37,6 +38,9 @@ pub enum CompilationError {
 
     #[error("I/O error: {0}")]
     IO(#[from] io::Error),
+
+    #[error("Error generating code")]
+    Chez(#[from] chez::ChezError),
 }
 
 #[derive(Debug, Error)]
@@ -71,6 +75,9 @@ pub struct Compiler {
 
     #[arg(long = "source")]
     pub source_path: PathBuf,
+
+    #[arg(long = "scheme")]
+    pub scheme_file: Option<PathBuf>,
 }
 
 impl Compiler {
@@ -138,9 +145,13 @@ impl Compiler {
             let program = resolved_symbols.elaborate_compilation_unit()?;
 
             let mut code = CodeBuffer::default();
-            program.emit_scheme_code(&mut code).unwrap();
+            program.emit_scheme_code(&mut code)?;
 
-            println!("/* generated_code.ss */\n{}", code);
+            if let Some(target) = &self.scheme_file {
+                code.write_to_file(target)?;
+            } else {
+                println!("{}", code);
+            }
 
             Ok(())
         } else {

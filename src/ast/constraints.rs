@@ -95,17 +95,10 @@ impl WitnessIndex {
         let mut deps = DependencyMatrix::default();
 
         for witness in self.store.values().flatten() {
-            match self.resolve_witness_dependencies(witness, &mut graph, ctx) {
-                Ok(()) => println!("resolve: {witness}"),
-                Err(e) => println!("resolve: {e}"),
-            }
+            self.resolve_witness_dependencies(witness, &mut graph, ctx)?;
         }
 
         for (k, v) in graph {
-            println!(
-                "resolve: {k} -> {}",
-                display_list(", ", &v.iter().collect::<Vec<_>>())
-            );
             deps.add_edge(k, v.into_iter().collect());
         }
 

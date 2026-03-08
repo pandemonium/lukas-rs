@@ -1,5 +1,5 @@
 use fmt::Write;
-use std::fmt;
+use std::{fmt, fs, io, path};
 
 use crate::{
     ast::{Binding, Literal, ProductElement, namer::QualifiedName},
@@ -44,6 +44,12 @@ impl typer::Type {
 
 #[derive(Debug, Default)]
 pub struct CodeBuffer(String);
+
+impl CodeBuffer {
+    pub fn write_to_file(&self, path: impl AsRef<path::Path>) -> io::Result<()> {
+        fs::write(path, &self.0)
+    }
+}
 
 impl fmt::Write for CodeBuffer {
     fn write_str(&mut self, s: &str) -> fmt::Result {

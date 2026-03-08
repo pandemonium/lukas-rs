@@ -1,5 +1,7 @@
 Maybe ::= forall a. Just a | Nothing
 
+
+
 start := lambda z.
   deconstruct Just (1, z, 3, 4) into
     Just (a, b, c, d) -> (a * b + c) / d

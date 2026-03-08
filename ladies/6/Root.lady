@@ -1,12 +1,7 @@
-IntOption ::= Some Int | None
+fibonacci :: Int -> Int := λn.
+  if n = 0 or n = 1 then 1
+  else fibonacci (n - 1) + fibonacci (n - 2)
 
-Record ::=
-  { i :: Int
-    t :: Text
-  }
-
-start :: Int -> Int := lambda _.
-  let o = Some 1 in
-  deconstruct o into
-    Some x -> x
-  | None -> 0
+start :: Int -> Unit := lambda n.
+  let f = fibonacci n
+  in print_endline "Fib `n` is `f`"

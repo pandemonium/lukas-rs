@@ -36,11 +36,11 @@ impl phase::SymbolTable<Types> {
             .in_resolvable_order()
             .iter()
             .filter(|name| self.symbols.contains_key(name))
-            .map(|name| {
-                println!("emit_scheme_code: {name}");
-                &self.symbols[name]
-            })
+            .map(|name| &self.symbols[name])
             .collect::<Vec<_>>();
+
+        writeln!(code, "#!r6rs")?;
+        writeln!(code, "(import (chezscheme) (runtime))")?;
 
         for declaration in symbols {
             if let Symbol::Term(TermSymbol { name, body, .. }) = declaration {
@@ -168,7 +168,7 @@ impl Uncurry {
 fn map_builtin_name(name: &QualifiedName) -> &'static str {
     let QualifiedName { module, member } = name;
     match member.as_str() {
-        "print_endline" => "write",
+        "print_endline" => "print-endline",
         "show" => "show",
         "=" => "=",
         "-" => "-",

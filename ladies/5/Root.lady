@@ -28,9 +28,3 @@ start :: Int -> Unit := λ_.
   print_endline "5. name `name` age `age` name2 `name2`"
 
   use_quux 6 quux "år"
-
-  let x = traverse id (Cons (This 0) Nil) in
-  print_endline "x: `x`."
-
-  let xs = List.tabulate 1 This in
-  print_endline "List: `sequence xs`."
