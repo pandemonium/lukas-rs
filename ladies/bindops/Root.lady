@@ -1,10 +1,12 @@
 use Stdlib.
 
 start := lambda _.
-  let x =
-    This 10
+  let* x = This 10
   in
     print_endline "Hi `x`"
-    11
+    This 11
 
-  print_endline "Hi?"
+  let+ x = This 12
+  in
+    print_endline "Hi `x`"
+    13

@@ -200,10 +200,12 @@ fn load_and_parse_module(source_path: PathBuf) -> Compilation<Vec<ast::Declarati
 
     let declarations = parser.parse_declaration_list()?;
 
-    println!(
-        "load_and_parse_module: {source_path:?} last known location {}",
-        parser.remains()[0].location()
-    );
+    if !parser.remains().is_empty() {
+        println!(
+            "load_and_parse_module: {source_path:?} last known location {}",
+            parser.remains()[0].location()
+        );
+    }
 
     Ok(declarations)
 }

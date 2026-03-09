@@ -1,6 +1,6 @@
 #!r6rs
 (library (runtime)
-  (export show print-endline)
+  (export show print-endline bool-xor)
   (import (chezscheme))
 
   (define (show x)
@@ -8,4 +8,8 @@
 
   (define (print-endline x)
     (display x)
-    (newline)))
+    (newline))
+
+  (define (bool-xor a b)
+    (if a (not b) b))
+)
