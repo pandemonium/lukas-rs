@@ -3,5 +3,5 @@ fibonacci :: Int -> Int := λn.
   else fibonacci (n - 1) + fibonacci (n - 2)
 
 start :: Int -> Unit := lambda n.
-  let f = fibonacci n
+  let f = fibonacci 5
   in print_endline "Fib `n` is `f`"

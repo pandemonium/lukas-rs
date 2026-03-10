@@ -8,7 +8,7 @@ use crate::{
     interpreter::{Interpretation, Literal, RuntimeError, cek::Val},
     parser::{self, ParseInfo, Parsed},
     phase::Phase,
-    typer::{BaseType, ConstraintSet, MetaVariable, Type, TypeScheme},
+    typer::{BaseType, ConstraintSet, MetaVariable, Type, TypeScheme, display_list},
 };
 
 #[derive(Clone)]
@@ -30,9 +30,22 @@ pub struct Lambda2<A, B, R> {
 }
 
 #[derive(Debug)]
+pub struct Lambda3<A, B, C, R> {
+    pub name: &'static str,
+    pub apply: fn(A, B, C) -> R,
+}
+
+#[derive(Debug)]
 pub struct RawLambda1<R> {
     pub name: &'static str,
     pub apply: fn(Val) -> R,
+}
+
+#[derive(Debug)]
+pub struct RawLambda3 {
+    pub name: &'static str,
+    pub apply: fn(Val, Val, Val) -> Val,
+    pub type_scheme: TypeScheme,
 }
 
 #[derive(Debug)]
@@ -112,6 +125,10 @@ impl TypeBridge for bool {
     const TYPE: Type = Type::Base(BaseType::Bool);
 }
 
+impl TypeBridge for char {
+    const TYPE: Type = Type::Base(BaseType::Char);
+}
+
 #[macro_export]
 macro_rules! lambda1 {
     ($f:ident) => {
@@ -133,9 +150,29 @@ macro_rules! lambda2 {
 }
 
 #[macro_export]
+macro_rules! lambda3 {
+    ($f:ident) => {
+        Lambda2 {
+            name: stringify!($f),
+            apply: $f,
+        }
+    };
+}
+
+#[macro_export]
 macro_rules! rawlambda1 {
     ($f:ident) => {
         RawLambda1 {
+            name: stringify!($f),
+            apply: $f,
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! rawlambda3 {
+    ($f:ident) => {
+        RawLambda3 {
             name: stringify!($f),
             apply: $f,
         }
@@ -203,6 +240,47 @@ where
     }
 }
 
+impl<A, B, C, R> External for Lambda3<A, B, C, R>
+where
+    A: TypeBridge + TryFrom<Val, Error = RuntimeError>,
+    B: TypeBridge + TryFrom<Val, Error = RuntimeError>,
+    C: TypeBridge + TryFrom<Val, Error = RuntimeError>,
+    R: TypeBridge + Into<Val>,
+{
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn arity(&self) -> usize {
+        3
+    }
+
+    fn invoke(&self, arguments: &[Val]) -> Interpretation {
+        let Self { apply, .. } = self;
+        Ok(apply(
+            arguments[0].clone().try_into()?,
+            arguments[1].clone().try_into()?,
+            arguments[2].clone().try_into()?,
+        )
+        .into())
+    }
+
+    fn type_scheme(&self) -> TypeScheme {
+        TypeScheme::from_constant(Type::Arrow {
+            domain: A::TYPE.into(),
+            codomain: Type::Arrow {
+                domain: B::TYPE.into(),
+                codomain: Type::Arrow {
+                    domain: C::TYPE.into(),
+                    codomain: R::TYPE.into(),
+                }
+                .into(),
+            }
+            .into(),
+        })
+    }
+}
+
 impl<R> External for RawLambda1<R>
 where
     R: TypeBridge + Into<Val>,
@@ -230,6 +308,31 @@ where
             },
             constraints: ConstraintSet::default(),
         }
+    }
+}
+
+impl External for RawLambda3 {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn arity(&self) -> usize {
+        3
+    }
+
+    fn invoke(&self, arguments: &[Val]) -> Interpretation {
+        let Self { apply, .. } = self;
+        println!("invoke: args {}", display_list(", ", arguments));
+        Ok(apply(
+            arguments[0].clone(),
+            arguments[1].clone(),
+            arguments[2].clone(),
+        )
+        .into())
+    }
+
+    fn type_scheme(&self) -> TypeScheme {
+        self.type_scheme.clone()
     }
 }
 

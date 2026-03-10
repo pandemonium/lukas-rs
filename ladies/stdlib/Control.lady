@@ -26,6 +26,10 @@ signature Foldable ::= ∀f : * -> *.
     fold_left  :: ∀α β. (β -> α -> β) -> β -> f α -> β
   }
 
+signature Display ::= ∀α.
+  { display :: α -> Text
+  }
+
 fold_map :: ∀t : *->* α m. Monoid m + Foldable t |- (α -> m) -> t α -> m := λf.
   fold_right (compose mappend f) mempty
 

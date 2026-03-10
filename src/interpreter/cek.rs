@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    fmt,
+    env, fmt,
     rc::{Rc, Weak},
 };
 
@@ -178,28 +178,44 @@ impl Env {
         symbol_name: &namer::QualifiedName,
         argument: ast::Literal,
     ) -> Interpretation<Val> {
-        let symbol = self.global(symbol_name).ok_or_else(|| {
+        let closure = self.global(symbol_name).ok_or_else(|| {
             RuntimeError::NoSuchSymbol(namer::Identifier::Free(symbol_name.clone().into()))
         })?;
 
-        match symbol {
-            Val::Closure(closure) => {
-                let closure = closure.borrow();
-                closure.provide_argument(Val::Constant(argument.into()));
-                closure.body.interpret(closure.capture.shared())
-            }
+        interpret_closure(symbol_name, closure, vec![Val::Constant(argument.into())])
+    }
+}
 
-            Val::RecursiveClosure { inner, .. } => {
-                let closure = inner.upgrade().ok_or_else(|| {
-                    RuntimeError::ExpiredSelfReferential(format!("{symbol_name}"))
-                })?;
-                let closure = closure.borrow();
-                closure.provide_argument(Val::Constant(argument.into()));
-                closure.body.interpret(closure.capture.shared())
-            }
+pub fn interpret_closure(
+    symbol_name: &QualifiedName,
+    closure: &Val,
+    arguments: Vec<Val>,
+) -> Interpretation {
+    arguments.into_iter().try_fold(closure.clone(), |z, a| {
+        eliminate_closure(symbol_name, &z, a)
+    })
+}
 
-            otherwise => Err(RuntimeError::ExpectedClosure(otherwise.clone())),
+fn eliminate_closure(symbol_name: &QualifiedName, closure: &Val, argument: Val) -> Interpretation {
+    match closure {
+        Val::Closure(closure) => {
+            let closure = closure.borrow();
+            let environment = closure.capture.disjoint();
+            environment.push_local(argument);
+            closure.body.interpret(environment)
         }
+
+        Val::RecursiveClosure { inner, .. } => {
+            let closure = inner
+                .upgrade()
+                .ok_or_else(|| RuntimeError::ExpiredSelfReferential(format!("{symbol_name}")))?;
+            let closure = closure.borrow();
+            let environment = closure.capture.disjoint();
+            environment.push_local(argument);
+            closure.body.interpret(environment)
+        }
+
+        otherwise => Err(RuntimeError::ExpectedClosure(otherwise.clone())),
     }
 }
 

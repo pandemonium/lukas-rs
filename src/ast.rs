@@ -554,6 +554,7 @@ pub enum Literal {
     Text(String),
     Bool(bool),
     Unit,
+    Char(char),
 }
 
 #[derive(Debug, Clone)]
@@ -792,6 +793,7 @@ impl fmt::Display for Literal {
             Self::Text(x) => write!(f, "{x}"),
             Self::Bool(x) => write!(f, "{x}"),
             Self::Unit => write!(f, "()"),
+            Self::Char(x) => write!(f, "{x}"),
         }
     }
 }

@@ -104,6 +104,7 @@ impl ast::Literal {
             ast::Literal::Bool(true) => write!(code, "#t")?,
             ast::Literal::Bool(false) => write!(code, "#f")?,
             ast::Literal::Unit => write!(code, "'()")?,
+            ast::Literal::Char(x) => write!(code, "#\\{x}")?,
         }
         Ok(())
     }
@@ -169,7 +170,7 @@ fn map_builtin_name(name: &QualifiedName) -> &'static str {
     let QualifiedName { member, .. } = name;
     match member.as_str() {
         "print_endline" => "print-endline",
-        "show" => "show",
+        "prim_show" => "show",
         "=" => "=",
         "-" => "-",
         "+" => "+",

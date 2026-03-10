@@ -1172,6 +1172,9 @@ impl Type {
             Self::Base(BaseType::Unit) => {
                 TypeExpression::Constructor(pi, IdentifierPath::new("Unit"))
             }
+            Self::Base(BaseType::Char) => {
+                TypeExpression::Constructor(pi, IdentifierPath::new("Char"))
+            }
             Self::Arrow { domain, codomain } => TypeExpression::Arrow(
                 pi,
                 ArrowTypeExpr {
@@ -1434,6 +1437,7 @@ pub enum BaseType {
     Text,
     Bool,
     Unit,
+    Char,
 }
 
 impl BaseType {
@@ -1443,6 +1447,7 @@ impl BaseType {
             Self::Text => "Text",
             Self::Bool => "Bool",
             Self::Unit => "Unit",
+            Self::Char => "Char",
         }
     }
 
@@ -3916,6 +3921,7 @@ impl Literal {
             Self::Text(..) => BaseType::Text,
             Self::Bool(..) => BaseType::Bool,
             Self::Unit => BaseType::Unit,
+            Self::Char(..) => BaseType::Char,
         })
     }
 }
@@ -4234,6 +4240,7 @@ impl fmt::Display for BaseType {
             Self::Text => write!(f, "Text"),
             Self::Bool => write!(f, "Bool"),
             Self::Unit => write!(f, "Unit"),
+            Self::Char => write!(f, "Char"),
         }
     }
 }

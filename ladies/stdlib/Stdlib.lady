@@ -93,6 +93,13 @@ module List:
           else xs
       in loop 0 Nil
 
+  concat :: List Text -> Text := λxs.
+    deconstruct xs into
+      Cons t tail -> "`t``concat tail`"
+    | Nil -> ""
+
+  singleton :: ∀α. α -> List α := λa. Cons a Nil
+
 
 Perhaps ::= ∀α. Nope | This α
 
@@ -138,3 +145,18 @@ module Result:
 
   map :: ∀α β e. (α -> β) -> Result α e -> Result β e :=
     λf ra. result Fault (compose Return f) ra
+
+module Text:
+  foldr :: ∀α z. (α -> z -> z) -> z -> Text -> z :=
+    λf z fa. text_fold_right f z fa
+
+  foldl :: ∀α z. (z -> α -> z) -> z -> Text -> z :=
+    λf z fa. text_fold_right (λc g z. g (f z c)) id fa z
+
+  to_list :: Text -> List Char :=
+    foldr Cons Nil
+
+  from_list :: List Char -> Text := λcs.
+    deconstruct cs into
+      Cons c tail -> "`c``from_list tail`"
+    | Nil -> ""

@@ -281,6 +281,7 @@ pub enum Literal {
     Text(String),
     Bool(bool),
     Unit,
+    Char(char),
 }
 
 impl From<ast::Literal> for Literal {
@@ -290,6 +291,7 @@ impl From<ast::Literal> for Literal {
             ast::Literal::Text(x) => Self::Text(x),
             ast::Literal::Bool(x) => Self::Bool(x),
             ast::Literal::Unit => Self::Unit,
+            ast::Literal::Char(x) => Self::Char(x),
         }
     }
 }
@@ -301,6 +303,7 @@ impl fmt::Display for Literal {
             Self::Text(x) => write!(f, "{x}"),
             Self::Bool(x) => write!(f, "{x}"),
             Self::Unit => write!(f, "()"),
+            Self::Char(x) => write!(f, "{x}"),
         }
     }
 }

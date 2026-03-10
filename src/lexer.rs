@@ -39,6 +39,7 @@ impl LexicalAnalyzer {
                 prefix @ [c, ..] if is_identifier_prefix(*c) => self.scan_identifier(prefix),
                 prefix @ [c, ..] if is_number_prefix(*c) => self.scan_number(prefix),
                 ['"', remains @ ..] => self.scan_text_literal(remains),
+                ['\'', c, '\'', remains @ ..] => todo!(),
 
                 [':', ':', '=', remains @ ..] => self.emit(3, TokenKind::TypeAssign, remains),
                 [':', '=', remains @ ..] => self.emit(2, TokenKind::Assign, remains),

@@ -1,15 +1,18 @@
 use crate::{
     ast::{
-        BUILTIN_MODULE_NAME, Kind, STDLIB_MODULE_NAME,
-        namer::{Symbol, TypeDefinition, TypeOrigin, TypeSymbol},
+        self, BUILTIN_MODULE_NAME, Kind, STDLIB_MODULE_NAME,
+        namer::{QualifiedName, Symbol, TypeDefinition, TypeOrigin, TypeSymbol},
     },
-    bridge::{External, Lambda1, Lambda2, PartialRawLambda2, RawLambda1},
-    interpreter::{Literal, cek::Val},
+    bridge::{External, Lambda1, Lambda2, PartialRawLambda2, RawLambda1, RawLambda3},
+    interpreter::{
+        self, Literal,
+        cek::{Val, interpret_closure},
+    },
     lambda1, lambda2,
     lexer::Operator,
     parser::{self, ParseInfo, Parsed},
     phase::Phase,
-    rawlambda1,
+    rawlambda1, rawlambda3,
     typer::{BaseType, ConstraintSet, MetaVariable, Type, TypeScheme},
 };
 
@@ -129,8 +132,41 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
         type_scheme: artithmetic_signature(),
     };
 
+    let text_fold_right_lambda = RawLambda3 {
+        name: "text_fold_right",
+        apply: text_fold_right,
+        type_scheme: {
+            let z = MetaVariable::fresh();
+
+            TypeScheme {
+                quantifiers: vec![z.clone()],
+                underlying: Type::Arrow {
+                    domain: Type::Arrow {
+                        domain: Type::Base(BaseType::Char).into(),
+                        codomain: Type::Arrow {
+                            domain: Type::Variable(z.clone()).into(),
+                            codomain: Type::Variable(z.clone()).into(),
+                        }
+                        .into(),
+                    }
+                    .into(),
+                    codomain: Type::Arrow {
+                        domain: Type::Variable(z.clone()).into(),
+                        codomain: Type::Arrow {
+                            domain: Type::Base(BaseType::Text).into(),
+                            codomain: Type::Variable(z).into(),
+                        }
+                        .into(),
+                    }
+                    .into(),
+                },
+                constraints: ConstraintSet::default(),
+            }
+        },
+    };
+
     let terms = vec![
-        rawlambda1!(show).into_symbol(&stdlib),
+        rawlambda1!(prim_show).into_symbol(&stdlib),
         lambda1!(print_endline).into_symbol(&stdlib),
         eq.into_symbol(&builtins),
         gte.into_symbol(&builtins),
@@ -145,6 +181,7 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
         times.into_symbol(&builtins),
         divided.into_symbol(&builtins),
         modulo.into_symbol(&builtins),
+        text_fold_right_lambda.into_symbol(&builtins),
     ];
 
     let types = vec![
@@ -152,25 +189,31 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
             definition: TypeDefinition::Builtin(BaseType::Int),
             origin: TypeOrigin::Builtin,
             arity: 0,
-            kind: Kind::default(),
+            kind: Kind::Star,
         },
         TypeSymbol {
             definition: TypeDefinition::Builtin(BaseType::Text),
             origin: TypeOrigin::Builtin,
             arity: 0,
-            kind: Kind::default(),
+            kind: Kind::Star,
         },
         TypeSymbol {
             definition: TypeDefinition::Builtin(BaseType::Bool),
             origin: TypeOrigin::Builtin,
             arity: 0,
-            kind: Kind::default(),
+            kind: Kind::Star,
         },
         TypeSymbol {
             definition: TypeDefinition::Builtin(BaseType::Unit),
             origin: TypeOrigin::Builtin,
             arity: 0,
-            kind: Kind::default(),
+            kind: Kind::Star,
+        },
+        TypeSymbol {
+            definition: TypeDefinition::Builtin(BaseType::Char),
+            origin: TypeOrigin::Builtin,
+            arity: 0,
+            kind: Kind::Star,
         },
     ];
 
@@ -181,7 +224,18 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
         .collect()
 }
 
-pub fn show(x: Val) -> String {
+pub fn text_fold_right(f: Val, z: Val, fa: Val) -> Val {
+    let Val::Constant(Literal::Text(t)) = fa else {
+        panic!("must be text")
+    };
+
+    let name = QualifiedName::builtin("text_fold_right");
+    t.chars().into_iter().rfold(z, |zz, c| {
+        interpret_closure(&name, &f, vec![Val::Constant(Literal::Char(c)), zz.clone()]).unwrap()
+    })
+}
+
+pub fn prim_show(x: Val) -> String {
     format!("{x}")
 }
 
@@ -195,6 +249,7 @@ pub fn equals(p: Val, q: Val) -> Option<bool> {
         (Val::Constant(Literal::Bool(p)), Val::Constant(Literal::Bool(q))) => Some(p == q),
         (Val::Constant(Literal::Text(p)), Val::Constant(Literal::Text(q))) => Some(p == q),
         (Val::Constant(Literal::Unit), Val::Constant(Literal::Unit)) => Some(true),
+        (Val::Constant(Literal::Char(p)), Val::Constant(Literal::Char(q))) => Some(p == q),
         (Val::Product(p), Val::Product(q)) => {
             let result = p.len() == q.len()
                 && p.into_iter()
@@ -212,6 +267,7 @@ pub fn gte(p: Literal, q: Literal) -> Option<bool> {
     match (p, q) {
         (Literal::Int(p), Literal::Int(q)) => Some(p >= q),
         (Literal::Text(p), Literal::Text(q)) => Some(p >= q),
+        (Literal::Char(p), Literal::Char(q)) => Some(p >= q),
         _otherwise => None,
     }
 }
@@ -220,6 +276,7 @@ pub fn gt(p: Literal, q: Literal) -> Option<bool> {
     match (p, q) {
         (Literal::Int(p), Literal::Int(q)) => Some(p > q),
         (Literal::Text(p), Literal::Text(q)) => Some(p > q),
+        (Literal::Char(p), Literal::Char(q)) => Some(p > q),
         _otherwise => None,
     }
 }
@@ -228,6 +285,7 @@ pub fn lte(p: Literal, q: Literal) -> Option<bool> {
     match (p, q) {
         (Literal::Int(p), Literal::Int(q)) => Some(p <= q),
         (Literal::Text(p), Literal::Text(q)) => Some(p <= q),
+        (Literal::Char(p), Literal::Char(q)) => Some(p <= q),
         _otherwise => None,
     }
 }
@@ -236,6 +294,7 @@ pub fn lt(p: Literal, q: Literal) -> Option<bool> {
     match (p, q) {
         (Literal::Int(p), Literal::Int(q)) => Some(p < q),
         (Literal::Text(p), Literal::Text(q)) => Some(p < q),
+        (Literal::Char(p), Literal::Char(q)) => Some(p < q),
         _otherwise => None,
     }
 }

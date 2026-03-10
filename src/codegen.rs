@@ -202,6 +202,7 @@ impl lambda_lift::Program {
             Literal::Text(x) => format!("VText(\"{x}\")"),
             Literal::Bool(x) => format!("VBool({x})"),
             Literal::Unit => "VUnit()".to_owned(),
+            Literal::Char(x) => format!("Vchar('{x}')"),
         }
     }
 

@@ -297,13 +297,13 @@ impl<'a> Parser<'a> {
 
             let indent = depth * 2;
 
-            println!(
-                "{:<width$}{}{}",
-                remains.into_iter().collect::<String>(),
-                " ".repeat(indent),
-                step,
-                width = REMAINS_COL
-            );
+            //println!(
+            //    "{:<width$}{}{}",
+            //    remains.into_iter().collect::<String>(),
+            //    " ".repeat(indent),
+            //    step,
+            //    width = REMAINS_COL
+            //);
         } else {
             println!("Unknown caller.");
         }
@@ -1258,11 +1258,11 @@ impl<'a> Parser<'a> {
 
         let prefix = self.parse_expression(0)?;
 
-        println!(
-            "parse_sequence: prefix {prefix} @ {}--- remains {}",
-            prefix.annotation().location,
-            display_list(" ", &self.remains().iter().take(5).collect::<Vec<_>>())
-        );
+        //println!(
+        //    "parse_sequence: prefix {prefix} @ {}--- remains {}",
+        //    prefix.annotation().location,
+        //    display_list(" ", &self.remains().iter().take(5).collect::<Vec<_>>())
+        //);
 
         match self.remains() {
             remains @ [t, u, ..]
@@ -1271,7 +1271,6 @@ impl<'a> Parser<'a> {
                     && u.location().is_same_block(&prefix.parse_info().location)
                     && !self.is_toplevel_start(&remains[1..]) =>
             {
-                println!("parse_sequence(1)");
                 // <NL> or ;
                 self.advance(1);
                 self.parse_subsequent(prefix)
@@ -1283,7 +1282,6 @@ impl<'a> Parser<'a> {
                     && self.is_expr_start(&u.kind)
                     && !self.is_toplevel_start(&remains[1..]) =>
             {
-                println!("parse_sequence(2)");
                 // <NL> or ;
                 self.advance(1);
                 self.parse_subsequent(prefix)
@@ -1294,14 +1292,10 @@ impl<'a> Parser<'a> {
                     && t.location().is_same_block(&prefix.parse_info().location)
                     && !self.is_toplevel_start(&remains) =>
             {
-                println!("parse_sequence(3)");
                 self.parse_subsequent(prefix)
             }
 
-            _ => {
-                println!("parse_sequence(4)");
-                Ok(prefix)
-            }
+            _ => Ok(prefix),
         }
     }
 
@@ -1310,11 +1304,11 @@ impl<'a> Parser<'a> {
 
         let and_then = self.parse_sequence()?;
 
-        println!(
-            "parse_subsequent: this {}, and_then {}",
-            this.parse_info().location,
-            and_then.parse_info().location
-        );
+        //println!(
+        //    "parse_subsequent: this {}, and_then {}",
+        //    this.parse_info().location,
+        //    and_then.parse_info().location
+        //);
 
         Ok(Expr::Sequence(
             *this.parse_info(),
@@ -1455,21 +1449,10 @@ impl<'a> Parser<'a> {
         let is_terminal = |t| terminals.contains(t);
 
         match self.remains() {
-            [t, ..] if t.is_dedent() => {
+            [t, ..] if t.is_dedent() && t.location().is_same_block(&lhs.parse_info().location) => {
                 // Ded, paired with this:
                 // self.advance(1); //the indent
-                println!(
-                    "parse_expr_prefix: DED check: ded {}, lhs {}",
-                    t.location(),
-                    lhs.parse_info().location,
-                );
-
-                if t.location().is_same_block(&lhs.parse_info().location) {
-                    println!("parse_expr_prefix(1)");
-                    self.advance(1);
-                } else {
-                    println!("parse_expr_prefix(2)");
-                }
+                self.advance(1);
                 Ok(lhs)
             }
 
