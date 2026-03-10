@@ -146,6 +146,11 @@ module Result:
   map :: ∀α β e. (α -> β) -> Result α e -> Result β e :=
     λf ra. result Fault (compose Return f) ra
 
+witness Monoid Text :=
+  { mempty  := ""
+    mappend := λp q. "`p``q`"
+  }
+
 module Text:
   foldr :: ∀α z. (α -> z -> z) -> z -> Text -> z :=
     λf z fa. text_fold_right f z fa

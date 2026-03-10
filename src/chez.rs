@@ -184,6 +184,7 @@ fn map_builtin_name(name: &QualifiedName) -> &'static str {
         "or" => "or",
         ">=" => ">=",
         "<=" => "<=",
+        "text_fold_right" => "text-fold-right",
         otherwise => panic!("unmapped external {otherwise:?}"),
     }
 }

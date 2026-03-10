@@ -39,7 +39,9 @@ impl LexicalAnalyzer {
                 prefix @ [c, ..] if is_identifier_prefix(*c) => self.scan_identifier(prefix),
                 prefix @ [c, ..] if is_number_prefix(*c) => self.scan_number(prefix),
                 ['"', remains @ ..] => self.scan_text_literal(remains),
-                ['\'', c, '\'', remains @ ..] => todo!(),
+                ['\'', c, '\'', remains @ ..] => {
+                    self.emit(1, TokenKind::Literal(Literal::Char(*c)), remains)
+                }
 
                 [':', ':', '=', remains @ ..] => self.emit(3, TokenKind::TypeAssign, remains),
                 [':', '=', remains @ ..] => self.emit(2, TokenKind::Assign, remains),
@@ -614,6 +616,7 @@ pub enum Literal {
     Text(String),
     Bool(bool),
     Unit,
+    Char(char),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -737,6 +740,7 @@ impl fmt::Display for Literal {
             Self::Text(x) => write!(f, "{x}"),
             Self::Bool(x) => write!(f, "{x}"),
             Self::Unit => write!(f, "()"),
+            Self::Char(x) => write!(f, "{x}"),
         }
     }
 }

@@ -1,18 +1,18 @@
 use crate::{
     ast::{
-        self, BUILTIN_MODULE_NAME, Kind, STDLIB_MODULE_NAME,
+        BUILTIN_MODULE_NAME, Kind, STDLIB_MODULE_NAME,
         namer::{QualifiedName, Symbol, TypeDefinition, TypeOrigin, TypeSymbol},
     },
     bridge::{External, Lambda1, Lambda2, PartialRawLambda2, RawLambda1, RawLambda3},
     interpreter::{
-        self, Literal,
+        Literal,
         cek::{Val, interpret_closure},
     },
     lambda1, lambda2,
     lexer::Operator,
     parser::{self, ParseInfo, Parsed},
     phase::Phase,
-    rawlambda1, rawlambda3,
+    rawlambda1,
     typer::{BaseType, ConstraintSet, MetaVariable, Type, TypeScheme},
 };
 

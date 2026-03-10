@@ -19,7 +19,6 @@ use crate::{
         TokenKind,
     },
     phase,
-    typer::display_list,
 };
 
 pub struct Parsed;
@@ -2284,6 +2283,7 @@ impl From<Literal> for ast::Literal {
             Literal::Text(x) => ast::Literal::Text(x),
             Literal::Bool(x) => ast::Literal::Bool(x),
             Literal::Unit => ast::Literal::Unit,
+            Literal::Char(x) => ast::Literal::Char(x),
         }
     }
 }
