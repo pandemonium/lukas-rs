@@ -529,6 +529,8 @@ pub struct SymbolTable<A, GlobalName, LocalId> {
     pub symbols: HashMap<SymbolName, Symbol<A, GlobalName, LocalId>>,
     pub imports: Vec<IdentifierPath>,
 
+    pub externals: Vec<ExternalTerm<GlobalName>>,
+
     pub signatures: HashSet<QualifiedName>,
     pub witnesses: HashSet<QualifiedName>,
 }
@@ -540,10 +542,18 @@ impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
             member_modules: HashMap::default(),
             symbols: HashMap::default(),
             imports: Vec::default(),
+            externals: Vec::default(),
             signatures: HashSet::default(),
             witnesses: HashSet::default(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalTerm<GlobalName> {
+    pub name: QualifiedName,
+    //This ought not be of A, but of ParseInfo because wtf does it buy?
+    pub type_signature: TypeSignature<ParseInfo, GlobalName>,
 }
 
 impl phase::SymbolTable<Desugared> {
@@ -771,6 +781,8 @@ impl phase::SymbolTable<Parsed> {
                 }
 
                 Declaration::Witness(_, decl) => self.add_witness_declaration(&module_path, decl),
+
+                Declaration::External(_, decl) => self.add_external_declaration(&module_path, decl),
             };
         }
 
@@ -799,6 +811,17 @@ impl phase::SymbolTable<Parsed> {
             },
         );
         self.witnesses.insert(name);
+    }
+
+    fn add_external_declaration(
+        &mut self,
+        module_path: &IdentifierPath,
+        decl: ast::ExternalDeclaration<ParseInfo>,
+    ) {
+        self.externals.push(ExternalTerm {
+            name: QualifiedName::new(module_path.clone(), decl.name.as_str()),
+            type_signature: decl.type_signature,
+        });
     }
 
     fn add_signature_declaration(
@@ -837,43 +860,43 @@ impl phase::SymbolTable<Parsed> {
     }
 
     pub fn import_compilation_unit(program: CompilationUnit<ParseInfo>) -> Compilation<Self> {
-        let mut ctx = Self::default();
+        let mut symtab = Self::default();
 
-        ctx.add_import_prefix(IdentifierPath::new(BUILTIN_MODULE_NAME));
+        symtab.add_import_prefix(IdentifierPath::new(BUILTIN_MODULE_NAME));
 
         // this is probably not stdlib--but what is it?
         let stdlib = IdentifierPath::new(STDLIB_MODULE_NAME);
-        ctx.add_import_prefix(stdlib.clone());
+        symtab.add_import_prefix(stdlib.clone());
 
         for symbol in builtin::import() {
             match symbol {
                 Symbol::Term(symbol) => {
                     let qualified_name = &symbol.name;
-                    ctx.add_module_term_member(
+                    symtab.add_module_term_member(
                         qualified_name.module().clone(),
                         qualified_name.member.clone(),
                     );
-                    ctx.add_term_symbol(qualified_name.clone(), symbol);
+                    symtab.add_term_symbol(qualified_name.clone(), symbol);
                 }
 
                 Symbol::Type(symbol) => {
                     let qualified_name = symbol.definition.qualified_name();
-                    ctx.add_module_type_member(
+                    symtab.add_module_type_member(
                         qualified_name.module().clone(),
                         qualified_name.member.clone(),
                     );
-                    ctx.add_type_symbol(qualified_name, symbol);
+                    symtab.add_type_symbol(qualified_name, symbol);
                 }
             }
         }
 
-        ctx.add_module_contents(
+        symtab.add_module_contents(
             &program.compiler,
             IdentifierPath::new(program.root_module.name.as_str()),
             Self::module_declarations(&program.compiler, program.root_module.declarator)?,
         )?;
 
-        Ok(ctx)
+        Ok(symtab)
     }
 
     fn module_declarations(
@@ -1794,6 +1817,18 @@ impl phase::SymbolTable<Desugared> {
                     // per Identifier really.
                     self.rename_symbol(ParseInfo::default(), symbol)
                         .map(|symbol| (id.clone(), symbol))
+                })
+                .collect::<Naming<_>>()?,
+            externals: self
+                .externals
+                .iter()
+                .map(|e| {
+                    e.type_signature
+                        .resolve_names(&self, ParseInfo::default(), &e.name.module)
+                        .map(|type_signature| ExternalTerm {
+                            name: e.name.clone(),
+                            type_signature,
+                        })
                 })
                 .collect::<Naming<_>>()?,
             imports: self.imports,

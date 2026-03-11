@@ -51,6 +51,7 @@ impl phase::SymbolTable<Types> {
             module_members: self.module_members,
             member_modules: self.member_modules,
             imports: self.imports,
+            externals: self.externals.clone(),
             signatures: self.signatures,
             witnesses: self.witnesses,
         }

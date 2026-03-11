@@ -6,11 +6,11 @@ use thiserror::Error;
 use crate::{
     ast::{
         self, Apply, ApplyTypeExpr, ArrowTypeExpr, Binding, ConstraintExpression, Declaration,
-        Deconstruct, FieldDeclarator, IdentifierPattern, IfThenElse, Interpolate, Kind, Lambda,
-        ModuleDeclaration, ModuleDeclarator, Projection, Record, SelfReferential, Sequence,
-        SignatureDeclaration, Tree, Tuple, TupleTypeExpr, TypeAscription, TypeDeclaration,
-        TypeDeclarator, TypeExpression, TypeSignature, TypeVariable, UseDeclaration,
-        ValueDeclaration, ValueDeclarator, WitnessDeclaration,
+        Deconstruct, ExternalDeclaration, FieldDeclarator, IdentifierPattern, IfThenElse,
+        Interpolate, Kind, Lambda, ModuleDeclaration, ModuleDeclarator, Projection, Record,
+        SelfReferential, Sequence, SignatureDeclaration, Tree, Tuple, TupleTypeExpr,
+        TypeAscription, TypeDeclaration, TypeDeclarator, TypeExpression, TypeSignature,
+        TypeVariable, UseDeclaration, ValueDeclaration, ValueDeclarator, WitnessDeclaration,
         namer::QualifiedName,
         pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern},
     },
@@ -210,6 +210,17 @@ impl phase::Interpolate<Parsed> {
     }
 
     pub fn expression(&mut self, expr: Expr) {
+        let expr = Expr::Apply(
+            *expr.parse_info(),
+            Apply {
+                function: Expr::Variable(
+                    *expr.parse_info(),
+                    IdentifierPattern::from_atom(*expr.parse_info(), "display"),
+                )
+                .into(),
+                argument: expr.into(),
+            },
+        );
         self.0.push(ast::Segment::Expression(expr.into()));
     }
 
@@ -376,14 +387,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    //    pub fn parse_compilation_unit(&mut self) -> Result<CompilationUnit<ParseInfo>> {
-    //        let _t = self.trace();
-    //
-    //        let decls = self.parse_declaration_list()?;
-    //
-    //        Ok(CompilationUnit::from_declarations(decls))
-    //    }
-
     pub fn parse_declaration_list(&mut self) -> Result<Vec<Declaration<ParseInfo>>> {
         let _t = self.trace();
 
@@ -429,7 +432,11 @@ impl<'a> Parser<'a> {
             ] | [
                 Token {
                     kind: TokenKind::Keyword(
-                        Keyword::Module | Keyword::Use | Keyword::Signature | Keyword::Witness
+                        Keyword::Module
+                            | Keyword::Use
+                            | Keyword::Signature
+                            | Keyword::Witness
+                            | Keyword::External
                     ),
                     ..
                 },
@@ -635,13 +642,34 @@ impl<'a> Parser<'a> {
                 // <:=>
                 self.advance(1);
 
-                let body = self.parse_block(|parser| parser.parse_record())?;
+                let implementation = self.parse_block(|parser| parser.parse_record())?;
 
                 Ok(Declaration::Witness(
                     ParseInfo::from_position(t.position),
                     WitnessDeclaration {
                         type_signature,
-                        implementation: body,
+                        implementation,
+                    },
+                ))
+            }
+
+            [t, ..] if t.is_keyword(Keyword::External) => {
+                // external
+                self.advance(1);
+
+                let (pos, id) = self.identifier()?;
+
+                self.expect(TokenKind::TypeAscribe)?;
+
+                let type_signature = self.parse_type_signature()?;
+
+                println!("parse_declaration: type signature {type_signature}");
+
+                Ok(Declaration::External(
+                    ParseInfo::from_position(pos),
+                    ExternalDeclaration {
+                        name: Identifier::from_str(&id),
+                        type_signature,
                     },
                 ))
             }

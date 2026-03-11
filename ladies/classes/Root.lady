@@ -21,9 +21,6 @@ unsum := λs. s.X
 
 mksum := λx. { X := x }
 
-mconcat :: ∀α. Monoid α |- List α -> α :=
-  λxs.
-    List.fold_right mappend mempty xs
 
 foo :: State Int Text :=
   let su = State.pure ()

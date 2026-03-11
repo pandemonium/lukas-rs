@@ -38,6 +38,7 @@ pub enum Declaration<A> {
     Use(A, UseDeclaration<A>),
     Signature(A, SignatureDeclaration<A>),
     Witness(A, WitnessDeclaration<A>),
+    External(A, ExternalDeclaration<A>),
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +100,12 @@ pub struct WitnessDeclaration<A> {
 }
 
 #[derive(Debug)]
+pub struct ExternalDeclaration<A> {
+    pub name: parser::Identifier,
+    pub type_signature: TypeSignature<A, parser::IdentifierPath>,
+}
+
+#[derive(Debug)]
 pub struct UseDeclaration<A> {
     pub qualified_binder: Option<parser::Identifier>,
     pub module: ModuleDeclaration<A>,
@@ -131,7 +138,6 @@ pub enum ModuleDeclarator<A> {
 #[derive(Debug)]
 pub struct TypeDeclaration<A> {
     pub name: parser::Identifier,
-    // This must be something else. TypeParameter is taken, perhaps that gets a new name. MetaVariable? TypeVariable?
     pub type_parameters: Vec<TypeVariable>,
     pub declarator: TypeDeclarator<A>,
 }
@@ -837,6 +843,7 @@ where
             Self::Use(_, decl) => write!(f, "use {decl}"),
             Self::Signature(_, decl) => write!(f, "constraint {decl}"),
             Self::Witness(_, decl) => write!(f, "witness {decl}"),
+            Self::External(_, decl) => write!(f, "external {}::{}", decl.name, decl.type_signature),
         }
     }
 }

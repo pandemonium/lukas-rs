@@ -172,9 +172,8 @@ impl phase::TypeSignature<Named> {
 impl phase::SymbolTable<Named> {
     pub fn elaborate_compilation_unit(mut self) -> Typing<phase::SymbolTable<Types>> {
         let mut ctx = self.elaborate_types()?;
-
         self.elaborate_constraints(&mut ctx)?;
-
+        self.elaborate_externals(&mut ctx)?;
         let symbols = self.elaborate_terms(ctx)?;
 
         Ok(SymbolTable {
@@ -182,6 +181,7 @@ impl phase::SymbolTable<Named> {
             member_modules: self.member_modules,
             symbols,
             imports: self.imports,
+            externals: self.externals,
             signatures: self.signatures,
             witnesses: self.witnesses,
         })
@@ -201,16 +201,11 @@ impl phase::SymbolTable<Named> {
         deps.merge(witness_deps.map(SymbolName::Term));
         let typed_terms = self.type_terms(&mut symbols, deps.in_resolvable_order(), &mut ctx)?;
 
-        for (
-            symbol,
-            Typed {
-                constraints, tree, ..
-            },
-        ) in typed_terms
-        {
-            let pi = tree.annotation().parse_info;
-            let expr = elaborate_term_constraints(&witness_index, constraints, tree, &ctx)
-                .map_err(|e| e.at(pi))?;
+        for (symbol, typed) in typed_terms {
+            let pi = typed.tree.annotation().parse_info;
+            let expr =
+                elaborate_term_constraints(&witness_index, typed.constraints, typed.tree, &ctx)
+                    .map_err(|e| e.at(pi))?;
 
             symbols.insert(
                 SymbolName::Term(symbol.name.clone()),
@@ -351,6 +346,14 @@ impl phase::SymbolTable<Named> {
         ctx.bind_free_term(qualified_name.clone(), scheme.clone());
 
         Ok(expr)
+    }
+
+    pub fn elaborate_externals(&self, ctx: &mut TypingContext) -> Typing<()> {
+        for ext in &self.externals {
+            let type_scheme = ext.type_signature.type_scheme(&HashMap::default(), ctx)?;
+            ctx.bind_free_term(ext.name.clone(), type_scheme);
+        }
+        Ok(())
     }
 }
 

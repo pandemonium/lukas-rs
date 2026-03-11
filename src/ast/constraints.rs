@@ -236,7 +236,6 @@ impl WitnessIndex {
             }
         }
 
-        println!("resolve_witness: index {self:?}");
         Err(TypeError::NoWitness(constraint.clone()))
     }
 }
