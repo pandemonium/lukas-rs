@@ -73,11 +73,11 @@ impl Witness {
 }
 
 #[derive(Debug, Default)]
-pub struct WitnessIndex {
+pub struct WitnessEnvironment {
     store: HashMap<QualifiedName, Vec<Witness>>,
 }
 
-impl WitnessIndex {
+impl WitnessEnvironment {
     pub fn register(&mut self, witness: Witness) {
         self.store
             .entry(witness.head.name().clone())
@@ -182,6 +182,8 @@ impl WitnessIndex {
         constraint: &Constraint,
         ctx: &TypeEnvironment,
     ) -> Result<phase::Expr<Types>, TypeError> {
+        println!("resolve_witness: {constraint}");
+
         let candidates = self
             .store
             .get(constraint.name())

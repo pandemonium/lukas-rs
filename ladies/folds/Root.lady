@@ -1,5 +1,15 @@
 use Stdlib.
 
+witness Display Text :=
+  { display := λt. prim_show t
+  }
+
+witness Display Char :=
+  { display := λt. prim_show t
+  }
+
+external parse_number :: Text -> Perhaps Int
+
 start := lambda _.
   let t = "hello, world" in
   let s = Text.to_list t in

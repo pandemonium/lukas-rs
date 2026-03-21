@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
     marker::PhantomData,
+    mem,
     ops::Deref,
     rc::Rc,
     slice::Iter,
@@ -14,11 +15,11 @@ use tracing::instrument;
 
 use crate::{
     ast::{
-        self, Apply, ApplyTypeExpr, ArrowTypeExpr, Binding, Deconstruct, IfThenElse, Injection,
-        Kind, Lambda, Literal, ProductElement, Projection, Record, Segment, SelfReferential,
-        Sequence, Tree, Tuple, TupleTypeExpr, TypeAscription, TypeExpression,
+        self, Apply, ApplyTypeExpr, ArrowTypeExpr, Binding, ConstraintExpression, Deconstruct,
+        IfThenElse, Injection, Kind, Lambda, Literal, ProductElement, Projection, Record, Segment,
+        SelfReferential, Sequence, Tree, Tuple, TupleTypeExpr, TypeAscription, TypeExpression,
         annotation::Annotated,
-        constraints::{Witness, WitnessIndex},
+        constraints::{Witness, WitnessEnvironment},
         namer::{
             self, CoproductSymbol, DependencyMatrix, Identifier, Named, QualifiedName,
             RecordSymbol, Symbol, SymbolName, TermSymbol, TypeDefinition, TypeSymbol,
@@ -30,7 +31,7 @@ use crate::{
     },
     compiler::{Located, LocatedError},
     parser::{self, IdentifierPath, ParseInfo, Parsed},
-    phase,
+    phase::{self, Phase},
 };
 
 pub struct Types;
@@ -131,6 +132,38 @@ impl<A> namer::SymbolTable<A, namer::QualifiedName, namer::Identifier> {
 }
 
 impl phase::TypeSignature<Named> {
+    fn desugar_constraints(&mut self) {
+        for c in mem::take(&mut self.constraints).into_iter().rev() {
+            self.prepend_argument(c.annotation, c.into_type_expression());
+        }
+    }
+
+    fn prepend_argument(
+        &mut self,
+        annotation: <Named as Phase>::Annotation,
+        argument: phase::TypeExpression<Named>,
+    ) {
+        self.body = TypeExpression::Arrow(
+            annotation,
+            ArrowTypeExpr {
+                domain: argument.into(),
+                codomain: mem::take(&mut self.body).into(),
+            },
+        );
+    }
+
+    pub fn map_body<F>(self, f: F) -> Self
+    where
+        F: FnOnce(phase::TypeExpression<Named>) -> phase::TypeExpression<Named>,
+    {
+        Self {
+            universal_quantifiers: self.universal_quantifiers,
+            constraints: self.constraints,
+            body: f(self.body),
+            phase: PhantomData,
+        }
+    }
+
     pub fn type_scheme(
         &self,
         context_type_param_map: &HashMap<parser::Identifier, MetaVariable>,
@@ -169,12 +202,43 @@ impl phase::TypeSignature<Named> {
     }
 }
 
+impl phase::ConstraintExpression<Named> {
+    fn from_signature_type_constructor(
+        annotation: <Named as Phase>::Annotation,
+        type_constructor: &TypeConstructor,
+    ) -> ConstraintExpression<<Named as Phase>::Annotation, QualifiedName> {
+        ConstraintExpression {
+            annotation,
+            class: type_constructor.definition().name.clone(),
+            parameters: type_constructor
+                .definition()
+                .defining_symbol
+                .type_parameters()
+                .iter()
+                .map(|tv| TypeExpression::Parameter(annotation, tv.name.clone()))
+                .collect(),
+        }
+    }
+}
+
 impl phase::SymbolTable<Named> {
     pub fn elaborate_compilation_unit(mut self) -> Typing<phase::SymbolTable<Types>> {
         let mut ctx = self.elaborate_types()?;
-        self.elaborate_constraints(&mut ctx)?;
         self.elaborate_externals(&mut ctx)?;
-        let symbols = self.elaborate_terms(ctx)?;
+        self.elaborate_constraints(&mut ctx)?;
+
+        for (k, v) in &ctx.types.bindings {
+            println!("elaborate_compilation_unit: type {k} is {v}");
+        }
+
+        let mut symbols = self.elaborate_terms(&mut ctx)?;
+
+        self.elaborate_signature_type_constructors(&mut ctx)?;
+        let selector_symbols = self.elaborate_signature_method_selectors(&mut ctx)?;
+
+        for (name, symbol) in selector_symbols {
+            symbols.insert(SymbolName::Term(name), Symbol::Term(symbol));
+        }
 
         Ok(SymbolTable {
             module_members: self.module_members,
@@ -189,7 +253,7 @@ impl phase::SymbolTable<Named> {
 
     fn elaborate_terms(
         &self,
-        mut ctx: TypingContext,
+        ctx: &mut TypingContext,
     ) -> Typing<HashMap<SymbolName, Symbol<TypeInfo, QualifiedName, Identifier>>> {
         let mut symbols = HashMap::with_capacity(self.symbols.len());
         let witness_index = self.register_witnesses(&ctx)?;
@@ -199,14 +263,15 @@ impl phase::SymbolTable<Named> {
 
         let mut deps = self.dependency_matrix();
         deps.merge(witness_deps.map(SymbolName::Term));
-        let typed_terms = self.type_terms(&mut symbols, deps.in_resolvable_order(), &mut ctx)?;
+        let typed_terms = self.type_terms(&mut symbols, deps.in_resolvable_order(), ctx)?;
 
         for (symbol, typed) in typed_terms {
             let pi = typed.tree.annotation().parse_info;
             let expr =
-                elaborate_term_constraints(&witness_index, typed.constraints, typed.tree, &ctx)
+                elaborate_term_constraints(&witness_index, typed.constraints, typed.tree, ctx)
                     .map_err(|e| e.at(pi))?;
 
+            println!("elaborate_terms: insert {} := {:?}", symbol.name, expr);
             symbols.insert(
                 SymbolName::Term(symbol.name.clone()),
                 Symbol::Term(TermSymbol {
@@ -226,6 +291,10 @@ impl phase::SymbolTable<Named> {
         evaluation_order: Vec<&SymbolName>,
         ctx: &mut TypingContext,
     ) -> Typing<Vec<(&TermSymbol<ParseInfo, QualifiedName, Identifier>, Typed)>> {
+        for (k, v) in &ctx.types.bindings {
+            println!("type_terms: type {k} is {v}");
+        }
+
         let mut typed_terms = Vec::with_capacity(evaluation_order.len());
         for name in evaluation_order {
             // Rewrite in terms of a match instead?
@@ -247,8 +316,8 @@ impl phase::SymbolTable<Named> {
         Ok(typed_terms)
     }
 
-    fn register_witnesses(&self, ctx: &TypingContext) -> Typing<WitnessIndex> {
-        let mut witness_index = WitnessIndex::default();
+    fn register_witnesses(&self, ctx: &TypingContext) -> Typing<WitnessEnvironment> {
+        let mut witnesses = WitnessEnvironment::default();
 
         for witness_name in &self.witnesses {
             let Symbol::Term(symbol) = &self.symbols[&SymbolName::Term(witness_name.clone())]
@@ -256,14 +325,14 @@ impl phase::SymbolTable<Named> {
                 panic!("non-term witness")
             };
 
-            witness_index.register(Witness::from_type_signature(
+            witnesses.register(Witness::from_type_signature(
                 witness_name.clone(),
                 symbol.type_signature.clone().unwrap(),
                 ctx,
             )?);
         }
 
-        Ok(witness_index)
+        Ok(witnesses)
     }
 
     fn elaborate_types(&self) -> Typing<TypingContext> {
@@ -285,11 +354,181 @@ impl phase::SymbolTable<Named> {
     }
 
     fn elaborate_constraints(&mut self, ctx: &mut TypingContext) -> Typing<()> {
-        self.insert_constraint_method_placeholders(ctx)?;
+        self.elaborate_signature_method_placeholders(ctx)?;
         Ok(())
     }
 
-    fn insert_constraint_method_placeholders(&self, ctx: &mut TypingContext) -> Typing<()> {
+    fn elaborate_signature_type_constructors(&self, ctx: &mut TypingContext) -> Typing<()> {
+        for signature in &self.signatures {
+            let mut type_constructor = ctx
+                .types
+                .bindings
+                .remove(signature)
+                .expect("internal error: constraint name does not match type constructor.");
+
+            let signature_constraint = ConstraintExpression::from_signature_type_constructor(
+                ParseInfo::default(),
+                &type_constructor,
+            );
+
+            if let TypeDefinition::Record(record) =
+                &mut type_constructor.definition_mut().defining_symbol.definition
+            {
+                for field in &mut record.fields {
+                    let pi = *field.type_signature.body.annotation();
+                    let mut c = signature_constraint.clone();
+                    c.annotation = pi;
+
+                    field.type_signature.desugar_constraints();
+                }
+            }
+
+            type_constructor = type_constructor.reelaborate(ctx)?;
+
+            ctx.types
+                .bindings
+                .insert(signature.clone(), type_constructor);
+        }
+
+        Ok(())
+    }
+
+    fn elaborate_signature_method_selectors(
+        &self,
+        ctx: &TypingContext,
+    ) -> Typing<
+        Vec<(
+            QualifiedName,
+            TermSymbol<TypeInfo, QualifiedName, Identifier>,
+        )>,
+    > {
+        let mut out = Vec::with_capacity(self.signatures.len());
+
+        let pi = ParseInfo::default();
+
+        for c in &self.signatures {
+            let type_constructor = ctx
+                .types
+                .lookup(c)
+                .cloned()
+                .expect("internal error: constraint name does not match type constructor.");
+
+            let signature_constraint =
+                ConstraintExpression::from_signature_type_constructor(pi, &type_constructor);
+
+            if let TypeDefinition::Record(record) =
+                &type_constructor.definition().defining_symbol.definition
+            {
+                for field in record.fields.iter() {
+                    let method_arity = field.type_signature.body.arrow_arity();
+                    println!(
+                        "insert_signature_method_selector: {} {method_arity}",
+                        field.name
+                    );
+                    let method_dictionary_count = field.type_signature.constraints.len();
+                    let method_total_arity = method_dictionary_count + method_arity;
+                    let signature_projector = ast::Expr::Project(
+                        pi.with_inferred_type(Type::fresh()),
+                        Projection {
+                            base: ast::Expr::Variable(
+                                pi.with_inferred_type(Type::fresh()),
+                                Identifier::Bound(1),
+                            )
+                            .into(),
+                            select: ProductElement::Name(field.name.clone()),
+                        },
+                    );
+                    let name = QualifiedName::new(
+                        type_constructor.defining_context().clone(),
+                        &format!(
+                            "{}${}",
+                            type_constructor.definition().name.member.as_str(),
+                            field.name.as_str()
+                        ),
+                    );
+
+                    let apply_spine = (0..method_total_arity).fold(signature_projector, |f, x| {
+                        ast::Expr::Apply(
+                            pi.with_inferred_type(Type::fresh()),
+                            Apply {
+                                function: f.into(),
+                                argument: ast::Expr::Variable(
+                                    pi.with_inferred_type(Type::fresh()),
+                                    Identifier::Bound(2 + x),
+                                )
+                                .into(),
+                            },
+                        )
+                    });
+                    let lambda_spine = (0..method_total_arity).rfold(apply_spine, |body, x| {
+                        ast::Expr::Lambda(
+                            pi.with_inferred_type(Type::fresh()),
+                            Lambda {
+                                parameter: Identifier::Bound(2 + x),
+                                body: body.into(),
+                            },
+                        )
+                    });
+
+                    let lambda = Lambda {
+                        parameter: Identifier::Bound(1),
+                        body: lambda_spine.into(),
+                    };
+
+                    let mut type_signature = field.type_signature.clone();
+
+                    type_signature.universal_quantifiers = {
+                        let mut signature_parameters = type_constructor
+                            .definition()
+                            .defining_symbol
+                            .type_parameters()
+                            .to_vec();
+                        signature_parameters
+                            .extend_from_slice(&type_signature.universal_quantifiers);
+                        signature_parameters
+                    };
+
+                    type_signature
+                        .constraints
+                        .insert(0, signature_constraint.clone());
+
+                    type_signature.desugar_constraints();
+
+                    let tree = ast::Expr::Ascription(
+                        pi.with_inferred_type(Type::fresh()),
+                        TypeAscription {
+                            ascribed_tree: ast::Expr::RecursiveLambda(
+                                pi.with_inferred_type(Type::fresh()),
+                                SelfReferential {
+                                    own_name: Identifier::Bound(0),
+                                    lambda,
+                                },
+                            )
+                            .into(),
+                            type_signature: type_signature
+                                .map_annotation(&|pi| pi.with_inferred_type(Type::fresh()))
+                                .clone(),
+                        },
+                    );
+
+                    println!("insert_signature_method_selectors: {name} is {}", tree);
+
+                    out.push((
+                        name.clone(),
+                        TermSymbol {
+                            name,
+                            type_signature: Some(type_signature),
+                            body: tree.into(),
+                        },
+                    ));
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    fn elaborate_signature_method_placeholders(&self, ctx: &mut TypingContext) -> Typing<()> {
         for c in &self.signatures {
             let type_constructor = ctx
                 .types
@@ -302,9 +541,7 @@ impl phase::SymbolTable<Named> {
                 [Constraint::from_type_constructor(&type_constructor)].as_slice(),
             );
 
-            let structure = type_constructor.structure();
-
-            if let TypeStructure::PolyRecord(record_type) = structure? {
+            if let TypeStructure::PolyRecord(record_type) = type_constructor.structure()? {
                 for (method_id, scheme) in record_type.fields() {
                     let scheme = scheme.clone();
                     let name = QualifiedName::new(
@@ -332,6 +569,8 @@ impl phase::SymbolTable<Named> {
         symbol: &TermSymbol<ParseInfo, namer::QualifiedName, Identifier>,
         ctx: &mut TypingContext,
     ) -> Typing<Typed> {
+        println!("type_term: {}, {}", symbol.name, symbol.body);
+
         let expr = ctx.infer_expr(&symbol.body)?;
         let qualified_name = symbol.name.clone();
 
@@ -358,16 +597,21 @@ impl phase::SymbolTable<Named> {
 }
 
 fn elaborate_term_constraints(
-    witness_index: &WitnessIndex,
+    witness_index: &WitnessEnvironment,
     constraints: ConstraintSet,
     tree: ast::Expr<TypeInfo, Identifier>,
     ctx: &TypingContext,
 ) -> Result<ast::Expr<TypeInfo, Identifier>, TypeError> {
+    println!("elaborate_term_constraints: {constraints}");
     let (non_ground_constraints, mut expr) =
         discharge_ground_constraints(tree, constraints, witness_index, ctx)?;
 
+    let mut constraint_slots = non_ground_constraints.iter().collect::<Vec<_>>();
+    constraint_slots.reverse();
+
     for c in non_ground_constraints.iter() {
-        abstract_constraint(c, &mut expr, ctx)?;
+        println!("elaborate_term_constraints: {c} of [{non_ground_constraints}]");
+        abstract_constraint(c, &mut expr, &constraint_slots, ctx)?;
     }
 
     Ok(expr)
@@ -376,20 +620,26 @@ fn elaborate_term_constraints(
 fn abstract_constraint(
     c: &Constraint,
     tree: &mut Expr,
+    slots: &[&Constraint],
     ctx: &TypingContext,
 ) -> Result<(), TypeError> {
     *tree = add_constraint_parameter_slot(tree);
-    *tree = add_constraint_projections(tree, c, ctx)?;
+    *tree = add_constraint_projections(tree, c, slots, ctx)?;
     Ok(())
 }
 
 fn discharge_ground_constraints(
     mut tree: Expr,
     constraints: ConstraintSet,
-    witness_index: &WitnessIndex,
+    witness_index: &WitnessEnvironment,
     ctx: &TypingContext,
 ) -> Result<(ConstraintSet, Expr), TypeError> {
     let (ground, non_ground) = constraints.iter().partition::<Vec<_>, _>(|c| c.is_ground());
+    println!(
+        "discharge_ground_constraint: ground {} non-ground: {}",
+        display_list(", ", &ground),
+        display_list(", ", &non_ground)
+    );
 
     let evidence = ground
         .iter()
@@ -397,11 +647,70 @@ fn discharge_ground_constraints(
         .collect::<Result<Vec<_>, TypeError>>()?;
 
     for (constraint, evidence) in evidence {
+        println!("discharge_ground_constraint: constraint {constraint} evidence {evidence}");
         let signature = constraint.signature(&ctx.types)?;
-        tree = inject_witness(tree, &signature.vtable, constraint, &evidence, &ctx);
+        tree = inject_witness(
+            tree,
+            &signature.vtable,
+            constraint,
+            &evidence,
+            witness_index,
+            &ctx,
+        );
     }
 
+    println!("discharge_ground_constraint: {constraints} done.");
+
     Ok((ConstraintSet::from(non_ground.as_slice()), tree))
+}
+
+fn elaborate_use_site_resolving_witnesses(
+    mut projected: Expr,
+    use_site_constraints: &ConstraintSet,
+    witness_index: &WitnessEnvironment,
+    ctx: &TypeEnvironment,
+) -> Result<Expr, TypeError> {
+    for c in use_site_constraints.iter().filter(|c| c.is_ground()) {
+        let witness = witness_index.resolve_witness(c, ctx)?;
+        println!("elaborate_use_site: add {c} witness {witness}");
+        projected = Expr::Apply(
+            projected.type_info().clone(),
+            Apply {
+                function: projected.into(),
+                argument: witness.into(),
+            },
+        )
+    }
+
+    Ok(projected)
+}
+
+fn elaborate_use_site_inserting_slot_refs(
+    mut projected: Expr,
+    use_site_constraints: &ConstraintSet,
+    slots: &[&Constraint],
+    ctx: &TypeEnvironment,
+) -> Result<Expr, TypeError> {
+    for c in use_site_constraints.iter().filter(|c| !c.is_ground()) {
+        if let Some(index) = slots
+            .iter()
+            // Is this the correct predicate?
+            .position(|&slot_constraint| slot_constraint == c)
+        {
+            println!("elaborate_use_site_inserting_slot_refs: add {c}");
+
+            let type_info = projected.type_info().clone();
+            projected = Expr::Apply(
+                type_info.clone(),
+                Apply {
+                    function: projected.into(),
+                    argument: Expr::Variable(type_info, Identifier::Bound(1 + index)).into(),
+                },
+            )
+        }
+    }
+
+    Ok(projected)
 }
 
 fn inject_witness(
@@ -409,6 +718,7 @@ fn inject_witness(
     vtable: &RecordShape,
     constraint: &Constraint,
     witness: &Expr,
+    witness_index: &WitnessEnvironment,
     ctx: &TypingContext,
 ) -> Expr {
     tree.map(&mut |e| match e {
@@ -420,19 +730,34 @@ fn inject_witness(
                 .underlying
                 .unified_with(&type_info.inferred_type, &ctx.types)
                 .expect("expr.typed");
-            let use_site_constraints = method_scheme.constraints.apply(&use_site_subst);
+            let mut use_site_constraints = method_scheme.constraints.apply(&use_site_subst);
 
             let suitable_injection_site = use_site_constraints.iter().any(|c| c == constraint);
 
             if suitable_injection_site {
-                Expr::Project(
+                println!("inject_witness: {m} use-site-constraints {use_site_constraints}");
+                use_site_constraints.without(|c| c == constraint);
+
+                let new_witness = elaborate_use_site_resolving_witnesses(
+                    witness.clone(),
+                    &use_site_constraints,
+                    witness_index,
+                    &ctx.types,
+                )
+                .expect("Can I really expect this? Witness resolution can fail.");
+
+                println!("inject_witness: witness {witness} new_witness {new_witness}");
+
+                let projected = Expr::Project(
                     type_info,
                     Projection {
-                        base: witness.clone().into(),
+                        base: new_witness.clone().into(),
                         // This must be the field index
                         select: ProductElement::Ordinal(vtable.index_of(m.member()).unwrap()),
                     },
-                )
+                );
+
+                projected
             } else {
                 Expr::Variable(type_info, Identifier::Free(m.clone()))
             }
@@ -466,19 +791,54 @@ fn inject_witness(
 fn add_constraint_projections(
     tree: &Expr,
     constraint: &Constraint,
+    slots: &[&Constraint],
     ctx: &TypingContext,
 ) -> Result<Expr, TypeError> {
     let signature = constraint.signature(&ctx.types)?;
 
     let tree = tree.clone().map(&mut |e| match e {
-        Expr::Variable(a, Identifier::Free(m)) if signature.vtable.contains(m.member()) => {
-            Expr::Project(
-                a.clone(),
+        Expr::Variable(type_info, ref term_id @ Identifier::Free(ref m))
+            if signature.vtable.contains(m.member()) =>
+        {
+            let projected = Expr::Project(
+                type_info.clone(),
                 Projection {
-                    base: Expr::Variable(a.clone(), Identifier::Bound(1)).into(),
+                    base: Expr::Variable(type_info.clone(), Identifier::Bound(1)).into(),
                     select: ProductElement::Ordinal(signature.vtable.index_of(m.member()).unwrap()),
                 },
+            );
+
+            let method_scheme = ctx.terms.lookup(term_id).expect("expr.typed").instantiate();
+            let use_site_subst = method_scheme
+                .underlying
+                .unified_with(&type_info.inferred_type, &ctx.types)
+                .expect("expr.typed");
+            let mut use_site_constraints = method_scheme.constraints.apply(&use_site_subst);
+            use_site_constraints.without(|c| {
+                let is_ok = c
+                    .constraint_type
+                    .unified_with(&constraint.constraint_type, &ctx.types)
+                    .is_ok();
+                println!("without: {c} and {constraint} is ok: {is_ok}");
+                is_ok
+            });
+
+            println!(
+                "add_constraint_projections: {term_id} constraints [{}] use-site [{}] slots {}",
+                method_scheme.constraints,
+                use_site_constraints,
+                display_list(", ", slots)
+            );
+
+            //projected
+
+            elaborate_use_site_inserting_slot_refs(
+                projected,
+                &use_site_constraints,
+                slots,
+                &ctx.types,
             )
+            .expect("wtf")
         }
 
         Expr::Variable(a, term_id @ Identifier::Free(..)) => {
@@ -561,7 +921,7 @@ impl phase::Lambda<Types> {
         Lambda {
             parameter: Identifier::Bound(first_level),
             body: Expr::Lambda(
-                self.body.type_info().clone(),
+                self.body.annotation().clone(),
                 Lambda {
                     parameter: Identifier::Bound(1 + first_level),
                     body: Rc::unwrap_or_clone(self.body)
@@ -936,6 +1296,10 @@ impl Typed {
 pub struct ConstraintSet(BTreeSet<Constraint>);
 
 impl ConstraintSet {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
     fn contains(&self, constraint: &Constraint) -> bool {
         self.0.contains(constraint)
     }
@@ -961,6 +1325,14 @@ impl ConstraintSet {
 
     pub fn variables(&self) -> HashSet<MetaVariable> {
         self.0.iter().flat_map(|tv| tv.variables()).collect()
+    }
+
+    pub fn without<P>(&mut self, mut p: P)
+    where
+        P: FnMut(&Constraint) -> bool,
+    {
+        let Self(constraints) = self;
+        constraints.retain(|c| !p(c));
     }
 }
 
@@ -1590,16 +1962,6 @@ impl TypeConstructorDefinition {
         self.make_spine_at(&self.instantiated_params)
     }
 
-    pub fn apply_at(&self, arguments: &[Type]) -> Type {
-        arguments.iter().fold(
-            Type::Constructor(self.name.clone()),
-            |constructor, argument| Type::Apply {
-                constructor: constructor.into(),
-                argument: argument.clone().into(),
-            },
-        )
-    }
-
     pub fn make_spine_at(
         &self,
         type_parameters: &HashMap<parser::Identifier, MetaVariable>,
@@ -1609,6 +1971,33 @@ impl TypeConstructorDefinition {
             |constructor, param| Type::Apply {
                 constructor: constructor.into(),
                 argument: Type::Variable(type_parameters[&param.name].clone()).into(),
+            },
+        )
+    }
+
+    fn make_spine_expr(&self) -> phase::TypeExpression<Named> {
+        let pi = ParseInfo::default();
+        self.defining_symbol.type_parameters().iter().fold(
+            ast::TypeExpression::Constructor(pi, self.name.clone()),
+            |constructor, param| {
+                ast::TypeExpression::Apply(
+                    pi,
+                    ApplyTypeExpr {
+                        function: constructor.into(),
+                        argument: ast::TypeExpression::Parameter(pi, param.name.clone()).into(),
+                        phase: PhantomData,
+                    },
+                )
+            },
+        )
+    }
+
+    pub fn apply_at(&self, arguments: &[Type]) -> Type {
+        arguments.iter().fold(
+            Type::Constructor(self.name.clone()),
+            |constructor, argument| Type::Apply {
+                constructor: constructor.into(),
+                argument: argument.clone().into(),
             },
         )
     }
@@ -1674,6 +2063,19 @@ impl PolyRecordType {
                 .collect::<Vec<_>>(),
         ))
     }
+
+    pub fn map<F>(&self, f: F) -> Self
+    where
+        F: Fn(&TypeScheme) -> TypeScheme,
+    {
+        let Self(fields) = self;
+        Self(
+            fields
+                .iter()
+                .map(|(field, scheme)| (field.clone(), f(scheme)))
+                .collect(),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1734,16 +2136,17 @@ impl TypeConstructor {
 
     fn elaborate(&mut self, ctx: &TypingContext) -> Typing<()> {
         if let Self::Unelaborated(constructor) = self {
-            *self = Self::Elaborated(ElaboratedTypeConstructor {
-                definition: constructor.clone(),
-                structure: constructor
-                    .defining_symbol
-                    .definition
-                    .synthesize_type(&constructor.instantiated_params, ctx)?,
-            });
+            *self = from_definition(constructor, ctx)?;
         }
 
         Ok(())
+    }
+
+    fn reelaborate(&self, ctx: &TypingContext) -> Typing<TypeConstructor> {
+        let (Self::Unelaborated(definition)
+        | Self::Elaborated(ElaboratedTypeConstructor { definition, .. })) = self;
+
+        from_definition(definition, ctx)
     }
 
     fn apply(&self, subs: &Substitutions) -> Self {
@@ -1768,6 +2171,13 @@ impl TypeConstructor {
         }
     }
 
+    fn definition_mut(&mut self) -> &mut TypeConstructorDefinition {
+        match self {
+            Self::Unelaborated(header) => header,
+            Self::Elaborated(constructor) => &mut constructor.definition,
+        }
+    }
+
     pub fn structure(&self) -> Typing<&TypeStructure> {
         if let Self::Elaborated(c) = self {
             Ok(&c.structure)
@@ -1779,7 +2189,17 @@ impl TypeConstructor {
         }
     }
 
-    // Move this to TypingContext?
+    pub fn structure_mut(&mut self) -> Typing<&mut TypeStructure> {
+        if let Self::Elaborated(c) = self {
+            Ok(&mut c.structure)
+        } else {
+            Err(
+                TypeError::UnelaboratedConstructor(self.definition().name.clone())
+                    .at(ParseInfo::default()),
+            )
+        }
+    }
+
     fn instantiate(&self, ctx: &TypingContext) -> Typing<Self> {
         let mut the = Self::from_symbol(&self.definition().defining_symbol);
         the.elaborate(ctx)?;
@@ -1789,6 +2209,19 @@ impl TypeConstructor {
     fn defining_context(&self) -> &parser::IdentifierPath {
         self.definition().name.module()
     }
+}
+
+fn from_definition(
+    definition: &TypeConstructorDefinition,
+    ctx: &TypingContext,
+) -> Typing<TypeConstructor> {
+    Ok(TypeConstructor::Elaborated(ElaboratedTypeConstructor {
+        definition: definition.clone(),
+        structure: definition
+            .defining_symbol
+            .definition
+            .synthesize_type(&definition.instantiated_params, ctx)?,
+    }))
 }
 
 fn fresh_type_parameters(
@@ -2087,6 +2520,10 @@ impl TypeEnvironment {
 
     pub fn lookup(&self, name: &namer::QualifiedName) -> Option<&TypeConstructor> {
         self.bindings.get(name)
+    }
+
+    pub fn lookup_mut(&mut self, name: &namer::QualifiedName) -> Option<&mut TypeConstructor> {
+        self.bindings.get_mut(name)
     }
 
     fn query_record_type_constructor(&self, shape: &RecordShape) -> Vec<&TypeConstructor> {
@@ -2429,8 +2866,16 @@ impl TypingContext {
         expected_type: &Type,
         rec: &phase::SelfReferential<Named>,
     ) -> Typing {
-        let normalized_type = self.expand_type_constructor(pi, expected_type)?;
-        if let Some(TypeStructure::Monotype(Type::Arrow { domain, codomain })) = &normalized_type {
+        let normalized_type = self
+            .expand_type_constructor(pi, expected_type)?
+            .unwrap_or_else(|| TypeStructure::Monotype(expected_type.clone()));
+
+        println!(
+            "check_recursive_lambda: expected {expected_type} tree {:?}",
+            rec.lambda
+        );
+
+        if let TypeStructure::Monotype(Type::Arrow { domain, codomain }) = &normalized_type {
             self.bind_term_and_then(
                 rec.own_name.clone(),
                 TypeScheme::from_constant(expected_type.clone()),
@@ -2742,6 +3187,9 @@ impl TypingContext {
         let ascribed_scheme = ascription
             .type_signature
             .type_scheme(&HashMap::default(), self)?;
+
+        println!("infer_ascription: scheme {ascribed_scheme}");
+
         let ascribed_type = ascribed_scheme.instantiate();
         let ascribed_tree =
             self.check_expr(&ascribed_type.underlying, &ascription.ascribed_tree)?;
@@ -3376,13 +3824,23 @@ impl TypingContext {
             constraints,
         } = self.infer_expr(&projection.base)?;
         let base_type = &base.type_info().inferred_type;
+
+        // This is where the elaboration of the polyrecord disappears
         let expanded_base_type = self
             .expand_type_constructor(pi, base_type)?
             .unwrap_or_else(|| TypeStructure::Monotype(base_type.clone()));
 
+        println!("infer_projection: base {base_type} expanded {expanded_base_type}");
+
+        for (k, v) in &self.types.bindings {
+            println!("infer_projection: {k} is {v}");
+        }
+
         match &projection.select {
             ProductElement::Name(field_name) => match expanded_base_type {
                 TypeStructure::PolyRecord(record) => {
+                    println!("infer_proj: {record:?}");
+
                     if let Some((field_index, (_, field_scheme))) = record
                         .0
                         .iter()
@@ -3390,6 +3848,9 @@ impl TypingContext {
                         .find(|(_, (label, _))| label == field_name)
                     {
                         let field_type = field_scheme.instantiate();
+
+                        println!("infer_projection: {field_name} :: {field_type}");
+
                         Ok(Typed::computed(
                             substitutions,
                             constraints.union(field_type.constraints),

@@ -1,3 +1,5 @@
+display :: ∀α. α -> Text := λa. prim_show a
+
 List ::= ∀α. Nil | Cons α (List α)
 
 Perhaps ::= ∀α. Nada | This α
@@ -121,7 +123,7 @@ start := λ_.
   print_endline "Hello, world"
 
   let the_thing = (1 + 68) * 840 / 2 in
-  let text = show the_thing
+  let text = prim_show the_thing
   in print_endline text
 
   let the_king_weareth_clothing = false in
@@ -137,7 +139,7 @@ start := λ_.
   let show_perhaps = λp.
     deconstruct p into
       Nada   -> "Division by zero"
-    | This x -> show x
+    | This x -> prim_show x
   in print_endline "4 / 2 is `show_perhaps (divide 4 2)` but 4 / 0 is `show_perhaps (divide 4 0)`."
 
   let show_arithmetic_error = λe.
@@ -146,7 +148,7 @@ start := λ_.
     | Division_by_Zero -> "Also Division by zero"
   in let show_result = λr.
     deconstruct r into
-      Return a -> show a
+      Return a -> prim_show a
     | Fault e  -> show_arithmetic_error e
   in print_endline "4 / 2 is `show_result (divide2 4 2)` but 4 / 0 is `show_result (divide2 4 0)`."
 

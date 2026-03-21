@@ -39,8 +39,7 @@ signature Traversable ::= ∀t : *->*.
 
 sequence :: ∀t : *->* f : *->* α.  Traversable t + Applicative f |- t (f α) -> f (t α) :=
   λtfa.
-    print_endline "sequence: tfa `tfa`."
-    traverse (λx. print_endline "tr: `x`."; x) tfa
+    traverse id tfa
 
 mconcat :: ∀α. Monoid α |- List α -> α :=
   fold_right mappend mempty

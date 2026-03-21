@@ -26,12 +26,14 @@ witness Applicative List :=
 
 witness Traversable List :=
   { traverse := λf xs.
-      print_endline "traverse: list looping..."
       deconstruct xs into
         Nil -> pure Nil
       | Cons a tail ->
-        print_endline "traverse: looping..."
         liftA2 Cons (f a) (traverse f tail)
+  }
+
+witness ∀α. Display α |- Display (List α) :=
+  { display := λxs. prim_show xs
   }
 
 module List:
@@ -82,8 +84,9 @@ module List:
   filter :: ∀α. (α -> Bool) -> List α -> List α :=
     λp. bind (λx. if p x then Cons x Nil else Nil)
 
-  flatten :: ∀α. List (List α) -> List α :=
-    bind id
+  flatten :: ∀α. List (List α) -> List α := λxs.
+    print_endline "flatten!"
+    bind id xs
 
   tabulate :: ∀α. Int -> (Int -> α) -> List α :=
     λc f.
@@ -123,6 +126,10 @@ witness Applicative Perhaps :=
     apply := λap fa. Perhaps.bind (λf. Perhaps.map f fa) ap
   }
 
+witness ∀α. Display α |- Display (Perhaps α) :=
+  { display := λt. prim_show t
+  }
+
 module Perhaps:
   perhaps :: ∀α z. z -> (α -> z) -> Perhaps α -> z :=
     λz f xa. deconstruct xa into This x -> f x | otherwise -> z
@@ -149,6 +156,18 @@ module Result:
 witness Monoid Text :=
   { mempty  := ""
     mappend := λp q. "`p``q`"
+  }
+
+witness Display Text :=
+  { display := λt. prim_show t
+  }
+
+witness Display Char :=
+  { display := λt. prim_show t
+  }
+
+witness Display Int :=
+  { display := λt. prim_show t
   }
 
 module Text:

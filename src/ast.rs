@@ -216,6 +216,30 @@ impl<A, TypeId> ConstraintExpression<A, TypeId> {
             parameters: parameters.into_iter().map(|p| p.map_name(f)).collect(),
         }
     }
+
+    pub fn into_type_expression(self) -> TypeExpression<A, TypeId>
+    where
+        A: Clone,
+    {
+        let Self {
+            annotation,
+            class,
+            parameters,
+        } = self;
+        parameters.into_iter().fold(
+            TypeExpression::Constructor(annotation.clone(), class),
+            |f, x| {
+                TypeExpression::Apply(
+                    annotation.clone(),
+                    ApplyTypeExpr {
+                        function: f.into(),
+                        argument: x.into(),
+                        phase: PhantomData,
+                    },
+                )
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -255,7 +279,33 @@ pub enum TypeExpression<A, TypeId> {
     Tuple(A, TupleTypeExpr<A, TypeId>),
 }
 
+impl<A, TypeId> Default for TypeExpression<A, TypeId>
+where
+    A: Default,
+{
+    fn default() -> Self {
+        Self::Tuple(A::default(), TupleTypeExpr(vec![]))
+    }
+}
+
 impl<A, TypeId> TypeExpression<A, TypeId> {
+    pub fn annotation(&self) -> &A {
+        match self {
+            Self::Constructor(a, _)
+            | Self::Parameter(a, _)
+            | Self::Apply(a, _)
+            | Self::Arrow(a, _)
+            | Self::Tuple(a, _) => a,
+        }
+    }
+
+    pub fn arrow_arity(&self) -> usize {
+        match self {
+            Self::Arrow(_, arrow) => 1 + arrow.codomain.arrow_arity(),
+            _ => 0,
+        }
+    }
+
     fn map_name<F, B>(self, f: &F) -> TypeExpression<A, B>
     where
         F: Fn(TypeId) -> B,
@@ -1048,9 +1098,9 @@ where
             ..
         } = self;
         if !universal_quantifiers.is_empty() {
-            write!(f, "forall ")?;
+            write!(f, "forall")?;
             for q in universal_quantifiers {
-                write!(f, "{q}")?;
+                write!(f, " {q}")?;
             }
             write!(f, ". ")?;
         }

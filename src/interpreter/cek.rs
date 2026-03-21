@@ -88,10 +88,19 @@ impl Globals {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Env {
     globals: Rc<Globals>,
     locals: Rc<RefCell<Vec<Val>>>,
+}
+
+impl fmt::Debug for Env {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Env")
+            //.field("globals", &self.globals)
+            //.field("locals", &self.locals)
+            .finish()
+    }
 }
 
 impl Env {
@@ -332,7 +341,11 @@ impl Suspension {
                 expression,
                 environment,
                 k,
-            }) => expression.eval(environment, k),
+            }) => {
+                //                println!("resume: expr {expression}");
+
+                expression.eval(environment, k)
+            }
 
             Self::Suspend(Suspended::Return { value, k }) => and_then(value, k),
 
@@ -824,13 +837,14 @@ impl Expr {
 
 impl fmt::Display for Closure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { capture, body } = self;
-        write!(f, "[ {capture} ]: {body}")
+        let Self { body, .. } = self;
+        write!(f, "[ << capture >> ]: {body}")
     }
 }
 
 impl fmt::Display for Env {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        println!("Env::fmt: ");
         let local_prefix = {
             self.locals
                 .borrow()

@@ -1,12 +1,6 @@
 use Stdlib.
 
 start := lambda _.
-  let fa = This 1 in
-  let fb = This "Hej" in
-  let fab = liftA2 (lambda a b. a, b) fa fb in
-  print_endline "Sjörövar-Fabbe `fab`."
-
-
   let* x = This 10
   in
     print_endline "Hi `x`"

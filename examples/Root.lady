@@ -9,6 +9,8 @@ Keyword ::= Module | If
 
 List ::= ∀α. Nil | Cons α (List α)
 
+display :: ∀α. α -> Text := λa. prim_show a
+
 module List:
   head :: ∀α. List α -> Perhaps α :=
     λxs. deconstruct xs into Cons a tail -> This a | otherwise -> Nope
@@ -207,7 +209,7 @@ start := λx.
   say_real_name "Slim Shady" "Marshall Mathers"
 
   let x = Data.Fault 1 in
-  print_endline (show x)
+  print_endline (prim_show x)
 
   let p = This 1 in
   print_endline "q: `Perhaps.map (λx. 10 * x) p`."
