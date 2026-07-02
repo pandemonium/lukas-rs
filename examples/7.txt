@@ -1,3 +1,0 @@
-
-
-start := lambda x. x, 427, "Patrik Andersson", 1

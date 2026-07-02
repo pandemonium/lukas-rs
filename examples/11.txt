@@ -1,7 +1,0 @@
-
-
-start := lambda x.
-  if true then
-    print_endline "sant"
-  else
-    print_endline "falskt"

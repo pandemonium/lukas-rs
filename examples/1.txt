@@ -1,9 +1,0 @@
-foo :=
-  lambda x.
-    x + 1
-    + 2
-
-bar::forall a. a -> Int :=
-  lambda x.
-    x + 1
-    + 2
