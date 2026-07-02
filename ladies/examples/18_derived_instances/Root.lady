@@ -1,0 +1,25 @@
+(* A conditional instance: `Eq (List α)` holds given `Eq α`, and resolves
+   recursively. *)
+
+List ::= ∀α. Nil | Cons α (List α)
+
+signature Eq ::= ∀α.
+  { eq :: α -> α -> Bool
+  }
+
+witness Eq Int := { eq := λp q. p = q }
+
+witness ∀α. Eq α |- Eq (List α) :=
+  { eq := λxs ys.
+      deconstruct xs, ys into
+        Cons x xs, Cons y ys -> eq x y and eq xs ys
+      | Nil, Nil             -> true
+      | otherwise            -> false
+  }
+
+yesno :: Bool -> Text := λb. if b then "true" else "false"
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (yesno (eq (Cons 1 (Cons 2 Nil)) (Cons 1 (Cons 2 Nil))))   (* true *)
+  print_endline (yesno (eq (Cons 1 Nil) (Cons 2 Nil)))                     (* false *)

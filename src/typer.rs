@@ -224,21 +224,15 @@ impl phase::ConstraintExpression<Named> {
 impl phase::SymbolTable<Named> {
     pub fn elaborate_compilation_unit(mut self) -> Typing<phase::SymbolTable<Types>> {
         let mut ctx = self.elaborate_types()?;
+
         self.elaborate_externals(&mut ctx)?;
-        self.elaborate_constraints(&mut ctx)?;
 
-        for (k, v) in &ctx.types.bindings {
-            println!("elaborate_compilation_unit: type {k} is {v}");
-        }
+        // Gives rise to signature method placeholders -- term typer needs this
+        let selectors_names = self.elaborate_constraints(&mut ctx)?;
 
-        let mut symbols = self.elaborate_terms(&mut ctx)?;
-
-        self.elaborate_signature_type_constructors(&mut ctx)?;
-        let selector_symbols = self.elaborate_signature_method_selectors(&mut ctx)?;
-
-        for (name, symbol) in selector_symbols {
-            symbols.insert(SymbolName::Term(name), Symbol::Term(symbol));
-        }
+        // This runs the term typer core
+        let symbols =
+            self.elaborate_terms(&selectors_names.iter().collect::<Vec<_>>(), &mut ctx)?;
 
         Ok(SymbolTable {
             module_members: self.module_members,
@@ -253,26 +247,62 @@ impl phase::SymbolTable<Named> {
 
     fn elaborate_terms(
         &self,
+        selector_names: &[&SymbolName],
         ctx: &mut TypingContext,
     ) -> Typing<HashMap<SymbolName, Symbol<TypeInfo, QualifiedName, Identifier>>> {
-        let mut symbols = HashMap::with_capacity(self.symbols.len());
-        let witness_index = self.register_witnesses(&ctx)?;
-        let witness_deps = witness_index
+        let mut typed_symbols = HashMap::with_capacity(self.symbols.len());
+
+        let witnesses = self.elaborate_witnesses(&ctx)?;
+        let witness_deps = witnesses
             .dependency_matrix(&ctx.types)
             .map_err(|e| e.at(ParseInfo::default()))?;
 
         let mut deps = self.dependency_matrix();
         deps.merge(witness_deps.map(SymbolName::Term));
-        let typed_terms = self.type_terms(&mut symbols, deps.in_resolvable_order(), ctx)?;
 
-        for (symbol, typed) in typed_terms {
-            let pi = typed.tree.annotation().parse_info;
-            let expr =
-                elaborate_term_constraints(&witness_index, typed.constraints, typed.tree, ctx)
-                    .map_err(|e| e.at(pi))?;
+        let selector_names = selector_names.into_iter().copied().collect::<HashSet<_>>();
 
-            println!("elaborate_terms: insert {} := {:?}", symbol.name, expr);
-            symbols.insert(
+        // This types and binds all terms in ctx.terms
+        let mut typed_terms = self.type_terms(
+            &mut typed_symbols,
+            deps.in_resolvable_order()
+                .iter()
+                .copied()
+                .filter(|t| !selector_names.contains(t)),
+            ctx,
+        )?;
+
+        self.elaborate_signature_type_constructors(ctx)?;
+
+        let typed_selectors =
+            self.type_terms(&mut typed_symbols, selector_names.iter().copied(), ctx)?;
+
+        for (term_symbol, typed) in &typed_selectors {
+            println!(
+                "elaborate_terms: typed selector {} : {}",
+                term_symbol.name, typed.tree
+            );
+        }
+
+        typed_terms.extend(typed_selectors);
+
+        for (symbol, term) in typed_terms {
+            let pi = term.tree.annotation().parse_info;
+
+            // this has to bind every term in TypingContext so that later elaborations
+            // can discover constraints (type and order)
+            // So it needs the name!
+            let expr = elaborate_term_constraints(
+                &symbol.name,
+                &witnesses,
+                term.constraints,
+                term.tree,
+                ctx,
+            )
+            .map_err(|e| e.at(pi))?;
+
+            println!("elaborate_terms: insert {} := {}", symbol.name, expr);
+            typed_symbols.insert(
                 SymbolName::Term(symbol.name.clone()),
                 Symbol::Term(TermSymbol {
                     name: symbol.name.clone(),
@@ -282,33 +312,30 @@ impl phase::SymbolTable<Named> {
             );
         }
 
-        Ok(symbols)
+        Ok(typed_symbols)
     }
 
-    fn type_terms(
+    fn type_terms<'a>(
         &self,
         symbols: &mut HashMap<SymbolName, Symbol<TypeInfo, QualifiedName, Identifier>>,
-        evaluation_order: Vec<&SymbolName>,
+        evaluation_order: impl Iterator<Item = &'a SymbolName>,
         ctx: &mut TypingContext,
     ) -> Typing<Vec<(&TermSymbol<ParseInfo, QualifiedName, Identifier>, Typed)>> {
-        for (k, v) in &ctx.types.bindings {
-            println!("type_terms: type {k} is {v}");
-        }
+        let mut typed_terms = Vec::default();
 
-        let mut typed_terms = Vec::with_capacity(evaluation_order.len());
         for name in evaluation_order {
             // Rewrite in terms of a match instead?
-            if let SymbolName::Term(term_name) = name
+            if let SymbolName::Term(term_name) = &name
                 // signature method placeholders are already typed
-                && !ctx.terms.free.contains_key(term_name)
-                && let Symbol::Term(symbol) = &self.symbols[name]
+                && !ctx.terms.free.contains_key(&term_name)
+                && let Symbol::Term(symbol) = &self.symbols[&name]
             {
                 //                println!("@@@ {} := {:?}", symbol.name, symbol.body);
                 typed_terms.push((symbol, self.type_term(symbol, ctx)?))
             }
 
             if let SymbolName::Type(..) = name
-                && let Symbol::Type(symbol) = &self.symbols[name]
+                && let Symbol::Type(symbol) = &self.symbols[&name]
             {
                 symbols.insert(name.clone(), Symbol::Type(symbol.clone()));
             }
@@ -316,10 +343,14 @@ impl phase::SymbolTable<Named> {
         Ok(typed_terms)
     }
 
-    fn register_witnesses(&self, ctx: &TypingContext) -> Typing<WitnessEnvironment> {
+    fn elaborate_witnesses(&self, ctx: &TypingContext) -> Typing<WitnessEnvironment> {
         let mut witnesses = WitnessEnvironment::default();
 
-        for witness_name in &self.witnesses {
+        // Deterministic order: witnesses are registered (and instantiated with
+        // fresh variables) here; HashSet order would make resolution flaky.
+        let mut witness_names = self.witnesses.iter().collect::<Vec<_>>();
+        witness_names.sort();
+        for witness_name in witness_names {
             let Symbol::Term(symbol) = &self.symbols[&SymbolName::Term(witness_name.clone())]
             else {
                 panic!("non-term witness")
@@ -327,7 +358,10 @@ impl phase::SymbolTable<Named> {
 
             witnesses.register(Witness::from_type_signature(
                 witness_name.clone(),
-                symbol.type_signature.clone().unwrap(),
+                symbol
+                    .type_signature
+                    .clone()
+                    .expect("all witnesses have type signatures"),
                 ctx,
             )?);
         }
@@ -353,9 +387,129 @@ impl phase::SymbolTable<Named> {
         Ok(ctx)
     }
 
-    fn elaborate_constraints(&mut self, ctx: &mut TypingContext) -> Typing<()> {
-        self.elaborate_signature_method_placeholders(ctx)?;
-        Ok(())
+    fn elaborate_constraints(&mut self, ctx: &mut TypingContext) -> Typing<Vec<SymbolName>> {
+        self.insert_signature_method_placeholders(ctx)?;
+        let selector_terms = self.elaborate_signature_method_selectors(ctx)?;
+        self.symbols.extend(
+            selector_terms
+                .iter()
+                .map(|t| (SymbolName::Term(t.name.clone()), Symbol::Term(t.clone()))),
+        );
+
+        self.lift_constrained_witness_methods(ctx);
+
+        Ok(selector_terms
+            .into_iter()
+            .map(|term| SymbolName::Term(term.name))
+            .collect())
+    }
+
+    /// A signature method that carries its own constraint (e.g.
+    /// `mconcat :: ∀α. Monoid α |- m α -> α`) is a rank-2 field: its value must be
+    /// a polymorphic, dictionary-taking function. That cannot be discharged at the
+    /// witness/builder level, so -- mirroring how accessor selectors are emitted as
+    /// top-level symbols -- we lift each such witness method body to its own
+    /// top-level term `<witness>$<method>` and replace the record field with a
+    /// reference to it. The lifted term then rides the ordinary type + discharge
+    /// path, so its constraint becomes a leading dictionary parameter of the field.
+    fn lift_constrained_witness_methods(&mut self, ctx: &TypingContext) {
+        // Method names whose signature type carries a constraint. Ordinary methods
+        // (e.g. `eq`) stay inline so the witness can discharge its own premises.
+        let mut constrained_methods: HashSet<parser::Identifier> = HashSet::new();
+        for signature in &self.signatures {
+            if let Some(tc) = ctx.types.lookup(signature)
+                && let TypeDefinition::Record(record) =
+                    &tc.definition().defining_symbol.definition
+            {
+                for field in &record.fields {
+                    if !field.type_signature.constraints.is_empty() {
+                        constrained_methods.insert(field.name.clone());
+                    }
+                }
+            }
+        }
+        if constrained_methods.is_empty() {
+            return;
+        }
+
+        // Collect the fields to lift (borrow self.symbols immutably first).
+        type NamedExpr = ast::Expr<ParseInfo, Identifier>;
+        let mut lifts: Vec<(QualifiedName, parser::Identifier, QualifiedName, Rc<NamedExpr>)> =
+            Vec::new();
+        let mut witness_names = self.witnesses.iter().cloned().collect::<Vec<_>>();
+        witness_names.sort();
+        for witness in witness_names {
+            let Some(Symbol::Term(symbol)) = self.symbols.get(&SymbolName::Term(witness.clone()))
+            else {
+                continue;
+            };
+            // The witness body is a record, wrapped in an ascription to the
+            // instance's dictionary type.
+            let record = match &symbol.body {
+                ast::Expr::Record(_, record) => record,
+                ast::Expr::Ascription(_, ascription) => {
+                    match ascription.ascribed_tree.as_ref() {
+                        ast::Expr::Record(_, record) => record,
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+            for (field_name, field_body) in &record.fields {
+                if constrained_methods.contains(field_name) {
+                    let lifted_name = QualifiedName::new(
+                        witness.module().clone(),
+                        &format!("{}${}", witness.member().as_str(), field_name.as_str()),
+                    );
+                    lifts.push((
+                        witness.clone(),
+                        field_name.clone(),
+                        lifted_name,
+                        field_body.clone(),
+                    ));
+                }
+            }
+        }
+
+        for (witness, field_name, lifted_name, field_body) in lifts {
+            let pi = *field_body.annotation();
+
+            self.symbols.insert(
+                SymbolName::Term(lifted_name.clone()),
+                Symbol::Term(TermSymbol {
+                    name: lifted_name.clone(),
+                    type_signature: None,
+                    body: Rc::unwrap_or_clone(field_body),
+                }),
+            );
+
+            let Some(Symbol::Term(symbol)) =
+                self.symbols.get_mut(&SymbolName::Term(witness.clone()))
+            else {
+                continue;
+            };
+            let record = match &mut symbol.body {
+                ast::Expr::Record(_, record) => Some(record),
+                ast::Expr::Ascription(_, ascription) => {
+                    match Rc::make_mut(&mut ascription.ascribed_tree) {
+                        ast::Expr::Record(_, record) => Some(record),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(record) = record {
+                let reference = Rc::new(ast::Expr::Variable(
+                    pi,
+                    Identifier::Free(lifted_name.clone().into()),
+                ));
+                for (name, value) in &mut record.fields {
+                    if *name == field_name {
+                        *value = reference.clone();
+                    }
+                }
+            }
+        }
     }
 
     fn elaborate_signature_type_constructors(&self, ctx: &mut TypingContext) -> Typing<()> {
@@ -393,17 +547,12 @@ impl phase::SymbolTable<Named> {
         Ok(())
     }
 
+    // This has to leave the constaints in the signature
     fn elaborate_signature_method_selectors(
         &self,
         ctx: &TypingContext,
-    ) -> Typing<
-        Vec<(
-            QualifiedName,
-            TermSymbol<TypeInfo, QualifiedName, Identifier>,
-        )>,
-    > {
-        let mut out = Vec::with_capacity(self.signatures.len());
-
+    ) -> Typing<Vec<TermSymbol<ParseInfo, QualifiedName, Identifier>>> {
+        let mut symbols = Vec::with_capacity(2 * self.signatures.len());
         let pi = ParseInfo::default();
 
         for c in &self.signatures {
@@ -426,18 +575,7 @@ impl phase::SymbolTable<Named> {
                         field.name
                     );
                     let method_dictionary_count = field.type_signature.constraints.len();
-                    let method_total_arity = method_dictionary_count + method_arity;
-                    let signature_projector = ast::Expr::Project(
-                        pi.with_inferred_type(Type::fresh()),
-                        Projection {
-                            base: ast::Expr::Variable(
-                                pi.with_inferred_type(Type::fresh()),
-                                Identifier::Bound(1),
-                            )
-                            .into(),
-                            select: ProductElement::Name(field.name.clone()),
-                        },
-                    );
+
                     let name = QualifiedName::new(
                         type_constructor.defining_context().clone(),
                         &format!(
@@ -447,32 +585,71 @@ impl phase::SymbolTable<Named> {
                         ),
                     );
 
-                    let apply_spine = (0..method_total_arity).fold(signature_projector, |f, x| {
-                        ast::Expr::Apply(
-                            pi.with_inferred_type(Type::fresh()),
+                    // The selector's dictionaries are injected at call sites in
+                    // ConstraintSet (BTreeSet) order, i.e. sorted by class name. Lay
+                    // the body and the type out in that same order, otherwise the
+                    // fixed slot the signature method is projected from disagrees with
+                    // the injection whenever the signature class does not sort first
+                    // (e.g. `Traversable` after `Applicative`). `None` marks the
+                    // signature dictionary; `Some(j)` the method's j-th own dictionary.
+                    let mut constraints: Vec<(Option<usize>, phase::ConstraintExpression<Named>)> =
+                        vec![(None, signature_constraint.clone())];
+                    for (j, c) in field.type_signature.constraints.iter().enumerate() {
+                        constraints.push((Some(j), c.clone()));
+                    }
+                    constraints.sort_by(|(_, a), (_, b)| a.class.cmp(&b.class));
+
+                    let num_constraints = constraints.len();
+                    let slot = |origin: Option<usize>| {
+                        1 + constraints
+                            .iter()
+                            .position(|(o, _)| *o == origin)
+                            .unwrap()
+                    };
+
+                    // Project the signature method from the signature dictionary, then
+                    // apply the method's own dictionaries (in method order) and finally
+                    // the value arguments (which follow all dictionaries).
+                    let mut spine = ast::Expr::Project(
+                        pi,
+                        Projection {
+                            base: ast::Expr::Variable(pi, Identifier::Bound(slot(None))).into(),
+                            select: ProductElement::Name(field.name.clone()),
+                        },
+                    );
+                    for j in 0..method_dictionary_count {
+                        spine = ast::Expr::Apply(
+                            pi,
                             Apply {
-                                function: f.into(),
-                                argument: ast::Expr::Variable(
-                                    pi.with_inferred_type(Type::fresh()),
-                                    Identifier::Bound(2 + x),
-                                )
-                                .into(),
+                                function: spine.into(),
+                                argument: ast::Expr::Variable(pi, Identifier::Bound(slot(Some(j))))
+                                    .into(),
                             },
-                        )
-                    });
-                    let lambda_spine = (0..method_total_arity).rfold(apply_spine, |body, x| {
+                        );
+                    }
+                    let total_params = num_constraints + method_arity;
+                    for arg in (num_constraints + 1)..=total_params {
+                        spine = ast::Expr::Apply(
+                            pi,
+                            Apply {
+                                function: spine.into(),
+                                argument: ast::Expr::Variable(pi, Identifier::Bound(arg)).into(),
+                            },
+                        );
+                    }
+
+                    let body = (2..=total_params).rev().fold(spine, |body, x| {
                         ast::Expr::Lambda(
-                            pi.with_inferred_type(Type::fresh()),
+                            pi,
                             Lambda {
-                                parameter: Identifier::Bound(2 + x),
+                                parameter: Identifier::Bound(x),
                                 body: body.into(),
                             },
                         )
                     });
-
                     let lambda = Lambda {
                         parameter: Identifier::Bound(1),
-                        body: lambda_spine.into(),
+                        body: body.into(),
                     };
 
                     let mut type_signature = field.type_signature.clone();
@@ -488,48 +665,54 @@ impl phase::SymbolTable<Named> {
                         signature_parameters
                     };
 
-                    type_signature
-                        .constraints
-                        .insert(0, signature_constraint.clone());
+                    // Constraints in the same sorted order the body expects.
+                    type_signature.constraints =
+                        constraints.iter().map(|(_, c)| c.clone()).collect();
 
+                    // Put the constraints back on the selector so that solve_constraints
+                    // in discharge_ground_constraints can understand what to do. Normal
+                    // functions will desuguar completely.
+                    let saved = type_signature.constraints.clone();
                     type_signature.desugar_constraints();
+                    type_signature.constraints = saved;
 
                     let tree = ast::Expr::Ascription(
-                        pi.with_inferred_type(Type::fresh()),
+                        pi,
                         TypeAscription {
                             ascribed_tree: ast::Expr::RecursiveLambda(
-                                pi.with_inferred_type(Type::fresh()),
+                                pi,
                                 SelfReferential {
                                     own_name: Identifier::Bound(0),
                                     lambda,
                                 },
                             )
                             .into(),
-                            type_signature: type_signature
-                                .map_annotation(&|pi| pi.with_inferred_type(Type::fresh()))
-                                .clone(),
+                            type_signature: type_signature.clone(),
                         },
                     );
 
                     println!("insert_signature_method_selectors: {name} is {}", tree);
 
-                    out.push((
-                        name.clone(),
-                        TermSymbol {
-                            name,
-                            type_signature: Some(type_signature),
-                            body: tree.into(),
-                        },
-                    ));
+                    symbols.push(TermSymbol {
+                        name,
+                        type_signature: Some(type_signature),
+                        body: tree.into(),
+                    });
                 }
             }
         }
 
-        Ok(out)
+        Ok(symbols)
     }
 
-    fn elaborate_signature_method_placeholders(&self, ctx: &mut TypingContext) -> Typing<()> {
-        for c in &self.signatures {
+    fn insert_signature_method_placeholders(&self, ctx: &mut TypingContext) -> Typing<()> {
+        // Iterate signatures in a deterministic order. A method name shared by two
+        // signatures (e.g. `pure` in both Applicative and Monad) overwrites the
+        // placeholder, so a HashSet's iteration order would make resolution -- and
+        // thus the whole program -- nondeterministic.
+        let mut signatures = self.signatures.iter().collect::<Vec<_>>();
+        signatures.sort();
+        for c in signatures {
             let type_constructor = ctx
                 .types
                 .lookup(c)
@@ -597,278 +780,312 @@ impl phase::SymbolTable<Named> {
 }
 
 fn elaborate_term_constraints(
-    witness_index: &WitnessEnvironment,
+    symbol_name: &QualifiedName,
+    witnesses: &WitnessEnvironment,
     constraints: ConstraintSet,
     tree: ast::Expr<TypeInfo, Identifier>,
-    ctx: &TypingContext,
+    ctx: &mut TypingContext,
 ) -> Result<ast::Expr<TypeInfo, Identifier>, TypeError> {
-    println!("elaborate_term_constraints: {constraints}");
-    let (non_ground_constraints, mut expr) =
-        discharge_ground_constraints(tree, constraints, witness_index, ctx)?;
+    println!("elaborate_term_constraints: {symbol_name} has {constraints} tree {tree}");
 
-    let mut constraint_slots = non_ground_constraints.iter().collect::<Vec<_>>();
-    constraint_slots.reverse();
+    let selectors = SelectorTable::from_constraints(&constraints, &ctx.types)?;
 
-    for c in non_ground_constraints.iter() {
-        println!("elaborate_term_constraints: {c} of [{non_ground_constraints}]");
-        abstract_constraint(c, &mut expr, &constraint_slots, ctx)?;
-    }
-
-    Ok(expr)
+    Ok(resolve_constraints(
+        symbol_name,
+        tree,
+        constraints,
+        witnesses,
+        ctx,
+    )?)
 }
 
-fn abstract_constraint(
-    c: &Constraint,
-    tree: &mut Expr,
-    slots: &[&Constraint],
-    ctx: &TypingContext,
-) -> Result<(), TypeError> {
-    *tree = add_constraint_parameter_slot(tree);
-    *tree = add_constraint_projections(tree, c, slots, ctx)?;
-    Ok(())
-}
-
-fn discharge_ground_constraints(
+fn resolve_constraints(
+    symbol_name: &QualifiedName,
     mut tree: Expr,
     constraints: ConstraintSet,
-    witness_index: &WitnessEnvironment,
-    ctx: &TypingContext,
-) -> Result<(ConstraintSet, Expr), TypeError> {
-    let (ground, non_ground) = constraints.iter().partition::<Vec<_>, _>(|c| c.is_ground());
+    witnesses: &WitnessEnvironment,
+    ctx: &mut TypingContext,
+) -> Result<Expr, TypeError> {
+    let is_constrained = !constraints.is_empty();
+
+    // Variable-headed constraints (e.g. `Eq α`) can never be matched by an
+    // instance, so they must become dictionary parameters. Everything else --
+    // ground constraints (`Eq Int`) and constructor-headed constraints
+    // (`Eq (List α)`) -- is discharged by an instance, whose own premises are in
+    // turn satisfied by those parameters.
+    let (parametric, resolvable) = constraints
+        .clone()
+        .into_iter()
+        .partition::<Vec<_>, _>(|c| c.is_parametric());
+
     println!(
-        "discharge_ground_constraint: ground {} non-ground: {}",
-        display_list(", ", &ground),
-        display_list(", ", &non_ground)
+        "discharge_ground_constraints: {symbol_name} parametric: {:?} resolvable {:?}",
+        &parametric, &resolvable
     );
 
-    let evidence = ground
-        .iter()
-        .map(|c| witness_index.resolve_witness(c, &ctx.types).map(|w| (c, w)))
-        .collect::<Result<Vec<_>, TypeError>>()?;
+    // Self referential trees have own_name at #0, first parameter is
+    // therefore offset by 1.
+    let is_self_referential = matches!(
+        &tree,
+        Expr::Ascription(
+            _,
+            the
+        ) if matches!(*the.ascribed_tree, Expr::RecursiveLambda(..))
+    ) || matches!(&tree, Expr::RecursiveLambda(..));
 
-    for (constraint, evidence) in evidence {
-        println!("discharge_ground_constraint: constraint {constraint} evidence {evidence}");
-        let signature = constraint.signature(&ctx.types)?;
-        tree = inject_witness(
-            tree,
-            &signature.vtable,
-            constraint,
-            &evidence,
-            witness_index,
-            &ctx,
+    // `bind_term(Bound(0))` pushes onto the shared `bound` stack, which is not
+    // otherwise cleared between symbols in the discharge loop. Reset it so this
+    // symbol's self-reference (#0) refers to *itself*, not to whichever
+    // self-referential constrained symbol happened to be discharged first.
+    ctx.reset_self_reference();
+    if is_constrained && is_self_referential {
+        ctx.bind_term(
+            Identifier::Bound(0),
+            Constrained {
+                constraints: constraints.clone(),
+                underlying: tree.type_info().inferred_type.clone(),
+            }
+            .generalize(ctx)
+            .underlying,
         );
     }
 
-    println!("discharge_ground_constraint: {constraints} done.");
+    let mut evidence = HashMap::new();
 
-    Ok((ConstraintSet::from(non_ground.as_slice()), tree))
-}
+    // Bind a dictionary parameter (#1, #2, ...) for each variable-headed
+    // constraint. `add_dictionary_parameter_slot` always yields a
+    // self-referential tree -- `own_name` at slot #0 and parameters from #1 --
+    // both when prepending to an existing lambda and when wrapping a non-lambda
+    // body (e.g. a witness whose body is a record), so the i-th parameter is at
+    // #(1 + i).
+    for (i, c) in parametric.iter().enumerate() {
+        let name = Identifier::Bound(1 + i);
+        println!(
+            "discharge_ground_constraints: binding {name} to {}",
+            c.constraint_type
+        );
 
-fn elaborate_use_site_resolving_witnesses(
-    mut projected: Expr,
-    use_site_constraints: &ConstraintSet,
-    witness_index: &WitnessEnvironment,
-    ctx: &TypeEnvironment,
-) -> Result<Expr, TypeError> {
-    for c in use_site_constraints.iter().filter(|c| c.is_ground()) {
-        let witness = witness_index.resolve_witness(c, ctx)?;
-        println!("elaborate_use_site: add {c} witness {witness}");
-        projected = Expr::Apply(
-            projected.type_info().clone(),
-            Apply {
-                function: projected.into(),
-                argument: witness.into(),
-            },
-        )
+        tree = add_dictionary_parameter_slot(&tree);
+
+        evidence.insert(
+            c.clone(),
+            Expr::Variable(
+                tree.annotation()
+                    .parse_info
+                    .with_inferred_type(c.constraint_type.clone()),
+                name,
+            ),
+        );
     }
 
-    Ok(projected)
-}
+    // Discharge the remaining constraints through their instances, using the
+    // parameter dictionaries just bound as assumptions for the instances'
+    // premises. A recursive derived instance resolves its own head this way,
+    // reconstructing the recursive dictionary from the parameters.
+    for c in resolvable {
+        let w = witnesses.resolve_witness(&c, &ctx.types, &evidence)?;
 
-fn elaborate_use_site_inserting_slot_refs(
-    mut projected: Expr,
-    use_site_constraints: &ConstraintSet,
-    slots: &[&Constraint],
-    ctx: &TypeEnvironment,
-) -> Result<Expr, TypeError> {
-    for c in use_site_constraints.iter().filter(|c| !c.is_ground()) {
-        if let Some(index) = slots
-            .iter()
-            // Is this the correct predicate?
-            .position(|&slot_constraint| slot_constraint == c)
-        {
-            println!("elaborate_use_site_inserting_slot_refs: add {c}");
+        // If a constraint resolves to the witness we are *currently*
+        // elaborating, that is a recursive dictionary. Refer to it through the
+        // self-reference slot (#0) rather than its global name -- exactly as
+        // ordinary recursion does -- so it does not become an (undefined) global
+        // self-dependency.
+        let w = w.map(&mut |e| match e {
+            Expr::Variable(ti, Identifier::Free(name)) if name.as_ref() == symbol_name => {
+                Expr::Variable(ti, Identifier::Bound(0))
+            }
+            other => other,
+        });
 
-            let type_info = projected.type_info().clone();
-            projected = Expr::Apply(
-                type_info.clone(),
-                Apply {
-                    function: projected.into(),
-                    argument: Expr::Variable(type_info, Identifier::Bound(1 + index)).into(),
-                },
-            )
-        }
+        evidence.insert(c, w);
     }
 
-    Ok(projected)
-}
+    //    println!("discharge_ground_constraints: {evidence}");
 
-fn inject_witness(
-    tree: Expr,
-    vtable: &RecordShape,
-    constraint: &Constraint,
-    witness: &Expr,
-    witness_index: &WitnessEnvironment,
-    ctx: &TypingContext,
-) -> Expr {
-    tree.map(&mut |e| match e {
-        Expr::Variable(type_info, ref term_id @ Identifier::Free(ref m))
-            if vtable.contains(m.member()) =>
-        {
-            let method_scheme = ctx.terms.lookup(term_id).expect("expr.typed").instantiate();
-            let use_site_subst = method_scheme
-                .underlying
-                .unified_with(&type_info.inferred_type, &ctx.types)
-                .expect("expr.typed");
-            let mut use_site_constraints = method_scheme.constraints.apply(&use_site_subst);
-
-            let suitable_injection_site = use_site_constraints.iter().any(|c| c == constraint);
-
-            if suitable_injection_site {
-                println!("inject_witness: {m} use-site-constraints {use_site_constraints}");
-                use_site_constraints.without(|c| c == constraint);
-
-                let new_witness = elaborate_use_site_resolving_witnesses(
-                    witness.clone(),
-                    &use_site_constraints,
-                    witness_index,
-                    &ctx.types,
-                )
-                .expect("Can I really expect this? Witness resolution can fail.");
-
-                println!("inject_witness: witness {witness} new_witness {new_witness}");
-
-                let projected = Expr::Project(
-                    type_info,
-                    Projection {
-                        base: new_witness.clone().into(),
-                        // This must be the field index
-                        select: ProductElement::Ordinal(vtable.index_of(m.member()).unwrap()),
-                    },
-                );
-
-                projected
-            } else {
-                Expr::Variable(type_info, Identifier::Free(m.clone()))
-            }
-        }
-
-        Expr::Variable(type_info, term_id @ Identifier::Free(..)) => {
-            let scheme = ctx.terms.lookup(&term_id).unwrap();
-
-            //);
-            if scheme
-                .constraints
-                .iter()
-                .any(|c| c.name() == constraint.name())
-            {
-                Expr::Apply(
-                    type_info.clone(),
-                    Apply {
-                        function: Expr::Variable(type_info, term_id).into(),
-                        argument: witness.clone().into(),
-                    },
-                )
-            } else {
-                Expr::Variable(type_info, term_id)
-            }
-        }
-
-        others => others.clone(),
-    })
-}
-
-fn add_constraint_projections(
-    tree: &Expr,
-    constraint: &Constraint,
-    slots: &[&Constraint],
-    ctx: &TypingContext,
-) -> Result<Expr, TypeError> {
-    let signature = constraint.signature(&ctx.types)?;
-
-    let tree = tree.clone().map(&mut |e| match e {
-        Expr::Variable(type_info, ref term_id @ Identifier::Free(ref m))
-            if signature.vtable.contains(m.member()) =>
-        {
-            let projected = Expr::Project(
-                type_info.clone(),
-                Projection {
-                    base: Expr::Variable(type_info.clone(), Identifier::Bound(1)).into(),
-                    select: ProductElement::Ordinal(signature.vtable.index_of(m.member()).unwrap()),
-                },
-            );
-
-            let method_scheme = ctx.terms.lookup(term_id).expect("expr.typed").instantiate();
-            let use_site_subst = method_scheme
-                .underlying
-                .unified_with(&type_info.inferred_type, &ctx.types)
-                .expect("expr.typed");
-            let mut use_site_constraints = method_scheme.constraints.apply(&use_site_subst);
-            use_site_constraints.without(|c| {
-                let is_ok = c
-                    .constraint_type
-                    .unified_with(&constraint.constraint_type, &ctx.types)
-                    .is_ok();
-                println!("without: {c} and {constraint} is ok: {is_ok}");
-                is_ok
-            });
-
-            println!(
-                "add_constraint_projections: {term_id} constraints [{}] use-site [{}] slots {}",
-                method_scheme.constraints,
-                use_site_constraints,
-                display_list(", ", slots)
-            );
-
-            //projected
-
-            elaborate_use_site_inserting_slot_refs(
-                projected,
-                &use_site_constraints,
-                slots,
-                &ctx.types,
-            )
-            .expect("wtf")
-        }
-
-        Expr::Variable(a, term_id @ Identifier::Free(..)) => {
-            let scheme = ctx.terms.lookup(&term_id).unwrap();
-            //println!(
-            //    "add_constraint_projections: {term_id} constraints {}, constraint {constraint}",
-            //    scheme.constraints,
-            //);
-
-            if scheme.constraints.contains(constraint) {
-                //                println!("add_constraint_projections: applying #1 to {term_id}");
-                Expr::Apply(
-                    a.clone(),
-                    Apply {
-                        function: Expr::Variable(a.clone(), term_id).into(),
-                        argument: Expr::Variable(a.clone(), Identifier::Bound(1)).into(),
-                    },
-                )
-            } else {
-                Expr::Variable(a, term_id)
-            }
-        }
-
-        others => others.clone(),
-    });
+    if !evidence.is_empty() {
+        println!("Sixten!");
+        tree = discharge_constraints(tree, &evidence, witnesses, ctx);
+    }
+    tree = elaborate_constraint_method_placeholders(tree, &constraints, ctx);
 
     Ok(tree)
 }
 
-fn add_constraint_parameter_slot(expr: &Expr) -> Expr {
+// witness C2 Int := ...
+//
+// f :: forall a b. C1 a + C2 b + C3 a |- a -> b -> Text := lambda a b.
+//   c1 a; c2 b; c3 a
+//
+// g :: forall a. C1 a + C3 a |- a -> Unit := lambda a.
+//   f a 10
+//
+// a := Text
+// b := Int
+//
+// ground: C 2 Int
+// non-ground: C1 a, C3 a
+//
+// Expects tree to be post insert_selectors_at_placeholders
+//
+// This function can carry a list of type errors.
+fn discharge_constraints(
+    tree: Expr,
+    evidence: &HashMap<Constraint, Expr>,
+    witnesses: &WitnessEnvironment,
+    ctx: &TypingContext,
+) -> Expr {
+    println!("solve_constraints: tree {tree} evidence {evidence:?}");
+
+    // It crashes on access to parameter 0 in a witness
+    // function. It is not recursive so it is bound at #0.
+    // There is also the question of whether or not I should even be
+    // inspecting Identifier::Bound(..) and not just Identifier::Free(..)
+
+    tree.map(&mut |e| match e {
+        Expr::Variable(type_info, ref term_id @ (Identifier::Free(..) | Identifier::Bound(0))) => {
+            // It is just not as easy as picking #0 too. It could be a plain variable
+            println!("solve_constraints: name {term_id}");
+
+            if let Some(type_scheme) = ctx.terms.lookup(&term_id)
+                && !type_scheme.constraints.is_empty()
+            {
+                let use_site_type = type_scheme.instantiate();
+
+                println!(
+                    "solve_constraints: scheme {use_site_type} type {}",
+                    type_info.inferred_type
+                );
+
+                let use_site_subst = use_site_type
+                    .underlying
+                    .unified_with(&type_info.inferred_type, &ctx.types)
+                    .expect("expr.typed");
+                let use_site_constraints = use_site_type.constraints.apply(&use_site_subst);
+
+                let is_injection_site = use_site_constraints
+                    .iter()
+                    .any(|c| evidence.contains_key(c));
+
+                if is_injection_site {
+                    //println!("solve_constraints: {method_name} ")
+
+                    use_site_constraints.iter().fold(
+                        Expr::Variable(type_info.clone(), term_id.clone()),
+                        |f, c| {
+                            let mut w = evidence[c].clone();
+
+                            // Do not try to insert dictionaries into variables, these
+                            // are for non-ground constraints that have be deferred
+                            // to dictionary paramters in the current top-level declaration
+                            if !matches!(w, Expr::Variable(..)) {
+                                w = discharge_constraints(
+                                    evidence[c].clone(),
+                                    evidence,
+                                    witnesses,
+                                    ctx,
+                                );
+                            }
+
+                            Expr::Apply(
+                                type_info.clone(),
+                                Apply {
+                                    function: f.into(),
+                                    argument: w.into(),
+                                },
+                            )
+                        },
+                    )
+                } else {
+                    Expr::Variable(type_info, term_id.clone())
+                }
+            } else {
+                Expr::Variable(type_info, term_id.clone())
+            }
+        }
+
+        _otherwise => _otherwise,
+    })
+}
+
+struct SelectorTable<'a>(HashMap<parser::Identifier, Vec<&'a Constraint>>);
+
+impl<'a> SelectorTable<'a> {
+    fn from_constraints(set: &'a ConstraintSet, ctx: &TypeEnvironment) -> Result<Self, TypeError> {
+        let mut constraint_signatures = HashMap::<_, Vec<_>>::new();
+
+        for c in set.iter() {
+            let signature = c.signature(&ctx)?;
+            for method in signature.vtable.into_vec() {
+                constraint_signatures.entry(method).or_default().push(c);
+            }
+        }
+
+        Ok(Self(constraint_signatures))
+    }
+
+    // This could give an iterator instead
+    fn selector_names(&self, placeholder: &QualifiedName) -> Vec<(&Constraint, QualifiedName)> {
+        let candidates = self.0.get(placeholder.member()).unwrap_or(&vec![]);
+
+        todo!()
+    }
+}
+
+fn elaborate_constraint_method_placeholders(
+    tree: Expr,
+    evidence: &ConstraintSet,
+    ctx: &TypingContext,
+) -> Expr {
+    let mut constraint_signatures = HashMap::new();
+    for c in evidence.iter() {
+        let signature = c.signature(&ctx.types).expect("expr.typed");
+        for method in signature.vtable.into_vec() {
+            constraint_signatures.insert(method, c);
+        }
+    }
+
+    // What if this function resolves the type scheme of the selector method name
+    // it names?
+
+    tree.map(&mut |e| match e {
+        Expr::Variable(type_info, ref term_id @ Identifier::Free(ref method_name))
+            if constraint_signatures.contains_key(method_name.member()) =>
+        {
+            let constraint = constraint_signatures[method_name.member()];
+            let QualifiedName { module, member } = constraint.name();
+            let selector_name = QualifiedName::new(
+                module.clone(),
+                &format!("{member}${}", method_name.member()),
+            );
+
+            let ty = ctx.terms.lookup_free(&selector_name);
+            println!("elaborate_constraint_method_placeholders: {selector_name} :: {ty:?} ");
+
+            Expr::Variable(
+                TypeInfo {
+                    parse_info: type_info.parse_info,
+                    inferred_type: ty.unwrap().underlying.clone().into(),
+                },
+                //TypeInfo {
+                //    parse_info: type_info.parse_info,
+                //    inferred_type: type_info.inferred_type.into(),
+                //},
+                //TypeInfo {
+                //    parse_info: type_info.parse_info,
+                //    inferred_type: Type::Arrow {
+                //        domain: constraint.constraint_type.clone().into(),
+                //        codomain: type_info.inferred_type.into(),
+                //    },
+                //},
+                Identifier::Free(selector_name.into()),
+            )
+        }
+
+        otherwise => otherwise,
+    })
+}
+
+fn add_dictionary_parameter_slot(expr: &Expr) -> Expr {
     if let Expr::Ascription(a0, ascription) = expr {
         match ascription.ascribed_tree.as_ref() {
             Expr::RecursiveLambda(a1, rec) => Expr::Ascription(
@@ -908,7 +1125,33 @@ fn add_constraint_parameter_slot(expr: &Expr) -> Expr {
             ),
         }
     } else {
-        expr.clone()
+        // A non-ascribed tree, e.g. an inferred constrained function or a lifted
+        // witness method body. Slot the dictionary parameter directly, with no
+        // ascription to preserve. Same shape as above: `own_name` at #0, the new
+        // parameter at #1.
+        match expr {
+            Expr::RecursiveLambda(a1, rec) => Expr::RecursiveLambda(
+                a1.clone(),
+                SelfReferential {
+                    own_name: rec.own_name.clone(),
+                    lambda: rec.lambda.clone().prepend_parameter().clone(),
+                },
+            ),
+
+            other => Expr::RecursiveLambda(
+                other.annotation().clone(),
+                SelfReferential {
+                    own_name: Identifier::Bound(0),
+                    lambda: Lambda {
+                        parameter: Identifier::Bound(1),
+                        body: other
+                            .clone()
+                            .map(&mut |e| e.shift_de_bruijn_levels(0, 2))
+                            .into(),
+                    },
+                },
+            ),
+        }
     }
 }
 
@@ -1323,6 +1566,10 @@ impl ConstraintSet {
         self.0.iter()
     }
 
+    pub fn into_iter(self) -> impl Iterator<Item = Constraint> {
+        self.0.into_iter()
+    }
+
     pub fn variables(&self) -> HashSet<MetaVariable> {
         self.0.iter().flat_map(|tv| tv.variables()).collect()
     }
@@ -1347,7 +1594,7 @@ impl From<&[&Constraint]> for ConstraintSet {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Constraint {
     pub constraint_type: Type,
 }
@@ -1406,6 +1653,19 @@ impl Constraint {
     fn is_ground(&self) -> bool {
         let variables = self.variables();
         variables.is_empty()
+    }
+
+    /// A constraint whose constrained type is a bare type variable (e.g. `Eq α`).
+    /// No instance can ever match a bare variable, so such a constraint must be
+    /// discharged by a dictionary *parameter*. Every other constraint -- ground
+    /// (`Eq Int`) or constructor-headed (`Eq (List α)`) -- is discharged by an
+    /// instance instead, with that instance's own premises satisfied by the
+    /// parameters.
+    fn is_parametric(&self) -> bool {
+        matches!(
+            &self.constraint_type,
+            Type::Apply { argument, .. } if matches!(argument.as_ref(), Type::Variable(..))
+        )
     }
 }
 
@@ -2402,7 +2662,9 @@ impl TermEnvironment {
 
     pub fn lookup(&self, term: &namer::Identifier) -> Option<&TypeScheme> {
         match term {
-            namer::Identifier::Bound(index) => Some(&self.bound[*index]),
+            namer::Identifier::Bound(index) => {
+                (*index < self.bound.len()).then(|| &self.bound[*index])
+            }
             namer::Identifier::Free(member) => self.free.get(member),
         }
     }
@@ -2436,6 +2698,10 @@ impl RecordShape {
 
     pub fn contains(&self, field_name: &parser::Identifier) -> bool {
         self.0.contains(field_name)
+    }
+
+    pub fn into_vec(self) -> Vec<parser::Identifier> {
+        self.0
     }
 }
 
@@ -2574,6 +2840,13 @@ pub struct TypingContext {
 }
 
 impl TypingContext {
+    /// Clear the local (`Bound`) term stack. Used before binding a top-level
+    /// symbol's self-reference (`#0`) during constraint discharge, so it does not
+    /// resolve to a stale entry left by an earlier symbol.
+    pub fn reset_self_reference(&mut self) {
+        self.terms.bound.clear();
+    }
+
     pub fn expand_type_constructor(
         &self,
         pi: ParseInfo,
@@ -2989,10 +3262,17 @@ impl TypingContext {
                     let typed = self.check_expr(&expected_field_type.underlying, expr)?;
                     expected_types.push((name.clone(), expected_field_type.underlying));
                     subst = subst.compose(&typed.substitutions);
-                    constraints = constraints
-                        .apply(&subst)
-                        .union(typed.constraints.apply(&subst))
-                        .union(expected_field_type.constraints);
+
+                    // A method whose signature carries its own constraint (e.g.
+                    // `mconcat :: ∀α. Monoid α |- m α -> α`) is a rank-2 field: its
+                    // value must be a polymorphic, dictionary-taking function, so
+                    // the constraint is discharged *inside the field* and must not
+                    // escape to the witness. Ordinary (unconstrained) fields bubble
+                    // their inferred constraints as usual.
+                    constraints = constraints.apply(&subst);
+                    if expected_field_type.constraints.is_empty() {
+                        constraints = constraints.union(typed.constraints.apply(&subst));
+                    }
                     typed_fields.push((name.clone(), typed.tree.into()));
                 }
 
@@ -3199,7 +3479,11 @@ impl TypingContext {
             .unified_with(&ascribed_tree.tree.type_info().inferred_type, &self.types)
             .map_err(|e| e.at(pi))?;
 
-        Ok(ascribed_tree.apply(&subst).map_tree(&mut |tree| {
+        let tree = ascribed_tree.apply(&subst).tree;
+
+        Ok(Typed::computed(
+            ascribed_tree.substitutions.compose(&subst),
+            ascribed_tree.constraints.apply(&subst),
             Expr::Ascription(
                 tree.type_info().clone(),
                 TypeAscription {
@@ -3209,8 +3493,8 @@ impl TypingContext {
                         inferred_type: ascribed_type.underlying.clone(),
                     }),
                 },
-            )
-        }))
+            ),
+        ))
     }
 
     #[instrument]

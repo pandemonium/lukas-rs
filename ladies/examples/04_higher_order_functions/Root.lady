@@ -1,0 +1,13 @@
+(* Functions as values: the classic combinators. *)
+
+id :: ∀α. α -> α := λx. x
+compose :: ∀α β γ. (β -> γ) -> (α -> β) -> α -> γ := λg f a. g (f a)
+flip :: ∀α β r. (α -> β -> r) -> β -> α -> r := λf b a. f a b
+const :: ∀α β. α -> β -> α := λa _. a
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  let inc = λx. x + 1 in
+  print_endline (prim_show (compose inc inc 40))  (* inc (inc 40) = 42 *)
+  print_endline (prim_show (flip const 1 2))      (* const 2 1 = 2 *)
+  print_endline (prim_show (id 5))

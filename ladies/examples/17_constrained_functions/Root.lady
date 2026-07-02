@@ -1,0 +1,23 @@
+(* A function with a class constraint: the premise becomes a dictionary threaded
+   through to the methods. *)
+
+List ::= ∀α. Nil | Cons α (List α)
+
+signature Monoid ::= ∀α.
+  { mempty  :: α
+    mappend :: α -> α -> α
+  }
+
+witness Monoid Int :=
+  { mempty  := 0
+    mappend := λp q. p + q
+  }
+
+mconcat :: ∀α. Monoid α |- List α -> α := λxs.
+  deconstruct xs into
+    Cons a tail -> mappend a (mconcat tail)
+  | Nil         -> mempty
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (mconcat (Cons 1 (Cons 2 (Cons 3 Nil)))))   (* 6 *)

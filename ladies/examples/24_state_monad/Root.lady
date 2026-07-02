@@ -1,0 +1,17 @@
+(* The State monad from the standard library: thread mutable state through a
+   pure computation. *)
+
+use Stdlib.
+
+(* read the counter, then increment it *)
+tick :: State Int Int :=
+  State.bind (λn.
+    State.bind (λ_.
+      State.pure n
+    ) (State.put (n + 1))
+  ) State.get
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (State.eval tick 41))   (* value read: 41 *)
+  print_endline (prim_show (State.exec tick 41))   (* final state: 42 *)

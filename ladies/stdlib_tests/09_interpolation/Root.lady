@@ -1,0 +1,5 @@
+use Stdlib.
+(* String interpolation via Display -- expect: val is 42. *)
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline "val is `40 + 2`."

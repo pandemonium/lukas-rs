@@ -1,0 +1,15 @@
+(* Modules: grouped declarations and qualified access (including self-qualified
+   references within a module). *)
+
+module Math:
+  square :: Int -> Int := λx. x * x
+  cube :: Int -> Int := λx. x * Math.square x
+
+module Stats:
+  sum3 :: Int -> Int -> Int -> Int := λa b c. a + b + c
+  mean3 :: Int -> Int -> Int -> Int := λa b c. Stats.sum3 a b c / 3
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (Math.cube 3))       (* 27 *)
+  print_endline (prim_show (Stats.mean3 3 6 9)) (* 6 *)

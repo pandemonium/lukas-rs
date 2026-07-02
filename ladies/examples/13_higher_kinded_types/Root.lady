@@ -1,0 +1,12 @@
+(* A type constructor of kind `* -> *`, used generically. *)
+
+Box ::= ∀α. MkBox α
+
+map_box :: ∀α β. (α -> β) -> Box α -> Box β := λf b. MkBox (f (unbox b))
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  let b = MkBox 20 in
+  print_endline (prim_show (unbox (map_box (λx. x * 2 + 1) b)))   (* 41 *)
+
+unbox :: ∀α. Box α -> α := λb. deconstruct b into MkBox a -> a

@@ -181,8 +181,19 @@ impl WitnessEnvironment {
         &self,
         constraint: &Constraint,
         ctx: &TypeEnvironment,
+        assumptions: &HashMap<Constraint, phase::Expr<Types>>,
     ) -> Result<phase::Expr<Types>, TypeError> {
         println!("resolve_witness: {constraint}");
+
+        // A constraint we already hold as evidence -- a dictionary parameter of
+        // the enclosing declaration, e.g. the `Eq α` premise threaded into an
+        // `Eq (List α)` instance -- is discharged directly by that evidence.
+        // This is what lets a recursive derived instance tie its own knot: the
+        // instance's `Eq (List α)` premise resolves to the instance applied to
+        // the `Eq α` parameter it already has in scope.
+        if let Some(evidence) = assumptions.get(constraint) {
+            return Ok(evidence.clone());
+        }
 
         let candidates = self
             .store
@@ -190,9 +201,17 @@ impl WitnessEnvironment {
             .ok_or_else(|| TypeError::NoWitness(constraint.clone()))?;
 
         for witness in candidates {
-            let subst = constraint
+            // Unify witness-head-against-query (not the reverse) so the
+            // witness's own quantifier variables are substituted *into the
+            // query's* variables. That keeps a resolved premise (e.g. `Eq α`)
+            // expressed in the same variable as the surrounding dictionary
+            // parameters, so the `assumptions` lookup above can find it. For a
+            // ground query the concrete type forces the same substitution either
+            // way.
+            let subst = witness
+                .head
                 .constraint_type
-                .unified_with(&witness.head.constraint_type, ctx);
+                .unified_with(&constraint.constraint_type, ctx);
 
             if subst.is_err() {
                 continue;
@@ -211,7 +230,7 @@ impl WitnessEnvironment {
             let solution = witness
                 .premises
                 .iter()
-                .map(|c| self.resolve_witness(c, ctx))
+                .map(|c| self.resolve_witness(c, ctx, assumptions))
                 .collect::<Result<Vec<_>, _>>();
 
             // Compute some honest type info to insert?

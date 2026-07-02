@@ -1,0 +1,29 @@
+(* 04: A top-level function carrying a constraint. *)
+(* `mconcat` is `Monoid α |- List α -> α`; elaboration must turn the premise *)
+(* into a dictionary parameter, thread it through to `mappend`/`mempty`, and *)
+(* discharge it with the ground `Monoid Int` witness at the call site. *)
+
+List ::= ∀α. Nil | Cons α (List α)
+
+signature Monoid ::= ∀α.
+  { mempty  :: α
+    mappend :: α -> α -> α
+  }
+
+witness Monoid Int :=
+  { mempty  := 0
+    mappend := λp q. p + q
+  }
+
+fold_right :: ∀z α. (α -> z -> z) -> z -> List α -> z :=
+  λf z xs.
+    deconstruct xs into
+      Cons a tail -> f a (fold_right f z tail)
+    | Nil         -> z
+
+mconcat :: ∀α. Monoid α |- List α -> α :=
+  λxs. fold_right mappend mempty xs
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (mconcat (Cons 1 (Cons 2 (Cons 3 Nil)))))

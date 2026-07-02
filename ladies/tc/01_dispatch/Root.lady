@@ -1,0 +1,15 @@
+(* 01: The simplest possible type class. *)
+(* A single-method signature whose method takes the class parameter as an *)
+(* argument, so the instance is dispatched purely from the argument's type. *)
+
+signature Show ::= ∀α.
+  { show :: α -> Text
+  }
+
+witness Show Int :=
+  { show := λn. prim_show n
+  }
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (show 42)

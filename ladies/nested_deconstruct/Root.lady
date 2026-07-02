@@ -1,0 +1,23 @@
+(* Layout bug: an *inline* nested `deconstruct` mis-parses. *)
+(* *)
+(* Here the inner match sits on one line inside the first clause of the outer *)
+(* match. The outer `| Nope -> 0` on the following line is wrongly attached to *)
+(* the inner `deconstruct q`, so parsing derails (observed: a parse error, or *)
+(* a spurious "clause is not useful" once layout shifts). *)
+(* *)
+(* The same program written with the inner `deconstruct` fully block-indented *)
+(* on its own lines parses and runs fine -- so this is purely a layout / clause *)
+(* attachment problem in the parser, not a typing issue. *)
+(* *)
+(* Expected: prints 7. Currently: fails to parse. *)
+
+Perhaps ::= ∀α. Nope | This α
+
+both :: Perhaps Int -> Perhaps Int -> Int := λp q.
+  deconstruct p into
+    This a -> deconstruct q into This b -> a + b | Nope -> a
+  | Nope   -> 0
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (both (This 3) (This 4)))

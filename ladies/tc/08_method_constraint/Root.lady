@@ -1,0 +1,35 @@
+(* 08: A signature method that itself carries an extra constraint. *)
+(* `Mconcat` is higher-kinded, and its method `mconcat` is *)
+(* `∀α. Monoid α |- m α -> α`. The known-open bug (see todo): such method *)
+(* constraints are not discharged, so the selector returns a closure despite *)
+(* typing correctly. This is the smallest reproduction of that failure. *)
+
+List ::= ∀α. Nil | Cons α (List α)
+
+signature Monoid ::= ∀α.
+  { mempty  :: α
+    mappend :: α -> α -> α
+  }
+
+witness Monoid Int :=
+  { mempty  := 0
+    mappend := λp q. p + q
+  }
+
+fold_right :: ∀z α. (α -> z -> z) -> z -> List α -> z :=
+  λf z xs.
+    deconstruct xs into
+      Cons a tail -> f a (fold_right f z tail)
+    | Nil         -> z
+
+signature Mconcat ::= ∀m : * -> *.
+  { mconcat :: ∀α. Monoid α |- m α -> α
+  }
+
+witness Mconcat List :=
+  { mconcat := λxs. fold_right mappend mempty xs
+  }
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (mconcat (Cons 1 (Cons 2 (Cons 3 Nil)))))

@@ -1,0 +1,7 @@
+use Stdlib.
+(* Functor fmap (Perhaps) -- expect 42 *)
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  deconstruct fmap (λx. x + 1) (This 41) into
+    This n -> print_endline (prim_show n)
+  | Nope   -> print_endline "no"

@@ -1,0 +1,28 @@
+(* Lambdas, currying, partial application, and higher-order combinators. *)
+
+id :: ∀α. α -> α := λx. x
+
+compose :: ∀α β γ. (β -> γ) -> (α -> β) -> α -> γ := λg f a. g (f a)
+
+flip :: ∀α β r. (α -> β -> r) -> β -> α -> r := λf b a. f a b
+
+const :: ∀α β. α -> β -> α := λa _. a
+
+add :: Int -> Int -> Int := λa b. a + b
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+
+  (* partial application ; expect 42 *)
+  let inc = add 1 in
+  print_endline (prim_show (inc 41))
+
+  (* composition ; expect 42 *)
+  let twice = compose inc inc in
+  print_endline (prim_show (twice 40))
+
+  (* flip + const ; flip const 99 7 = const 7 99 = 7 *)
+  print_endline (prim_show (flip const 99 7))
+
+  (* identity ; expect 5 *)
+  print_endline (prim_show (id 5))

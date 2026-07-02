@@ -1,0 +1,16 @@
+(* Deconstruction over several scrutinees at once, plus a catch-all. *)
+
+Perhaps ::= ∀α. Nope | This α
+
+add_maybe :: Perhaps Int -> Perhaps Int -> Perhaps Int := λa b.
+  deconstruct a, b into
+    This x, This y -> This (x + y)
+  | otherwise      -> Nope
+
+show_maybe :: Perhaps Int -> Text := λp.
+  deconstruct p into This n -> prim_show n | Nope -> "nope"
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (show_maybe (add_maybe (This 40) (This 2)))   (* 42 *)
+  print_endline (show_maybe (add_maybe (This 1) Nope))        (* nope *)

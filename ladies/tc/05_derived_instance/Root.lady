@@ -1,0 +1,33 @@
+(* 05: A conditional / derived instance. *)
+(* `Eq (List α)` holds only given `Eq α`. Resolving `eq` on two lists must *)
+(* select the derived witness and, in turn, discharge its `Eq α` premise with *)
+(* the `Eq Int` witness for the elements. *)
+
+List ::= ∀α. Nil | Cons α (List α)
+
+signature Eq ::= ∀α.
+  { eq :: α -> α -> Bool
+  }
+
+witness Eq Int :=
+  { eq := λp q. p = q
+  }
+
+witness ∀α. Eq α |- Eq (List α) :=
+  { eq := λxs ys.
+      deconstruct xs, ys into
+        Cons x xs, Cons y ys -> eq x y and eq xs ys
+      | Nil, Nil             -> true
+      | otherwise            -> false
+  }
+
+yesno :: Bool -> Text :=
+  λb. if b then "true" else "false"
+
+start :: Int -> Unit := λ_.
+  let a = Cons 1 (Cons 2 (Cons 3 Nil)) in
+  let b = Cons 1 (Cons 2 (Cons 3 Nil)) in
+  let c = Cons 1 (Cons 9 Nil) in
+  print_endline "##TC"
+  print_endline (yesno (eq a b))
+  print_endline (yesno (eq a c))

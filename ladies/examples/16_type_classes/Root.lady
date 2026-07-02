@@ -1,0 +1,14 @@
+(* A `signature` (class) with a `witness` (instance) per type; dispatch on the
+   argument's type. *)
+
+signature Show ::= ∀α.
+  { show :: α -> Text
+  }
+
+witness Show Int  := { show := λn. prim_show n }
+witness Show Bool := { show := λb. if b then "true" else "false" }
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (show 42)     (* Show Int  *)
+  print_endline (show true)   (* Show Bool *)

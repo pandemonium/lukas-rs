@@ -1,0 +1,13 @@
+(* Self-recursive definitions. *)
+
+factorial :: Int -> Int := λn.
+  if n = 0 then 1 else n * factorial (n - 1)
+
+fibonacci :: Int -> Int := λn.
+  if n = 0 or n = 1 then 1
+  else fibonacci (n - 1) + fibonacci (n - 2)
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (factorial 5))    (* 120 *)
+  print_endline (prim_show (fibonacci 10))   (* 89 *)

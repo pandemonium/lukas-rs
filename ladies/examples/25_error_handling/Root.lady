@@ -1,0 +1,24 @@
+(* Error handling with a Result type, custom errors, and a chaining combinator. *)
+
+Result ::= ∀α e. Fault e | Return α
+Error  ::= DivByZero | Negative
+
+safe_div :: Int -> Int -> Result Int Error := λa b.
+  if b = 0 then Fault DivByZero else Return (a / b)
+
+(* run the next fallible step only if the previous one succeeded *)
+chain :: ∀α β e. (α -> Result β e) -> Result α e -> Result β e := λf r.
+  deconstruct r into
+    Return a -> f a
+  | Fault e  -> Fault e
+
+show :: Result Int Error -> Text := λr.
+  deconstruct r into
+    Return a          -> prim_show a
+  | Fault DivByZero   -> "error: divide by zero"
+  | Fault Negative    -> "error: negative"
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (show (chain (λx. safe_div x 2) (Return 84)))   (* 42 *)
+  print_endline (show (chain (λx. safe_div x 0) (Return 84)))   (* error: divide by zero *)

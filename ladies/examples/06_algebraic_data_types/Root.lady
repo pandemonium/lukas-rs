@@ -1,0 +1,15 @@
+(* Sum types (coproducts) with constructors of different arities. *)
+
+Shape ::= Circle Int | Rectangle Int Int | Dot
+
+area :: Shape -> Int := λs.
+  deconstruct s into
+    Circle r      -> 3 * r * r
+  | Rectangle w h -> w * h
+  | Dot           -> 0
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (area (Circle 10)))      (* 300 *)
+  print_endline (prim_show (area (Rectangle 3 4)))  (* 12 *)
+  print_endline (prim_show (area Dot))              (* 0 *)

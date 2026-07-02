@@ -1,0 +1,8 @@
+(* `let … in`, nested lets, and shadowing. *)
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  let x = 10 in
+  let y = x + 5 in       (* refers to the earlier binding *)
+  let x = y * 2 in       (* shadows the outer x *)
+  print_endline (prim_show x)   (* 30 *)

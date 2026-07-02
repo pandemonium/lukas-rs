@@ -1,0 +1,13 @@
+(* Matching on literal values with `otherwise` as a catch-all. *)
+
+name :: Int -> Text := λn.
+  deconstruct n into
+    1         -> "one"
+  | 2         -> "two"
+  | 3         -> "three"
+  | otherwise -> "many"
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (name 2)   (* two *)
+  print_endline (name 9)   (* many *)

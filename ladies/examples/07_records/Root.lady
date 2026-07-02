@@ -1,0 +1,14 @@
+(* Records: declaration, construction (:=), projection (.F), patterns (F:). *)
+
+Point ::=
+  { X :: Int
+    Y :: Int
+  }
+
+mk :: Int -> Int -> Point := λx y. { X := x; Y := y }
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  let p = mk 3 4 in
+  print_endline (prim_show (p.X * p.X + p.Y * p.Y))   (* 25 *)
+  deconstruct p into { X: a; Y: b } -> print_endline (prim_show (a + b))   (* 7 *)

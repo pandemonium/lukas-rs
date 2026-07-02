@@ -1,0 +1,5 @@
+use Stdlib.
+(* Monoid mappend (Text) -- expect abcd *)
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (mappend "ab" "cd")

@@ -1,0 +1,7 @@
+use Stdlib.
+(* Perhaps.map -- expect 42 *)
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  deconstruct Perhaps.map (λx. x + 1) (This 41) into
+    This n -> print_endline (prim_show n)
+  | Nope   -> print_endline "no"

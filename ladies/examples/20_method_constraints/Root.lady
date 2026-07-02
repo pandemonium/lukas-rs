@@ -1,0 +1,26 @@
+(* A signature method that carries its *own* constraint. `squash` is
+   `∀α. Monoid α |- m α -> α`, so the dictionary is supplied per call. *)
+
+Box ::= ∀α. MkBox α
+
+signature Monoid ::= ∀α.
+  { mempty  :: α
+    mappend :: α -> α -> α
+  }
+
+witness Monoid Int :=
+  { mempty  := 0
+    mappend := λp q. p + q
+  }
+
+signature Squash ::= ∀m : * -> *.
+  { squash :: ∀α. Monoid α |- m α -> α
+  }
+
+witness Squash Box :=
+  { squash := λb. deconstruct b into MkBox a -> mappend a mempty
+  }
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (squash (MkBox 5)))   (* mappend 5 0 = 5 *)

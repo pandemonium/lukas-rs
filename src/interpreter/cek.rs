@@ -62,35 +62,39 @@ impl Closure {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Globals(HashMap<QualifiedName, Val>);
+pub struct Globals(Rc<RefCell<HashMap<QualifiedName, Val>>>);
 
-// But this means that all functions essentally close over Globals thus far
-// They should all share the same and it does not matter that what they own
-// a reference to is modified underneeth, things cannot disappear from globals
+// Globals are shared and *live*: every closure closes over the same map (cloning
+// `Globals` shares the `Rc`), so a symbol defined later during static
+// initialization is visible to a closure captured earlier. This is what lets
+// mutually recursive top-level definitions -- e.g. a recursive dictionary and its
+// lifted method body referencing each other -- resolve at call time. Nothing is
+// ever removed, so an outstanding reference can never dangle.
 impl Globals {
-    fn lookup(&self, name: &QualifiedName) -> Option<&Val> {
-        let Self(m) = self;
-        m.get(name)
+    fn lookup(&self, name: &QualifiedName) -> Option<Val> {
+        self.0.borrow().get(name).cloned()
     }
 
-    pub fn define(&mut self, name: QualifiedName, val: Val) {
-        let Self(m) = self;
-        m.insert(name, val);
+    pub fn define(&self, name: QualifiedName, val: Val) {
+        self.0.borrow_mut().insert(name, val);
     }
 
-    fn bindings(&self) -> impl Iterator<Item = (&QualifiedName, &Val)> {
-        let Self(m) = self;
-        m.iter()
+    fn bindings(&self) -> Vec<(QualifiedName, Val)> {
+        self.0
+            .borrow()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     fn len(&self) -> usize {
-        self.0.len()
+        self.0.borrow().len()
     }
 }
 
 #[derive(Default)]
 pub struct Env {
-    globals: Rc<Globals>,
+    globals: Globals,
     locals: Rc<RefCell<Vec<Val>>>,
 }
 
@@ -114,7 +118,7 @@ impl Env {
 
     pub fn from_globals(globals: Globals) -> Self {
         Self {
-            globals: Rc::new(globals),
+            globals,
             locals: Rc::new(RefCell::new(Vec::default())),
         }
     }
@@ -128,7 +132,7 @@ impl Env {
 
     pub fn disjoint(&self) -> Self {
         Self {
-            globals: Rc::clone(&self.globals),
+            globals: self.globals.clone(),
             locals: Rc::new(RefCell::new(self.locals.borrow().clone())),
         }
     }
@@ -145,7 +149,7 @@ impl Env {
         self.locals.borrow_mut().pop().unwrap()
     }
 
-    pub fn global(&self, binder: &QualifiedName) -> Option<&Val> {
+    pub fn global(&self, binder: &QualifiedName) -> Option<Val> {
         self.globals.lookup(binder)
     }
 
@@ -191,7 +195,7 @@ impl Env {
             RuntimeError::NoSuchSymbol(namer::Identifier::Free(symbol_name.clone().into()))
         })?;
 
-        interpret_closure(symbol_name, closure, vec![Val::Constant(argument.into())])
+        interpret_closure(symbol_name, &closure, vec![Val::Constant(argument.into())])
     }
 }
 
@@ -661,7 +665,7 @@ impl Expr {
             Self::Variable(_, the) => {
                 let value = match the {
                     namer::Identifier::Bound(index) => environment.local(*index),
-                    namer::Identifier::Free(name) => environment.global(name).cloned(),
+                    namer::Identifier::Free(name) => environment.global(name),
                 };
 
                 value.map_or_else(
@@ -858,6 +862,7 @@ impl fmt::Display for Env {
         let static_prefix = self
             .globals
             .bindings()
+            .into_iter()
             .take(5)
             .map(|(path, value)| format!("{path}: {value}"))
             .collect::<Vec<_>>()

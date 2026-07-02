@@ -1,0 +1,19 @@
+(* Literals, operators, comparison, boolean ops, if/then/else, and let. *)
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+
+  (* arithmetic: * / % bind tighter than + - ; expect 12 *)
+  print_endline (prim_show (2 + 3 * 4 - 10 / 2 + 7 % 4))
+
+  (* comparison + boolean and/or ; expect yes *)
+  print_endline (if (3 < 4) and (5 >= 5) then "yes" else "no")
+
+  (* if as an expression ; expect 100 *)
+  print_endline (prim_show (if 2 = 2 then 100 else 0))
+
+  (* let, nested let, and shadowing ; expect 30 *)
+  let x = 10 in
+  let y = x + 5 in
+  let x = y * 2 in
+  print_endline (prim_show x)

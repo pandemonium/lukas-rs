@@ -1,0 +1,13 @@
+(* Grouping definitions into modules, with qualified access. *)
+
+module Math:
+  square :: Int -> Int := λx. x * x
+  cube :: Int -> Int := λx. x * Math.square x    (* self-qualified reference *)
+
+module Stats:
+  mean3 :: Int -> Int -> Int -> Int := λa b c. (a + b + c) / 3
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (Math.cube 3))         (* 27 *)
+  print_endline (prim_show (Stats.mean3 3 6 9))   (* 6 *)

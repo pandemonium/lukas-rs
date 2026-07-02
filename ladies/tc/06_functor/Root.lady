@@ -1,0 +1,31 @@
+(* 06: A higher-kinded class (Functor over `* -> *`). *)
+(* The signature is quantified over a type constructor `f`, and the method *)
+(* `fmap` carries its own quantifiers `∀α β`. Instance is `Functor List`. *)
+
+List ::= ∀α. Nil | Cons α (List α)
+
+signature Functor ::= ∀f : * -> *.
+  { fmap :: ∀α β. (α -> β) -> f α -> f β
+  }
+
+map :: ∀α β. (α -> β) -> List α -> List β :=
+  λf xs.
+    deconstruct xs into
+      Cons a tail -> Cons (f a) (map f tail)
+    | Nil         -> Nil
+
+fold_right :: ∀z α. (α -> z -> z) -> z -> List α -> z :=
+  λf z xs.
+    deconstruct xs into
+      Cons a tail -> f a (fold_right f z tail)
+    | Nil         -> z
+
+witness Functor List :=
+  { fmap := λf xs. map f xs
+  }
+
+start :: Int -> Unit := λ_.
+  let xs = Cons 1 (Cons 2 (Cons 3 Nil)) in
+  let ys = fmap (λx. x * 10) xs in
+  print_endline "##TC"
+  print_endline (prim_show (fold_right (λa z. a + z) 0 ys))

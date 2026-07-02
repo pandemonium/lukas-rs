@@ -1,0 +1,18 @@
+(* 03: A multi-method class (Monoid Int). *)
+(* `mappend` dispatches from its arguments; `mempty` is return-type *)
+(* polymorphic and must be resolved by unification with the surrounding *)
+(* concrete use (here it unifies with Int through `mappend`). *)
+
+signature Monoid ::= ∀α.
+  { mempty  :: α
+    mappend :: α -> α -> α
+  }
+
+witness Monoid Int :=
+  { mempty  := 0
+    mappend := λp q. p + q
+  }
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (mappend 3 (mappend 4 mempty)))

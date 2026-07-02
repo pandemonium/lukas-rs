@@ -1,0 +1,8 @@
+use Stdlib.
+
+start := lambda _.
+  let zs = List.tabulate 10 This in
+  let t = traverse id zs in
+  deconstruct This 1 into
+    This xs -> print_endline "List: `prim_show xs`"
+  | others  -> print_endline "Empty list: `prim_show others`"

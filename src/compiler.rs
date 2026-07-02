@@ -104,20 +104,20 @@ impl Compiler {
         let resolved_symbols = symbols.desugar().resolve_names()?;
 
         let dependencies = resolved_symbols.dependency_matrix();
-        let evaluation_order = dependencies.in_resolvable_order();
 
         if dependencies.are_sound() {
-            let mut globals = Globals::default();
+            // Shared, live globals: `clone()` shares the underlying map, so a
+            // closure captured for an earlier symbol sees symbols defined later
+            // (mutually recursive dictionaries / lifted methods).
+            let globals = Globals::default();
 
-            for symbol in resolved_symbols
-                .elaborate_compilation_unit()?
-                // Should compute a new evaluation_order before .terms
-                // -- one that takes witness premises into account
-                .terms(evaluation_order.iter())
-            {
+            let compilation_unit = resolved_symbols.elaborate_compilation_unit()?;
+            let deps = compilation_unit.dependency_matrix();
+            let evaluation_order = deps.in_resolvable_order();
+
+            for symbol in compilation_unit.terms(evaluation_order.iter()) {
                 let value = Rc::new(symbol.body.erase_annotation())
                     .interpret(Env::from_globals(globals.clone()))
-                    //.reduce(&Env::from_globals(globals.clone()))
                     .expect("successful static init");
 
                 globals.define(symbol.name.clone(), value);

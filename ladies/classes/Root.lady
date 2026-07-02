@@ -1,4 +1,9 @@
-use Stdlib.
+List ::= forall a. Cons a (List a) | Nil
+
+sum_list :: forall a. Monoid a |- List a -> a := lambda xs.
+  deconstruct xs into
+    Cons a as -> mappend a (sum_list as)
+  | Nil -> mempty
 
 signature Monoid ::= ∀α.
   { mempty  :: α
@@ -10,26 +15,21 @@ witness Monoid Int :=
     mappend := λp q. p + q
   }
 
-witness Monoid Sum :=
-  { mempty  := mksum 0
-    mappend := λp q. mksum (unsum p + unsum q)
+fold_right :: ∀z α. (α -> z -> z) -> z -> List α -> z :=
+  λf z xs.
+    deconstruct xs into
+      Cons a tail -> f a (fold_right f z tail)
+    | Nil         -> z
+
+signature Mconcat ::= forall m : * -> *.
+  { mconcat :: ∀α. Monoid α |- m α -> α
   }
 
-Sum ::= { X :: Int }
-
-unsum := λs. s.X
-
-mksum := λx. { X := x }
-
-
-foo :: State Int Text :=
-  let su = State.pure ()
-  in State.map (λ_. "hej, mamma") su
+witness Mconcat List :=
+  { mconcat := λxs. fold_right mappend mempty xs
+  }
 
 start :: Int -> Unit := λ_.
-  let xs = List.tabulate 500 mksum in
-  let ys = List.reverse xs in
-  let qs = List.zip xs ys in
-  let zs = List.map (λpq. mksum (unsum (pq :: (Sum, Sum)).0 + unsum pq.1)) qs in
-
-  print_endline "Hi, mom: `unsum (mconcat zs)`"
+  let xs = Cons 1 (Cons 2 Nil) in
+  let sum = mconcat xs in
+  print_endline (prim_show sum)

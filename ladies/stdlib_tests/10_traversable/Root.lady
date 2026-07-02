@@ -1,0 +1,7 @@
+use Stdlib.
+(* Traversable traverse (Applicative f + Traversable t) -- expect 2. KNOWN BROKEN. *)
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  deconstruct traverse (λx. This x) (Cons 1 (Cons 2 Nil)) into
+    This ys -> print_endline (prim_show (List.length ys))
+  | Nope    -> print_endline "no"

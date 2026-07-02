@@ -1,0 +1,5 @@
+use Stdlib.
+(* Foldable via fold_map (Monoid m + Foldable t) -- expect ab *)
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (fold_map (λx. x) (Cons "a" (Cons "b" Nil)))

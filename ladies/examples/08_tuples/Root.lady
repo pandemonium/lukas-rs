@@ -1,0 +1,11 @@
+(* Tuples: construction, ordinal projection (.0/.1/…), and tuple patterns. *)
+
+swap :: ∀α β. (α, β) -> (β, α) := λp. (p.1, p.0)
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  let t = 1, 2, 3 in
+  print_endline (prim_show (t.0 + t.1 + t.2))   (* 6 *)
+  let s = swap (7, 100) in
+  print_endline (prim_show s.0)                  (* 100 *)
+  deconstruct (3, 4) into a, b -> print_endline (prim_show (a * b))   (* 12 *)

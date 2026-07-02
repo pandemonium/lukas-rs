@@ -1,0 +1,21 @@
+(* Records: declaration, construction (:=), field projection, and patterns (:). *)
+
+Point ::=
+  { X :: Int
+    Y :: Int
+  }
+
+mk :: Int -> Int -> Point := λx y. { X := x; Y := y }
+
+mag2 :: Point -> Int := λp. p.X * p.X + p.Y * p.Y
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+
+  let p = mk 3 4 in
+
+  (* field projection ; expect 25 *)
+  print_endline (prim_show (mag2 p))
+
+  (* record pattern ; expect 7 *)
+  deconstruct p into { X: a; Y: b } -> print_endline (prim_show (a + b))

@@ -1,0 +1,13 @@
+(* Ascribing a type to an expression with `::`. *)
+
+Perhaps ::= ∀α. Nope | This α
+
+show_maybe :: Perhaps Int -> Text := λp.
+  deconstruct p into This n -> prim_show n | Nope -> "-"
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  let x = (This 66 :: Perhaps Int) in
+  print_endline (show_maybe x)                     (* 66 *)
+  let t = (1, 2) :: (Int, Int) in
+  print_endline (prim_show (t.0 + t.1))            (* 3 *)

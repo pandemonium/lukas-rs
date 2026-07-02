@@ -377,6 +377,10 @@ where
                 )
             })
             .collect::<Vec<_>>();
+        // Deterministic order: the resolved sequence drives type-checking order and
+        // hence fresh-variable allocation, so HashMap iteration order here must not
+        // leak into the result.
+        graph.sort_by_key(|(node, _)| node.to_string());
 
         let mut in_degrees = graph
             .iter()
@@ -391,30 +395,63 @@ where
         let mut witnesses = VecDeque::new();
         let mut non_witnesses = VecDeque::new();
 
-        for (&node, in_degree) in &in_degrees {
-            if *in_degree == 0 {
-                if self.witnesses.contains(node) {
-                    witnesses.push_back(node);
-                } else {
-                    non_witnesses.push_back(node);
-                }
+        // Seed the frontier in a deterministic order (HashMap iteration order is
+        // not stable), so the whole initialization order is reproducible.
+        let mut seeds = in_degrees
+            .iter()
+            .filter(|(_, in_degree)| **in_degree == 0)
+            .map(|(&node, _)| node)
+            .collect::<Vec<_>>();
+        seeds.sort_by_key(|node| node.to_string());
+        for node in seeds {
+            if self.witnesses.contains(node) {
+                witnesses.push_back(node);
+            } else {
+                non_witnesses.push_back(node);
             }
         }
 
-        while let Some(independent) = if !witnesses.is_empty() {
-            witnesses.pop_front()
-        } else {
-            non_witnesses.pop_front()
-        } {
+        loop {
+            let independent = if let Some(node) = witnesses.pop_front() {
+                node
+            } else if let Some(node) = non_witnesses.pop_front() {
+                node
+            } else {
+                // Both frontiers are empty. Any nodes still left form a
+                // dependency cycle -- e.g. a recursive dictionary and its lifted
+                // method body reference each other. Those references resolve
+                // lazily at runtime, so break the cycle by emitting a remaining
+                // node rather than dropping it (and everything downstream, like
+                // `start`). Prefer a non-witness with the fewest remaining
+                // dependencies, so a witness record that eagerly holds a lifted
+                // method body is emitted after that body.
+                // Break ties deterministically (fewest deps, then name) so the
+                // static-initialization order is reproducible -- HashMap iteration
+                // order otherwise makes it flaky.
+                let breaker = in_degrees
+                    .iter()
+                    .filter(|(node, _)| !self.witnesses.contains(**node))
+                    .min_by_key(|(node, count)| (**count, node.to_string()))
+                    .or_else(|| {
+                        in_degrees
+                            .iter()
+                            .min_by_key(|(node, count)| (**count, node.to_string()))
+                    })
+                    .map(|(node, _)| *node);
+                match breaker {
+                    Some(node) => node,
+                    None => break,
+                }
+            };
+
             resolved.push(independent);
 
             for (node, edges) in &mut graph {
                 if edges.remove(independent)
                     && let Some(count) = in_degrees.get_mut(node)
                 {
-                    *count -= 1;
+                    *count = count.saturating_sub(1);
                     if *count == 0 {
-                        //                        queue.push_back(node);
                         if self.witnesses.contains(node) {
                             witnesses.push_back(node);
                         } else {

@@ -1,0 +1,9 @@
+(* Lambdas, currying, and partial application. *)
+
+add :: Int -> Int -> Int := λa b. a + b
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  let inc = add 1 in                          (* partial application *)
+  print_endline (prim_show (inc 41))          (* 42 *)
+  print_endline (prim_show ((λx. λy. x * y) 6 7))  (* explicit currying: 42 *)

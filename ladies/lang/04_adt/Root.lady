@@ -1,0 +1,23 @@
+(* Algebraic data types, deconstruct over constructors, literal + otherwise. *)
+
+Shape ::= Circle Int | Rectangle Int Int | Dot
+
+area :: Shape -> Int := λs.
+  deconstruct s into
+    Circle r      -> 3 * r * r
+  | Rectangle w h -> w * h
+  | Dot           -> 0
+
+classify :: Int -> Text := λn.
+  deconstruct n into
+    0         -> "zero"
+  | 1         -> "one"
+  | otherwise -> "many"
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (area (Circle 10)))     (* 300 *)
+  print_endline (prim_show (area (Rectangle 3 4))) (* 12 *)
+  print_endline (prim_show (area Dot))             (* 0 *)
+  print_endline (classify 0)                        (* zero *)
+  print_endline (classify 7)                        (* many *)

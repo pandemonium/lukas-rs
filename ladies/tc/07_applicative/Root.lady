@@ -1,0 +1,32 @@
+(* 07: Applicative plus a constrained higher-kinded helper. *)
+(* `liftA2` is `Applicative f |- ...` and uses `pure` (return-type *)
+(* polymorphic, resolved through the dictionary) and `apply`. Exercises a *)
+(* constrained function whose methods themselves have quantifiers. *)
+
+Perhaps ::= ∀α. Nope | This α
+
+signature Applicative ::= ∀f : * -> *.
+  { pure  :: ∀α. α -> f α
+    apply :: ∀α β. f (α -> β) -> f α -> f β
+  }
+
+witness Applicative Perhaps :=
+  { pure  := λx. This x
+    apply := λff fa.
+      deconstruct ff into
+        Nope   -> Nope
+      | This f ->
+          deconstruct fa into
+            Nope   -> Nope
+          | This a -> This (f a)
+  }
+
+liftA2 :: ∀f : *->* α β γ. Applicative f |- (α -> β -> γ) -> f α -> f β -> f γ :=
+  λh fa fb. apply (apply (pure h) fa) fb
+
+start :: Int -> Unit := λ_.
+  let r = liftA2 (λa b. a + b) (This 3) (This 4) in
+  print_endline "##TC"
+  deconstruct r into
+    This x -> print_endline (prim_show x)
+  | Nope   -> print_endline "nope"

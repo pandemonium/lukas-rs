@@ -1,0 +1,6 @@
+use Stdlib.
+(* List.fold_right / tabulate / map -- expect 12 *)
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  let xs = List.tabulate 4 (λi. i) in
+  print_endline (prim_show (List.fold_right (λa z. a + z) 0 (List.map (λx. x * 2) xs)))

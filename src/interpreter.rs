@@ -25,7 +25,7 @@ impl Expr {
             Self::Variable(_, the) => {
                 let value = match the {
                     namer::Identifier::Bound(index) => env.local(*index),
-                    namer::Identifier::Free(name) => env.global(name).cloned(),
+                    namer::Identifier::Free(name) => env.global(name),
                 };
                 value.ok_or_else(|| RuntimeError::NoSuchSymbol(the.clone()))
             }

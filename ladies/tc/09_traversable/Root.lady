@@ -1,0 +1,53 @@
+(* 09: Traversable -- the hardest case, known broken. *)
+(* `traverse :: ∀f α β. Applicative f |- (α -> f β) -> t α -> f (t β)`. The *)
+(* method is constrained by an Applicative that is distinct from the *)
+(* Traversable's own type constructor, and the witness body uses `pure` and *)
+(* `liftA2` under that method-level constraint. *)
+
+List ::= ∀α. Nil | Cons α (List α)
+
+Perhaps ::= ∀α. Nope | This α
+
+signature Applicative ::= ∀f : * -> *.
+  { pure  :: ∀α. α -> f α
+    apply :: ∀α β. f (α -> β) -> f α -> f β
+  }
+
+witness Applicative Perhaps :=
+  { pure  := λx. This x
+    apply := λff fa.
+      deconstruct ff into
+        Nope   -> Nope
+      | This f ->
+          deconstruct fa into
+            Nope   -> Nope
+          | This a -> This (f a)
+  }
+
+liftA2 :: ∀f : *->* α β γ. Applicative f |- (α -> β -> γ) -> f α -> f β -> f γ :=
+  λh fa fb. apply (apply (pure h) fa) fb
+
+fold_right :: ∀z α. (α -> z -> z) -> z -> List α -> z :=
+  λf z xs.
+    deconstruct xs into
+      Cons a tail -> f a (fold_right f z tail)
+    | Nil         -> z
+
+signature Traversable ::= ∀t : * -> *.
+  { traverse :: ∀f : * -> * α β. Applicative f |- (α -> f β) -> t α -> f (t β)
+  }
+
+witness Traversable List :=
+  { traverse := λf xs.
+      deconstruct xs into
+        Nil          -> pure Nil
+      | Cons a tail  -> liftA2 Cons (f a) (traverse f tail)
+  }
+
+start :: Int -> Unit := λ_.
+  let xs = Cons 1 (Cons 2 (Cons 3 Nil)) in
+  let r  = traverse (λx. if x > 0 then This x else Nope) xs in
+  print_endline "##TC"
+  deconstruct r into
+    This ys -> print_endline (prim_show (fold_right (λa z. a + z) 0 ys))
+  | Nope    -> print_endline "nope"
