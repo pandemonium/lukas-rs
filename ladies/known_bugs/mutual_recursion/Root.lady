@@ -1,0 +1,15 @@
+(* Name-resolution bug: two top-level functions that call *each other* fail to *)
+(* resolve. Self-recursion works (`countdown` calls itself), and an *acyclic* *)
+(* forward reference works (`a := b` with `b` defined below). But a dependency *)
+(* *cycle* between two definitions is not handled -- the first one can't see the *)
+(* second. *)
+(* *)
+(* Expected: prints 0 (ping 4 -> pong 3 -> ping 2 -> pong 1 -> ping 0 -> 0). *)
+(* Actual:   type error: undefined name Root.pong *)
+
+ping := λn. if n <= 0 then 0 else pong (n - 1)
+pong := λn. if n <= 0 then 1 else ping (n - 1)
+
+start := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (ping 4))

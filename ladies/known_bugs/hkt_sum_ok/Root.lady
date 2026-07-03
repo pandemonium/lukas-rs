@@ -1,0 +1,18 @@
+(* PASSING contrast for ../hkt_sum_extract (kept here to mark the exact boundary *)
+(* of the kind-checker bug -- this is NOT itself a bug). *)
+(* *)
+(* Same higher-kinded sum type `Wrap`, but the `f α` payload is consumed inline *)
+(* at a concrete `f = Box`, never abstracted through a polymorphic binding. The *)
+(* declaration, the constructor, construction, and inline `deconstruct` all work. *)
+(* *)
+(* Expected: prints 41.  Actual: prints 41. *)
+
+Box  ::= ∀α. MkBox α
+Wrap ::= ∀f : * -> * α. MkWrap (f α)
+
+unbox := λb. deconstruct b into MkBox a -> a
+
+start := λ_.
+  print_endline "##TC"
+  deconstruct MkWrap (MkBox 41) into
+    MkWrap x -> print_endline (prim_show (unbox x))

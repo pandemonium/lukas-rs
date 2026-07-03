@@ -1,0 +1,130 @@
+(* Pattern matching in depth: nested constructors, list prefixes, records, *)
+(* records-inside-lists, recursion over a tree, and multiple scrutinees. *)
+
+List    ::= ∀α. Nil | Cons α (List α)
+Perhaps ::= ∀α. Nope | This α
+Tree    ::= Leaf Int | Branch Tree Tree
+Colour  ::= Red | Green | Blue
+
+Pixel ::=
+  { colour :: Colour
+    alpha  :: Int
+  }
+
+Gradient ::=
+  { from :: Colour
+    to   :: Colour
+  }
+
+Theme ::=
+  { primary :: Colour
+    accent  :: Colour
+    level   :: Int
+  }
+
+(* lists: classify by matching a prefix of nested Cons cells *)
+describe :: List Int -> Text := λxs.
+  deconstruct xs into
+    Nil                        -> "empty"
+  | Cons _ Nil                 -> "one"
+  | Cons _ (Cons _ Nil)        -> "two"
+  | Cons _ (Cons _ (Cons _ _)) -> "three or more"
+
+(* bind the first few elements out of a longer list *)
+sum_first_three :: List Int -> Int := λxs.
+  deconstruct xs into
+    Cons a (Cons b (Cons c _)) -> a + b + c
+  | Cons a (Cons b _)          -> a + b
+  | Cons a _                   -> a
+  | Nil                        -> 0
+
+(* recurse over a nested ADT *)
+sum_tree :: Tree -> Int := λt.
+  deconstruct t into
+    Leaf n     -> n
+  | Branch l r -> sum_tree l + sum_tree r
+
+(* match a specific deep shape: a branch of two leaves *)
+is_pair :: Tree -> Bool := λt.
+  deconstruct t into
+    Branch (Leaf _) (Leaf _) -> true
+  | otherwise                -> false
+
+(* records: a *bare* nullary constructor (Red) in a field that is followed by *)
+(* another field -- the case that used to crash the parser on the `;`. *)
+paint :: Pixel -> Text := λp.
+  deconstruct p into
+    { colour: _;   alpha: 0   } -> "invisible"
+  | { colour: Red; alpha: 255 } -> "solid red"
+  | { colour: _;   alpha: _   } -> "translucent"
+
+(* two adjacent bare nullary constructors, the first followed by another field *)
+blend :: Gradient -> Text := λg.
+  deconstruct g into
+    { from: Red;  to: Blue } -> "sunset"
+  | { from: Red;  to: _    } -> "warm"
+  | { from: Blue; to: Red  } -> "sunrise"
+  | otherwise                -> "other"
+
+(* a bare nullary constructor as a *middle* field (Red first, Green in the *)
+(* middle) -- both are followed by a `;` and further fields. *)
+theme_name :: Theme -> Text := λt.
+  deconstruct t into
+    { primary: Red;  accent: Green; level: 0 } -> "flag"
+  | { primary: Blue; accent: _;     level: _ } -> "ocean"
+  | { primary: _;    accent: Blue;  level: _ } -> "sky"
+  | otherwise                                  -> "custom"
+
+(* a record pattern nested underneath a Cons *)
+first_alpha :: List Pixel -> Int := λps.
+  deconstruct ps into
+    Cons { colour: _; alpha: a } _ -> a
+  | Nil                            -> 0
+
+(* a *bare nullary constructor inside a record inside a Cons* -- recurse until *)
+(* the first red pixel and read off its alpha. *)
+first_red_alpha :: List Pixel -> Int := λps.
+  deconstruct ps into
+    Cons { colour: Red; alpha: a } _ -> a
+  | Cons _ rest                      -> first_red_alpha rest
+  | Nil                              -> 0
+
+(* multiple scrutinees at once *)
+merge :: Perhaps Int -> Perhaps Int -> Perhaps Int := λa b.
+  deconstruct a, b into
+    This x, This y -> This (x + y)
+  | This x, Nope   -> This x
+  | Nope,   This y -> b
+  | Nope,   Nope   -> b
+
+show_perhaps :: Perhaps Int -> Text := λp.
+  deconstruct p into This n -> prim_show n | Nope -> "nope"
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  let one   = Cons 10 Nil in
+  let three = Cons 10 (Cons 20 (Cons 30 Nil)) in
+  print_endline (describe Nil)                             (* empty *)
+  print_endline (describe three)                           (* three or more *)
+  print_endline (prim_show (sum_first_three three))        (* 60 *)
+  print_endline (prim_show (sum_first_three one))          (* 10 *)
+  let tree = Branch (Branch (Leaf 1) (Leaf 2)) (Leaf 3) in
+  print_endline (prim_show (sum_tree tree))                (* 6 *)
+  print_endline (if is_pair (Branch (Leaf 1) (Leaf 2)) then "pair" else "no")   (* pair *)
+  print_endline (if is_pair tree then "pair" else "no")    (* no *)
+  print_endline (paint { colour := Red; alpha := 255 })    (* solid red *)
+  print_endline (paint { colour := Blue; alpha := 0 })     (* invisible *)
+  print_endline (paint { colour := Green; alpha := 128 })  (* translucent *)
+  print_endline (blend { from := Red; to := Blue })        (* sunset *)
+  print_endline (blend { from := Red; to := Green })       (* warm *)
+  print_endline (blend { from := Blue; to := Red })        (* sunrise *)
+  print_endline (theme_name { primary := Red; accent := Green; level := 0 })     (* flag *)
+  print_endline (theme_name { primary := Blue; accent := Red; level := 5 })      (* ocean *)
+  print_endline (theme_name { primary := Green; accent := Blue; level := 2 })    (* sky *)
+  print_endline (theme_name { primary := Green; accent := Green; level := 1 })   (* custom *)
+  let pixels = Cons { colour := Green; alpha := 77 } Nil in
+  print_endline (prim_show (first_alpha pixels))           (* 77 *)
+  let pixels2 = Cons { colour := Blue; alpha := 10 } (Cons { colour := Red; alpha := 88 } Nil) in
+  print_endline (prim_show (first_red_alpha pixels2))      (* 88 *)
+  print_endline (show_perhaps (merge (This 40) (This 2)))  (* 42 *)
+  print_endline (show_perhaps (merge Nope (This 9)))       (* 9 *)

@@ -1,0 +1,20 @@
+(* Layout/comment bug: a *multi-line* block comment sitting *between* two top-level *)
+(* declarations crashes (src/main.rs:87). A single-line comment in the same spot is *)
+(* fine, and a multi-line comment at the very top of the file is fine -- it's the *)
+(* combination (multi-line + between declarations) that breaks, because the newline *)
+(* inside the comment emits spurious layout tokens. *)
+(* *)
+(* The two-line comment between `f` and `g` below is the trigger. *)
+(* *)
+(* Expected: prints 3. *)
+(* Actual:   panic at src/main.rs:87 *)
+
+f := λx. x + 1
+
+(* this comment
+   spans two lines *)
+g := λx. x + 2
+
+start := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (f (g 0)))

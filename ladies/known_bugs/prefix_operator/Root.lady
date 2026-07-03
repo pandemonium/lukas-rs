@@ -1,0 +1,15 @@
+(* Parser bug: the prefix-expression parser has no error path -- when it meets a *)
+(* token that can't *start* an expression it panics (src/parser.rs:1426) instead *)
+(* of reporting a parse error. Several reasonable things trip it: *)
+(*   - negative integer literals:  (-5) *)
+(*   - operator sections:          (+ 1) *)
+(*   - a trailing comma in a tuple: (1, 2,)   (after the comma it meets `)`) *)
+(* (Subtraction with two operands, `0 - 5`, parses fine.) *)
+(* *)
+(* Expected: prints -5. *)
+(* Actual:   panic at src/parser.rs:1426 *)
+
+start := λ_.
+  print_endline "##TC"
+  let x = (-5) in
+  print_endline (prim_show x)

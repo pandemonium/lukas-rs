@@ -1,0 +1,11 @@
+(* Runtime bug: integer division by zero panics the host (Rust) process at *)
+(* src/builtin.rs:337 instead of surfacing a controlled Marmelade error. The *)
+(* divisor is only known at run time, so this passes the type checker and then *)
+(* aborts the interpreter. *)
+(* *)
+(* Expected: a graceful error (or a defined result). *)
+(* Actual:   panic at src/builtin.rs:337 *)
+
+start := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (10 / 0))

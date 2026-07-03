@@ -1,0 +1,26 @@
+(* Kind-checker bug: extracting a higher-kinded payload from a sum type through *)
+(* a function that is polymorphic in the type constructor fails. *)
+(* *)
+(* `Wrap` abstracts over a type constructor `f : * -> *` and stores an `f α`. *)
+(* Declaring it, constructing a value, and matching it *inline* all work fine *)
+(* (see the sibling `../hkt_sum_ok` shape). The bug bites only when the `f α` *)
+(* payload has to flow out through a binding whose type is generalized over the *)
+(* higher-kinded `f` -- here the extractor `unwrap`. At that generalization the *)
+(* checker loses `f`'s `* -> *` kind and tries to unify `f` with `f α`. *)
+(* *)
+(* An explicit annotation on `unwrap` does NOT help -- it is a checker bug, not *)
+(* an inference gap. *)
+(* *)
+(* Expected: prints 41. *)
+(* Actual:   type error: unification error: kind mismatch: cannot unify *)
+(*           $N:* -> * with $N:* -> * [ $M:* ]   (i.e. `f` vs `f α`) *)
+
+Box  ::= ∀α. MkBox α
+Wrap ::= ∀f : * -> * α. MkWrap (f α)
+
+unwrap :: ∀f : * -> * α. Wrap f α -> f α := λw. deconstruct w into MkWrap x -> x
+unbox  := λb. deconstruct b into MkBox a -> a
+
+start := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (unbox (unwrap (MkWrap (MkBox 41)))))

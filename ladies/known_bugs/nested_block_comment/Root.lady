@@ -1,0 +1,14 @@
+(* Lexer bug: block comments do not nest. A `(*` inside a comment is not tracked, *)
+(* so the *first* `*)` closes the comment and the trailing ` c *)` is then lexed *)
+(* as source, and the dangling `*)` crashes the lexer (src/lexer.rs:78). *)
+(* *)
+(* The offending line is below: `(* a (* b *) c *)` should be one whole comment. *)
+(* *)
+(* Expected: prints hi. *)
+(* Actual:   panic at src/lexer.rs:78 *)
+
+(* a (* b *) c *)
+
+start := λ_.
+  print_endline "##TC"
+  print_endline "hi"

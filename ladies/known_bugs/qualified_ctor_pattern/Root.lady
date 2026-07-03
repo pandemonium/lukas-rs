@@ -1,0 +1,20 @@
+(* Parser bug: a *qualified* constructor name in a pattern (`Root.Cons`, `M.Foo`) *)
+(* crashes the pattern parser (src/parser.rs:2090). Unqualified constructor *)
+(* patterns (`Cons`, `Nil`) are fine, and a qualified constructor in *expression* *)
+(* position works. This also blocks matching a module's constructors: a *)
+(* `deconstruct c into M.Red -> …` over a type defined in module `M` hits the *)
+(* same crash, so a local module's sum type can be built but not pattern-matched *)
+(* by its qualified constructor names. *)
+(* *)
+(* Expected: prints 1. *)
+(* Actual:   panic at src/parser.rs:2090 *)
+
+List ::= ∀α. Nil | Cons α (List α)
+
+len := λxs. deconstruct xs into
+    Root.Nil      -> 0
+  | Root.Cons _ t -> 1 + len t
+
+start := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (len (Cons 1 Nil)))

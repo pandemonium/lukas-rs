@@ -1,0 +1,20 @@
+(* Module bug: `use` only works for *external* modules (library files). Applied to *)
+(* a module defined *in the same file*, `use M.` is still resolved as a file *)
+(* import, so the compiler goes looking for a source file that doesn't exist and *)
+(* fails with an I/O error -- there is no way to bring a local module's names into *)
+(* scope unqualified. *)
+(* *)
+(* Qualified access to the same local module (`M.helper`) works fine; only the *)
+(* `use`-to-open-it path is broken. *)
+(* *)
+(* Expected: prints 42 (helper 21, with M opened). *)
+(* Actual:   I/O error: No such file or directory (os error 2) *)
+
+module M:
+  helper := λx. x * 2
+
+use M.
+
+start := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (helper 21))

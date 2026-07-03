@@ -1,0 +1,14 @@
+(* Parser/layout bug: a record *type* declaration's closing `}` must sit on its *)
+(* own line. Putting it on the last field's line -- `y :: Int }` -- fails to parse *)
+(* (`expected }`), even though the same record with `}` on a fresh line is fine. *)
+(* Record *values* (`{ x := 1; y := 2 }`) don't have this restriction. *)
+(* *)
+(* Expected: prints hi. *)
+(* Actual:   parse error: expected } *)
+
+R ::= { x :: Int
+    y :: Int }
+
+start := λ_.
+  print_endline "##TC"
+  print_endline "hi"
