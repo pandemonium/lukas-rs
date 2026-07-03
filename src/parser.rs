@@ -2128,6 +2128,7 @@ impl<'a> Parser<'a> {
                 | TokenKind::RightBrace
                 | TokenKind::Equals
                 | TokenKind::RightParen
+                | TokenKind::Semicolon
         ) {
             arguments.push(self.parse_pattern_prefix()?);
         }

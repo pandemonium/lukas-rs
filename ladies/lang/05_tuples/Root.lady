@@ -1,7 +1,7 @@
 (* Tuples: construction, ordinal projection, and tuple patterns. *)
 
 swap :: ∀α β. (α, β) -> (β, α) :=
-  λp. (p.1, p.0)
+  λ(a, b). (b, a)
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"

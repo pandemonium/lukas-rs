@@ -11,19 +11,16 @@ signature Foldable ::= ∀t : * -> *.
   { fold_right :: ∀α β. (α -> β -> β) -> β -> t α -> β
   }
 
-(* A plain recursive helper; the witness just points at it. *)
-list_fold_right :: ∀α β. (α -> β -> β) -> β -> List α -> β := λf z xs.
-  deconstruct xs into
-    Cons a tail -> f a (list_fold_right f z tail)
-  | Nil         -> z
-
 witness Monoid Int :=
   { mempty  := 0
     mappend := λp q. p + q
   }
 
 witness Foldable List :=
-  { fold_right := list_fold_right
+  { fold_right := λf z xs.
+      deconstruct xs into
+        Cons a tail -> f a (fold_right f z tail)
+      | Nil         -> z
   }
 
 fold_map :: ∀t : *->* α m. Monoid m + Foldable t |- (α -> m) -> t α -> m :=
