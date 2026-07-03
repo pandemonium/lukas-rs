@@ -836,7 +836,7 @@ mod tests {
 
         let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
         for crate::lexer::Token { kind, position } in tokens {
-            println!("[{position}] {kind:?}");
+            tracing::trace!("[{position}] {kind:?}");
         }
     }
 }

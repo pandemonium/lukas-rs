@@ -346,7 +346,7 @@ impl Suspension {
                 environment,
                 k,
             }) => {
-                //                println!("resume: expr {expression}");
+                //                tracing::trace!("resume: expr {expression}");
 
                 expression.eval(environment, k)
             }
@@ -848,7 +848,7 @@ impl fmt::Display for Closure {
 
 impl fmt::Display for Env {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        println!("Env::fmt: ");
+        tracing::trace!("Env::fmt: ");
         let local_prefix = {
             self.locals
                 .borrow()

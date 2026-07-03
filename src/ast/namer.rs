@@ -355,7 +355,7 @@ where
             .filter_map(|(_, deps)| deps.iter().find(|&dep| !self.graph.contains_key(dep)))
             .collect::<Vec<_>>();
 
-        println!("dependencies: unsatisfied {:?}", unsatisfieds);
+        tracing::debug!("dependencies: unsatisfied {:?}", unsatisfieds);
 
         unsatisfieds.is_empty()
     }

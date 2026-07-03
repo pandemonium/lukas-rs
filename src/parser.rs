@@ -307,7 +307,7 @@ impl<'a> Parser<'a> {
 
             let indent = depth * 2;
 
-            //println!(
+            //tracing::trace!(
             //    "{:<width$}{}{}",
             //    remains.into_iter().collect::<String>(),
             //    " ".repeat(indent),
@@ -315,7 +315,7 @@ impl<'a> Parser<'a> {
             //    width = REMAINS_COL
             //);
         } else {
-            println!("Unknown caller.");
+            tracing::trace!("Unknown caller.");
         }
 
         TraceGuard::enter()
@@ -663,7 +663,7 @@ impl<'a> Parser<'a> {
 
                 let type_signature = self.parse_type_signature()?;
 
-                println!("parse_declaration: type signature {type_signature}");
+                tracing::trace!("parse_declaration: type signature {type_signature}");
 
                 Ok(Declaration::External(
                     ParseInfo::from_position(pos),
@@ -1086,7 +1086,7 @@ impl<'a> Parser<'a> {
             let body = parse_body(self)?;
             // This does not interact well with sequences because parse_sequence
             // does not see a sequence separator anymore after this
-            //            println!("parse_block: delete dedent");
+            //            tracing::trace!("parse_block: delete dedent");
 
             // I am not happy about this
             let token = self.peek()?;
@@ -1285,7 +1285,7 @@ impl<'a> Parser<'a> {
 
         let prefix = self.parse_expression(0)?;
 
-        //println!(
+        //tracing::trace!(
         //    "parse_sequence: prefix {prefix} @ {}--- remains {}",
         //    prefix.annotation().location,
         //    display_list(" ", &self.remains().iter().take(5).collect::<Vec<_>>())
@@ -1331,7 +1331,7 @@ impl<'a> Parser<'a> {
 
         let and_then = self.parse_sequence()?;
 
-        //println!(
+        //tracing::trace!(
         //    "parse_subsequent: this {}, and_then {}",
         //    this.parse_info().location,
         //    and_then.parse_info().location
@@ -2372,12 +2372,12 @@ mod tests {
         let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
 
         for t in tokens {
-            println!("{t}")
+            tracing::trace!("{t}")
         }
 
         let mut p = Parser::from_tokens(tokens);
         let x = p.parse_type_expression(0).unwrap();
-        println!("{x}")
+        tracing::trace!("{x}")
     }
 
     #[test]
@@ -2388,11 +2388,11 @@ mod tests {
         let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
 
         for t in tokens {
-            println!("{t}")
+            tracing::trace!("{t}")
         }
 
         let mut p = Parser::from_tokens(tokens);
         let x = p.parse_declaration_list().unwrap();
-        println!("{x:?}")
+        tracing::trace!("{x:?}")
     }
 }

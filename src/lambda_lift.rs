@@ -90,7 +90,7 @@ impl Crane {
             Expr::Lambda(capture_info, lambda) => {
                 let name = self.fresh_name();
 
-                println!(
+                tracing::trace!(
                     "lift_lambdas: {name} has type {}",
                     capture_info.type_info.inferred_type
                 );
@@ -114,7 +114,7 @@ impl Crane {
             Expr::RecursiveLambda(capture_info, mut self_ref) => {
                 let lambda_name = self.fresh_name();
 
-                println!(
+                tracing::trace!(
                     "lift_lambdas: rec {lambda_name} has type {}",
                     capture_info.type_info.inferred_type
                 );

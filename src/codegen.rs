@@ -75,7 +75,7 @@ impl lambda_lift::Program {
         {
             let ty = &capture_info.type_info.inferred_type;
 
-            println!("generate_code: {name} :: {ty}");
+            tracing::trace!("generate_code: {name} :: {ty}");
 
             match ty.try_as_arrow() {
                 Some((param, return_ty)) => {

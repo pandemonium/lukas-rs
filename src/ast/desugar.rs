@@ -296,7 +296,7 @@ impl phase::Expr<Parsed> {
         a: ParseInfo,
         the: Lambda<ParseInfo, ast::IdentifierPattern<ParseInfo>>,
     ) -> Lambda<ParseInfo, IdentifierPath> {
-        println!("lower_inline_patterns: lowering!");
+        tracing::trace!("lower_inline_patterns: lowering!");
         let binder = fresh_identifier_path();
         Lambda {
             parameter: binder.clone(),
@@ -362,7 +362,7 @@ impl phase::SymbolTable<Parsed> {
     }
 
     pub fn desugar(&self) -> phase::SymbolTable<Desugared> {
-        println!("desugar: running");
+        tracing::debug!("desugar: running");
         self.desugar_expressions()
     }
 }

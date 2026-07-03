@@ -322,7 +322,7 @@ impl External for RawLambda3 {
 
     fn invoke(&self, arguments: &[Val]) -> Interpretation {
         let Self { apply, .. } = self;
-        println!("invoke: args {}", display_list(", ", arguments));
+        tracing::trace!("invoke: args {}", display_list(", ", arguments));
         Ok(apply(
             arguments[0].clone(),
             arguments[1].clone(),

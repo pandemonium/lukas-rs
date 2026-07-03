@@ -245,6 +245,7 @@ impl phase::SymbolTable<Named> {
         })
     }
 
+    #[instrument(skip_all)]
     fn elaborate_terms(
         &self,
         selector_names: &[&SymbolName],
@@ -278,8 +279,8 @@ impl phase::SymbolTable<Named> {
             self.type_terms(&mut typed_symbols, selector_names.iter().copied(), ctx)?;
 
         for (term_symbol, typed) in &typed_selectors {
-            println!(
-                "elaborate_terms: typed selector {} : {}",
+            tracing::trace!(
+                "typed selector {} : {}",
                 term_symbol.name, typed.tree
             );
         }
@@ -301,7 +302,7 @@ impl phase::SymbolTable<Named> {
             )
             .map_err(|e| e.at(pi))?;
 
-            println!("elaborate_terms: insert {} := {}", symbol.name, expr);
+            tracing::trace!("insert {} := {}", symbol.name, expr);
             typed_symbols.insert(
                 SymbolName::Term(symbol.name.clone()),
                 Symbol::Term(TermSymbol {
@@ -330,7 +331,7 @@ impl phase::SymbolTable<Named> {
                 && !ctx.terms.free.contains_key(&term_name)
                 && let Symbol::Term(symbol) = &self.symbols[&name]
             {
-                //                println!("@@@ {} := {:?}", symbol.name, symbol.body);
+                //                tracing::trace!("@@@ {} := {:?}", symbol.name, symbol.body);
                 typed_terms.push((symbol, self.type_term(symbol, ctx)?))
             }
 
@@ -570,8 +571,8 @@ impl phase::SymbolTable<Named> {
             {
                 for field in record.fields.iter() {
                     let method_arity = field.type_signature.body.arrow_arity();
-                    println!(
-                        "insert_signature_method_selector: {} {method_arity}",
+                    tracing::trace!(
+                        "{} {method_arity}",
                         field.name
                     );
                     let method_dictionary_count = field.type_signature.constraints.len();
@@ -691,7 +692,7 @@ impl phase::SymbolTable<Named> {
                         },
                     );
 
-                    println!("insert_signature_method_selectors: {name} is {}", tree);
+                    tracing::trace!("{name} is {}", tree);
 
                     symbols.push(TermSymbol {
                         name,
@@ -738,7 +739,7 @@ impl phase::SymbolTable<Named> {
                     };
                     let scheme = constrained.generalize(ctx);
 
-                    println!(">>> placeholder {name} :: {scheme}");
+                    tracing::trace!(">>> placeholder {name} :: {scheme}");
                     ctx.bind_free_term(name, scheme.underlying);
                 }
             }
@@ -747,12 +748,13 @@ impl phase::SymbolTable<Named> {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     fn type_term(
         &self,
         symbol: &TermSymbol<ParseInfo, namer::QualifiedName, Identifier>,
         ctx: &mut TypingContext,
     ) -> Typing<Typed> {
-        println!("type_term: {}, {}", symbol.name, symbol.body);
+        tracing::debug!("{}, {}", symbol.name, symbol.body);
 
         let expr = ctx.infer_expr(&symbol.body)?;
         let qualified_name = symbol.name.clone();
@@ -764,7 +766,7 @@ impl phase::SymbolTable<Named> {
             inferred_type.generalize(ctx).underlying
         };
 
-        println!(">>> {} :: {}", qualified_name, scheme);
+        tracing::trace!(">>> {} :: {}", qualified_name, scheme);
         ctx.bind_free_term(qualified_name.clone(), scheme.clone());
 
         Ok(expr)
@@ -779,6 +781,7 @@ impl phase::SymbolTable<Named> {
     }
 }
 
+#[instrument(skip_all)]
 fn elaborate_term_constraints(
     symbol_name: &QualifiedName,
     witnesses: &WitnessEnvironment,
@@ -786,7 +789,7 @@ fn elaborate_term_constraints(
     tree: ast::Expr<TypeInfo, Identifier>,
     ctx: &mut TypingContext,
 ) -> Result<ast::Expr<TypeInfo, Identifier>, TypeError> {
-    println!("elaborate_term_constraints: {symbol_name} has {constraints} tree {tree}");
+    tracing::trace!("{symbol_name} has {constraints} tree {tree}");
 
     let selectors = SelectorTable::from_constraints(&constraints, &ctx.types)?;
 
@@ -799,6 +802,7 @@ fn elaborate_term_constraints(
     )?)
 }
 
+#[instrument(skip_all)]
 fn resolve_constraints(
     symbol_name: &QualifiedName,
     mut tree: Expr,
@@ -818,8 +822,8 @@ fn resolve_constraints(
         .into_iter()
         .partition::<Vec<_>, _>(|c| c.is_parametric());
 
-    println!(
-        "discharge_ground_constraints: {symbol_name} parametric: {:?} resolvable {:?}",
+    tracing::trace!(
+        "{symbol_name} parametric: {:?} resolvable {:?}",
         &parametric, &resolvable
     );
 
@@ -860,8 +864,8 @@ fn resolve_constraints(
     // #(1 + i).
     for (i, c) in parametric.iter().enumerate() {
         let name = Identifier::Bound(1 + i);
-        println!(
-            "discharge_ground_constraints: binding {name} to {}",
+        tracing::trace!(
+            "binding {name} to {}",
             c.constraint_type
         );
 
@@ -900,10 +904,10 @@ fn resolve_constraints(
         evidence.insert(c, w);
     }
 
-    //    println!("discharge_ground_constraints: {evidence}");
+    //    tracing::trace!("{evidence}");
 
     if !evidence.is_empty() {
-        println!("Sixten!");
+        tracing::trace!("Sixten!");
         tree = discharge_constraints(tree, &evidence, witnesses, ctx);
     }
     tree = elaborate_constraint_method_placeholders(tree, &constraints, ctx);
@@ -928,13 +932,14 @@ fn resolve_constraints(
 // Expects tree to be post insert_selectors_at_placeholders
 //
 // This function can carry a list of type errors.
+#[instrument(skip_all)]
 fn discharge_constraints(
     tree: Expr,
     evidence: &HashMap<Constraint, Expr>,
     witnesses: &WitnessEnvironment,
     ctx: &TypingContext,
 ) -> Expr {
-    println!("solve_constraints: tree {tree} evidence {evidence:?}");
+    tracing::trace!("tree {tree} evidence {evidence:?}");
 
     // It crashes on access to parameter 0 in a witness
     // function. It is not recursive so it is bound at #0.
@@ -944,15 +949,15 @@ fn discharge_constraints(
     tree.map(&mut |e| match e {
         Expr::Variable(type_info, ref term_id @ (Identifier::Free(..) | Identifier::Bound(0))) => {
             // It is just not as easy as picking #0 too. It could be a plain variable
-            println!("solve_constraints: name {term_id}");
+            tracing::trace!("name {term_id}");
 
             if let Some(type_scheme) = ctx.terms.lookup(&term_id)
                 && !type_scheme.constraints.is_empty()
             {
                 let use_site_type = type_scheme.instantiate();
 
-                println!(
-                    "solve_constraints: scheme {use_site_type} type {}",
+                tracing::trace!(
+                    "scheme {use_site_type} type {}",
                     type_info.inferred_type
                 );
 
@@ -967,7 +972,7 @@ fn discharge_constraints(
                     .any(|c| evidence.contains_key(c));
 
                 if is_injection_site {
-                    //println!("solve_constraints: {method_name} ")
+                    //tracing::trace!("{method_name} ")
 
                     use_site_constraints.iter().fold(
                         Expr::Variable(type_info.clone(), term_id.clone()),
@@ -1031,6 +1036,7 @@ impl<'a> SelectorTable<'a> {
     }
 }
 
+#[instrument(skip_all)]
 fn elaborate_constraint_method_placeholders(
     tree: Expr,
     evidence: &ConstraintSet,
@@ -1059,7 +1065,7 @@ fn elaborate_constraint_method_placeholders(
             );
 
             let ty = ctx.terms.lookup_free(&selector_name);
-            println!("elaborate_constraint_method_placeholders: {selector_name} :: {ty:?} ");
+            tracing::trace!("{selector_name} :: {ty:?} ");
 
             Expr::Variable(
                 TypeInfo {
@@ -2916,7 +2922,7 @@ impl TypingContext {
             }
 
             _ => {
-                println!("reduce_applied_constructor: fallback with {applied}");
+                tracing::trace!("fallback with {applied}");
                 Ok(TypeStructure::Monotype(applied.clone()))
             }
         }
@@ -3143,8 +3149,8 @@ impl TypingContext {
             .expand_type_constructor(pi, expected_type)?
             .unwrap_or_else(|| TypeStructure::Monotype(expected_type.clone()));
 
-        println!(
-            "check_recursive_lambda: expected {expected_type} tree {:?}",
+        tracing::trace!(
+            "expected {expected_type} tree {:?}",
             rec.lambda
         );
 
@@ -3468,7 +3474,7 @@ impl TypingContext {
             .type_signature
             .type_scheme(&HashMap::default(), self)?;
 
-        println!("infer_ascription: scheme {ascribed_scheme}");
+        tracing::trace!("scheme {ascribed_scheme}");
 
         let ascribed_type = ascribed_scheme.instantiate();
         let ascribed_tree =
@@ -4114,16 +4120,16 @@ impl TypingContext {
             .expand_type_constructor(pi, base_type)?
             .unwrap_or_else(|| TypeStructure::Monotype(base_type.clone()));
 
-        println!("infer_projection: base {base_type} expanded {expanded_base_type}");
+        tracing::trace!("base {base_type} expanded {expanded_base_type}");
 
         for (k, v) in &self.types.bindings {
-            println!("infer_projection: {k} is {v}");
+            tracing::trace!("{k} is {v}");
         }
 
         match &projection.select {
             ProductElement::Name(field_name) => match expanded_base_type {
                 TypeStructure::PolyRecord(record) => {
-                    println!("infer_proj: {record:?}");
+                    tracing::trace!("{record:?}");
 
                     if let Some((field_index, (_, field_scheme))) = record
                         .0
@@ -4133,7 +4139,7 @@ impl TypingContext {
                     {
                         let field_type = field_scheme.instantiate();
 
-                        println!("infer_projection: {field_name} :: {field_type}");
+                        tracing::trace!("{field_name} :: {field_type}");
 
                         Ok(Typed::computed(
                             substitutions,
@@ -4386,7 +4392,7 @@ impl TypingContext {
         let function_type = &function.tree.type_info().inferred_type;
 
         if let Type::Variable(..) = function_type {
-            println!("infer_apply2: unknown function");
+            tracing::trace!("unknown function");
             let domain = Type::fresh();
             let codomain = Type::fresh();
             let unification = Type::Arrow {

@@ -139,7 +139,7 @@ impl WitnessEnvironment {
 
             let mut graph_candidate = HashMap::default();
 
-            //println!(
+            //tracing::trace!(
             //    "resolve_and_record: {} has {} premises.",
             //    witness.name,
             //    display_list(", ", &witness.premises)
@@ -159,7 +159,7 @@ impl WitnessEnvironment {
                 .collect::<Result<Vec<_>, TypeError>>();
 
             if let Ok(solution) = solution {
-                //println!(
+                //tracing::trace!(
                 //    "resolve_and_record: witness {} solution {} source {source}.",
                 //    witness.name,
                 //    display_list(", ", &solution)
@@ -177,13 +177,14 @@ impl WitnessEnvironment {
         Err(TypeError::NoWitness(constraint.clone()))
     }
 
+    #[tracing::instrument(skip_all)]
     pub fn resolve_witness(
         &self,
         constraint: &Constraint,
         ctx: &TypeEnvironment,
         assumptions: &HashMap<Constraint, phase::Expr<Types>>,
     ) -> Result<phase::Expr<Types>, TypeError> {
-        println!("resolve_witness: {constraint}");
+        tracing::trace!("{constraint}");
 
         // A constraint we already hold as evidence -- a dictionary parameter of
         // the enclosing declaration, e.g. the `Eq α` premise threaded into an
@@ -219,7 +220,7 @@ impl WitnessEnvironment {
 
             let subst = subst?;
 
-            //println!(
+            //tracing::trace!(
             //    "resolve_witness: {constraint} subst {subst} head {} premises `{}`",
             //    witness.head.constraint_type,
             //    display_list(", ", &witness.premises),
@@ -235,7 +236,7 @@ impl WitnessEnvironment {
 
             // Compute some honest type info to insert?
             if let Ok(solution) = solution {
-                //println!("resolve_witness: solution {solution:?}");
+                //tracing::trace!("solution {solution:?}");
 
                 // surely the witness can contain this.
                 let pi = ParseInfo::default();
