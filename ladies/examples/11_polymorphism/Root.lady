@@ -1,13 +1,9 @@
-(* Parametric polymorphism: a definition quantified over its element type. *)
+(* Parametric polymorphism: one definition used at several element types.
+   `List` and `List.length` come from the standard library. *)
 
-List ::= ∀α. Nil | Cons α (List α)
-
-length :: ∀α. List α -> Int := λxs.
-  deconstruct xs into
-    Cons a tail -> 1 + length tail
-  | Nil         -> 0
+use Stdlib.
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (length (Cons 1 (Cons 2 (Cons 3 Nil)))))  (* 3 *)
-  print_endline (prim_show (length (Cons "a" (Cons "b" Nil))))       (* same fn, list of Text: 2 *)
+  print_endline (prim_show (List.length (Cons 1 (Cons 2 (Cons 3 Nil)))))  (* 3 *)
+  print_endline (prim_show (List.length (Cons "a" (Cons "b" Nil))))        (* same fn, list of Text: 2 *)

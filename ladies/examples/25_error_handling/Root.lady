@@ -1,7 +1,9 @@
-(* Error handling with a Result type, custom errors, and a chaining combinator. *)
+(* Error handling with the standard library's `Result` type, plus custom errors
+   and a chaining combinator of our own. *)
 
-Result ::= ∀α e. Fault e | Return α
-Error  ::= DivByZero | Negative
+use Stdlib.
+
+Error ::= DivByZero | Negative
 
 safe_div :: Int -> Int -> Result Int Error := λa b.
   if b = 0 then Fault DivByZero else Return (a / b)

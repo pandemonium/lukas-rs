@@ -1,17 +1,10 @@
 (* A signature method that carries its *own* constraint. `squash` is
-   `∀α. Monoid α |- m α -> α`, so the dictionary is supplied per call. *)
+   `∀α. Monoid α |- m α -> α`, so the dictionary is supplied per call. `Monoid`
+   and `Monoid Int` come from the standard library; Box/Squash are ours. *)
+
+use Stdlib.
 
 Box ::= ∀α. MkBox α
-
-signature Monoid ::= ∀α.
-  { mempty  :: α
-    mappend :: α -> α -> α
-  }
-
-witness Monoid Int :=
-  { mempty  := 0
-    mappend := λp q. p + q
-  }
 
 signature Squash ::= ∀m : * -> *.
   { squash :: ∀α. Monoid α |- m α -> α

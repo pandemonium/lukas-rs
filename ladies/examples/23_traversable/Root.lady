@@ -1,47 +1,12 @@
-(* Traversable: a method constrained by a *distinct* Applicative. Traverse a
-   list with an effectful function and collect the results. *)
+(* Traversable via the standard library: `traverse` a list with an effectful
+   (Perhaps) function under its Applicative, collecting the results. Everything
+   here -- List, Perhaps, Applicative, Traversable, traverse -- comes from Stdlib. *)
 
-List ::= ∀α. Nil | Cons α (List α)
-Perhaps ::= ∀α. Nope | This α
-
-signature Applicative ::= ∀f : * -> *.
-  { pure  :: ∀α. α -> f α
-    apply :: ∀α β. f (α -> β) -> f α -> f β
-  }
-
-witness Applicative Perhaps :=
-  { pure  := λx. This x
-    apply := λff fa.
-      deconstruct ff into
-        Nope   -> Nope
-      | This f ->
-          deconstruct fa into
-            Nope   -> Nope
-          | This a -> This (f a)
-  }
-
-liftA2 :: ∀f : *->* α β γ. Applicative f |- (α -> β -> γ) -> f α -> f β -> f γ :=
-  λh fa fb. apply (apply (pure h) fa) fb
-
-signature Traversable ::= ∀t : * -> *.
-  { traverse :: ∀f : * -> * α β. Applicative f |- (α -> f β) -> t α -> f (t β)
-  }
-
-witness Traversable List :=
-  { traverse := λf xs.
-      deconstruct xs into
-        Nil          -> pure Nil
-      | Cons a tail  -> liftA2 Cons (f a) (traverse f tail)
-  }
-
-length :: ∀α. List α -> Int := λxs.
-  deconstruct xs into
-    Cons a tail -> 1 + length tail
-  | Nil         -> 0
+use Stdlib.
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
   let r = traverse (λx. if x > 0 then This x else Nope) (Cons 1 (Cons 2 (Cons 3 Nil))) in
   deconstruct r into
-    This ys -> print_endline (prim_show (length ys))   (* 3 *)
+    This ys -> print_endline (prim_show (List.length ys))   (* 3 *)
   | Nope    -> print_endline "a value was rejected"

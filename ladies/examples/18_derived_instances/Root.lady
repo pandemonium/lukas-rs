@@ -1,21 +1,8 @@
 (* A conditional instance: `Eq (List α)` holds given `Eq α`, and resolves
-   recursively. *)
+   recursively. Both the `Eq` class and the derived `Eq (List α)` instance come
+   from the standard library. *)
 
-List ::= ∀α. Nil | Cons α (List α)
-
-signature Eq ::= ∀α.
-  { eq :: α -> α -> Bool
-  }
-
-witness Eq Int := { eq := λp q. p = q }
-
-witness ∀α. Eq α |- Eq (List α) :=
-  { eq := λxs ys.
-      deconstruct xs, ys into
-        Cons x xs, Cons y ys -> eq x y and eq xs ys
-      | Nil, Nil             -> true
-      | otherwise            -> false
-  }
+use Stdlib.
 
 yesno :: Bool -> Text := λb. if b then "true" else "false"
 

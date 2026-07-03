@@ -1,11 +1,7 @@
-(* String interpolation. Each `expr` segment is rendered via a Display instance. *)
+(* String interpolation. Each `expr` segment is rendered via a Display instance
+   from the standard library. *)
 
-signature Display ::= ∀α.
-  { display :: α -> Text
-  }
-
-witness Display Int  := { display := λn. prim_show n }
-witness Display Text := { display := λt. t }
+use Stdlib.
 
 greet :: Text -> Int -> Text := λname age.
   "Hello `name`, next year you will be `age + 1`."

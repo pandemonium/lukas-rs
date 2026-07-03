@@ -1,6 +1,6 @@
-(* Ascribing a type to an expression with `::`. *)
+(* Ascribing a type to an expression with `::`. `Perhaps` is from the stdlib. *)
 
-Perhaps ::= ∀α. Nope | This α
+use Stdlib.
 
 show_maybe :: Perhaps Int -> Text := λp.
   deconstruct p into This n -> prim_show n | Nope -> "-"

@@ -1,6 +1,7 @@
-(* Deconstruction over several scrutinees at once, plus a catch-all. *)
+(* Deconstruction over several scrutinees at once, plus a catch-all.
+   `Perhaps` comes from the standard library. *)
 
-Perhaps ::= ∀α. Nope | This α
+use Stdlib.
 
 add_maybe :: Perhaps Int -> Perhaps Int -> Perhaps Int := λa b.
   deconstruct a, b into
