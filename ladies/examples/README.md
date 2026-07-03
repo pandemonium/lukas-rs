@@ -57,6 +57,7 @@ Or the whole gallery: `./ladies/examples/run.sh`.
 | 24 | `state_monad` | the standard-library `State` monad | `41` / `42` |
 | 25 | `error_handling` | a `Result` type with custom errors and chaining | `42` / `error: divide by zero` |
 | 26 | `expression_evaluator` | a tiny interpreter: recursive ADT + pattern matching | `30` |
+| 27 | `binding_operators` | idiom syntax: `let*` (monadic `bind`) and `let+` (applicative `fmap`) sugar | `30` / `stopped` / `42` |
 
 ## Notes on layout (learned building these)
 

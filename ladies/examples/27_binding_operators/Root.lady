@@ -1,0 +1,38 @@
+(* Idiom (binding-operator) syntax, desugared through the standard library:
+
+     let* x = m in body   ≡   bind (λx. body) m     -- monadic (Monad)
+     let+ x = m in body   ≡   fmap (λx. body) m     -- applicative/functor (Functor)
+
+   Here on Perhaps (the Maybe monad): a `let*` chain short-circuits to Nope the
+   moment any step fails. *)
+
+use Stdlib.
+
+halve :: Int -> Perhaps Int := λn.
+  if (n % 2) = 0 then This (n / 2) else Nope
+
+show_maybe :: Perhaps Int -> Text := λp.
+  deconstruct p into This n -> prim_show n | Nope -> "stopped"
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+
+  (* every step succeeds -> This 30 *)
+  let chained =
+    let* a = halve 40 in
+    let* b = halve a  in
+    This (a + b)
+  in
+  print_endline (show_maybe chained)      (* 30 *)
+
+  (* halve 15 is Nope, so the whole block short-circuits *)
+  let stopped =
+    let* a = halve 40 in
+    let* b = halve 15 in
+    This (a + b)
+  in
+  print_endline (show_maybe stopped)      (* stopped *)
+
+  (* let+ maps a pure function over a single functor value *)
+  let mapped = let+ x = This 41 in x + 1 in
+  print_endline (show_maybe mapped)       (* 42 *)
