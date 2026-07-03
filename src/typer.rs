@@ -889,17 +889,26 @@ fn resolve_constraints(
     for c in resolvable {
         let w = witnesses.resolve_witness(&c, &ctx.types, &evidence)?;
 
-        // If a constraint resolves to the witness we are *currently*
-        // elaborating, that is a recursive dictionary. Refer to it through the
-        // self-reference slot (#0) rather than its global name -- exactly as
-        // ordinary recursion does -- so it does not become an (undefined) global
-        // self-dependency.
-        let w = w.map(&mut |e| match e {
-            Expr::Variable(ti, Identifier::Free(name)) if name.as_ref() == symbol_name => {
-                Expr::Variable(ti, Identifier::Bound(0))
-            }
-            other => other,
-        });
+        // If a constraint resolves to the witness we are *currently* elaborating,
+        // that is a recursive dictionary. When this tree has a self-reference slot
+        // (#0) -- i.e. it is a self-referential lambda, as constrained/derived
+        // witnesses and functions are -- route the recursion through #0, exactly as
+        // ordinary recursion does.
+        //
+        // A *ground* witness (e.g. `Foldable List`) has no such slot: its body is a
+        // plain record, so #0 would collide with a field lambda's own parameter and
+        // mis-project at run time (a `BadProjection`). Leave those as the global
+        // self-reference, which resolves through the shared, live globals.
+        let w = if is_self_referential {
+            w.map(&mut |e| match e {
+                Expr::Variable(ti, Identifier::Free(name)) if name.as_ref() == symbol_name => {
+                    Expr::Variable(ti, Identifier::Bound(0))
+                }
+                other => other,
+            })
+        } else {
+            w
+        };
 
         evidence.insert(c, w);
     }

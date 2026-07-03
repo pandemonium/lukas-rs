@@ -56,9 +56,17 @@ These already have homes in the repo; listed here so the full set is discoverabl
 |-------|-----|-------|
 | `ladies/nested_deconstruct/` | An *inline* nested `deconstruct` mis-parses — the outer `\| …` clause is wrongly attached to the inner match (clause-attachment / layout). | parse error |
 | `ladies/lang/09_pattern_matching/` | Coverage checker false positive: enumerating all four two-scrutinee `This`/`Nope` cases rejects the last as *not useful*. | `type error: … -> #2 is not useful` |
-| `ladies/examples/22_monoid_and_foldable/` | Recursive dictionary method: a `Foldable` witness whose `fold_right` recurses through its own class method. | run-time `BadProjection … Ordinal(0)` |
 
 See each program's header comment / the panel READMEs for the full write-up.
+
+## Fixed
+
+- **Recursive dictionary method** (`ladies/examples/22_monoid_and_foldable/`) — a ground
+  `Foldable List` witness whose `fold_right` recurses through the class method crashed
+  with `BadProjection … Ordinal(0)`. Fixed in `resolve_constraints`: a recursive
+  dictionary is rewritten to the self-slot `#0` only when the tree actually has one; a
+  ground witness (record body, no self-slot) keeps its global self-reference, resolved
+  via the shared live globals.
 
 ## Design critiques
 

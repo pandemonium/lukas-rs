@@ -52,7 +52,7 @@ Or the whole gallery: `./ladies/examples/run.sh`.
 | # | Folder | Concept | Output |
 |---|--------|---------|--------|
 | 21 | `functor_applicative_monad` | the whole hierarchy on one type | `41` |
-| 22 | `monoid_and_foldable` | fold a structure into a monoid (`fold_map`) | ⚠ **`CRASH`** (see recursive-dictionary note) |
+| 22 | `monoid_and_foldable` | fold a structure into a monoid (`fold_map`); `Foldable List`'s `fold_right` recurses through the class method | `6` |
 | 23 | `traversable` | `traverse` under a *distinct* `Applicative` | `3` |
 | 24 | `state_monad` | the standard-library `State` monad | `41` / `42` |
 | 25 | `error_handling` | a `Result` type with custom errors and chaining | `42` / `error: divide by zero` |
@@ -66,11 +66,13 @@ The parser is layout-sensitive in a few ways worth knowing:
   last field's line.
 - A record field whose value is a multi-line `deconstruct` can't be followed by
   another field — delegate such fields to a top-level helper (as the stdlib does).
-- **Recursive dictionary method (makes `22` crash):** the `Foldable List` witness now
-  defines `fold_right` inline, recursing through the class method itself. That produces
-  a bad dictionary projection at run time — `Expected a return value: BadProjection …
-  Ordinal(0)`. Delegating the field to a plain top-level `list_fold_right` sidesteps it
-  (that's the workaround we removed).
+- **Recursive dictionary method (fixed):** `22`'s `Foldable List` witness defines
+  `fold_right` inline, recursing through the class method itself. This used to crash with
+  `BadProjection … Ordinal(0)` — the ground witness had no self-reference slot, so the
+  recursive dictionary was rewritten to `#0`, colliding with the field lambda's own
+  parameter. Fixed in `resolve_constraints` (only rewrite a recursive dictionary to `#0`
+  when the tree actually has a self-slot; a ground witness keeps its global
+  self-reference, resolved via the shared live globals).
 - A single-clause `deconstruct` on its own line, immediately before another top-level
   declaration, mis-parses; put such a definition last, or bind its result in a `let`.
 - **Higher-kinded type parameters** are accepted in ordinary sum/record declarations,
