@@ -1,6 +1,7 @@
 use Prelude.
 use State.
 use Control.
+use IO.
 
 List ::= ∀α. Nil | Cons α (List α)
 
@@ -154,23 +155,6 @@ module Result:
 witness Monoid Text :=
   { mempty  := ""
     mappend := λp q. "`p``q`"
-  }
-
-witness Monoid Int :=
-  { mempty  := 0
-    mappend := λp q. p + q
-  }
-
-witness Eq Int :=
-  { eq := λp q. p = q
-  }
-
-witness ∀α. Eq α |- Eq (List α) :=
-  { eq := λxs ys.
-      deconstruct xs, ys into
-        Cons x xs, Cons y ys -> eq x y and eq xs ys
-      | Nil, Nil             -> true
-      | otherwise            -> false
   }
 
 witness Display Text :=

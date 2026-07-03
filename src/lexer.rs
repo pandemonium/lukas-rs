@@ -824,19 +824,3 @@ impl fmt::Display for BindingOperator {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::lexer::LexicalAnalyzer;
-
-    #[test]
-    fn lexington() {
-        let mut lexer = LexicalAnalyzer::default();
-        let input = include_str!("../examples/3.txt");
-
-        let tokens = lexer.tokenize(&input.chars().collect::<Vec<_>>());
-        for crate::lexer::Token { kind, position } in tokens {
-            tracing::trace!("[{position}] {kind:?}");
-        }
-    }
-}

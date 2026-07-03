@@ -1,0 +1,35 @@
+IO ::= ∀α. Suspend (Unit -> α)
+
+witness Monad IO :=
+  { bind := Impl.bind
+  }
+
+witness Functor IO :=
+  { fmap := Impl.map
+  }
+
+witness Applicative IO :=
+  { pure  := Impl.return
+    apply := Impl.apply
+  }
+
+output :: Text -> IO Unit := λtext.
+  Suspend (λ_. print_endline text)
+
+unsafeRunIO :: ∀α. IO α -> Unit := λ(Suspend thunk).
+  thunk ()
+
+module Impl:
+  return :: ∀α. α -> IO α := λa.
+    Suspend (λ_. a)
+
+  map :: ∀α β. (α -> β) -> IO α -> IO β := λf (Suspend thunk).
+    Suspend (λ_. f (thunk ()))
+
+  bind :: ∀α β. (α -> IO β) -> IO α -> IO β := λf (Suspend thunk).
+    Suspend (λ_.
+        let Suspend th2 = f (thunk ()) in th2 ()
+    )
+
+  apply :: ∀α β. IO (α -> β) -> IO α -> IO β := λ(Suspend f) (Suspend a).
+    Suspend (λ_. (f ()) (a ()))

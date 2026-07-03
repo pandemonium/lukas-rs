@@ -1,0 +1,10 @@
+use Stdlib.
+
+main :: IO Unit :=
+  let* t = pure "Hello, world" in
+  let* _ = IO.output t in
+  let* _ = IO.output "Value: `3 * 42`" in
+  pure ()
+
+start := λ_.
+  IO.unsafeRunIO main
