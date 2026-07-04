@@ -1,0 +1,22 @@
+use Stdlib.
+
+ExprF ::= ∀name α r.
+    Var    α name
+  | Lit    α Constant
+  | Lambda α name r
+  | Apply  α r r
+
+Constant ::=
+  MkInt Int | MkText Text
+
+witness ∀name α. Functor (ExprF name α) :=
+  { fmap := λf fa.
+      deconstruct fa into
+        Var a name      -> Var a name
+      | Lit a const     -> Lit a const
+      | Lambda a name r -> Lambda a name (f r)
+      | Apply a r s     -> Apply a (f r) (f s)
+  }
+
+start := λ_.
+  print_endline "Hi"

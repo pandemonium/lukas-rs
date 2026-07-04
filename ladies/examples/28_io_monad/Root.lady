@@ -7,4 +7,5 @@ main :: IO Unit :=
   pure ()
 
 start := λ_.
+  print_endline "##TC"
   IO.unsafeRunIO main

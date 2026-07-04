@@ -1,7 +1,7 @@
 use Stdlib.
-(* Traversable traverse (Applicative f + Traversable t) -- expect 2. KNOWN BROKEN. *)
+(* Traversable traverse. Discriminating: fold z*10+a so order/contents matter -- expect 123. *)
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  deconstruct traverse (λx. This x) (Cons 1 (Cons 2 Nil)) into
-    This ys -> print_endline (prim_show (List.length ys))
+  deconstruct traverse (λx. This x) (Cons 1 (Cons 2 (Cons 3 Nil))) into
+    This ys -> print_endline (prim_show (List.fold_left (λz a. z * 10 + a) 0 ys))
   | Nope    -> print_endline "no"

@@ -1,4 +1,4 @@
-(* 09: Traversable -- the hardest case, known broken. *)
+(* 09: Traversable -- the hardest case. Works; result is 6. *)
 (* `traverse :: ∀f α β. Applicative f |- (α -> f β) -> t α -> f (t β)`. The *)
 (* method is constrained by an Applicative that is distinct from the *)
 (* Traversable's own type constructor, and the witness body uses `pure` and *)

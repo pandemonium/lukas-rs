@@ -1924,19 +1924,37 @@ impl Type {
         //trace!("{self} -- subs {subs}");
 
         match self {
-            p @ Self::Variable(param) => subs
-                .substitution(param)
-                .map_or_else(
-                    || p.clone(),
-                    |t| {
-                        if !matches!(t, Type::Variable(p2) if p2 == param) {
-                            t.apply(subs)
-                        } else {
-                            t.clone()
+            Self::Variable(param) => {
+                // Follow variable→variable chains iteratively. Unification can
+                // compose a substitution containing a cycle of mutually-equal
+                // variables (e.g. `$a ↦ $b`, `$b ↦ $a`, produced when two match
+                // clauses unify their scrutinee spines in opposite directions).
+                // Such a cycle is sound — the variables were unified, so they are
+                // equal — but chasing it recursively would loop forever. Resolve
+                // the chain to a stable canonical representative instead.
+                let mut current = param.clone();
+                let mut seen = HashSet::<MetaVariable>::default();
+                loop {
+                    match subs.substitution(&current) {
+                        None => break Self::Variable(current),
+                        // Identity self-binding: nothing more to resolve.
+                        Some(Type::Variable(next)) if *next == current => {
+                            break Self::Variable(current);
                         }
-                    },
-                )
-                .clone(),
+                        Some(Type::Variable(next)) => {
+                            if !seen.insert(current.clone()) {
+                                // Closed a variable cycle: every variable in it is
+                                // equal, so pick a deterministic representative.
+                                let rep = seen.into_iter().min().unwrap_or(current);
+                                break Self::Variable(rep);
+                            }
+                            current = next.clone();
+                        }
+                        // A non-variable binding: substitute it structurally.
+                        Some(t) => break t.clone().apply(subs),
+                    }
+                }
+            }
 
             Self::Base(b) => Self::Base(*b),
 

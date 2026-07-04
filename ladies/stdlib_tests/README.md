@@ -18,7 +18,7 @@ All ten features pass, deterministically (`use Stdlib.` elaborates and runs).
 | 07 | foldable | `fold_map` (`Monoid m + Foldable t`) | `ab` | ✅ |
 | 08 | state | `State` monad (`State.pure`/`eval`) | `7` | ✅ |
 | 09 | interpolation | string interpolation via `Display` | `val is 42.` | ✅ |
-| 10 | traversable | `traverse` (`Applicative f + Traversable t`) | `2` | ✅ |
+| 10 | traversable | `traverse` (`Applicative f + Traversable t`) | `123` | ✅ |
 
 ## What was broken, and the fixes
 
