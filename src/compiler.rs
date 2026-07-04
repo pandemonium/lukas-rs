@@ -41,6 +41,12 @@ pub enum CompilationError {
 
     #[error("Error generating code")]
     Chez(#[from] chez::ChezError),
+
+    #[error(
+        "the root module (Root.lady) must define an entry point `start` \
+         (e.g. `start := λ_. ...`), but none was found"
+    )]
+    MissingStart,
 }
 
 #[derive(Debug, Error)]
@@ -83,8 +89,23 @@ pub struct Compiler {
 impl Compiler {
     pub fn parse_compilation_unit(&self) -> Compilation {
         let module_name = parser::Identifier::from_str(ROOT_MODULE_NAME);
+        let root_module = self.load_module(&module_name)?;
+
+        // Every Root.lady must define `start`, the program entry point. Check it
+        // here so a missing (or, thanks to a parse desync, dropped) `start` is a
+        // clear compile error rather than a `NoSuchSymbol` crash at run time.
+        let has_start = matches!(
+            &root_module.declarator,
+            ast::ModuleDeclarator::Inline(decls) if decls.iter().any(|d| matches!(
+                d, ast::Declaration::Value(_, v) if v.name.as_str() == "start"
+            ))
+        );
+        if !has_start {
+            Err(CompilationError::MissingStart)?;
+        }
+
         Ok(CompilationUnit {
-            root_module: self.load_module(&module_name)?,
+            root_module,
             compiler: self.clone(),
         })
     }
@@ -200,11 +221,16 @@ fn load_and_parse_module(source_path: PathBuf) -> Compilation<Vec<ast::Declarati
 
     let declarations = parser.parse_declaration_list()?;
 
-    if !parser.remains().is_empty() {
-        tracing::warn!(
-            "load_and_parse_module: {source_path:?} last known location {}",
-            parser.remains()[0].location()
-        );
+    // A fully-parsed module leaves only the `End` sentinel. Any other leftover
+    // token means the declaration loop desynced (usually an unexpected layout
+    // indent/dedent) and silently abandoned the rest of the file. Report it
+    // instead of dropping it -- otherwise the failure only surfaces much later
+    // as a missing `start` at run time.
+    if let Some(token) = parser.remains().iter().find(|t| !t.is_end()) {
+        Err(parser::ParseError::UnconsumedInput {
+            found: token.kind.clone(),
+            position: *token.location(),
+        })?;
     }
 
     Ok(declarations)

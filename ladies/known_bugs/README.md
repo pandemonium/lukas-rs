@@ -24,7 +24,7 @@ cargo run -q --bin lukas -- --library ladies/stdlib --source ladies/known_bugs/h
 | `double_forall_adt` | A type declaration accepts only one `∀`; a second forall in the body (`∀a. ∀b. …`) panics. | panic `src/parser.rs:858` |
 | `qualified_ctor_pattern` | A qualified constructor in a *pattern* (`Root.Cons`, `M.Red`) crashes the pattern parser (also blocks matching a module's constructors). | panic `src/parser.rs:2090` |
 | `brace_on_last_line` | A record *type*'s closing `}` must be on its own line; on the last field's line it fails. | `parse error: expected }` |
-| `multiline_application` | An application split across lines silently corrupts the parse → runtime abort. | panic `src/main.rs:87` |
+| `multiline_application` | *Mostly a misunderstanding:* multi-line application works via the offside rule (head on its own line, args indented past it and aligned). Two real footguns remain: head left on the `:=` line with a wrapped arg **panics**; args at the *same* column as the head silently take the last one. | panic `src/main.rs:87` |
 
 ### Lexer / comments
 

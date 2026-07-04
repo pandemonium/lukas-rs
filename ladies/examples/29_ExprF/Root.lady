@@ -69,9 +69,21 @@ sumAlg :: ∀name. ExprF name Int Int -> Int :=
 
 sumAnnotations :: ∀name. Expr name Int -> Int := foldExpr sumAlg
 
-(* the AST for `(λx. x) 1`, annotated: Apply 9 (Lambda 7 "x" (Var 3 "x")) (Lit 5 1) *)
-sample :: Expr Text Int :=
-  MkExpr (Apply 9 (MkExpr (Lambda 7 "x" (MkExpr (Var 3 "x")))) (MkExpr (Lit 5 (MkInt 1))))
+(* The AST for `(λx. x) 1`, built bottom-up (annotations are the Ints). *)
+xVar  :: Expr Text Int := MkExpr (Var 3 "x")
+idFun :: Expr Text Int := MkExpr (Lambda 7 "x" xVar)
+lit1  :: Expr Text Int := MkExpr (Lit 5 (MkInt 1))
+
+(* The top `Apply` node, one argument per line -- Marmelade's layout is *)
+(* offside, so an application continues across lines when the head is on *)
+(* its own line and each argument is indented past it and aligned.       *)
+appNode :: ExprF Text Int (Expr Text Int) :=
+  Apply
+    9
+    idFun
+    lit1
+
+sample :: Expr Text Int := MkExpr appNode
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"

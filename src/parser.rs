@@ -171,6 +171,17 @@ pub enum ParseError {
 
     #[error("expected a type constructor (Capitalized name.)")]
     ExpectedTypeConstructor,
+
+    #[error(
+        "{position}: unexpected input; the parser stopped here with tokens left over.\n\
+         A declaration above likely failed to parse, or the layout desynced (a stray \
+         indent/dedent). Everything from here on -- possibly including `start` -- was \
+         dropped.\nfound: {found}"
+    )]
+    UnconsumedInput {
+        found: TokenKind,
+        position: SourceLocation,
+    },
 }
 
 type Result<A> = result::Result<A, ParseError>;
