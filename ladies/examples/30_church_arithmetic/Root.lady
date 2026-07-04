@@ -1,0 +1,100 @@
+(* Peano / Church arithmetic on a fixpoint of a pattern functor.
+
+   A natural number is `Fix NatF`, where `NatF` is the "shape" of a Nat with
+   its single recursive position factored out into `r`. `Fix` ties the knot,
+   so a value is a tower `MkFix (SuccF (MkFix (SuccF ... (MkFix ZeroF))))`.
+
+   Two flavours of definition appear below:
+     - direct structural recursion (add, mul, pow, pred, monus, factorial),
+       matching the nested `MkFix (SuccF r)` shape in a single deconstruct;
+     - the catamorphism `foldNat`, and `church`, which views a Nat as a
+       Church numeral -- "apply f, n times, to x" -- so that e.g. iterating
+       "double" starting from one computes a power of two. *)
+
+use Stdlib.
+
+NatF ::= ∀r. ZeroF | SuccF r
+Fix  ::= ∀f : * -> *. MkFix (f (Fix f))
+
+(* NatF is a functor in its recursive slot -- this is what `foldNat` folds over *)
+witness Functor NatF :=
+  { fmap := λf fa. deconstruct fa into ZeroF -> ZeroF | SuccF r -> SuccF (f r) }
+
+(* constructors *)
+zero :: Fix NatF := MkFix ZeroF
+succ :: Fix NatF -> Fix NatF := λn. MkFix (SuccF n)
+
+one   :: Fix NatF := succ zero
+two   :: Fix NatF := succ one
+three :: Fix NatF := succ two
+
+(* conversions to/from machine Ints, for building inputs and showing results *)
+toInt :: Fix NatF -> Int := λn.
+  deconstruct n into
+    MkFix ZeroF     -> 0
+  | MkFix (SuccF r) -> 1 + toInt r
+
+fromInt :: Int -> Fix NatF := λn.
+  if n = 0 then zero else succ (fromInt (n - 1))
+
+(* addition: 0 + b = b ; (1 + n) + b = 1 + (n + b) *)
+add :: Fix NatF -> Fix NatF -> Fix NatF := λa b.
+  deconstruct a into
+    MkFix ZeroF     -> b
+  | MkFix (SuccF n) -> succ (add n b)
+
+(* multiplication in terms of addition *)
+mul :: Fix NatF -> Fix NatF -> Fix NatF := λa b.
+  deconstruct a into
+    MkFix ZeroF     -> zero
+  | MkFix (SuccF n) -> add b (mul n b)
+
+(* exponentiation in terms of multiplication: b^0 = 1 ; b^(1+n) = b * b^n *)
+pow :: Fix NatF -> Fix NatF -> Fix NatF := λb e.
+  deconstruct e into
+    MkFix ZeroF     -> one
+  | MkFix (SuccF n) -> mul b (pow b n)
+
+(* predecessor (pred 0 = 0) *)
+pred :: Fix NatF -> Fix NatF := λn.
+  deconstruct n into
+    MkFix ZeroF     -> zero
+  | MkFix (SuccF m) -> m
+
+(* truncated subtraction (monus): a - 0 = a ; a - (1+m) = pred (a - m) *)
+monus :: Fix NatF -> Fix NatF -> Fix NatF := λa b.
+  deconstruct b into
+    MkFix ZeroF     -> a
+  | MkFix (SuccF m) -> pred (monus a m)
+
+(* factorial: 0! = 1 ; (1+m)! = (1+m) * m! *)
+factorial :: Fix NatF -> Fix NatF := λn.
+  deconstruct n into
+    MkFix ZeroF     -> one
+  | MkFix (SuccF m) -> mul n (factorial m)
+
+isZero :: Fix NatF -> Bool := λn.
+  deconstruct n into MkFix ZeroF -> true | MkFix (SuccF m) -> false
+
+(* equality without a nested match: a = b  iff  (a - b) + (b - a) = 0 *)
+eqNat :: Fix NatF -> Fix NatF -> Bool := λa b.
+  isZero (add (monus a b) (monus b a))
+
+(* the catamorphism: collapse a Nat by an algebra for one NatF layer *)
+foldNat :: ∀a. (NatF a -> a) -> Fix NatF -> a :=
+  λalg (MkFix e). alg (fmap (foldNat alg) e)
+
+(* a Nat *as* a Church numeral: `church f x n` applies f to x, n times *)
+church :: ∀a. (a -> a) -> a -> Fix NatF -> a := λf x n.
+  foldNat (λe. deconstruct e into ZeroF -> x | SuccF r -> f r) n
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (toInt (add three (fromInt 4))))          (* 7   *)
+  print_endline (prim_show (toInt (mul three (fromInt 4))))          (* 12  *)
+  print_endline (prim_show (toInt (pow two (fromInt 5))))            (* 32  *)
+  print_endline (prim_show (toInt (monus (fromInt 7) (fromInt 4))))  (* 3   *)
+  print_endline (prim_show (toInt (factorial (fromInt 5))))          (* 120 *)
+  print_endline (prim_show (eqNat (mul three two) (fromInt 6)))      (* true *)
+  print_endline (prim_show (toInt (church (λk. mul two k) one (fromInt 8))))  (* 256 = 2^8 *)
+  print_endline (prim_show (toInt (church succ zero three)))         (* 3, since f^n x with f=succ,x=zero *)

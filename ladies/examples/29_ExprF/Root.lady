@@ -28,9 +28,7 @@ Expr ::= ∀name a. MkExpr (ExprF name a (Expr name a))
 
 (* foldExpr alg = go where go (Expr e) = alg (fmap go e) *)
 foldExpr :: ∀name a r. (ExprF name a r -> r) -> Expr name a -> r :=
-  λalg x.
-    deconstruct x into
-      MkExpr e -> alg (fmap (foldExpr alg) e)
+  λalg (MkExpr e). alg (fmap (foldExpr alg) e)
 
 (* `first f` from Data.Bifunctor, over the annotation slot (hand-written) *)
 firstExpr :: ∀name a b r. (a -> b) -> ExprF name a r -> ExprF name b r :=
