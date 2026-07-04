@@ -45,8 +45,8 @@ cargo run -q --bin lukas -- --library ladies/stdlib --source ladies/known_bugs/h
 | Folder | Bug | Error |
 |--------|-----|-------|
 | `div_by_zero` | Integer division by zero aborts the host process instead of a controlled error (only known at run time, so it type-checks). | panic `src/builtin.rs:337` |
-| `hkt_sum_extract` | Extracting a higher-kinded `f α` payload from a sum type through a function polymorphic in `f`. Declaring/constructing/inline-matching the type is fine; generalizing over the higher-kinded `f` is not (annotation doesn't help). | `kind mismatch: cannot unify f with f α` |
-| `hkt_sum_ok` | *(not a bug — the passing boundary for `hkt_sum_extract`)* | prints `41` |
+| `hkt_sum_extract` | *(FIXED — now a passing guard; see Fixed below)* | prints `41` |
+| `hkt_sum_ok` | *(companion to `hkt_sum_extract` — the concrete-`f` contrast)* | prints `41` |
 
 ## Related failing cases living elsewhere
 
@@ -67,6 +67,38 @@ See each program's header comment / the panel READMEs for the full write-up.
   dictionary is rewritten to the self-slot `#0` only when the tree actually has one; a
   ground witness (record body, no self-slot) keeps its global self-reference, resolved
   via the shared live globals.
+- **Concrete-witness method in a self-recursive function** (`recursive_witness_method/`,
+  now a passing guard) — a self-recursive function (`foldExpr`, a `cata` over an `Expr`
+  newtype) that calls a type-class method (`fmap`) resolved against a *concrete* global
+  witness (`Functor (ExprF name a)`) crashed at run time with `ExpectedMatch`. In
+  `resolve_constraints` the self-reference `#0` was bound with *all* the function's
+  constraints, but only *parametric* (bare-variable-headed, e.g. `Functor f`) constraints
+  become dictionary parameters; a resolvable constructor-headed one is discharged inline
+  and takes no parameter. So the recursive call injected a phantom dictionary argument
+  (`foldExpr <dict> alg`), shifting the value arguments and deconstructing the algebra
+  closure against `MkExpr`. Fixed by binding the self-reference with only the parametric
+  constraints. (Non-recursive uses, and the generic `cata` whose `Functor f` dictionary is
+  a real parameter, always worked.)
+- **Higher-kinded payload extraction** (`hkt_sum_extract/`, now a passing guard) — pulling
+  an `f α` payload out of a sum type in a context polymorphic in the `* -> *` constructor
+  `f` (e.g. `unwrap :: ∀f : *->* α. Wrap f α -> f α`, or `unfix`/`cata` over
+  `Fix ::= ∀f : *->*. MkFix (f (Fix f))`) failed with `kind mismatch: cannot unify f with
+  f α`. Root cause in `reduce_applied_constructor`: normalizing an applied type peels the
+  arguments off the spine, but when the head is a *variable* (`f`) rather than a named
+  constructor, the fallback returned just the head and **dropped the arguments**, so `f α`
+  collapsed to `f`. The pattern binder then bound the payload at the truncated, mis-kinded
+  type `f` instead of `f α`. Fixed by rebuilding the applied spine in that fallback. This
+  is what unblocks `Fix`/`cata` and the whole recursion-schemes layer.
+- **Cyclic substitution in multi-clause `deconstruct`** (`functor_partial_multi_ctor/`,
+  now a passing guard) — elaborating a `Functor` witness for a *partially applied*,
+  *multi-constructor* type (e.g. `Functor (Q a)` where `Q ::= ∀a r. MkQ1 a r | MkQ2 a r`)
+  overflowed the stack in the typer. Each match clause normalizes the scrutinee to its
+  own freshly-instantiated constructor spine; unifying those spines across clauses
+  composed a substitution with a variable↔variable cycle (`$a ↦ $b`, `$b ↦ $a`) that the
+  single-step occurs-check couldn't catch, and `Type::apply` chased it forever. Fixed by
+  resolving variable chains iteratively to a canonical representative in `Type::apply`
+  (the cycle is sound — the variables were unified, hence equal). `ExprF`
+  (`ladies/examples/29_ExprF/`) is the real program that hit this.
 
 ## Design critiques
 

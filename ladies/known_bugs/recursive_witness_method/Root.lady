@@ -1,0 +1,44 @@
+(* FIXED regression guard (was a runtime ExpectedMatch from a mis-threaded dict). *)
+(* *)
+(* A self-recursive function that calls a type-class method (`fmap`) resolved *)
+(* against a *concrete* global witness -- here `Functor (ExprF name a)` -- used to *)
+(* crash at run time. `foldExpr` is the catamorphism over the `Expr` newtype; its *)
+(* `fmap` needs the `Functor (ExprF name a)` dictionary. *)
+(* *)
+(* Root cause (typer.rs `resolve_constraints`): the self-reference `#0` was bound *)
+(* with *all* the function's constraints, including this resolvable, *)
+(* constructor-headed one. But only *parametric* constraints (a bare variable head, *)
+(* like `Functor f`) become leading dictionary parameters; a resolvable constraint *)
+(* is discharged inline and takes no parameter. So the recursive call `foldExpr alg` *)
+(* got a phantom dictionary injected -> `foldExpr <dict> alg`, shifting the value *)
+(* arguments (dict into the `alg` slot, `alg` into the `x` slot). Under eager *)
+(* evaluation the mis-built recursive call was forced and deconstructed the algebra *)
+(* closure against `MkExpr`, hence ExpectedMatch. Fixed by binding the *)
+(* self-reference with only the parametric constraints. *)
+(* *)
+(* (A non-recursive function using the same `fmap`, or the generic `cata` whose *)
+(* `Functor f` dictionary is a real parameter, both always worked -- this needed *)
+(* the concrete-witness method *inside a self-recursive function*.) *)
+(* *)
+(* Expected: prints 3.  Actual (before fix): runtime ExpectedMatch. *)
+
+use Stdlib.
+
+Constant ::= MkInt Int | MkText Text
+ExprF ::= ∀name α r. Var α name | Lit α Constant | Lambda α name r | Apply α r r
+
+witness ∀name α. Functor (ExprF name α) := { fmap := λf fa. deconstruct fa into Var a nm -> Var a nm | Lit a c -> Lit a c | Lambda a nm r -> Lambda a nm (f r) | Apply a r s -> Apply a (f r) (f s) }
+
+Expr ::= ∀name a. MkExpr (ExprF name a (Expr name a))
+
+(* foldExpr alg = go where go (Expr e) = alg (fmap go e) -- uses the fmap witness *)
+foldExpr :: ∀name a r. (ExprF name a r -> r) -> Expr name a -> r := λalg x. deconstruct x into MkExpr e -> alg (fmap (foldExpr alg) e)
+
+countAlg :: ∀name a. ExprF name a Int -> Int := λe. deconstruct e into Var a nm -> 1 | Lit a c -> 1 | Lambda a nm r -> r + 1 | Apply a r s -> r + s + 1
+countNodes :: ∀name a. Expr name a -> Int := foldExpr countAlg
+
+sample :: Expr Text Int := MkExpr (Apply 9 (MkExpr (Var 9 "x")) (MkExpr (Lit 9 (MkInt 5))))
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (countNodes sample))

@@ -1,0 +1,28 @@
+(* Regression guard for the recursion-schemes layer (unblocked by the *)
+(* `reduce_applied_constructor` fix; see ../hkt_sum_extract for the root cause). *)
+(* *)
+(* `Fix` ties the knot on a pattern functor: `MkFix (f (Fix f))`. A generic *)
+(* `cata` (catamorphism / fold) is polymorphic in the `* -> *` constructor `f` *)
+(* and must pull the `f (Fix f)` payload out of `MkFix` -- a *nested* applied *)
+(* spine, the exact shape that used to collapse `f α` to `f` and mis-kind the *)
+(* pattern binder. This is the load-bearing primitive for ana / hylo / Free etc. *)
+(* *)
+(* Expected: prints 2  (the depth of `Succ (Succ Zero)` folded to an Int). *)
+(* Actual (before fix): kind mismatch `f` vs `f (Fix f)`. *)
+
+use Stdlib.
+
+NatF ::= ∀r. ZeroF | SuccF r
+
+witness Functor NatF :=
+  { fmap := λf fa. deconstruct fa into ZeroF -> ZeroF | SuccF r -> SuccF (f r) }
+
+Fix ::= ∀f : * -> *. MkFix (f (Fix f))
+
+cata :: ∀f : * -> * a. Functor f |- (f a -> a) -> Fix f -> a := λalg x. deconstruct x into MkFix layer -> alg (fmap (cata alg) layer)
+
+depth :: NatF Int -> Int := λn. deconstruct n into ZeroF -> 0 | SuccF r -> r + 1
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (cata depth (MkFix (SuccF (MkFix (SuccF (MkFix ZeroF)))))))

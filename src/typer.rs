@@ -843,10 +843,17 @@ fn resolve_constraints(
     // self-referential constrained symbol happened to be discharged first.
     ctx.reset_self_reference();
     if is_constrained && is_self_referential {
+        // The self-reference must advertise only the *parametric* constraints --
+        // the ones that actually became leading dictionary parameters (#1, #2,
+        // ...) below. A recursive call has to re-pass exactly those dictionaries.
+        // Resolvable constraints (ground- or constructor-headed, e.g.
+        // `Functor (ExprF name a)`) are discharged inline in the body and take no
+        // parameter, so listing them here would make the recursive call inject a
+        // phantom dictionary argument and shift the real arguments.
         ctx.bind_term(
             Identifier::Bound(0),
             Constrained {
-                constraints: constraints.clone(),
+                constraints: ConstraintSet::from(parametric.as_slice()),
                 underlying: tree.type_info().inferred_type.clone(),
             }
             .generalize(ctx)
@@ -2950,7 +2957,19 @@ impl TypingContext {
 
             _ => {
                 tracing::trace!("fallback with {applied}");
-                Ok(TypeStructure::Monotype(applied.clone()))
+                // The head isn't a reducible named constructor (e.g. a type
+                // variable `f` in `f α`, or an otherwise-neutral head). Rebuild
+                // the applied spine from the arguments we peeled off on the way
+                // down — otherwise `f α` collapses to just `f`, dropping `α` and
+                // mis-binding pattern variables at a truncated (mis-kinded) type.
+                arguments.reverse();
+                let ty = arguments.drain(..).fold(applied.clone(), |constructor, argument| {
+                    Type::Apply {
+                        constructor: constructor.into(),
+                        argument: argument.into(),
+                    }
+                });
+                Ok(TypeStructure::Monotype(ty))
             }
         }
     }

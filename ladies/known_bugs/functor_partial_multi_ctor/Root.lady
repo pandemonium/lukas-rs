@@ -1,0 +1,44 @@
+(* FIXED regression guard (was a stack overflow in the typer). *)
+(* *)
+(* Elaborating a `Functor` witness for a *partially applied*, *multi-constructor* *)
+(* type used to overflow the stack during type checking. The trigger needs all *)
+(* three of these at once: *)
+(*   1. the instance head is partially applied -- `Functor (Q a)`, leaving `r` *)
+(*      as the functorial slot; *)
+(*   2. the data type has >= 2 constructors     -- `MkQ1 | MkQ2`; *)
+(*   3. it is a `witness`                        -- the path that unifies spines. *)
+(* Drop any one and it always compiled: a single constructor, a saturated head *)
+(* (`Functor Q`), or a plain multi-branch `deconstruct` (no witness) are all fine. *)
+(* *)
+(* Root cause: each match clause normalizes the scrutinee to its own freshly *)
+(* instantiated constructor spine (`Q $89 $93`, then `Q $97 $93`, ...). Unifying *)
+(* those spines across clauses composed a substitution holding a variable<->variable *)
+(* cycle (`$a -> $b`, `$b -> $a`). Neither binding trips the single-step *)
+(* occurs-check (a var mapped to a *different* var), but `Type::apply` chased the *)
+(* cycle transitively and looped forever. The cycle is sound -- the two variables *)
+(* were unified, so they are equal -- so the fix resolves variable chains *)
+(* iteratively to a stable canonical representative in `Type::apply` (typer.rs), *)
+(* instead of recursing. *)
+(* *)
+(* This program exercises `fmap` over both constructors so it guards behaviour, *)
+(* not just compilation: `f` must hit the recursive `r` slot only. *)
+(* *)
+(* Expected: prints 42 then 10.  Actual (before fix): stack overflow, SIGABRT. *)
+
+use Stdlib.
+
+Q ::= ∀a r. MkQ1 a r | MkQ2 a r
+
+witness ∀a. Functor (Q a) :=
+  { fmap := λf fa.
+      deconstruct fa into
+        MkQ1 a x -> MkQ1 a (f x)
+      | MkQ2 a y -> MkQ2 a (f y)
+  }
+
+get := λq. deconstruct q into MkQ1 a x -> x | MkQ2 a y -> y
+
+start := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (get (fmap (λn. n + 1) (MkQ1 "k" 41))))
+  print_endline (prim_show (get (fmap (λn. n + 1) (MkQ2 "k" 9))))

@@ -1,3 +1,8 @@
+(* Pattern-functor / recursion-schemes style. `ExprF` factors the recursive
+   positions of an expression AST out into the parameter `r`, so the recursion
+   structure comes entirely from its `Functor` instance. `Expr` ties the knot,
+   and `foldExpr` is the catamorphism -- every fold below is just an algebra. *)
+
 use Stdlib.
 
 ExprF ::= ∀name α r.
@@ -18,5 +23,61 @@ witness ∀name α. Functor (ExprF name α) :=
       | Apply a r s     -> Apply a (f r) (f s)
   }
 
-start := λ_.
-  print_endline "Hi"
+(* newtype Expr name a = Expr { unExpr :: ExprF name a (Expr name a) } *)
+Expr ::= ∀name a. MkExpr (ExprF name a (Expr name a))
+
+(* foldExpr alg = go where go (Expr e) = alg (fmap go e) *)
+foldExpr :: ∀name a r. (ExprF name a r -> r) -> Expr name a -> r :=
+  λalg x.
+    deconstruct x into
+      MkExpr e -> alg (fmap (foldExpr alg) e)
+
+(* `first f` from Data.Bifunctor, over the annotation slot (hand-written) *)
+firstExpr :: ∀name a b r. (a -> b) -> ExprF name a r -> ExprF name b r :=
+  λf e.
+    deconstruct e into
+      Var a name      -> Var (f a) name
+    | Lit a const     -> Lit (f a) const
+    | Lambda a name r -> Lambda (f a) name r
+    | Apply a r s     -> Apply (f a) r s
+
+(* mapAnnotation f = foldExpr (Expr . first f) *)
+mapAnnotation :: ∀name a b. (a -> b) -> Expr name a -> Expr name b :=
+  λf. foldExpr (compose MkExpr (firstExpr f))
+
+(* stripAnnotations = mapAnnotation (const ()) *)
+stripAnnotations :: ∀name a. Expr name a -> Expr name Unit :=
+  mapAnnotation (const ())
+
+(* --- some algebras (each is just an `ExprF _ _ r -> r`) --- *)
+
+countAlg :: ∀name a. ExprF name a Int -> Int :=
+  λe.
+    deconstruct e into
+      Var a name      -> 1
+    | Lit a const     -> 1
+    | Lambda a name r -> r + 1
+    | Apply a r s     -> r + s + 1
+
+countNodes :: ∀name a. Expr name a -> Int := foldExpr countAlg
+
+sumAlg :: ∀name. ExprF name Int Int -> Int :=
+  λe.
+    deconstruct e into
+      Var a name      -> a
+    | Lit a const     -> a
+    | Lambda a name r -> a + r
+    | Apply a r s     -> a + r + s
+
+sumAnnotations :: ∀name. Expr name Int -> Int := foldExpr sumAlg
+
+(* the AST for `(λx. x) 1`, annotated: Apply 9 (Lambda 7 "x" (Var 3 "x")) (Lit 5 1) *)
+sample :: Expr Text Int :=
+  MkExpr (Apply 9 (MkExpr (Lambda 7 "x" (MkExpr (Var 3 "x")))) (MkExpr (Lit 5 (MkInt 1))))
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (countNodes sample))                      (* 4 *)
+  print_endline (prim_show (sumAnnotations sample))                  (* 24 *)
+  print_endline (prim_show (countNodes (stripAnnotations sample)))   (* 4 *)
+  print_endline (prim_show (sumAnnotations (mapAnnotation (λn. n + 1) sample)))  (* 28 *)
