@@ -49,6 +49,14 @@ impl CodeBuffer {
     pub fn write_to_file(&self, path: impl AsRef<path::Path>) -> io::Result<()> {
         fs::write(path, &self.0)
     }
+
+    /// Splice a file's contents into the buffer verbatim -- used to inline a
+    /// module's foreign `.ss` implementation into the emitted Scheme.
+    pub fn splice_file(&mut self, path: impl AsRef<path::Path>) -> io::Result<()> {
+        self.0.push_str(&fs::read_to_string(path)?);
+        self.0.push('\n');
+        Ok(())
+    }
 }
 
 impl fmt::Write for CodeBuffer {

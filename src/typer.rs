@@ -127,6 +127,10 @@ impl<A> namer::SymbolTable<A, namer::QualifiedName, namer::Identifier> {
             }
         }
 
+        for external in &self.externals {
+            matrix.add_edge(SymbolName::Term(external.name.clone()), vec![]);
+        }
+
         matrix
     }
 }
@@ -279,10 +283,7 @@ impl phase::SymbolTable<Named> {
             self.type_terms(&mut typed_symbols, selector_names.iter().copied(), ctx)?;
 
         for (term_symbol, typed) in &typed_selectors {
-            tracing::trace!(
-                "typed selector {} : {}",
-                term_symbol.name, typed.tree
-            );
+            tracing::trace!("typed selector {} : {}", term_symbol.name, typed.tree);
         }
 
         typed_terms.extend(typed_selectors);
@@ -419,8 +420,7 @@ impl phase::SymbolTable<Named> {
         let mut constrained_methods: HashSet<parser::Identifier> = HashSet::new();
         for signature in &self.signatures {
             if let Some(tc) = ctx.types.lookup(signature)
-                && let TypeDefinition::Record(record) =
-                    &tc.definition().defining_symbol.definition
+                && let TypeDefinition::Record(record) = &tc.definition().defining_symbol.definition
             {
                 for field in &record.fields {
                     if !field.type_signature.constraints.is_empty() {
@@ -435,8 +435,12 @@ impl phase::SymbolTable<Named> {
 
         // Collect the fields to lift (borrow self.symbols immutably first).
         type NamedExpr = ast::Expr<ParseInfo, Identifier>;
-        let mut lifts: Vec<(QualifiedName, parser::Identifier, QualifiedName, Rc<NamedExpr>)> =
-            Vec::new();
+        let mut lifts: Vec<(
+            QualifiedName,
+            parser::Identifier,
+            QualifiedName,
+            Rc<NamedExpr>,
+        )> = Vec::new();
         let mut witness_names = self.witnesses.iter().cloned().collect::<Vec<_>>();
         witness_names.sort();
         for witness in witness_names {
@@ -448,12 +452,10 @@ impl phase::SymbolTable<Named> {
             // instance's dictionary type.
             let record = match &symbol.body {
                 ast::Expr::Record(_, record) => record,
-                ast::Expr::Ascription(_, ascription) => {
-                    match ascription.ascribed_tree.as_ref() {
-                        ast::Expr::Record(_, record) => record,
-                        _ => continue,
-                    }
-                }
+                ast::Expr::Ascription(_, ascription) => match ascription.ascribed_tree.as_ref() {
+                    ast::Expr::Record(_, record) => record,
+                    _ => continue,
+                },
                 _ => continue,
             };
             for (field_name, field_body) in &record.fields {
@@ -571,10 +573,7 @@ impl phase::SymbolTable<Named> {
             {
                 for field in record.fields.iter() {
                     let method_arity = field.type_signature.body.arrow_arity();
-                    tracing::trace!(
-                        "{} {method_arity}",
-                        field.name
-                    );
+                    tracing::trace!("{} {method_arity}", field.name);
                     let method_dictionary_count = field.type_signature.constraints.len();
 
                     let name = QualifiedName::new(
@@ -602,10 +601,7 @@ impl phase::SymbolTable<Named> {
 
                     let num_constraints = constraints.len();
                     let slot = |origin: Option<usize>| {
-                        1 + constraints
-                            .iter()
-                            .position(|(o, _)| *o == origin)
-                            .unwrap()
+                        1 + constraints.iter().position(|(o, _)| *o == origin).unwrap()
                     };
 
                     // Project the signature method from the signature dictionary, then
@@ -824,7 +820,8 @@ fn resolve_constraints(
 
     tracing::trace!(
         "{symbol_name} parametric: {:?} resolvable {:?}",
-        &parametric, &resolvable
+        &parametric,
+        &resolvable
     );
 
     // Self referential trees have own_name at #0, first parameter is
@@ -871,10 +868,7 @@ fn resolve_constraints(
     // #(1 + i).
     for (i, c) in parametric.iter().enumerate() {
         let name = Identifier::Bound(1 + i);
-        tracing::trace!(
-            "binding {name} to {}",
-            c.constraint_type
-        );
+        tracing::trace!("binding {name} to {}", c.constraint_type);
 
         tree = add_dictionary_parameter_slot(&tree);
 
@@ -972,10 +966,7 @@ fn discharge_constraints(
             {
                 let use_site_type = type_scheme.instantiate();
 
-                tracing::trace!(
-                    "scheme {use_site_type} type {}",
-                    type_info.inferred_type
-                );
+                tracing::trace!("scheme {use_site_type} type {}", type_info.inferred_type);
 
                 let use_site_subst = use_site_type
                     .underlying
@@ -2963,12 +2954,12 @@ impl TypingContext {
                 // down — otherwise `f α` collapses to just `f`, dropping `α` and
                 // mis-binding pattern variables at a truncated (mis-kinded) type.
                 arguments.reverse();
-                let ty = arguments.drain(..).fold(applied.clone(), |constructor, argument| {
-                    Type::Apply {
+                let ty = arguments
+                    .drain(..)
+                    .fold(applied.clone(), |constructor, argument| Type::Apply {
                         constructor: constructor.into(),
                         argument: argument.into(),
-                    }
-                });
+                    });
                 Ok(TypeStructure::Monotype(ty))
             }
         }
@@ -3195,10 +3186,7 @@ impl TypingContext {
             .expand_type_constructor(pi, expected_type)?
             .unwrap_or_else(|| TypeStructure::Monotype(expected_type.clone()));
 
-        tracing::trace!(
-            "expected {expected_type} tree {:?}",
-            rec.lambda
-        );
+        tracing::trace!("expected {expected_type} tree {:?}", rec.lambda);
 
         if let TypeStructure::Monotype(Type::Arrow { domain, codomain }) = &normalized_type {
             self.bind_term_and_then(

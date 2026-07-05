@@ -1,0 +1,12 @@
+(* An `external` function: it exists in Marmelade (a name + a type), but has no
+   body here. Its implementation is expected from the backend/runtime, not from
+   Marmelade source -- so it type-checks and can be called, but only *executes*
+   once compiled through a backend that supplies the body. *)
+
+use Stdlib.
+
+external sqrt_int :: Int -> Int
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (sqrt_int 144))

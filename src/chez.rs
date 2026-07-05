@@ -25,12 +25,19 @@ use fmt::Write;
 pub enum ChezError {
     #[error("Formatting error {0}")]
     FmtError(#[from] fmt::Error),
+
+    #[error("I/O error splicing a foreign implementation: {0}")]
+    IoError(#[from] std::io::Error),
 }
 
 pub type Result<A> = result::Result<A, ChezError>;
 
 impl phase::SymbolTable<Types> {
-    pub fn emit_scheme_code(&self, code: &mut CodeBuffer) -> Result<()> {
+    pub fn emit_scheme_code(
+        &self,
+        code: &mut CodeBuffer,
+        foreign_files: &[std::path::PathBuf],
+    ) -> Result<()> {
         let deps = self.dependency_matrix();
         let symbols = deps
             .in_resolvable_order()
@@ -41,6 +48,12 @@ impl phase::SymbolTable<Types> {
 
         writeln!(code, "#!r6rs")?;
         writeln!(code, "(import (chezscheme) (runtime))")?;
+
+        // Foreign functions have no in-source body; splice in each declaring
+        // module's `<Module>.ss` implementation.
+        for path in foreign_files {
+            code.splice_file(path)?;
+        }
 
         for declaration in symbols {
             if let Symbol::Term(TermSymbol { name, body, .. }) = declaration {

@@ -819,7 +819,10 @@ impl phase::SymbolTable<Parsed> {
 
                 Declaration::Witness(_, decl) => self.add_witness_declaration(&module_path, decl),
 
-                Declaration::External(_, decl) => self.add_external_declaration(&module_path, decl),
+                Declaration::External(_, decl) => {
+                    self.add_module_term_member(module_path.clone(), decl.name.clone());
+                    self.add_external_declaration(&module_path, decl);
+                }
             };
         }
 

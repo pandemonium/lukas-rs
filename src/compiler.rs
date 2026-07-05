@@ -74,6 +74,25 @@ impl<T> LocatedError for T where T: fmt::Debug {}
 
 pub type Compilation<A = CompilationUnit> = Result<A, CompilationError>;
 
+/// Which on-disk artifact a module name resolves to. Both are located with the
+/// same source-then-`--library` search; they differ only in file extension.
+#[derive(Clone, Copy, Debug)]
+pub enum Artifact {
+    /// The Marmelade source module: `<Name>.lady`.
+    Module,
+    /// A backend-provided implementation of a module's foreign functions: `<Name>.ss`.
+    Foreign,
+}
+
+impl Artifact {
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Module => "lady",
+            Self::Foreign => "ss",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Parser)]
 pub struct Compiler {
     #[arg(long = "library")]
@@ -165,8 +184,21 @@ impl Compiler {
 
             let program = resolved_symbols.elaborate_compilation_unit()?;
 
+            // Each module that declares foreign functions gets its `<Module>.ss`
+            // implementation resolved (source-dir first, then --library) and spliced
+            // into the emitted Scheme.
+            let mut foreign_files = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for external in &program.externals {
+                let module = &external.name.module;
+                if seen.insert(module.clone()) {
+                    let name = parser::Identifier::from_str(&module.head);
+                    foreign_files.push(self.get_source_path(&name, Artifact::Foreign));
+                }
+            }
+
             let mut code = CodeBuffer::default();
-            program.emit_scheme_code(&mut code)?;
+            program.emit_scheme_code(&mut code, &foreign_files)?;
 
             if let Some(target) = &self.scheme_file {
                 code.write_to_file(target)?;
@@ -184,7 +216,7 @@ impl Compiler {
         &self,
         module: &parser::Identifier,
     ) -> Compilation<Vec<ast::Declaration<ParseInfo>>> {
-        let source_path = self.get_source_path(module);
+        let source_path = self.get_source_path(module, Artifact::Module);
         load_and_parse_module(source_path)
     }
 
@@ -198,8 +230,8 @@ impl Compiler {
         })
     }
 
-    fn get_source_path(&self, module: &parser::Identifier) -> PathBuf {
-        let name = PathBuf::from(format!("{}.lady", module.as_str()));
+    fn get_source_path(&self, module: &parser::Identifier, artifact: Artifact) -> PathBuf {
+        let name = PathBuf::from(format!("{}.{}", module.as_str(), artifact.extension()));
         let file_path = self.source_path.join(&name);
         if fs::exists(&file_path).unwrap() {
             file_path
