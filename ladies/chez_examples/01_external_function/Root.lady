@@ -7,6 +7,22 @@ use Stdlib.
 
 external sqrt_int :: Int -> Int
 
+Text_File ::= Input_Port Int
+
+module Text_File:
+  module __FFI:
+    external open_input_file :: Text -> Int
+    external close_input_file :: Int -> Unit
+
+  from_path :: Text -> Text_File := λfile_path.
+    let p = __FFI.open_input_file file_path
+    in Input_Port p
+
+  unmake :: Text_File -> Unit := λ(Input_Port p).
+    __FFI.close_input_file p
+
 start :: Int -> Unit := λ_.
   print_endline "##TC"
   print_endline (prim_show (sqrt_int 144))
+  let f = Text_File.from_path "todo.txt" in
+  print_endline "File handle: `prim_show f`"

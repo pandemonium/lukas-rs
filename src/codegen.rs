@@ -53,7 +53,10 @@ impl CodeBuffer {
     /// Splice a file's contents into the buffer verbatim -- used to inline a
     /// module's foreign `.ss` implementation into the emitted Scheme.
     pub fn splice_file(&mut self, path: impl AsRef<path::Path>) -> io::Result<()> {
-        self.0.push_str(&fs::read_to_string(path)?);
+        let path = path.as_ref();
+        let contents = fs::read_to_string(path)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+        self.0.push_str(&contents);
         self.0.push('\n');
         Ok(())
     }

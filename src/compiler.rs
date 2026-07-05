@@ -39,7 +39,7 @@ pub enum CompilationError {
     #[error("I/O error: {0}")]
     IO(#[from] io::Error),
 
-    #[error("Error generating code")]
+    #[error("code generation error: {0}")]
     Chez(#[from] chez::ChezError),
 
     #[error(
@@ -192,8 +192,10 @@ impl Compiler {
             for external in &program.externals {
                 let module = &external.name.module;
                 if seen.insert(module.clone()) {
-                    let name = parser::Identifier::from_str(&module.head);
-                    foreign_files.push(self.get_source_path(&name, Artifact::Foreign));
+                    // A companion foreign file is named by the module's fully-qualified
+                    // name: `Root.Stdlib` -> `Root.Stdlib.ss`, `Root` -> `Root.ss`. This
+                    // is unambiguous (no collision between same-named nested modules).
+                    foreign_files.push(self.get_source_path(&module.to_string(), Artifact::Foreign));
                 }
             }
 
@@ -216,7 +218,7 @@ impl Compiler {
         &self,
         module: &parser::Identifier,
     ) -> Compilation<Vec<ast::Declaration<ParseInfo>>> {
-        let source_path = self.get_source_path(module, Artifact::Module);
+        let source_path = self.get_source_path(module.as_str(), Artifact::Module);
         load_and_parse_module(source_path)
     }
 
@@ -230,13 +232,13 @@ impl Compiler {
         })
     }
 
-    fn get_source_path(&self, module: &parser::Identifier, artifact: Artifact) -> PathBuf {
-        let name = PathBuf::from(format!("{}.{}", module.as_str(), artifact.extension()));
-        let file_path = self.source_path.join(&name);
+    fn get_source_path(&self, name: &str, artifact: Artifact) -> PathBuf {
+        let file = PathBuf::from(format!("{}.{}", name, artifact.extension()));
+        let file_path = self.source_path.join(&file);
         if fs::exists(&file_path).unwrap() {
             file_path
         } else {
-            self.library_path.join(name)
+            self.library_path.join(file)
         }
     }
 }
