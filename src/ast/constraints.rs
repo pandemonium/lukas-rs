@@ -148,6 +148,12 @@ impl WitnessEnvironment {
             let solution = witness
                 .premises
                 .iter()
+                // A parametric premise (variable-headed, e.g. `Applicative m`) is
+                // satisfied by a dictionary *parameter*, not by another witness -- so
+                // it has no witness dependency. Resolving it against instances is both
+                // wrong and non-terminating: it unifies with a transformer head like
+                // `Applicative (ExceptT m e)` (m := ExceptT ...) and recurses forever.
+                .filter(|c| !c.is_parametric())
                 .map(|c| {
                     self.resolve_constraint_witness_dependencies(
                         c,

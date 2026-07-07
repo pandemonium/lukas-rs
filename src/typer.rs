@@ -1674,7 +1674,7 @@ impl Constraint {
     /// (`Eq Int`) or constructor-headed (`Eq (List α)`) -- is discharged by an
     /// instance instead, with that instance's own premises satisfied by the
     /// parameters.
-    fn is_parametric(&self) -> bool {
+    pub fn is_parametric(&self) -> bool {
         matches!(
             &self.constraint_type,
             Type::Apply { argument, .. } if matches!(argument.as_ref(), Type::Variable(..))
