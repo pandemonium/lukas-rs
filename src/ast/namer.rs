@@ -347,17 +347,21 @@ where
         self.witnesses.insert(witness);
     }
 
-    pub fn are_sound(&self) -> bool {
-        //        let Self(map) = self;
-        let unsatisfieds = self
-            .graph
+    /// Every `(symbol, dependency)` edge whose dependency has no defining node in
+    /// the graph -- i.e. a name that is referenced but never defined.
+    pub fn unsatisfied(&self) -> Vec<(&Id, &Id)> {
+        self.graph
             .iter()
-            .filter_map(|(_, deps)| deps.iter().find(|&dep| !self.graph.contains_key(dep)))
-            .collect::<Vec<_>>();
+            .flat_map(|(node, deps)| {
+                deps.iter()
+                    .filter(|dep| !self.graph.contains_key(dep))
+                    .map(move |dep| (node, dep))
+            })
+            .collect()
+    }
 
-        tracing::debug!("dependencies: unsatisfied {:?}", unsatisfieds);
-
-        unsatisfieds.is_empty()
+    pub fn are_sound(&self) -> bool {
+        self.unsatisfied().is_empty()
     }
 
     pub fn in_resolvable_order(&self) -> Vec<&Id> {

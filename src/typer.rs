@@ -1765,6 +1765,7 @@ pub enum Type {
     },
     Tuple(TupleType),
     Record(RecordType),
+    // Could this be used as the backing for Opaque types? A zero arity coproduct
     Coproduct(CoproductType),
     Constructor(namer::QualifiedName),
     Apply {

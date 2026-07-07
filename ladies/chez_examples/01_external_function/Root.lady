@@ -1,28 +1,49 @@
 (* An `external` function: it exists in Marmelade (a name + a type), but has no
    body here. Its implementation is expected from the backend/runtime, not from
    Marmelade source -- so it type-checks and can be called, but only *executes*
-   once compiled through a backend that supplies the body. *)
+   once compiled through a backend that supplies the body.
+
+   from_path could return a V-table instead. I like that stuff, do that but not
+   first.
+
+   *)
 
 use Stdlib.
 
 external sqrt_int :: Int -> Int
 
-Text_File ::= Input_Port Int
+Fault ::= FileDoesNotExist Text
 
-module Text_File:
+(* Do I need a fucking monad transformer? *)
+module File:
+  TextFile ::=
+    { read_to_string :: IO (Result Text Fault)
+      read_line      :: IO (Result Text Fault)
+      close          :: IO (Result Unit Fault)
+    }
+
   module __FFI:
-    external open_input_file :: Text -> Int
-    external close_input_file :: Int -> Unit
+    external open_file_input_port :: Text -> Int
+    external close_port           :: Int -> Unit
+    external is_eof_object        :: Int -> Bool
+    external get_line             :: Int -> Text
+    external get_string_all       :: Int -> Text
 
-  from_path :: Text -> Text_File := λfile_path.
-    let p = __FFI.open_input_file file_path
-    in Input_Port p
+  text_from_path :: Text -> IO (Result TextFile Fault) := λfile_path.
+    let* port = IO.suspend (λ_. __FFI.open_file_input_port file_path) in
+    pure { read_to_string := IO.suspend (λ_. __FFI.get_string_all port)
+           read_line      := IO.suspend (λ_. __FFI.get_line port)
+           close          := IO.suspend (λ_. __FFI.close_port port)
+         }
 
-  unmake :: Text_File -> Unit := λ(Input_Port p).
-    __FFI.close_input_file p
+file_io :: IO Text := λ_.
+  let* f = File.text_from_path "todo.txt" in
+  let* contents = f.read_to_string in
+  let* _ = f.close in
+  contents
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
   print_endline (prim_show (sqrt_int 144))
-  let f = Text_File.from_path "todo.txt" in
-  print_endline "File handle: `prim_show f`"
+  let contents = IO.unsafeRunIO file_io in
+  print_endline "File contents: `contents`"

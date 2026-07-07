@@ -47,6 +47,21 @@ pub enum CompilationError {
          (e.g. `start := λ_. ...`), but none was found"
     )]
     MissingStart,
+
+    #[error("unsatisfied dependencies -- a name is referenced but never defined:\n{0}")]
+    UnsatisfiedDependencies(String),
+}
+
+/// Format the unresolved edges of a dependency graph into an error naming which
+/// symbol depends on which undefined name.
+fn bad_dependencies(deps: &namer::DependencyMatrix<namer::SymbolName>) -> CompilationError {
+    let report = deps
+        .unsatisfied()
+        .iter()
+        .map(|(from, dep)| format!("  `{from}` depends on `{dep}`, which is not defined"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    CompilationError::UnsatisfiedDependencies(report)
 }
 
 #[derive(Debug, Error)]
@@ -166,7 +181,7 @@ impl Compiler {
             Ok(Env::from_globals(globals))
         } else {
             // Err(CompilationError::Dependencies...)
-            panic!("Bad dependencies")
+            Err(bad_dependencies(&dependencies))
         }
     }
 
@@ -210,7 +225,7 @@ impl Compiler {
 
             Ok(())
         } else {
-            panic!("Bad dependencies")
+            Err(bad_dependencies(&dependencies))
         }
     }
 

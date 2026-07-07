@@ -16,6 +16,8 @@ witness Applicative IO :=
 output :: Text -> IO Unit := λtext.
   Suspend (λ_. print_endline text)
 
+suspend :: ∀α. (Unit -> α) -> IO α := Suspend
+
 unsafeRunIO :: ∀α. IO α -> Unit := λ(Suspend thunk).
   thunk ()
 
