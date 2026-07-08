@@ -355,7 +355,7 @@ impl phase::SymbolTable<Parsed> {
                 })
                 .collect(),
             imports: self.imports.clone(),
-            externals: self.externals.clone(),
+            foreign_terms: self.foreign_terms.clone(),
             signatures: self.signatures.clone(),
             witnesses: self.witnesses.clone(),
         }

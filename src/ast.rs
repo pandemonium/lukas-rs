@@ -38,7 +38,7 @@ pub enum Declaration<A> {
     Use(A, UseDeclaration<A>),
     Signature(A, SignatureDeclaration<A>),
     Witness(A, WitnessDeclaration<A>),
-    External(A, ExternalDeclaration<A>),
+    Foreign(A, ForeignDeclaration<A>),
 }
 
 #[derive(Debug, Clone)]
@@ -100,7 +100,7 @@ pub struct WitnessDeclaration<A> {
 }
 
 #[derive(Debug)]
-pub struct ExternalDeclaration<A> {
+pub struct ForeignDeclaration<A> {
     pub name: parser::Identifier,
     pub type_signature: TypeSignature<A, parser::IdentifierPath>,
 }
@@ -893,7 +893,7 @@ where
             Self::Use(_, decl) => write!(f, "use {decl}"),
             Self::Signature(_, decl) => write!(f, "constraint {decl}"),
             Self::Witness(_, decl) => write!(f, "witness {decl}"),
-            Self::External(_, decl) => write!(f, "external {}::{}", decl.name, decl.type_signature),
+            Self::Foreign(_, decl) => write!(f, "foreign {}::{}", decl.name, decl.type_signature),
         }
     }
 }

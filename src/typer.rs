@@ -127,8 +127,8 @@ impl<A> namer::SymbolTable<A, namer::QualifiedName, namer::Identifier> {
             }
         }
 
-        for external in &self.externals {
-            matrix.add_edge(SymbolName::Term(external.name.clone()), vec![]);
+        for foreign in &self.foreign_terms {
+            matrix.add_edge(SymbolName::Term(foreign.name.clone()), vec![]);
         }
 
         matrix
@@ -229,7 +229,7 @@ impl phase::SymbolTable<Named> {
     pub fn elaborate_compilation_unit(mut self) -> Typing<phase::SymbolTable<Types>> {
         let mut ctx = self.elaborate_types()?;
 
-        self.elaborate_externals(&mut ctx)?;
+        self.elaborate_foreign_terms(&mut ctx)?;
 
         // Gives rise to signature method placeholders -- term typer needs this
         let selectors_names = self.elaborate_constraints(&mut ctx)?;
@@ -243,7 +243,7 @@ impl phase::SymbolTable<Named> {
             member_modules: self.member_modules,
             symbols,
             imports: self.imports,
-            externals: self.externals,
+            foreign_terms: self.foreign_terms,
             signatures: self.signatures,
             witnesses: self.witnesses,
         })
@@ -768,8 +768,8 @@ impl phase::SymbolTable<Named> {
         Ok(expr)
     }
 
-    pub fn elaborate_externals(&self, ctx: &mut TypingContext) -> Typing<()> {
-        for ext in &self.externals {
+    pub fn elaborate_foreign_terms(&self, ctx: &mut TypingContext) -> Typing<()> {
+        for ext in &self.foreign_terms {
             let type_scheme = ext.type_signature.type_scheme(&HashMap::default(), ctx)?;
             ctx.bind_free_term(ext.name.clone(), type_scheme);
         }
@@ -3432,7 +3432,7 @@ impl TypingContext {
             }
 
             UntypedExpr::InvokeBridge(pi, bridge) => {
-                let inferred_type = bridge.external.type_scheme().instantiate();
+                let inferred_type = bridge.intrinsic.type_scheme().instantiate();
 
                 Ok(Typed::computed(
                     Substitutions::default(),

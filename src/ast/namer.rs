@@ -570,7 +570,7 @@ pub struct SymbolTable<A, GlobalName, LocalId> {
     pub symbols: HashMap<SymbolName, Symbol<A, GlobalName, LocalId>>,
     pub imports: Vec<IdentifierPath>,
 
-    pub externals: Vec<ExternalTerm<GlobalName>>,
+    pub foreign_terms: Vec<ForeignTerm<GlobalName>>,
 
     pub signatures: HashSet<QualifiedName>,
     pub witnesses: HashSet<QualifiedName>,
@@ -583,7 +583,7 @@ impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
             member_modules: HashMap::default(),
             symbols: HashMap::default(),
             imports: Vec::default(),
-            externals: Vec::default(),
+            foreign_terms: Vec::default(),
             signatures: HashSet::default(),
             witnesses: HashSet::default(),
         }
@@ -591,7 +591,7 @@ impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
 }
 
 #[derive(Debug, Clone)]
-pub struct ExternalTerm<GlobalName> {
+pub struct ForeignTerm<GlobalName> {
     pub name: QualifiedName,
     //This ought not be of A, but of ParseInfo because wtf does it buy?
     pub type_signature: TypeSignature<ParseInfo, GlobalName>,
@@ -823,9 +823,9 @@ impl phase::SymbolTable<Parsed> {
 
                 Declaration::Witness(_, decl) => self.add_witness_declaration(&module_path, decl),
 
-                Declaration::External(_, decl) => {
+                Declaration::Foreign(_, decl) => {
                     self.add_module_term_member(module_path.clone(), decl.name.clone());
-                    self.add_external_declaration(&module_path, decl);
+                    self.add_foreign_declaration(&module_path, decl);
                 }
             };
         }
@@ -857,12 +857,12 @@ impl phase::SymbolTable<Parsed> {
         self.witnesses.insert(name);
     }
 
-    fn add_external_declaration(
+    fn add_foreign_declaration(
         &mut self,
         module_path: &IdentifierPath,
-        decl: ast::ExternalDeclaration<ParseInfo>,
+        decl: ast::ForeignDeclaration<ParseInfo>,
     ) {
-        self.externals.push(ExternalTerm {
+        self.foreign_terms.push(ForeignTerm {
             name: QualifiedName::new(module_path.clone(), decl.name.as_str()),
             type_signature: decl.type_signature,
         });
@@ -1863,13 +1863,13 @@ impl phase::SymbolTable<Desugared> {
                         .map(|symbol| (id.clone(), symbol))
                 })
                 .collect::<Naming<_>>()?,
-            externals: self
-                .externals
+            foreign_terms: self
+                .foreign_terms
                 .iter()
                 .map(|e| {
                     e.type_signature
                         .resolve_names(&self, ParseInfo::default(), &e.name.module)
-                        .map(|type_signature| ExternalTerm {
+                        .map(|type_signature| ForeignTerm {
                             name: e.name.clone(),
                             type_signature,
                         })

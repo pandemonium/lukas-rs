@@ -198,18 +198,17 @@ fn map_builtin_name(name: &QualifiedName) -> &'static str {
         ">=" => ">=",
         "<=" => "<=",
         "text_fold_right" => "text-fold-right",
-        otherwise => panic!("unmapped external {otherwise:?}"),
+        otherwise => panic!("unmapped builtin {otherwise:?}"),
     }
 }
 
-// I need some sort of external function declarator
 impl phase::Expr<Erased> {
     fn emit(&self, code: &mut CodeBuffer) -> Result<()> {
         match self {
             ast::Expr::Variable(_, the) => the.emit(code)?,
 
             ast::Expr::InvokeBridge(_, the) => {
-                Uncurry::of_arity(&the.qualified_name, the.external.arity()).emit(code)?
+                Uncurry::of_arity(&the.qualified_name, the.intrinsic.arity()).emit(code)?
             }
 
             ast::Expr::Constant(_, the) => the.emit(code)?,

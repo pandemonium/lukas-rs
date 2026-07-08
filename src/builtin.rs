@@ -3,7 +3,7 @@ use crate::{
         BUILTIN_MODULE_NAME, Kind, STDLIB_MODULE_NAME,
         namer::{QualifiedName, Symbol, TypeDefinition, TypeOrigin, TypeSymbol},
     },
-    bridge::{External, Lambda1, Lambda2, PartialRawLambda2, RawLambda1, RawLambda3},
+    bridge::{Intrinsic, Lambda1, Lambda2, PartialRawLambda2, RawLambda1, RawLambda3},
     interpreter::{
         Literal,
         cek::{Val, interpret_closure},

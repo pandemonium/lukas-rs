@@ -421,10 +421,10 @@ fn and_then(value: Val, k: AndThen) -> Suspension {
             } => {
                 arguments.push(value);
 
-                if arguments.len() < bridge.external.arity() {
+                if arguments.len() < bridge.intrinsic.arity() {
                     Suspension::return_and(Val::PartiallyAppliedBridge { bridge, arguments }, *k)
                 } else {
-                    match bridge.external.invoke(&arguments) {
+                    match bridge.intrinsic.invoke(&arguments) {
                         Ok(r) => Suspension::return_and(r, *k),
                         Err(e) => Suspension::Diverged(e),
                     }

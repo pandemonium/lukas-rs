@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::{
     ast::{
         self, Apply, ApplyTypeExpr, ArrowTypeExpr, Binding, ConstraintExpression, Declaration,
-        Deconstruct, ExternalDeclaration, FieldDeclarator, IdentifierPattern, IfThenElse,
+        Deconstruct, FieldDeclarator, ForeignDeclaration, IdentifierPattern, IfThenElse,
         Interpolate, Kind, Lambda, ModuleDeclaration, ModuleDeclarator, Projection, Record,
         SelfReferential, Sequence, SignatureDeclaration, Tree, Tuple, TupleTypeExpr,
         TypeAscription, TypeDeclaration, TypeDeclarator, TypeExpression, TypeSignature,
@@ -447,7 +447,7 @@ impl<'a> Parser<'a> {
                             | Keyword::Use
                             | Keyword::Signature
                             | Keyword::Witness
-                            | Keyword::External
+                            | Keyword::Foreign
                     ),
                     ..
                 },
@@ -664,8 +664,8 @@ impl<'a> Parser<'a> {
                 ))
             }
 
-            [t, ..] if t.is_keyword(Keyword::External) => {
-                // external
+            [t, ..] if t.is_keyword(Keyword::Foreign) => {
+                // foreign
                 self.advance(1);
 
                 let (pos, id) = self.identifier()?;
@@ -676,9 +676,9 @@ impl<'a> Parser<'a> {
 
                 tracing::trace!("parse_declaration: type signature {type_signature}");
 
-                Ok(Declaration::External(
+                Ok(Declaration::Foreign(
                     ParseInfo::from_position(pos),
-                    ExternalDeclaration {
+                    ForeignDeclaration {
                         name: Identifier::from_str(&id),
                         type_signature,
                     },

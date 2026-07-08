@@ -64,10 +64,10 @@ impl Expr {
                 } => {
                     arguments.push(the.argument.reduce(env)?);
 
-                    if arguments.len() < bridge.external.arity() {
+                    if arguments.len() < bridge.intrinsic.arity() {
                         Ok(Val::PartiallyAppliedBridge { bridge, arguments })
                     } else {
-                        Ok(bridge.external.invoke(&arguments)?)
+                        Ok(bridge.intrinsic.invoke(&arguments)?)
                     }
                 }
 

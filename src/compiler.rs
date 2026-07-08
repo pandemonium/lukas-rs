@@ -204,13 +204,14 @@ impl Compiler {
             // into the emitted Scheme.
             let mut foreign_files = Vec::new();
             let mut seen = std::collections::HashSet::new();
-            for external in &program.externals {
-                let module = &external.name.module;
+            for foreign in &program.foreign_terms {
+                let module = &foreign.name.module;
                 if seen.insert(module.clone()) {
                     // A companion foreign file is named by the module's fully-qualified
                     // name: `Root.Stdlib` -> `Root.Stdlib.ss`, `Root` -> `Root.ss`. This
                     // is unambiguous (no collision between same-named nested modules).
-                    foreign_files.push(self.get_source_path(&module.to_string(), Artifact::Foreign));
+                    foreign_files
+                        .push(self.get_source_path(&module.to_string(), Artifact::Foreign));
                 }
             }
 

@@ -10,7 +10,7 @@
 
 use Stdlib.
 
-external sqrt_int :: Int -> Int
+foreign sqrt_int :: Int -> Int
 
 Fault ::= FileDoesNotExist Text
 
@@ -23,11 +23,11 @@ module File:
     }
 
   module __FFI:
-    external open_file_input_port :: Text -> Int
-    external close_port           :: Int -> Unit
-    external is_eof_object        :: Int -> Bool
-    external get_line             :: Int -> Text
-    external get_string_all       :: Int -> Text
+    foreign open_file_input_port :: Text -> Int
+    foreign close_port           :: Int -> Unit
+    foreign is_eof_object        :: Int -> Bool
+    foreign get_line             :: Int -> Text
+    foreign get_string_all       :: Int -> Text
 
   text_from_path :: Text -> IO (Result TextFile Fault) := λfile_path.
     let* port = IO.suspend (λ_. __FFI.open_file_input_port file_path) in

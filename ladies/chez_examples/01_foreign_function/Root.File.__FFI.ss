@@ -1,5 +1,5 @@
-;;    external open_input_file :: Text -> Int
-;;    external close_input_file :: Int -> Unit
+;;    foreign open_input_file :: Text -> Int
+;;    foreign close_input_file :: Int -> Unit
 
 (define Root-File-__FFI-open_file_input_port
   (lambda (file-path)

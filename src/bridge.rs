@@ -13,7 +13,7 @@ use crate::{
 
 #[derive(Clone)]
 pub struct Bridge {
-    pub external: Rc<dyn External + 'static>,
+    pub intrinsic: Rc<dyn Intrinsic + 'static>,
     pub qualified_name: Box<QualifiedName>,
 }
 
@@ -56,13 +56,13 @@ pub struct PartialRawLambda2<F> {
 }
 
 impl Bridge {
-    pub fn for_external<E>(external: E, module: &parser::IdentifierPath) -> Self
+    pub fn for_intrinsic<E>(intrinsic: E, module: &parser::IdentifierPath) -> Self
     where
-        E: External + 'static,
+        E: Intrinsic + 'static,
     {
-        let qualified_name = QualifiedName::new(module.clone(), external.name());
+        let qualified_name = QualifiedName::new(module.clone(), intrinsic.name());
         Bridge {
-            external: Rc::new(external),
+            intrinsic: Rc::new(intrinsic),
             qualified_name: qualified_name.into(),
         }
     }
@@ -72,11 +72,11 @@ impl Bridge {
     }
 
     pub fn type_scheme(&self) -> TypeScheme {
-        self.external.type_scheme()
+        self.intrinsic.type_scheme()
     }
 }
 
-pub trait External {
+pub trait Intrinsic {
     fn name(&self) -> &'static str;
 
     fn arity(&self) -> usize;
@@ -95,7 +95,7 @@ pub trait External {
         TermSymbol {
             name: QualifiedName::new(module.clone(), self.name()),
             type_signature: None, // Some(self.type_signature()), (reify the type_scheme!)
-            body: Expr::InvokeBridge(ParseInfo::default(), Bridge::for_external(self, module))
+            body: Expr::InvokeBridge(ParseInfo::default(), Bridge::for_intrinsic(self, module))
                 .into(),
         }
     }
@@ -179,7 +179,7 @@ macro_rules! rawlambda3 {
     };
 }
 
-impl<A, R> External for Lambda1<A, R>
+impl<A, R> Intrinsic for Lambda1<A, R>
 where
     A: TypeBridge + TryFrom<Val, Error = RuntimeError>,
     R: TypeBridge + Into<Val>,
@@ -205,7 +205,7 @@ where
     }
 }
 
-impl<A, B, R> External for Lambda2<A, B, R>
+impl<A, B, R> Intrinsic for Lambda2<A, B, R>
 where
     A: TypeBridge + TryFrom<Val, Error = RuntimeError>,
     B: TypeBridge + TryFrom<Val, Error = RuntimeError>,
@@ -240,7 +240,7 @@ where
     }
 }
 
-impl<A, B, C, R> External for Lambda3<A, B, C, R>
+impl<A, B, C, R> Intrinsic for Lambda3<A, B, C, R>
 where
     A: TypeBridge + TryFrom<Val, Error = RuntimeError>,
     B: TypeBridge + TryFrom<Val, Error = RuntimeError>,
@@ -281,7 +281,7 @@ where
     }
 }
 
-impl<R> External for RawLambda1<R>
+impl<R> Intrinsic for RawLambda1<R>
 where
     R: TypeBridge + Into<Val>,
 {
@@ -311,7 +311,7 @@ where
     }
 }
 
-impl External for RawLambda3 {
+impl Intrinsic for RawLambda3 {
     fn name(&self) -> &'static str {
         self.name
     }
@@ -336,7 +336,7 @@ impl External for RawLambda3 {
     }
 }
 
-impl<F> External for PartialRawLambda2<F>
+impl<F> Intrinsic for PartialRawLambda2<F>
 where
     // By reference instead?
     F: Fn(Val, Val) -> Option<Val>,
@@ -438,12 +438,12 @@ impl From<bool> for Val {
 
 impl fmt::Display for Bridge {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { external, .. } = self;
+        let Self { intrinsic, .. } = self;
         write!(
             f,
             "Bridge {} :: {}",
-            external.name(),
-            external.type_scheme()
+            intrinsic.name(),
+            intrinsic.type_scheme()
         )
     }
 }
@@ -451,8 +451,8 @@ impl fmt::Display for Bridge {
 impl fmt::Debug for Bridge {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Bridge")
-            .field(&self.external.name())
-            .field(&self.external.type_scheme())
+            .field(&self.intrinsic.name())
+            .field(&self.intrinsic.type_scheme())
             .finish()
     }
 }

@@ -1,0 +1,49 @@
+(* Monad transformers, mtl-style: ExceptT e over a monad m, with Functor/
+   Applicative/Monad instances plus a MonadError class used by m-polymorphic
+   functions (safeDiv / withDefault). Demonstrates throwError + catchError.
+
+   Fixed a typer stack overflow that this exercised: building the witness
+   dependency graph resolved a *parametric* premise (`Applicative m`, m a variable)
+   against instances, unifying it with the transformer head `Applicative (ExceptT m e)`
+   and recursing forever. Parametric premises are dictionary parameters, not witness
+   dependencies, so they're now skipped (src/ast/constraints.rs). *)
+
+use Stdlib.
+
+ExceptT ::= ∀m : * -> * e a. MkExceptT (m (Result a e))
+runExceptT :: ∀m : * -> * e a. ExceptT m e a -> m (Result a e) := λ(MkExceptT inner). inner
+
+witness ∀m : * -> * e. Applicative m + Monad m |- Applicative (ExceptT m e) :=
+  { pure  := λa. MkExceptT (pure (Return a))
+    apply := λmf mx. MkExceptT (bind (λrf. deconstruct rf into Fault e -> pure (Fault e) | Return f -> bind (λrx. deconstruct rx into Fault e2 -> pure (Fault e2) | Return x -> pure (Return (f x))) (runExceptT mx)) (runExceptT mf))
+  }
+
+witness ∀m : * -> * e. Applicative m + Monad m |- Monad (ExceptT m e) :=
+  { bind := λk x. MkExceptT (bind (λra. deconstruct ra into Fault e -> pure (Fault e) | Return a -> runExceptT (k a)) (runExceptT x))
+  }
+
+signature MonadError ::= ∀e m : * -> *.
+  { throwError :: ∀a. e -> m a
+    catchError :: ∀a. m a -> (e -> m a) -> m a
+  }
+
+witness ∀m : * -> * e. Applicative m + Monad m |- MonadError e (ExceptT m e) :=
+  { throwError := λerr. MkExceptT (pure (Fault err))
+    catchError := λx h. MkExceptT (bind (λra. deconstruct ra into Fault e -> runExceptT (h e) | Return a -> pure (Return a)) (runExceptT x))
+  }
+
+safeDiv :: ∀m : * -> *. Applicative m + MonadError Text m |- Int -> Int -> m Int := λn d.
+  if d = 0 then throwError "divide by zero" else pure (n / d)
+
+withDefault :: ∀m : * -> *. Applicative m + MonadError Text m |- Int -> m Int -> m Int := λdflt mx.
+  catchError mx (λ_. pure dflt)
+
+forceIO :: ∀a. IO a -> a := λ(Suspend f). f ()
+showR :: Result Int Text -> Text := λr. Result.result (λe. e) (λn. prim_show n) r
+run :: ExceptT IO Text Int -> Text := λp. showR (forceIO (runExceptT p))
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (run (safeDiv 10 2))
+  print_endline (run (safeDiv 10 0))
+  print_endline (run (withDefault 99 (safeDiv 10 0)))

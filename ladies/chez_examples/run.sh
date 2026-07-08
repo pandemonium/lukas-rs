@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # Compile each program through the CHEZ backend (compile-lady.sh) and CHECK its
-# output against `expected`. These programs use `external`/foreign functions, so
+# output against `expected`. These programs use foreign functions, so
 # they only run through the backend -- not the tree-walking interpreter.
 #
 # Each `start` prints a "##TC" sentinel before its results; we carve everything
