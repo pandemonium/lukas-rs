@@ -4,7 +4,7 @@ use crate::{
     ast::{
         self,
         annotation::Annotated,
-        namer::QualifiedName,
+        namer::{QualifiedName, TypeOrigin},
         pattern::{MatchClause, Pattern},
     },
     bridge::Bridge,
@@ -140,6 +140,8 @@ pub struct TypeDeclaration<A> {
     pub name: parser::Identifier,
     pub type_parameters: Vec<TypeVariable>,
     pub declarator: TypeDeclarator<A>,
+    pub origin: TypeOrigin,
+    pub opaque: bool,
 }
 
 #[derive(Debug)]
@@ -1012,7 +1014,15 @@ impl<A> fmt::Display for TypeDeclaration<A> {
             name,
             type_parameters,
             declarator,
+            origin,
+            opaque,
         } = self;
+        if matches!(origin, TypeOrigin::Foreign) {
+            return write!(f, "foreign {name}");
+        }
+        if *opaque {
+            write!(f, "opaque ")?;
+        }
         write!(f, "{name} ::= ")?;
         if !type_parameters.is_empty() {
             write!(f, "forall")?;

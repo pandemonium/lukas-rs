@@ -54,6 +54,7 @@ impl phase::SymbolTable<Types> {
             foreign_terms: self.foreign_terms.clone(),
             signatures: self.signatures,
             witnesses: self.witnesses,
+            constructor_opacity: self.constructor_opacity,
         }
     }
 }

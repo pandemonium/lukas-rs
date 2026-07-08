@@ -581,6 +581,7 @@ pub enum Keyword {
     Signature,
     Witness,
     Foreign,
+    Opaque,
 }
 
 impl Keyword {
@@ -607,6 +608,7 @@ impl Keyword {
             "signature" => Some(Self::Signature),
             "witness" => Some(Self::Witness),
             "foreign" => Some(Self::Foreign),
+            "opaque" => Some(Self::Opaque),
             _otherwise => None,
         }
     }
@@ -811,6 +813,7 @@ impl fmt::Display for Keyword {
             Self::Signature => write!(f, "Signature"),
             Self::Witness => write!(f, "Witness"),
             Self::Foreign => write!(f, "Foreign"),
+            Self::Opaque => write!(f, "Opaque"),
         }
     }
 }

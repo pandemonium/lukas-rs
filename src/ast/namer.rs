@@ -513,6 +513,8 @@ impl RecordDeclarator<ParseInfo> {
         &self,
         type_parameters: &[TypeVariable],
         name: &QualifiedName,
+        origin: TypeOrigin,
+        opacity: Opacity,
     ) -> TypeSymbol<IdentifierPath> {
         TypeSymbol {
             definition: TypeDefinition::Record(RecordSymbol {
@@ -527,7 +529,8 @@ impl RecordDeclarator<ParseInfo> {
                     })
                     .collect(),
             }),
-            origin: TypeOrigin::UserDefined,
+            origin,
+            opacity,
             arity: type_parameters.len(),
             kind: compute_type_constructor_kind(type_parameters),
         }
@@ -546,6 +549,8 @@ impl CoproductDeclarator<ParseInfo> {
         type_parameters: &[TypeVariable],
         name: &QualifiedName,
         constructors: Vec<ConstructorSymbol<IdentifierPath>>,
+        origin: TypeOrigin,
+        opacity: Opacity,
     ) -> TypeSymbol<IdentifierPath> {
         TypeSymbol {
             definition: TypeDefinition::Coproduct(CoproductSymbol {
@@ -553,7 +558,8 @@ impl CoproductDeclarator<ParseInfo> {
                 type_parameters: type_parameters.to_vec(),
                 constructors,
             }),
-            origin: TypeOrigin::UserDefined,
+            origin,
+            opacity,
             arity: type_parameters.len(),
             kind: compute_type_constructor_kind(type_parameters),
         }
@@ -574,6 +580,8 @@ pub struct SymbolTable<A, GlobalName, LocalId> {
 
     pub signatures: HashSet<QualifiedName>,
     pub witnesses: HashSet<QualifiedName>,
+
+    pub constructor_opacity: HashMap<QualifiedName, Opacity>,
 }
 
 impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
@@ -586,6 +594,7 @@ impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
             foreign_terms: Vec::default(),
             signatures: HashSet::default(),
             witnesses: HashSet::default(),
+            constructor_opacity: HashMap::default(),
         }
     }
 }
@@ -624,7 +633,7 @@ impl phase::SymbolTable<Desugared> {
             })
         })?;
 
-        prefix_chain(&fully_qualified).find_map(|prefix| {
+        let resolved = prefix_chain(&fully_qualified).find_map(|prefix| {
             self.module_members
                 .contains_key(&prefix)
                 .then_some(NameExpr {
@@ -632,7 +641,25 @@ impl phase::SymbolTable<Desugared> {
                     member: fully_qualified.element(prefix.len())?.to_owned(),
                     projections: fully_qualified.tail[prefix.len()..].to_vec(),
                 })
-        })
+        })?;
+
+        // Enforce opaque-type boundaries: a constructor whose owning type is opaque
+        // outside its module may not be named (constructed or matched) from a scope
+        // outside that module (or its submodules). This single guard covers both the
+        // expression and the pattern resolution paths. Surfaces as `UnknownName`.
+        if resolved.projections.is_empty() {
+            let candidate = QualifiedName {
+                module: resolved.module_prefix.clone(),
+                member: parser::Identifier::from_str(&resolved.member),
+            };
+            if let Some(opacity) = self.constructor_opacity.get(&candidate) {
+                if !opacity.is_visible_from(semantic_scope) {
+                    return None;
+                }
+            }
+        }
+
+        Some(resolved)
     }
 
     fn resolve_type_name(
@@ -716,17 +743,26 @@ impl phase::SymbolTable<Parsed> {
             name,
             type_parameters,
             declarator,
+            origin,
+            opaque,
         }: ast::TypeDeclaration<ParseInfo>,
     ) {
         {
             self.add_module_type_member(module_path.clone(), name.clone());
 
             let name = QualifiedName::new(module_path.clone(), name.as_str());
+
+            let opacity = if opaque || matches!(origin, TypeOrigin::Foreign) {
+                Opacity::TransparentWithin(module_path.clone())
+            } else {
+                Opacity::Transparent
+            };
+
             match declarator {
                 ast::TypeDeclarator::Record(_, record) => {
                     self.add_type_symbol(
                         name.clone(),
-                        record.as_type_symbol(&type_parameters, &name),
+                        record.as_type_symbol(&type_parameters, &name, origin, opacity),
                     );
                 }
 
@@ -749,11 +785,25 @@ impl phase::SymbolTable<Parsed> {
                             constructor.name.clone(),
                             constructor.as_constructor_term_symbol(pi, &type_parameters, &name),
                         );
+                        // Project the owning type's opacity onto each constructor so
+                        // `resolve_free_term_name` can enforce it by constructor name.
+                        // Only restricted constructors are indexed; transparent ones
+                        // are always visible and need no entry.
+                        if !matches!(opacity, Opacity::Transparent) {
+                            self.constructor_opacity
+                                .insert(constructor.name.clone(), opacity.clone());
+                        }
                     }
 
                     self.add_type_symbol(
                         name.clone(),
-                        coproduct.as_type_symbol(&type_parameters, &name, constructors),
+                        coproduct.as_type_symbol(
+                            &type_parameters,
+                            &name,
+                            constructors,
+                            origin,
+                            opacity,
+                        ),
                     );
                 }
             };
@@ -880,7 +930,12 @@ impl phase::SymbolTable<Parsed> {
         }
         self.add_type_symbol(
             name.clone(),
-            decl.declarator.as_type_symbol(&decl.type_parameters, &name),
+            decl.declarator.as_type_symbol(
+                &decl.type_parameters,
+                &name,
+                TypeOrigin::UserDefined,
+                Opacity::Transparent,
+            ),
         );
         self.signatures.insert(name);
     }
@@ -1009,6 +1064,7 @@ impl<A> Symbol<A, QualifiedName, Identifier> {
 pub struct TypeSymbol<GlobalName> {
     pub definition: TypeDefinition<GlobalName>,
     pub origin: TypeOrigin,
+    pub opacity: Opacity,
     pub arity: usize,
     pub kind: Kind,
 }
@@ -1017,6 +1073,22 @@ pub struct TypeSymbol<GlobalName> {
 pub enum TypeOrigin {
     UserDefined,
     Builtin,
+    Foreign,
+}
+
+#[derive(Debug, Clone)]
+pub enum Opacity {
+    Transparent,
+    TransparentWithin(IdentifierPath),
+}
+
+impl Opacity {
+    pub fn is_visible_from(&self, semantic_scope: &IdentifierPath) -> bool {
+        match self {
+            Self::Transparent => true,
+            Self::TransparentWithin(module) => prefix_chain(semantic_scope).any(|m| &m == module),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1878,6 +1950,7 @@ impl phase::SymbolTable<Desugared> {
             imports: self.imports,
             signatures: self.signatures.clone(),
             witnesses: self.witnesses.clone(),
+            constructor_opacity: self.constructor_opacity.clone(),
         })
     }
 
@@ -1934,6 +2007,7 @@ impl phase::SymbolTable<Desugared> {
                                 .collect::<Naming<Vec<_>>>()?,
                         }),
                         origin: symbol.origin,
+                        opacity: symbol.opacity.clone(),
                         arity: symbol.arity,
                         kind: symbol.kind.clone(),
                     },
@@ -1959,6 +2033,7 @@ impl phase::SymbolTable<Desugared> {
                                 .collect::<Naming<_>>()?,
                         }),
                         origin: symbol.origin,
+                        opacity: symbol.opacity.clone(),
                         arity: symbol.arity,
                         kind: symbol.kind.clone(),
                     },
@@ -1966,6 +2041,7 @@ impl phase::SymbolTable<Desugared> {
                     TypeDefinition::Builtin(base_type) => TypeSymbol {
                         definition: TypeDefinition::Builtin(*base_type),
                         origin: symbol.origin,
+                        opacity: symbol.opacity.clone(),
                         arity: symbol.arity,
                         kind: Kind::default(),
                     },

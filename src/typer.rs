@@ -246,6 +246,7 @@ impl phase::SymbolTable<Named> {
             foreign_terms: self.foreign_terms,
             signatures: self.signatures,
             witnesses: self.witnesses,
+            constructor_opacity: self.constructor_opacity,
         })
     }
 

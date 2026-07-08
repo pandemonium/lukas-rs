@@ -1,0 +1,32 @@
+(* Opaque types: a type whose *name* is exported but whose *structure* is
+   private to the declaring module.
+
+   Outside `Celsius` you can hold a `Temperature`, pass it around, and feed it
+   back into the module's functions -- but you cannot see or name its
+   constructor `MkC`. So the only way to make one is `Celsius.of_degrees`, and
+   the only way to read one is `Celsius.degrees`. That lets the module enforce
+   an invariant (here: never below absolute zero, -273 C) that outside code
+   cannot bypass.
+
+   Writing `MkC 20`, or `deconstruct t into MkC d -> d`, out here in `Root`
+   would be a compile error: the constructor is invisible outside `Celsius`.
+   Only the type name `Temperature` crosses the module boundary. *)
+
+module Celsius:
+  opaque Temperature ::= MkC Int
+
+  (* Smart constructor clamps to absolute zero; outsiders can't skip it. *)
+  of_degrees :: Int -> Temperature := λd.
+    if d < (0 - 273) then MkC (0 - 273) else MkC d
+
+  degrees :: Temperature -> Int := λ(MkC d). d
+
+  warmer :: Temperature -> Int -> Temperature := λt n.
+    Celsius.of_degrees (Celsius.degrees t + n)
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  let room = Celsius.of_degrees 20 in
+  let hot  = Celsius.warmer room 5 in
+  print_endline (prim_show (Celsius.degrees hot))                              (* 25 *)
+  print_endline (prim_show (Celsius.degrees (Celsius.of_degrees (0 - 300))))   (* -273, clamped *)

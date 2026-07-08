@@ -36,6 +36,7 @@ Or the whole gallery: `./ladies/examples/run.sh`.
 | 13 | `higher_kinded_types` | a function generic over a type constructor `f : * -> *` (`Functor f \|- …`), applied at two constructors | `41` / `2` |
 | 14 | `modules` | `module M:` grouping and qualified access | `27` / `6` |
 | 15 | `string_interpolation` | `` "`expr`" `` rendered via a `Display` instance | `Hello Ada, next year you will be 37.` |
+| 31 | `opaque_types` | `opaque T ::= …`: the type name is exported but its constructors stay private to the declaring module, so a smart constructor can enforce an invariant | `25` / `-273` |
 
 ## Type classes
 

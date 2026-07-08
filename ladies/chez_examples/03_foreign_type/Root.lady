@@ -1,0 +1,21 @@
+(* Foreign *types*: `Rational` has a name and a kind in Marmelade, but no body
+   here -- its values live entirely in the Chez backend as exact rationals. The
+   `foreign` functions below are the only way to make, combine, and render one.
+
+   Because `Rational` is nominal, the type checker keeps it distinct from `Int`:
+   you could not accidentally pass a plain `Int` where a `Rational` is expected.
+
+   The type itself emits no Scheme -- a foreign type is compiled away -- so only
+   the foreign *functions* need bodies, supplied by the companion `Root.ss`. *)
+
+foreign Rational
+
+foreign make_rational :: Int -> Int -> Rational
+foreign add_rational  :: Rational -> Rational -> Rational
+foreign show_rational :: Rational -> Text
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  let half  = make_rational 1 2 in
+  let third = make_rational 1 3 in
+  print_endline (show_rational (add_rational half third))   (* 5/6 *)

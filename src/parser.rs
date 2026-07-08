@@ -11,7 +11,7 @@ use crate::{
         SelfReferential, Sequence, SignatureDeclaration, Tree, Tuple, TupleTypeExpr,
         TypeAscription, TypeDeclaration, TypeDeclarator, TypeExpression, TypeSignature,
         TypeVariable, UseDeclaration, ValueDeclaration, ValueDeclarator, WitnessDeclaration,
-        namer::QualifiedName,
+        namer::{QualifiedName, TypeOrigin},
         pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern},
     },
     lexer::{
@@ -536,6 +536,35 @@ impl<'a> Parser<'a> {
                         // Move this to TypeDeclarator
                         type_parameters: self.parse_forall_clause()?,
                         declarator: self.parse_block(|parser| parser.parse_type_declarator())?,
+                        origin: TypeOrigin::UserDefined,
+                        opaque: false,
+                    },
+                ))
+            }
+
+            [
+                t,
+                Token {
+                    kind: TokenKind::Identifier(name),
+                    position,
+                },
+                Token {
+                    kind: TokenKind::TypeAssign,
+                    ..
+                },
+                ..,
+            ] if t.is_keyword(Keyword::Opaque) => {
+                // <opaque> <id> <::=>
+                self.advance(3);
+
+                Ok(Declaration::Type(
+                    ParseInfo::from_position(*position),
+                    TypeDeclaration {
+                        name: Identifier::from_str(name),
+                        type_parameters: self.parse_forall_clause()?,
+                        declarator: self.parse_block(|parser| parser.parse_type_declarator())?,
+                        origin: TypeOrigin::UserDefined,
+                        opaque: true,
                     },
                 ))
             }
@@ -670,19 +699,47 @@ impl<'a> Parser<'a> {
 
                 let (pos, id) = self.identifier()?;
 
-                self.expect(TokenKind::TypeAscribe)?;
+                if matches!(
+                    self.remains(),
+                    [
+                        Token {
+                            kind: TokenKind::TypeAscribe,
+                            ..
+                        },
+                        ..
+                    ]
+                ) {
+                    // foreign function: `foreign <id> :: <signature>`
+                    self.expect(TokenKind::TypeAscribe)?;
 
-                let type_signature = self.parse_type_signature()?;
+                    let type_signature = self.parse_type_signature()?;
 
-                tracing::trace!("parse_declaration: type signature {type_signature}");
+                    tracing::trace!("parse_declaration: type signature {type_signature}");
 
-                Ok(Declaration::Foreign(
-                    ParseInfo::from_position(pos),
-                    ForeignDeclaration {
-                        name: Identifier::from_str(&id),
-                        type_signature,
-                    },
-                ))
+                    Ok(Declaration::Foreign(
+                        ParseInfo::from_position(pos),
+                        ForeignDeclaration {
+                            name: Identifier::from_str(&id),
+                            type_signature,
+                        },
+                    ))
+                } else {
+                    Ok(Declaration::Type(
+                        ParseInfo::from_position(pos),
+                        TypeDeclaration {
+                            name: Identifier::from_str(&id),
+                            type_parameters: Vec::new(),
+                            declarator: TypeDeclarator::Coproduct(
+                                ParseInfo::from_position(pos),
+                                CoproductDeclarator {
+                                    constructors: Vec::new(),
+                                },
+                            ),
+                            origin: TypeOrigin::Foreign,
+                            opaque: false,
+                        },
+                    ))
+                }
             }
 
             otherwise => panic!("{otherwise:?}"),
