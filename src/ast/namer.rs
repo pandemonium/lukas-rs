@@ -512,28 +512,34 @@ impl IdentifierPath {
 }
 
 impl RecordDeclarator<ParseInfo> {
+    fn as_record_symbol(
+        &self,
+        type_parameters: &[TypeVariable],
+        name: &QualifiedName,
+    ) -> RecordSymbol<IdentifierPath> {
+        RecordSymbol {
+            name: name.clone(),
+            type_parameters: type_parameters.to_vec(),
+            fields: self
+                .fields
+                .iter()
+                .map(|decl| FieldSymbol {
+                    name: decl.name.clone(),
+                    type_signature: decl.type_signature.clone(),
+                })
+                .collect(),
+        }
+    }
+
     fn as_type_symbol(
         &self,
         type_parameters: &[TypeVariable],
         name: &QualifiedName,
         origin: TypeOrigin,
         opacity: Opacity,
-        supersignatures: Vec<ast::ConstraintExpression<ParseInfo, IdentifierPath>>,
     ) -> TypeSymbol<IdentifierPath> {
         TypeSymbol {
-            definition: TypeDefinition::Record(RecordSymbol {
-                name: name.clone(),
-                type_parameters: type_parameters.to_vec(),
-                fields: self
-                    .fields
-                    .iter()
-                    .map(|decl| FieldSymbol {
-                        name: decl.name.clone(),
-                        type_signature: decl.type_signature.clone(),
-                    })
-                    .collect(),
-                supersignatures,
-            }),
+            definition: TypeDefinition::Record(self.as_record_symbol(type_parameters, name)),
             origin,
             opacity,
             arity: type_parameters.len(),
@@ -763,13 +769,7 @@ impl phase::SymbolTable<Parsed> {
                 ast::TypeDeclarator::Record(_, record) => {
                     self.add_type_symbol(
                         name.clone(),
-                        record.as_type_symbol(
-                            &type_parameters,
-                            &name,
-                            origin,
-                            opacity,
-                            Vec::new(),
-                        ),
+                        record.as_type_symbol(&type_parameters, &name, origin, opacity),
                     );
                 }
 
@@ -937,13 +937,18 @@ impl phase::SymbolTable<Parsed> {
         }
         self.add_type_symbol(
             name.clone(),
-            decl.declarator.as_type_symbol(
-                &decl.type_parameters,
-                &name,
-                TypeOrigin::UserDefined,
-                Opacity::Transparent,
-                decl.constraints,
-            ),
+            TypeSymbol {
+                definition: TypeDefinition::Signature(SignatureSymbol {
+                    vtable: decl
+                        .declarator
+                        .as_record_symbol(&decl.type_parameters, &name),
+                    supersignatures: decl.constraints,
+                }),
+                origin: TypeOrigin::UserDefined,
+                opacity: Opacity::Transparent,
+                arity: decl.type_parameters.len(),
+                kind: compute_type_constructor_kind(&decl.type_parameters),
+            },
         );
         self.signatures.insert(name);
     }
@@ -1102,6 +1107,7 @@ impl Opacity {
 #[derive(Debug, Clone)]
 pub enum TypeDefinition<GlobalName> {
     Record(RecordSymbol<GlobalName>),
+    Signature(SignatureSymbol<GlobalName>),
     Coproduct(CoproductSymbol<GlobalName>),
     Builtin(BaseType),
 }
@@ -1114,6 +1120,7 @@ impl<GlobalName> TypeDefinition<GlobalName> {
     pub fn qualified_name(&self) -> QualifiedName {
         match self {
             Self::Record(the) => the.name.clone(),
+            Self::Signature(the) => the.vtable.name.clone(),
             Self::Coproduct(the) => the.name.clone(),
             Self::Builtin(the) => the.qualified_name(),
         }
@@ -1124,6 +1131,7 @@ impl TypeSymbol<QualifiedName> {
     pub fn qualified_name(&self) -> QualifiedName {
         match &self.definition {
             TypeDefinition::Record(symbol) => symbol.name.clone(),
+            TypeDefinition::Signature(symbol) => symbol.vtable.name.clone(),
             TypeDefinition::Coproduct(symbol) => symbol.name.clone(),
             TypeDefinition::Builtin(base_type) => base_type.qualified_name(),
         }
@@ -1132,6 +1140,7 @@ impl TypeSymbol<QualifiedName> {
     pub fn type_parameters(&self) -> &[TypeVariable] {
         match &self.definition {
             TypeDefinition::Record(sym) => &sym.type_parameters,
+            TypeDefinition::Signature(sym) => &sym.vtable.type_parameters,
             TypeDefinition::Coproduct(sym) => &sym.type_parameters,
             TypeDefinition::Builtin(..) => &[],
         }
@@ -1143,8 +1152,13 @@ pub struct RecordSymbol<GlobalName> {
     pub name: QualifiedName,
     pub type_parameters: Vec<TypeVariable>,
     pub fields: Vec<FieldSymbol<GlobalName>>,
-    /// Supersignature constraints, when this record is a `signature`'s vtable.
-    /// Empty for ordinary record types. (See notes/supersignatures.md.)
+}
+
+/// A `signature` (type class): the method-dictionary record (`vtable`) plus the
+/// supersignatures it requires. See notes/supersignatures.md.
+#[derive(Debug, Clone)]
+pub struct SignatureSymbol<GlobalName> {
+    pub vtable: RecordSymbol<GlobalName>,
     pub supersignatures: Vec<ast::ConstraintExpression<ParseInfo, GlobalName>>,
 }
 
@@ -1998,9 +2012,10 @@ impl phase::SymbolTable<Desugared> {
 
             Symbol::Type(symbol) => Ok(Symbol::Type({
                 let semantic_scope = &symbol.definition.qualified_name().module;
-                match &symbol.definition {
-                    TypeDefinition::Record(record) => TypeSymbol {
-                        definition: TypeDefinition::Record(RecordSymbol {
+
+                let resolve_record =
+                    |record: &RecordSymbol<IdentifierPath>| -> Naming<RecordSymbol<QualifiedName>> {
+                        Ok(RecordSymbol {
                             name: record.name.clone(),
                             type_parameters: record.type_parameters.clone(),
                             fields: record
@@ -2016,7 +2031,22 @@ impl phase::SymbolTable<Desugared> {
                                         })
                                 })
                                 .collect::<Naming<Vec<_>>>()?,
-                            supersignatures: record
+                        })
+                    };
+
+                match &symbol.definition {
+                    TypeDefinition::Record(record) => TypeSymbol {
+                        definition: TypeDefinition::Record(resolve_record(record)?),
+                        origin: symbol.origin,
+                        opacity: symbol.opacity.clone(),
+                        arity: symbol.arity,
+                        kind: symbol.kind.clone(),
+                    },
+
+                    TypeDefinition::Signature(sig) => TypeSymbol {
+                        definition: TypeDefinition::Signature(SignatureSymbol {
+                            vtable: resolve_record(&sig.vtable)?,
+                            supersignatures: sig
                                 .supersignatures
                                 .iter()
                                 .map(|c| c.resolve_names(self, pi, semantic_scope))

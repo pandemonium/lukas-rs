@@ -22,7 +22,8 @@ use crate::{
         constraints::{Witness, WitnessEnvironment},
         namer::{
             self, CoproductSymbol, DependencyMatrix, Identifier, Named, QualifiedName,
-            RecordSymbol, Symbol, SymbolName, TermSymbol, TypeDefinition, TypeSymbol,
+            RecordSymbol, SignatureSymbol, Symbol, SymbolName, TermSymbol, TypeDefinition,
+            TypeSymbol,
         },
         pattern::{
             ConstructorPattern, Denotation, MatchClause, Pattern, Shape, StructPattern,
@@ -111,7 +112,7 @@ impl<A> namer::SymbolTable<A, namer::QualifiedName, namer::Identifier> {
                 .get(&SymbolName::Type(constraint_name.clone()))
                 .and_then(|symbol| {
                     if let Symbol::Type(symbol) = symbol
-                        && let TypeDefinition::Record(symbol) = &symbol.definition
+                        && let TypeDefinition::Signature(symbol) = &symbol.definition
                     {
                         Some(symbol)
                     } else {
@@ -121,7 +122,7 @@ impl<A> namer::SymbolTable<A, namer::QualifiedName, namer::Identifier> {
                 .expect("Internal error");
             let semantic_context = constraint_name.module();
 
-            for method in &constraint.fields {
+            for method in &constraint.vtable.fields {
                 let name = QualifiedName::new(semantic_context.clone(), method.name.as_str());
                 matrix.add_edge(SymbolName::Term(name), vec![]);
             }
@@ -256,11 +257,11 @@ impl phase::SymbolTable<Named> {
     /// read off the signature's vtable record symbol. Empty for non-signatures.
     fn direct_supersignatures(&self, sig: &QualifiedName) -> Vec<QualifiedName> {
         if let Some(Symbol::Type(TypeSymbol {
-            definition: TypeDefinition::Record(record),
+            definition: TypeDefinition::Signature(signature),
             ..
         })) = self.symbols.get(&SymbolName::Type(sig.clone()))
         {
-            record
+            signature
                 .supersignatures
                 .iter()
                 .map(|c| c.class.clone())
@@ -477,9 +478,9 @@ impl phase::SymbolTable<Named> {
         let mut constrained_methods: HashSet<parser::Identifier> = HashSet::new();
         for signature in &self.signatures {
             if let Some(tc) = ctx.types.lookup(signature)
-                && let TypeDefinition::Record(record) = &tc.definition().defining_symbol.definition
+                && let TypeDefinition::Signature(sig) = &tc.definition().defining_symbol.definition
             {
-                for field in &record.fields {
+                for field in &sig.vtable.fields {
                     if !field.type_signature.constraints.is_empty() {
                         constrained_methods.insert(field.name.clone());
                     }
@@ -585,10 +586,10 @@ impl phase::SymbolTable<Named> {
                 &type_constructor,
             );
 
-            if let TypeDefinition::Record(record) =
+            if let TypeDefinition::Signature(sig) =
                 &mut type_constructor.definition_mut().defining_symbol.definition
             {
-                for field in &mut record.fields {
+                for field in &mut sig.vtable.fields {
                     let pi = *field.type_signature.body.annotation();
                     let mut c = signature_constraint.clone();
                     c.annotation = pi;
@@ -625,10 +626,10 @@ impl phase::SymbolTable<Named> {
             let signature_constraint =
                 ConstraintExpression::from_signature_type_constructor(pi, &type_constructor);
 
-            if let TypeDefinition::Record(record) =
+            if let TypeDefinition::Signature(sig) =
                 &type_constructor.definition().defining_symbol.definition
             {
-                for field in record.fields.iter() {
+                for field in sig.vtable.fields.iter() {
                     let method_arity = field.type_signature.body.arrow_arity();
                     tracing::trace!("{} {method_arity}", field.name);
                     let method_dictionary_count = field.type_signature.constraints.len();
@@ -2599,6 +2600,7 @@ impl TypeDefinition<QualifiedName> {
     ) -> Typing<TypeStructure> {
         match self {
             Self::Record(record) => record.synthesize_type(type_param_map, ctx),
+            Self::Signature(sig) => sig.vtable.synthesize_type(type_param_map, ctx),
             Self::Coproduct(coproduct) => Ok(TypeStructure::Monotype(
                 coproduct.synthesize_type(type_param_map, ctx)?,
             )),
