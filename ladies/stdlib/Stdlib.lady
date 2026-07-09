@@ -33,7 +33,10 @@ witness Traversable List :=
   }
 
 witness ∀α. Display α |- Display (List α) :=
-  { display := λxs. prim_show xs
+  { display := λxs.
+      deconstruct xs into
+        Nil       -> "nil"
+      | Cons x ys -> "`x` : `ys`"
   }
 
 module List:
@@ -91,10 +94,10 @@ module List:
   tabulate :: ∀α. Int -> (Int -> α) -> List α :=
     λc f.
       let loop = λi xs.
-        if i < c
-          then loop (1 + i) (Cons (f i) xs)
-          else xs
-      in loop 0 Nil
+        if i < 0
+          then xs
+          else loop (i - 1) (Cons (f i) xs)
+      in loop (c - 1) Nil
 
   concat :: List Text -> Text := λxs.
     deconstruct xs into
@@ -152,18 +155,28 @@ module Result:
   map :: ∀α β e. (α -> β) -> Result α e -> Result β e :=
     λf ra. result Fault (compose Return f) ra
 
+witness Semigroup Text :=
+  { mappend := λp q. "`p``q`"
+  }
+
 witness Monoid Text :=
-  { mempty  := ""
-    mappend := λp q. "`p``q`"
+  { mempty := ""
+  }
+
+witness Semigroup Int :=
+  { mappend := λp q. p + q
   }
 
 witness Monoid Int :=
-  { mempty  := 0
-    mappend := λp q. p + q
+  { mempty := 0
   }
 
 witness Eq Int :=
   { eq := λp q. p = q
+  }
+
+witness Ord Int :=
+  { lte := λp q. p <= q
   }
 
 witness ∀α. Eq α |- Eq (List α) :=

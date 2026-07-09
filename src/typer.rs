@@ -1355,14 +1355,18 @@ fn elaborate_constraint_method_placeholders(
     evidence: &ConstraintSet,
     ctx: &TypingContext,
 ) -> Expr {
-    let mut constraint_signatures = HashMap::new();
+    // Key by the method's *fully-qualified* name (its signature's module +
+    // member), not the bare member. Otherwise an unrelated module function that
+    // merely shares a method's name -- e.g. `State.bind` vs the `Monad` method
+    // `bind` -- would be clobbered into the class selector.
+    let mut constraint_signatures: HashMap<QualifiedName, &Constraint> = HashMap::new();
     for c in evidence.iter() {
         let signature = c.signature(&ctx.types).expect("expr.typed");
         for method in signature.vtable.into_vec() {
             if is_super_field(&method) {
                 continue;
             }
-            constraint_signatures.insert(method, c);
+            constraint_signatures.insert(QualifiedName::new(c.name().module.clone(), method.as_str()), c);
         }
     }
 
@@ -1371,9 +1375,9 @@ fn elaborate_constraint_method_placeholders(
 
     tree.map(&mut |e| match e {
         Expr::Variable(type_info, ref term_id @ Identifier::Free(ref method_name))
-            if constraint_signatures.contains_key(method_name.member()) =>
+            if constraint_signatures.contains_key(method_name.as_ref()) =>
         {
-            let constraint = constraint_signatures[method_name.member()];
+            let constraint = constraint_signatures[method_name.as_ref()];
             let QualifiedName { module, member } = constraint.name();
             let selector_name = QualifiedName::new(
                 module.clone(),
