@@ -21,9 +21,9 @@ use crate::{
         annotation::Annotated,
         constraints::{Witness, WitnessEnvironment},
         namer::{
-            self, CoproductSymbol, DependencyMatrix, Identifier, Named, QualifiedName,
-            RecordSymbol, SignatureSymbol, Symbol, SymbolName, TermSymbol, TypeDefinition,
-            TypeSymbol,
+            self, CoproductSymbol, DependencyMatrix, FieldSymbol, Identifier, Named,
+            QualifiedName, RecordSymbol, SignatureSymbol, Symbol, SymbolName, TermSymbol,
+            TypeDefinition, TypeSymbol,
         },
         pattern::{
             ConstructorPattern, Denotation, MatchClause, Pattern, Shape, StructPattern,
@@ -122,7 +122,12 @@ impl<A> namer::SymbolTable<A, namer::QualifiedName, namer::Identifier> {
                 .expect("Internal error");
             let semantic_context = constraint_name.module();
 
-            for method in &constraint.vtable.fields {
+            for method in constraint
+                .vtable
+                .fields
+                .iter()
+                .filter(|f| !is_super_field(&f.name))
+            {
                 let name = QualifiedName::new(semantic_context.clone(), method.name.as_str());
                 matrix.add_edge(SymbolName::Term(name), vec![]);
             }
@@ -349,12 +354,21 @@ impl phase::SymbolTable<Named> {
         for (symbol, term) in typed_terms {
             let pi = term.tree.annotation().parse_info;
 
+            // The `given` constraints are the ones this term *declares* (its
+            // signature's `|-` context), reconciled to the body's metavariables.
+            // They become the dictionary parameters. The body's *inferred*
+            // constraints (`term.constraints`) are the `wanted` set, discharged
+            // against the givens -- including via supersignature projection. With
+            // no signature, declared == inferred (current behaviour).
+            let given = given_constraints(symbol, &term, ctx)?;
+
             // this has to bind every term in TypingContext so that later elaborations
             // can discover constraints (type and order)
             // So it needs the name!
             let expr = elaborate_term_constraints(
                 &symbol.name,
                 &witnesses,
+                given,
                 term.constraints,
                 term.tree,
                 ctx,
@@ -596,6 +610,27 @@ impl phase::SymbolTable<Named> {
 
                     field.type_signature.desugar_constraints();
                 }
+
+                // Phase 2 (supersignatures): encode each supersignature as a
+                // hidden `$super$<Class>` field of the vtable holding that super's
+                // dictionary. `$` can't start a surface identifier, so it can't
+                // collide with a method; the `$super$` fields are filtered out of
+                // the method-facing loops (selectors/placeholders/deps) so they
+                // stay pure data. See notes/supersignatures.md.
+                let super_fields = sig
+                    .supersignatures
+                    .iter()
+                    .map(|c| FieldSymbol {
+                        name: super_field_name(&c.class),
+                        type_signature: ast::TypeSignature {
+                            universal_quantifiers: Vec::new(),
+                            constraints: Vec::new(),
+                            body: c.clone().into_type_expression(),
+                            phase: PhantomData,
+                        },
+                    })
+                    .collect::<Vec<_>>();
+                sig.vtable.fields.extend(super_fields);
             }
 
             type_constructor = type_constructor.reelaborate(ctx)?;
@@ -629,7 +664,7 @@ impl phase::SymbolTable<Named> {
             if let TypeDefinition::Signature(sig) =
                 &type_constructor.definition().defining_symbol.definition
             {
-                for field in sig.vtable.fields.iter() {
+                for field in sig.vtable.fields.iter().filter(|f| !is_super_field(&f.name)) {
                     let method_arity = field.type_signature.body.arrow_arity();
                     tracing::trace!("{} {method_arity}", field.name);
                     let method_dictionary_count = field.type_signature.constraints.len();
@@ -780,7 +815,9 @@ impl phase::SymbolTable<Named> {
             );
 
             if let TypeStructure::PolyRecord(record_type) = type_constructor.structure()? {
-                for (method_id, scheme) in record_type.fields() {
+                for (method_id, scheme) in
+                    record_type.fields().filter(|(id, _)| !is_super_field(id))
+                {
                     let scheme = scheme.clone();
                     let name = QualifiedName::new(
                         type_constructor.defining_context().clone(),
@@ -835,21 +872,168 @@ impl phase::SymbolTable<Named> {
     }
 }
 
+/// Prefix for the hidden supersignature dictionary fields injected into a
+/// signature's vtable. `$` cannot begin a surface identifier, so these never
+/// collide with user method names.
+const SUPER_FIELD_PREFIX: &str = "$super$";
+
+fn super_field_name(class: &QualifiedName) -> parser::Identifier {
+    parser::Identifier::from_str(&format!("{SUPER_FIELD_PREFIX}{}", class.member.as_str()))
+}
+
+fn is_super_field(name: &parser::Identifier) -> bool {
+    name.as_str().starts_with(SUPER_FIELD_PREFIX)
+}
+
+/// The supersignature obligations of a witness whose produced dictionary has type
+/// `head` (e.g. `Ord Int`, `Monad (ExceptT m e)`): each hidden `$super$<Class>`
+/// field to fill, paired with the instantiated super constraint whose dictionary
+/// fills it. Returns empty for any type that is not a signature dictionary, so it
+/// is safe to call on every term.
+fn super_obligations(
+    head: &Type,
+    ctx: &TypingContext,
+) -> Result<Vec<(parser::Identifier, Constraint)>, TypeError> {
+    let class = match head {
+        Type::Apply { .. } | Type::Constructor(..) => head.applied_name(),
+        _ => return Ok(Vec::new()),
+    };
+    let Some(tc) = ctx.types.lookup(class) else {
+        return Ok(Vec::new());
+    };
+    if !matches!(
+        &tc.definition().defining_symbol.definition,
+        TypeDefinition::Signature(sig) if !sig.supersignatures.is_empty()
+    ) {
+        return Ok(Vec::new());
+    }
+
+    // Instantiate the signature with fresh parameters, unify its spine with the
+    // head to learn the head's type arguments, then apply that to each super.
+    let inst = tc.instantiate(ctx).map_err(|e| *e.error)?;
+    let subst = inst.make_spine().unified_with(head, &ctx.types)?;
+    let params = inst.definition().instantiated_params.clone();
+    let TypeDefinition::Signature(sig) = &inst.definition().defining_symbol.definition else {
+        return Ok(Vec::new());
+    };
+
+    sig.supersignatures
+        .iter()
+        .map(|super_ce| {
+            let c = Constraint::from_constraint_expr(&params, super_ce, ctx).map_err(|e| *e.error)?;
+            Ok((super_field_name(&super_ce.class), c.apply(&subst)))
+        })
+        .collect()
+}
+
+/// The ordinal of a `$super$…` field within `dict`'s vtable record. Projections
+/// built here run *after* type inference, so they must carry the resolved
+/// ordinal directly (the interpreter/codegen only understand `Ordinal`).
+fn super_field_ordinal(dict: &Constraint, field: &parser::Identifier, ctx: &TypingContext) -> Option<usize> {
+    let tc = ctx
+        .types
+        .lookup(dict.constraint_type.applied_name())?
+        .instantiate(ctx)
+        .ok()?;
+    match tc.structure().ok()? {
+        TypeStructure::PolyRecord(record_type) => record_type.field_info(field).map(|(i, _)| i),
+        _ => None,
+    }
+}
+
+/// If the given constraint `g` entails the wanted constraint `w` through a chain
+/// of supersignatures, the projection path (field ordinal + resulting dictionary
+/// type at each hop) from `g`'s dictionary to `w`'s. Both are expected to share
+/// the enclosing term's metavariables, so the supers instantiated at `g`'s
+/// arguments match `w` by equality.
+fn super_projection_path(
+    g: &Constraint,
+    w: &Constraint,
+    ctx: &TypingContext,
+) -> Option<Vec<(usize, Type)>> {
+    for (field, super_c) in super_obligations(&g.constraint_type, ctx).ok()? {
+        let ordinal = super_field_ordinal(g, &field, ctx)?;
+        if &super_c == w {
+            return Some(vec![(ordinal, super_c.constraint_type)]);
+        }
+        if let Some(mut rest) = super_projection_path(&super_c, w, ctx) {
+            rest.insert(0, (ordinal, super_c.constraint_type));
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// Build the evidence for a supersignature-entailed constraint: project the
+/// `$super$…` chain (by ordinal) out of the entailing dictionary `base`.
+fn project_super_evidence(base: Expr, path: &[(usize, Type)]) -> Expr {
+    let pi = base.annotation().parse_info;
+    path.iter().fold(base, |base, (ordinal, ty)| {
+        Expr::Project(
+            pi.with_inferred_type(ty.clone()),
+            Projection {
+                base: std::rc::Rc::new(base),
+                select: ProductElement::Ordinal(*ordinal),
+            },
+        )
+    })
+}
+
+/// Descend through a witness's dictionary-parameter lambdas / ascription to the
+/// record it ultimately builds, returning its fields for mutation.
+fn witness_record_fields_mut(
+    tree: &mut Expr,
+) -> Option<&mut Vec<(parser::Identifier, std::rc::Rc<Expr>)>> {
+    match tree {
+        Expr::Record(_, record) => Some(&mut record.fields),
+        Expr::Ascription(_, a) => witness_record_fields_mut(std::rc::Rc::make_mut(&mut a.ascribed_tree)),
+        Expr::RecursiveLambda(_, rec) => {
+            witness_record_fields_mut(std::rc::Rc::make_mut(&mut rec.lambda.body))
+        }
+        Expr::Lambda(_, l) => witness_record_fields_mut(std::rc::Rc::make_mut(&mut l.body)),
+        _ => None,
+    }
+}
+
+/// The constraints a term *declares* (its signature's `|-` context), instantiated
+/// and reconciled to the body's metavariables so supersignature entailment can
+/// match them against the body's inferred (wanted) constraints. With no
+/// signature, the declared set is exactly the inferred set.
+fn given_constraints(
+    symbol: &TermSymbol<ParseInfo, QualifiedName, Identifier>,
+    term: &Typed,
+    ctx: &TypingContext,
+) -> Typing<ConstraintSet> {
+    match &symbol.type_signature {
+        Some(signature) => {
+            let instantiated = signature.type_scheme(&HashMap::default(), ctx)?.instantiate();
+            let subst = instantiated
+                .underlying
+                .unified_with(&term.tree.type_info().inferred_type, &ctx.types)
+                .map_err(|e| e.at(ParseInfo::default()))?;
+            Ok(instantiated.constraints.apply(&subst))
+        }
+        None => Ok(term.constraints.clone()),
+    }
+}
+
 #[instrument(skip_all)]
 fn elaborate_term_constraints(
     symbol_name: &QualifiedName,
     witnesses: &WitnessEnvironment,
+    given: ConstraintSet,
     constraints: ConstraintSet,
     tree: ast::Expr<TypeInfo, Identifier>,
     ctx: &mut TypingContext,
 ) -> Result<ast::Expr<TypeInfo, Identifier>, TypeError> {
-    tracing::trace!("{symbol_name} has {constraints} tree {tree}");
+    tracing::trace!("{symbol_name} given {given} wanted {constraints} tree {tree}");
 
     let selectors = SelectorTable::from_constraints(&constraints, &ctx.types)?;
 
     Ok(resolve_constraints(
         symbol_name,
         tree,
+        given,
         constraints,
         witnesses,
         ctx,
@@ -860,25 +1044,58 @@ fn elaborate_term_constraints(
 fn resolve_constraints(
     symbol_name: &QualifiedName,
     mut tree: Expr,
+    given: ConstraintSet,
     constraints: ConstraintSet,
     witnesses: &WitnessEnvironment,
     ctx: &mut TypingContext,
 ) -> Result<Expr, TypeError> {
-    let is_constrained = !constraints.is_empty();
+    let is_constrained = !given.is_empty() || !constraints.is_empty();
 
-    // Variable-headed constraints (e.g. `Eq α`) can never be matched by an
-    // instance, so they must become dictionary parameters. Everything else --
-    // ground constraints (`Eq Int`) and constructor-headed constraints
-    // (`Eq (List α)`) -- is discharged by an instance, whose own premises are in
-    // turn satisfied by those parameters.
-    let (parametric, resolvable) = constraints
+    // Supersignatures: if this term builds a signature dictionary (a witness),
+    // capture the hidden `$super$` fields it must fill *before* the tree is
+    // wrapped in dictionary-parameter lambdas below (which would change its type
+    // to an arrow). Populated after discharge, using the same evidence.
+    let super_obligations = super_obligations(&tree.type_info().inferred_type, ctx)?;
+
+    // The wanted (inferred) constraints split into variable-headed (`Eq α`, which
+    // no instance can match) and instance-resolvable (`Eq Int`, `Eq (List α)`).
+    let (wanted_parametric, resolvable) = constraints
         .clone()
         .into_iter()
         .partition::<Vec<_>, _>(|c| c.is_parametric());
 
+    // Parameters are driven by the *wanted* (inferred) constraints -- a term only
+    // needs a dictionary parameter for a class its body actually uses. The given
+    // (declared) constraints only redirect a wanted: if a *proper supersignature*
+    // of a given covers the wanted, the given becomes the parameter and the wanted
+    // is projected out of it (`Ord α` given covers a wanted `Eq α`). Otherwise the
+    // wanted is its own parameter -- exactly the pre-supersignature behaviour, so
+    // selectors (whose dictionary is an explicit argument, no inferred constraint)
+    // and ordinary constrained functions are unaffected.
+    let given_parametric: Vec<Constraint> =
+        given.iter().filter(|c| c.is_parametric()).cloned().collect();
+
+    let mut params: Vec<Constraint> = Vec::new();
+    let mut projections: Vec<(Constraint, Constraint, Vec<(usize, Type)>)> = Vec::new();
+    for w in &wanted_parametric {
+        if let Some((g, path)) = given_parametric.iter().find_map(|g| {
+            (g != w)
+                .then(|| super_projection_path(g, w, ctx).map(|path| (g.clone(), path)))
+                .flatten()
+        }) {
+            if !params.contains(&g) {
+                params.push(g.clone());
+            }
+            projections.push((w.clone(), g, path));
+        } else if !params.contains(w) {
+            params.push(w.clone());
+        }
+    }
+
     tracing::trace!(
-        "{symbol_name} parametric: {:?} resolvable {:?}",
-        &parametric,
+        "{symbol_name} params: {:?} projections {:?} resolvable {:?}",
+        &params,
+        &projections,
         &resolvable
     );
 
@@ -908,7 +1125,7 @@ fn resolve_constraints(
         ctx.bind_term(
             Identifier::Bound(0),
             Constrained {
-                constraints: ConstraintSet::from(parametric.as_slice()),
+                constraints: ConstraintSet::from(params.as_slice()),
                 underlying: tree.type_info().inferred_type.clone(),
             }
             .generalize(ctx)
@@ -918,13 +1135,12 @@ fn resolve_constraints(
 
     let mut evidence = HashMap::new();
 
-    // Bind a dictionary parameter (#1, #2, ...) for each variable-headed
-    // constraint. `add_dictionary_parameter_slot` always yields a
-    // self-referential tree -- `own_name` at slot #0 and parameters from #1 --
-    // both when prepending to an existing lambda and when wrapping a non-lambda
-    // body (e.g. a witness whose body is a record), so the i-th parameter is at
-    // #(1 + i).
-    for (i, c) in parametric.iter().enumerate() {
+    // Bind a dictionary parameter (#1, #2, ...) for each given/undeclared
+    // constraint. `add_dictionary_parameter_slot` always yields a self-referential
+    // tree -- `own_name` at slot #0 and parameters from #1 -- both when prepending
+    // to an existing lambda and when wrapping a non-lambda body (e.g. a witness
+    // whose body is a record), so the i-th parameter is at #(1 + i).
+    for (i, c) in params.iter().enumerate() {
         let name = Identifier::Bound(1 + i);
         tracing::trace!("binding {name} to {}", c.constraint_type);
 
@@ -939,6 +1155,14 @@ fn resolve_constraints(
                 name,
             ),
         );
+    }
+
+    // Supersignature entailment: a wanted constraint that is a supersignature of a
+    // given is discharged by projecting the `$super$…` chain out of that given's
+    // dictionary parameter -- so it needs no parameter of its own.
+    for (w, param_given, path) in projections {
+        let base = evidence[&param_given].clone();
+        evidence.insert(w, project_super_evidence(base, &path));
     }
 
     // Discharge the remaining constraints through their instances, using the
@@ -979,6 +1203,27 @@ fn resolve_constraints(
         tree = discharge_constraints(tree, &evidence, witnesses, ctx);
     }
     tree = elaborate_constraint_method_placeholders(tree, &constraints, ctx);
+
+    // Supersignatures: fill each `$super$<Class>` field with the resolved super
+    // dictionary. A ground super (`Eq Int`) resolves to that ground witness; a
+    // parametric super (`Applicative (ExceptT m e)`) resolves against the
+    // dictionary parameters just bound (the same `evidence`). The value is
+    // already fully discharged, so it is spliced in *after* `discharge_constraints`.
+    if !super_obligations.is_empty() {
+        let mut super_fields = Vec::with_capacity(super_obligations.len());
+        for (field, constraint) in &super_obligations {
+            let dictionary = witnesses.resolve_witness(constraint, &ctx.types, &evidence)?;
+            super_fields.push((field.clone(), std::rc::Rc::new(dictionary)));
+        }
+        if let Some(fields) = witness_record_fields_mut(&mut tree) {
+            fields.extend(super_fields);
+            // The dictionary record's runtime layout must match the vtable record
+            // TYPE, which sorts fields by name (`RecordType::from_fields`). Project
+            // selectors read by that sorted ordinal, so keep the value in the same
+            // order.
+            fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+        }
+    }
 
     Ok(tree)
 }
@@ -1086,6 +1331,9 @@ impl<'a> SelectorTable<'a> {
         for c in set.iter() {
             let signature = c.signature(&ctx)?;
             for method in signature.vtable.into_vec() {
+                if is_super_field(&method) {
+                    continue;
+                }
                 constraint_signatures.entry(method).or_default().push(c);
             }
         }
@@ -1111,6 +1359,9 @@ fn elaborate_constraint_method_placeholders(
     for c in evidence.iter() {
         let signature = c.signature(&ctx.types).expect("expr.typed");
         for method in signature.vtable.into_vec() {
+            if is_super_field(&method) {
+                continue;
+            }
             constraint_signatures.insert(method, c);
         }
     }
