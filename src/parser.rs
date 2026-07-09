@@ -653,11 +653,23 @@ impl<'a> Parser<'a> {
                 // constraint <id> <::=>
                 self.advance(3);
 
+                let type_parameters = self.parse_forall_clause()?;
+                // Optional supersignature context: `Eq α + Show α |- { … }`.
+                // Reuses the witness/method constraint parser. `has_type_constraints`
+                // looks for a `|-` before the block-opening layout, so a method-level
+                // `|-` inside `{ … }` is out of range.
+                let constraints = if self.has_type_constraints() {
+                    self.parse_constraint_clause()?
+                } else {
+                    Vec::default()
+                };
+
                 Ok(Declaration::Signature(
                     ParseInfo::from_position(*position),
                     SignatureDeclaration {
                         name: Identifier::from_str(name),
-                        type_parameters: self.parse_forall_clause()?,
+                        type_parameters,
+                        constraints,
                         declarator: if let TypeDeclarator::Record(_, record) =
                             self.parse_block(|parser| parser.parse_type_declarator())?
                         {

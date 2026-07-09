@@ -221,11 +221,17 @@ pub struct NameExpr {
 }
 
 impl NameExpr {
-    fn into_projection(self, pi: ParseInfo) -> Expr {
-        let path = QualifiedName {
-            module: self.module_prefix,
+    /// The `module_prefix` + `member` as a qualified name, ignoring any trailing
+    /// projections.
+    pub fn qualified_name(&self) -> QualifiedName {
+        QualifiedName {
+            module: self.module_prefix.clone(),
             member: parser::Identifier::from_str(&self.member),
-        };
+        }
+    }
+
+    fn into_projection(self, pi: ParseInfo) -> Expr {
+        let path = self.qualified_name();
 
         self.projections.iter().fold(
             Expr::Variable(pi, Identifier::Free(path.into())),
@@ -242,10 +248,7 @@ impl NameExpr {
     }
 
     pub fn into_qualified_name(self) -> QualifiedName {
-        QualifiedName {
-            module: self.module_prefix,
-            member: parser::Identifier::from_str(&self.member),
-        }
+        self.qualified_name()
     }
 }
 
@@ -515,6 +518,7 @@ impl RecordDeclarator<ParseInfo> {
         name: &QualifiedName,
         origin: TypeOrigin,
         opacity: Opacity,
+        supersignatures: Vec<ast::ConstraintExpression<ParseInfo, IdentifierPath>>,
     ) -> TypeSymbol<IdentifierPath> {
         TypeSymbol {
             definition: TypeDefinition::Record(RecordSymbol {
@@ -528,6 +532,7 @@ impl RecordDeclarator<ParseInfo> {
                         type_signature: decl.type_signature.clone(),
                     })
                     .collect(),
+                supersignatures,
             }),
             origin,
             opacity,
@@ -648,11 +653,7 @@ impl phase::SymbolTable<Desugared> {
         // outside that module (or its submodules). This single guard covers both the
         // expression and the pattern resolution paths. Surfaces as `UnknownName`.
         if resolved.projections.is_empty() {
-            let candidate = QualifiedName {
-                module: resolved.module_prefix.clone(),
-                member: parser::Identifier::from_str(&resolved.member),
-            };
-            if let Some(opacity) = self.constructor_opacity.get(&candidate) {
+            if let Some(opacity) = self.constructor_opacity.get(&resolved.qualified_name()) {
                 if !opacity.is_visible_from(semantic_scope) {
                     return None;
                 }
@@ -762,7 +763,13 @@ impl phase::SymbolTable<Parsed> {
                 ast::TypeDeclarator::Record(_, record) => {
                     self.add_type_symbol(
                         name.clone(),
-                        record.as_type_symbol(&type_parameters, &name, origin, opacity),
+                        record.as_type_symbol(
+                            &type_parameters,
+                            &name,
+                            origin,
+                            opacity,
+                            Vec::new(),
+                        ),
                     );
                 }
 
@@ -935,6 +942,7 @@ impl phase::SymbolTable<Parsed> {
                 &name,
                 TypeOrigin::UserDefined,
                 Opacity::Transparent,
+                decl.constraints,
             ),
         );
         self.signatures.insert(name);
@@ -1135,6 +1143,9 @@ pub struct RecordSymbol<GlobalName> {
     pub name: QualifiedName,
     pub type_parameters: Vec<TypeVariable>,
     pub fields: Vec<FieldSymbol<GlobalName>>,
+    /// Supersignature constraints, when this record is a `signature`'s vtable.
+    /// Empty for ordinary record types. (See notes/supersignatures.md.)
+    pub supersignatures: Vec<ast::ConstraintExpression<ParseInfo, GlobalName>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2004,6 +2015,11 @@ impl phase::SymbolTable<Desugared> {
                                             type_signature: te,
                                         })
                                 })
+                                .collect::<Naming<Vec<_>>>()?,
+                            supersignatures: record
+                                .supersignatures
+                                .iter()
+                                .map(|c| c.resolve_names(self, pi, semantic_scope))
                                 .collect::<Naming<Vec<_>>>()?,
                         }),
                         origin: symbol.origin,

@@ -227,6 +227,8 @@ impl phase::ConstraintExpression<Named> {
 
 impl phase::SymbolTable<Named> {
     pub fn elaborate_compilation_unit(mut self) -> Typing<phase::SymbolTable<Types>> {
+        self.check_supersignature_acyclicity()?;
+
         let mut ctx = self.elaborate_types()?;
 
         self.elaborate_foreign_terms(&mut ctx)?;
@@ -248,6 +250,60 @@ impl phase::SymbolTable<Named> {
             witnesses: self.witnesses,
             constructor_opacity: self.constructor_opacity,
         })
+    }
+
+    /// The direct supersignatures of `sig` — the class names of its `|-` context,
+    /// read off the signature's vtable record symbol. Empty for non-signatures.
+    fn direct_supersignatures(&self, sig: &QualifiedName) -> Vec<QualifiedName> {
+        if let Some(Symbol::Type(TypeSymbol {
+            definition: TypeDefinition::Record(record),
+            ..
+        })) = self.symbols.get(&SymbolName::Type(sig.clone()))
+        {
+            record
+                .supersignatures
+                .iter()
+                .map(|c| c.class.clone())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Reject cyclic supersignature declarations (`A requires B`, `B requires A`)
+    /// before any elaboration walks the super-edges.
+    fn check_supersignature_acyclicity(&self) -> Typing<()> {
+        let mut done: HashSet<QualifiedName> = HashSet::new();
+        let mut signatures = self.signatures.iter().cloned().collect::<Vec<_>>();
+        signatures.sort();
+        for sig in &signatures {
+            self.detect_super_cycle(sig, &mut Vec::new(), &mut done)?;
+        }
+        Ok(())
+    }
+
+    fn detect_super_cycle(
+        &self,
+        node: &QualifiedName,
+        path: &mut Vec<QualifiedName>,
+        done: &mut HashSet<QualifiedName>,
+    ) -> Typing<()> {
+        if done.contains(node) {
+            return Ok(());
+        }
+        if let Some(start) = path.iter().position(|n| n == node) {
+            let mut cycle = path[start..].to_vec();
+            cycle.push(node.clone());
+            return Err(TypeError::CyclicSupersignature { cycle }.at(ParseInfo::default()));
+        }
+
+        path.push(node.clone());
+        for sup in self.direct_supersignatures(node) {
+            self.detect_super_cycle(&sup, path, done)?;
+        }
+        path.pop();
+        done.insert(node.clone());
+        Ok(())
     }
 
     #[instrument(skip_all)]
@@ -1369,6 +1425,9 @@ pub enum TypeError {
 
     #[error("undefined constraint signature {0}")]
     UndefinedSignature(QualifiedName),
+
+    #[error("cyclic supersignatures: {}", display_list(" requires ", cycle))]
+    CyclicSupersignature { cycle: Vec<QualifiedName> },
 
     #[error("no witness found for constraint {0}")]
     NoWitness(Constraint),

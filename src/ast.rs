@@ -90,6 +90,9 @@ impl<A> From<Pattern<A, IdentifierPath>> for IdentifierPattern<A> {
 pub struct SignatureDeclaration<A> {
     pub name: parser::Identifier,
     pub type_parameters: Vec<TypeVariable>,
+    /// Supersignature constraints (the `|-` context): signatures this one
+    /// requires, the analog of Haskell superclasses. Empty for a plain signature.
+    pub constraints: Vec<ConstraintExpression<A, parser::IdentifierPath>>,
     pub declarator: RecordDeclarator<A>,
 }
 
@@ -908,14 +911,15 @@ where
         let Self {
             name,
             type_parameters,
+            constraints,
             declarator,
         } = self;
 
-        write!(
-            f,
-            "∀{}. {name} ::= {declarator}",
-            display_list(" ", type_parameters)
-        )
+        write!(f, "∀{}. {name} ::= ", display_list(" ", type_parameters))?;
+        if !constraints.is_empty() {
+            write!(f, "{} |- ", display_list(" + ", constraints))?;
+        }
+        write!(f, "{declarator}")
     }
 }
 
