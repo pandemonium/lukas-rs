@@ -50,6 +50,9 @@ pub enum CompilationError {
 
     #[error("unsatisfied dependencies -- a name is referenced but never defined:\n{0}")]
     UnsatisfiedDependencies(String),
+
+    #[error("cyclic module import: {0}")]
+    CyclicModuleImport(String),
 }
 
 /// Format the unresolved edges of a dependency graph into an error naming which

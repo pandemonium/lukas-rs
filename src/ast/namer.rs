@@ -20,7 +20,7 @@ use crate::{
         pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern},
     },
     builtin,
-    compiler::{Compilation, Compiler, Located, LocatedError},
+    compiler::{Compilation, CompilationError, Compiler, Located, LocatedError},
     parser::{self, IdentifierPath, ParseInfo, Parsed},
     phase::{self, Phase},
     typer::{BaseType, display_list},
@@ -839,6 +839,7 @@ impl phase::SymbolTable<Parsed> {
         module_path: &IdentifierPath,
         decl: ast::ModuleDeclaration<ParseInfo>,
         compiler: &Compiler,
+        loading: &mut Vec<parser::Identifier>,
     ) -> Compilation<()> {
         // Modules compete in the term namespace
         self.add_module_term_member(
@@ -846,12 +847,30 @@ impl phase::SymbolTable<Parsed> {
             parser::Identifier::from_str(decl.name.as_str()),
         );
 
+        let external = if matches!(decl.declarator, ast::ModuleDeclarator::External(_)) {
+            if let Some(start) = loading.iter().position(|m| m == &decl.name) {
+                let cycle = loading[start..]
+                    .iter()
+                    .map(|m| m.as_str())
+                    .chain(std::iter::once(decl.name.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                return Err(CompilationError::CyclicModuleImport(cycle));
+            }
+            loading.push(decl.name.clone());
+            true
+        } else {
+            false
+        };
+
         let module_path = module_path.clone().with_suffix(decl.name.as_str());
-        self.add_module_contents(
-            compiler,
-            module_path,
-            Self::module_declarations(compiler, decl.declarator)?,
-        )
+        let declarations = Self::module_declarations(compiler, decl.declarator)?;
+        let result = self.add_module_contents(compiler, module_path, declarations, loading);
+
+        if external {
+            loading.pop();
+        }
+        result
     }
 
     fn add_module_contents(
@@ -859,19 +878,20 @@ impl phase::SymbolTable<Parsed> {
         compiler: &Compiler,
         module_path: IdentifierPath,
         declarations: Vec<Declaration<ParseInfo>>,
+        loading: &mut Vec<parser::Identifier>,
     ) -> Compilation<()> {
         for decl in declarations {
             match decl {
                 Declaration::Value(_, decl) => self.add_value_declaration(&module_path, decl),
 
                 Declaration::Module(_, decl) => {
-                    self.add_module_declaration(&module_path, decl, compiler)?
+                    self.add_module_declaration(&module_path, decl, compiler, loading)?
                 }
 
                 Declaration::Type(_, decl) => self.add_type_declaration(&module_path, decl),
 
                 Declaration::Use(_, decl) => {
-                    self.add_use_declaration(compiler, &module_path, decl)?
+                    self.add_use_declaration(compiler, &module_path, decl, loading)?
                 }
 
                 Declaration::Signature(_, decl) => {
@@ -958,13 +978,14 @@ impl phase::SymbolTable<Parsed> {
         compiler: &Compiler,
         module_path: &IdentifierPath,
         use_declaration: ast::UseDeclaration<ParseInfo>,
+        loading: &mut Vec<parser::Identifier>,
     ) -> Compilation<()> {
         if use_declaration.qualified_binder.is_some() {
             todo!()
         }
         let module = use_declaration.module;
         self.add_import_prefix(module_path.clone().with_suffix(module.name.as_str()));
-        self.add_module_declaration(module_path, module, compiler)
+        self.add_module_declaration(module_path, module, compiler, loading)
     }
 
     pub fn add_import_prefix(&mut self, prefix: IdentifierPath) {
@@ -1002,10 +1023,12 @@ impl phase::SymbolTable<Parsed> {
             }
         }
 
+        let mut loading = vec![program.root_module.name.clone()];
         symtab.add_module_contents(
             &program.compiler,
             IdentifierPath::new(program.root_module.name.as_str()),
             Self::module_declarations(&program.compiler, program.root_module.declarator)?,
+            &mut loading,
         )?;
 
         Ok(symtab)

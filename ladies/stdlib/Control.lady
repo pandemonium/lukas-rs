@@ -40,6 +40,12 @@ signature Display ::= ∀α.
   { display :: α -> Text
   }
 
+ExceptT ::= ∀m : *->* e α. MkExceptT (m (Result α e))
+
+module ExceptT:
+  run :: ∀m : *->* e α. ExceptT m e α -> m (Result α e) :=
+    λ(MkExceptT result). result
+
 fold_map :: ∀t : *->* α m. Monoid m + Foldable t |- (α -> m) -> t α -> m := λf.
   fold_right (compose mappend f) mempty
 
