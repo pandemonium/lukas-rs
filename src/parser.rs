@@ -621,24 +621,17 @@ impl<'a> Parser<'a> {
             [
                 t,
                 Token {
-                    kind: TokenKind::Identifier(name),
+                    kind: TokenKind::Identifier(_),
                     position,
                 },
                 ..,
             ] if t.is_keyword(Keyword::Use) => {
-                // <module> <id> <.>
-                self.advance(3);
-
-                let name = Identifier::from_str(name);
+                let position = *position;
+                self.advance(1); // past `use`
+                let path = self.parse_module_path()?;
                 Ok(Declaration::Use(
-                    ParseInfo::from_position(*position),
-                    UseDeclaration {
-                        qualified_binder: None,
-                        module: ModuleDeclaration {
-                            name: name.clone(),
-                            declarator: ast::ModuleDeclarator::External(name),
-                        },
-                    },
+                    ParseInfo::from_position(position),
+                    UseDeclaration::new(None, path),
                 ))
             }
 
@@ -762,6 +755,45 @@ impl<'a> Parser<'a> {
         let _t = self.trace();
 
         Ok(ModuleDeclarator::Inline(self.parse_declaration_list()?))
+    }
+
+    fn parse_module_path(&mut self) -> Result<IdentifierPath> {
+        let _t = self.trace();
+
+        let head = match self.remains() {
+            [
+                Token {
+                    kind: TokenKind::Identifier(name),
+                    ..
+                },
+                ..,
+            ] => Ok(name.clone()),
+            [t, ..] => Err(ParseError::ExpectedIdentifier(t.clone())),
+            [] => Err(ParseError::UnexpectedUnderflow),
+        }?;
+        self.advance(1);
+
+        let mut path = IdentifierPath::new(&head);
+        while let [
+            Token {
+                kind: TokenKind::Period,
+                ..
+            },
+            Token {
+                kind: TokenKind::Identifier(segment),
+                ..
+            },
+            ..,
+        ] = self.remains()
+        {
+            let segment = segment.clone();
+            self.advance(2);
+            path.push(&segment);
+        }
+
+        // Consume the terminating `.`.
+        self.expect(TokenKind::Period)?;
+        Ok(path)
     }
 
     // preceed with parse_block, but it has to lookahead to see

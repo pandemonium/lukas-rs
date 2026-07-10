@@ -51,8 +51,8 @@ pub enum CompilationError {
     #[error("unsatisfied dependencies -- a name is referenced but never defined:\n{0}")]
     UnsatisfiedDependencies(String),
 
-    #[error("cyclic module import: {0}")]
-    CyclicModuleImport(String),
+    #[error("cannot load module `{name}`: no source file found at {}", .path.display())]
+    MissingModule { name: String, path: PathBuf },
 }
 
 /// Format the unresolved edges of a dependency graph into an error naming which
@@ -239,6 +239,42 @@ impl Compiler {
     ) -> Compilation<Vec<ast::Declaration<ParseInfo>>> {
         let source_path = self.get_source_path(module.as_str(), Artifact::Module);
         load_and_parse_module(source_path)
+    }
+
+    pub fn load_top_level_module(
+        &self,
+        name: &str,
+    ) -> Compilation<(Vec<ast::Declaration<ParseInfo>>, PathBuf)> {
+        let file = self.get_source_path(name, Artifact::Module);
+        if fs::exists(&file).unwrap_or(false) {
+            let children_dir = file
+                .parent()
+                .map(|dir| dir.join(name))
+                .unwrap_or_else(|| PathBuf::from(name));
+            Ok((load_and_parse_module(file)?, children_dir))
+        } else {
+            Err(CompilationError::MissingModule {
+                name: name.to_owned(),
+                path: file,
+            })
+        }
+    }
+
+    pub fn load_nested_module(
+        &self,
+        dir: &std::path::Path,
+        name: &str,
+    ) -> Compilation<(Vec<ast::Declaration<ParseInfo>>, PathBuf)> {
+        let file = dir.join(format!("{}.{}", name, Artifact::Module.extension()));
+        if fs::exists(&file).unwrap_or(false) {
+            let children_dir = dir.join(name);
+            Ok((load_and_parse_module(file)?, children_dir))
+        } else {
+            Err(CompilationError::MissingModule {
+                name: name.to_owned(),
+                path: file,
+            })
+        }
     }
 
     pub fn load_module(

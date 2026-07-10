@@ -1,37 +1,50 @@
+use Control.
+
 State ::= ∀s α. State (s -> (s, α))
 
-module State:
-  pure :: ∀s α. α -> State s α := λa. State (λs. s, a)
+witness ∀s. Functor (State s) :=
+  { fmap := λg (State f).
+      State (λs0.
+        let s, a = f s0
+        in s, g a
+      )
+  }
 
-  map :: ∀s α β. (α -> β) -> State s α -> State s β := λg (State f).
-    State (λs0.
-      let s, a = f s0
-      in s, g a
-    )
+witness ∀s. Applicative (State s) :=
+  { pure := λa. State (λs. s, a)
+    apply := λ(State ff) (State fa).
+      State (λs0.
+        let s1, g = ff s0 in
+        let s2, a = fa s1 in
+        s2, g a
+      )
+  }
 
-  bind :: ∀s α β. (α -> State s β) -> State s α -> State s β := λk (State f).
-    State (λs0.
-      let s, a = f s0 in
-      let State g = k a in
-      g s
-    )
+witness ∀s. Monad (State s) :=
+  { bind := λk (State f).
+      State (λs0.
+        let s, a = f s0 in
+        let State g = k a in
+        g s
+      )
+  }
 
-  run :: ∀s α. State s α -> s -> (s, α) := λ(State f) s. f s
+run :: ∀s α. State s α -> s -> (s, α) := λ(State f) s. f s
 
-  eval :: ∀s α. State s α -> s -> α :=
-    λst s. (run st s).1
+eval :: ∀s α. State s α -> s -> α :=
+  λst s. (run st s).1
 
-  exec :: ∀s α. State s α -> s -> s :=
-    λst s. (run st s).0
+exec :: ∀s α. State s α -> s -> s :=
+  λst s. (run st s).0
 
-  get :: ∀s α. State s s :=
-    State (λs. s, s)
+get :: ∀s. State s s :=
+  State (λs. s, s)
 
-  gets :: ∀s α. (s -> α) -> State s α := λf.
-    State (λs. s, f s)
+gets :: ∀s α. (s -> α) -> State s α := λf.
+  State (λs. s, f s)
 
-  put :: ∀s. s -> State s Unit :=
-    λs. State (λ_. s, ())
+put :: ∀s. s -> State s Unit :=
+  λs. State (λ_. s, ())
 
-  modify :: ∀s. (s -> s) -> State s Unit :=
-    λf. State (λs. f s, ())
+modify :: ∀s. (s -> s) -> State s Unit :=
+  λf. State (λs. f s, ())

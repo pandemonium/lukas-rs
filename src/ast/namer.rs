@@ -4,6 +4,7 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     iter,
     marker::PhantomData,
+    path::Path,
     rc::Rc,
 };
 
@@ -13,14 +14,14 @@ use crate::{
     ast::{
         self, Apply, ApplyTypeExpr, ArrowTypeExpr, BUILTIN_MODULE_NAME, Binding, CompilationUnit,
         ConstraintExpression, CoproductDeclarator, Declaration, Deconstruct, IdentifierPattern,
-        IfThenElse, Injection, Kind, Lambda, ModuleDeclarator, ProductElement, Projection, Record,
-        RecordDeclarator, STDLIB_MODULE_NAME, SelfReferential, Sequence, Tuple, TupleTypeExpr,
-        TypeAscription, TypeExpression, TypeSignature, TypeVariable,
+        IfThenElse, Injection, Kind, Lambda, ModuleDeclarator, ProductElement, Projection,
+        ROOT_MODULE_NAME, Record, RecordDeclarator, STDLIB_MODULE_NAME, SelfReferential, Sequence,
+        Tuple, TupleTypeExpr, TypeAscription, TypeExpression, TypeSignature, TypeVariable,
         desugar::Desugared,
         pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern},
     },
     builtin,
-    compiler::{Compilation, CompilationError, Compiler, Located, LocatedError},
+    compiler::{Compilation, Compiler, Located, LocatedError},
     parser::{self, IdentifierPath, ParseInfo, Parsed},
     phase::{self, Phase},
     typer::{BaseType, display_list},
@@ -629,44 +630,48 @@ impl phase::SymbolTable<Desugared> {
 
         let parents = prefix_chain(semantic_scope);
 
-        let mut search_order = parents.chain(self.imports.iter().rev().cloned());
+        let search_order = parents.chain(self.imports.iter().rev().cloned());
 
-        // Could this call in_module instead?
-        let fully_qualified = search_order.find_map(|m| {
-            search_space.contains(&m).then_some(IdentifierPath {
-                head: m.head.clone(),
-                tail: {
-                    let mut new_tail = m.tail.clone();
-                    new_tail.push(id.head.clone());
-                    new_tail.extend_from_slice(&id.tail);
-                    new_tail
-                },
-            })
-        })?;
+        let resolved = search_order
+            .filter(|m| search_space.contains(m))
+            .find_map(|m| {
+                let fully_qualified = IdentifierPath {
+                    head: m.head.clone(),
+                    tail: {
+                        let mut new_tail = m.tail.clone();
+                        new_tail.push(id.head.clone());
+                        new_tail.extend_from_slice(&id.tail);
+                        new_tail
+                    },
+                };
 
-        let resolved = prefix_chain(&fully_qualified).find_map(|prefix| {
-            self.module_members
-                .contains_key(&prefix)
-                .then_some(NameExpr {
-                    module_prefix: prefix.clone(),
-                    member: fully_qualified.element(prefix.len())?.to_owned(),
-                    projections: fully_qualified.tail[prefix.len()..].to_vec(),
-                })
-        })?;
+                let name_expr = prefix_chain(&fully_qualified).find_map(|prefix| {
+                    self.module_members
+                        .contains_key(&prefix)
+                        .then_some(NameExpr {
+                            module_prefix: prefix.clone(),
+                            member: fully_qualified.element(prefix.len())?.to_owned(),
+                            projections: fully_qualified.tail[prefix.len()..].to_vec(),
+                        })
+                })?;
 
-        // Enforce opaque-type boundaries: a constructor whose owning type is opaque
-        // outside its module may not be named (constructed or matched) from a scope
-        // outside that module (or its submodules). This single guard covers both the
-        // expression and the pattern resolution paths. Surfaces as `UnknownName`.
-        if resolved.projections.is_empty() {
-            if let Some(opacity) = self.constructor_opacity.get(&resolved.qualified_name()) {
-                if !opacity.is_visible_from(semantic_scope) {
-                    return None;
-                }
-            }
-        }
+                let names_a_real_member = self
+                    .member_modules
+                    .get(&ModuleMember::Term(parser::Identifier::from_str(
+                        name_expr.member.as_str(),
+                    )))
+                    .is_some_and(|modules| modules.contains(&name_expr.module_prefix));
 
-        Some(resolved)
+                (!name_expr.projections.is_empty() || names_a_real_member).then_some(name_expr)
+            })?;
+
+        let hidden = resolved.projections.is_empty()
+            && self
+                .constructor_opacity
+                .get(&resolved.qualified_name())
+                .is_some_and(|opacity| !opacity.is_visible_from(semantic_scope));
+
+        (!hidden).then_some(resolved)
     }
 
     fn resolve_type_name(
@@ -837,61 +842,51 @@ impl phase::SymbolTable<Parsed> {
     pub fn add_module_declaration(
         &mut self,
         module_path: &IdentifierPath,
+        dir: &Path,
         decl: ast::ModuleDeclaration<ParseInfo>,
         compiler: &Compiler,
-        loading: &mut Vec<parser::Identifier>,
+        loaded: &mut HashSet<IdentifierPath>,
     ) -> Compilation<()> {
-        // Modules compete in the term namespace
-        self.add_module_term_member(
-            module_path.clone(),
-            parser::Identifier::from_str(decl.name.as_str()),
-        );
+        let name = parser::Identifier::from_str(decl.name.as_str());
+        self.add_module_term_member(module_path.clone(), name);
 
-        let external = if matches!(decl.declarator, ast::ModuleDeclarator::External(_)) {
-            if let Some(start) = loading.iter().position(|m| m == &decl.name) {
-                let cycle = loading[start..]
-                    .iter()
-                    .map(|m| m.as_str())
-                    .chain(std::iter::once(decl.name.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(" -> ");
-                return Err(CompilationError::CyclicModuleImport(cycle));
-            }
-            loading.push(decl.name.clone());
-            true
+        let canonical = module_path.clone().with_suffix(decl.name.as_str());
+
+        if loaded.insert(canonical.clone()) {
+            let (declarations, child_dir) = match decl.declarator {
+                ModuleDeclarator::Inline(declarations) => {
+                    (declarations, dir.join(decl.name.as_str()))
+                }
+                ModuleDeclarator::External(_) => {
+                    compiler.load_nested_module(dir, decl.name.as_str())?
+                }
+            };
+            self.add_module_contents(compiler, canonical, &child_dir, declarations, loaded)
         } else {
-            false
-        };
-
-        let module_path = module_path.clone().with_suffix(decl.name.as_str());
-        let declarations = Self::module_declarations(compiler, decl.declarator)?;
-        let result = self.add_module_contents(compiler, module_path, declarations, loading);
-
-        if external {
-            loading.pop();
+            Ok(())
         }
-        result
     }
 
     fn add_module_contents(
         &mut self,
         compiler: &Compiler,
         module_path: IdentifierPath,
+        dir: &Path,
         declarations: Vec<Declaration<ParseInfo>>,
-        loading: &mut Vec<parser::Identifier>,
+        loaded: &mut HashSet<IdentifierPath>,
     ) -> Compilation<()> {
         for decl in declarations {
             match decl {
                 Declaration::Value(_, decl) => self.add_value_declaration(&module_path, decl),
 
                 Declaration::Module(_, decl) => {
-                    self.add_module_declaration(&module_path, decl, compiler, loading)?
+                    self.add_module_declaration(&module_path, dir, decl, compiler, loaded)?
                 }
 
                 Declaration::Type(_, decl) => self.add_type_declaration(&module_path, decl),
 
-                Declaration::Use(_, decl) => {
-                    self.add_use_declaration(compiler, &module_path, decl, loading)?
+                Declaration::Use(pi, decl) => {
+                    self.add_use_declaration(compiler, &module_path, pi, decl, loaded)?
                 }
 
                 Declaration::Signature(_, decl) => {
@@ -977,15 +972,57 @@ impl phase::SymbolTable<Parsed> {
         &mut self,
         compiler: &Compiler,
         module_path: &IdentifierPath,
+        pi: ParseInfo,
         use_declaration: ast::UseDeclaration<ParseInfo>,
-        loading: &mut Vec<parser::Identifier>,
+        loaded: &mut HashSet<IdentifierPath>,
     ) -> Compilation<()> {
         if use_declaration.qualified_binder.is_some() {
             todo!()
         }
-        let module = use_declaration.module;
-        self.add_import_prefix(module_path.clone().with_suffix(module.name.as_str()));
-        self.add_module_declaration(module_path, module, compiler, loading)
+        let path = use_declaration.path;
+
+        if path.tail.is_empty() {
+            let name = parser::Identifier::from_str(&path.head);
+            let root = IdentifierPath::new(ROOT_MODULE_NAME);
+            self.add_module_term_member(root.clone(), name.clone());
+            let canonical = root.with_suffix(&path.head);
+            self.add_import_prefix(canonical.clone());
+
+            if loaded.insert(canonical.clone()) {
+                let (declarations, child_dir) = compiler.load_top_level_module(&path.head)?;
+                self.add_module_contents(compiler, canonical, &child_dir, declarations, loaded)?;
+            }
+            Ok(())
+        } else {
+            let canonical = self.resolve_module_path(&path, module_path, pi)?;
+            self.add_import_prefix(canonical);
+            Ok(())
+        }
+    }
+
+    fn resolve_module_path(
+        &self,
+        path: &IdentifierPath,
+        scope: &IdentifierPath,
+        pi: ParseInfo,
+    ) -> Compilation<IdentifierPath> {
+        prefix_chain(scope)
+            .chain(self.imports.iter().rev().cloned())
+            .find_map(|base| {
+                let candidate = IdentifierPath {
+                    head: base.head.clone(),
+                    tail: {
+                        let mut tail = base.tail.clone();
+                        tail.push(path.head.clone());
+                        tail.extend(path.tail.iter().cloned());
+                        tail
+                    },
+                };
+                self.module_members
+                    .contains_key(&candidate)
+                    .then_some(candidate)
+            })
+            .ok_or_else(|| NameError::UnknownName(path.clone()).at(pi).into())
     }
 
     pub fn add_import_prefix(&mut self, prefix: IdentifierPath) {
@@ -1023,12 +1060,14 @@ impl phase::SymbolTable<Parsed> {
             }
         }
 
-        let mut loading = vec![program.root_module.name.clone()];
+        let mut loaded = HashSet::from([IdentifierPath::new(program.root_module.name.as_str())]);
+        let root_dir = program.compiler.source_path.clone();
         symtab.add_module_contents(
             &program.compiler,
             IdentifierPath::new(program.root_module.name.as_str()),
+            &root_dir,
             Self::module_declarations(&program.compiler, program.root_module.declarator)?,
-            &mut loading,
+            &mut loaded,
         )?;
 
         Ok(symtab)

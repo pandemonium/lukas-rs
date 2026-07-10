@@ -2,4 +2,4 @@ use Stdlib.
 (* State monad -- expect 7 *)
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (State.eval (State.pure 7) 0))
+  print_endline (prim_show (eval (pure 7) 0))

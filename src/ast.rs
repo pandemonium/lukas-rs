@@ -111,7 +111,18 @@ pub struct ForeignDeclaration<A> {
 #[derive(Debug)]
 pub struct UseDeclaration<A> {
     pub qualified_binder: Option<parser::Identifier>,
-    pub module: ModuleDeclaration<A>,
+    pub path: parser::IdentifierPath,
+    _phase: std::marker::PhantomData<A>,
+}
+
+impl<A> UseDeclaration<A> {
+    pub fn new(qualified_binder: Option<parser::Identifier>, path: parser::IdentifierPath) -> Self {
+        Self {
+            qualified_binder,
+            path,
+            _phase: std::marker::PhantomData,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -875,9 +886,10 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             qualified_binder,
-            module,
+            path,
+            _phase,
         } = self;
-        write!(f, "{module}")?;
+        write!(f, "{path}")?;
         if let Some(qualifier) = qualified_binder {
             write!(f, " at {qualifier}")?;
         }
