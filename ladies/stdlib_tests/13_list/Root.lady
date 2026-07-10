@@ -1,0 +1,10 @@
+use Stdlib.
+(* List: Semigroup (concat), Monoid identity, Traversable via sequence (short-circuits on Nope). *)
+shL  :: List Int -> Text := λxs. deconstruct xs into Nil -> "nil" | Cons a t -> "`a`,`shL t`"
+shPL :: Perhaps (List Int) -> Text := λp. deconstruct p into This xs -> shL xs | Nope -> "nope"
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (shL (mappend (Cons 1 (Cons 2 Nil)) (Cons 3 Nil)))     (* Semigroup: 1,2,3,nil *)
+  print_endline (shL (mappend mempty (Cons 9 Nil)))                    (* Monoid identity: 9,nil *)
+  print_endline (shPL (sequence (Cons (This 1) (Cons (This 2) Nil))))  (* sequence: 1,2,nil *)
+  print_endline (shPL (sequence (Cons (This 1) (Cons Nope Nil))))      (* sequence Nope: nope *)

@@ -1,5 +1,3 @@
-use Control.
-
 State ::= ∀s α. State (s -> (s, α))
 
 witness ∀s. Functor (State s) :=

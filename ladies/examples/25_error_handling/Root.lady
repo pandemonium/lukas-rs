@@ -5,16 +5,16 @@ use Stdlib.
 
 Error ::= DivByZero | Negative
 
-safe_div :: Int -> Int -> Result Int Error := λa b.
+safe_div :: Int -> Int -> Result Error Int := λa b.
   if b = 0 then Fault DivByZero else Return (a / b)
 
 (* run the next fallible step only if the previous one succeeded *)
-chain :: ∀α β e. (α -> Result β e) -> Result α e -> Result β e := λf r.
+chain :: ∀α β e. (α -> Result e β) -> Result e α -> Result e β := λf r.
   deconstruct r into
     Return a -> f a
   | Fault e  -> Fault e
 
-show :: Result Int Error -> Text := λr.
+show :: Result Error Int -> Text := λr.
   deconstruct r into
     Return a          -> prim_show a
   | Fault DivByZero   -> "error: divide by zero"

@@ -1,0 +1,15 @@
+use Stdlib.
+(* Result (error-first Either): Monad chain + short-circuit, Functor, Foldable, Semigroup. *)
+Err ::= Boom
+step :: Int -> Result Err Int := λx. if x < 0 then Fault Boom else Return (x + 1)
+run3 :: Int -> Result Err Int := λx. let* a = step x in let* b = step a in step b
+shR  :: Result Err Int  -> Text := λr. deconstruct r into Return n -> prim_show n | Fault Boom -> "boom"
+shRT :: Result Err Text -> Text := λr. deconstruct r into Return s -> s           | Fault Boom -> "boom"
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (shR (run3 39))                                        (* Monad: 42 *)
+  print_endline (shR (run3 (0 - 5)))                                   (* short-circuit: boom *)
+  print_endline (shR (fmap (λn. n + 1) (Return 41)))                   (* Functor: 42 *)
+  print_endline (prim_show (fold_right (λa z. a + z) 100 (Return 5)))  (* Foldable: 105 *)
+  print_endline (prim_show (fold_right (λa z. a + z) 100 (Fault Boom)))(* Foldable Fault: 100 *)
+  print_endline (shRT (mappend (Return "a") (Return "b")))             (* Semigroup: ab *)

@@ -36,14 +36,11 @@ signature Foldable ::= ∀f : * -> *.
     fold_left  :: ∀α β. (β -> α -> β) -> β -> f α -> β
   }
 
-signature Display ::= ∀α.
-  { display :: α -> Text
-  }
 
-ExceptT ::= ∀m : *->* e α. MkExceptT (m (Result α e))
+ExceptT ::= ∀m : *->* e α. MkExceptT (m (Result e α))
 
 module ExceptT:
-  run :: ∀m : *->* e α. ExceptT m e α -> m (Result α e) :=
+  run :: ∀m : *->* e α. ExceptT m e α -> m (Result e α) :=
     λ(MkExceptT result). result
 
 fold_map :: ∀t : *->* α m. Monoid m + Foldable t |- (α -> m) -> t α -> m := λf.
@@ -59,3 +56,5 @@ sequence :: ∀t : *->* f : *->* α.  Traversable t + Applicative f |- t (f α) 
 
 mconcat :: ∀α. Monoid α |- List α -> α :=
   fold_right mappend mempty
+
+module State.

@@ -1,0 +1,13 @@
+use Stdlib.
+(* Perhaps (Maybe): Foldable, Semigroup + Monoid identity, Traversable over the Perhaps effect. *)
+shP   :: Perhaps Text -> Text := λp. deconstruct p into This s -> s | Nope -> "nope"
+shPI  :: Perhaps Int  -> Text := λp. deconstruct p into This n -> prim_show n | Nope -> "nope"
+shPP  :: Perhaps (Perhaps Int) -> Text := λp. deconstruct p into This q -> "This `shPI q`" | Nope -> "Nope"
+guard :: Int -> Perhaps Int := λx. if x > 0 then This x else Nope
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (fold_right (λa z. a + z) 100 (This 5)))    (* Foldable: 105 *)
+  print_endline (shP (mappend (This "a") (This "b")))                  (* Semigroup: ab *)
+  print_endline (shP (mappend mempty (This "id")))                     (* Monoid identity: id *)
+  print_endline (shPP (traverse guard (This 5)))                       (* Traversable: This 5 *)
+  print_endline (shPP (traverse guard Nope))                           (* Traversable: This nope *)

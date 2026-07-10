@@ -1272,14 +1272,15 @@ impl<'a> Parser<'a> {
         self.strip_layout()?;
         let column = *self.peek()?.location();
 
-        let mut fields = vec![self.parse_field_init()?];
-
-        while self.is_record_field_separator(column)? {
-            self.consume()?;
+        let mut fields = vec![];
+        while self.peek()?.kind != TokenKind::RightBrace {
             fields.push(self.parse_field_init()?);
+            self.strip_layout()?;
+            if self.peek()?.kind == TokenKind::Semicolon {
+                self.consume()?;
+                self.strip_layout()?;
+            }
         }
-
-        self.strip_layout()?;
 
         self.expect(TokenKind::RightBrace)?;
 

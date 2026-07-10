@@ -1,0 +1,65 @@
+Perhaps ::= ∀α. Nope | This α
+
+
+witness Functor Perhaps :=
+  { fmap := λf fa.
+      deconstruct fa into
+        This a -> This (f a)
+      | Nope   -> Nope
+  }
+
+witness Monad Perhaps :=
+  { bind := λf ma.
+      deconstruct ma into
+        This a -> f a
+      | Nope   -> Nope
+  }
+
+witness Applicative Perhaps :=
+  { pure  := λx. This x
+    apply := λap fa.
+      deconstruct ap into
+        This f -> fmap f fa
+      | Nope   -> Nope
+  }
+
+witness Foldable Perhaps :=
+  { fold_right := λstep z fa.
+      deconstruct fa into
+        This a -> step a z
+      | Nope   -> z
+    fold_left := λstep z fa.
+      deconstruct fa into
+        This a -> step z a
+      | Nope   -> z
+  }
+
+witness ∀α. Semigroup α |- Semigroup (Perhaps α) :=
+  { mappend := liftA2 mappend
+  }
+
+witness ∀α. Monoid α |- Monoid (Perhaps α) :=
+  { mempty := This mempty
+  }
+
+witness ∀α. Display α |- Display (Perhaps α) :=
+  { display := λt. prim_show t
+  }
+
+witness Traversable Perhaps :=
+  { traverse := λf. perhaps (pure Nope) (compose (fmap This) f)
+  }
+
+witness ∀α. Eq α |- Eq (Perhaps α) :=
+  { eq := λp q. p = q
+  }
+
+
+perhaps :: ∀α z. z -> (α -> z) -> Perhaps α -> z :=
+  λz f xa. deconstruct xa into This x -> f x | otherwise -> z
+
+map :: ∀α β. (α -> β) -> Perhaps α -> Perhaps β :=
+  λf. perhaps Nope (compose This f)
+
+bind :: ∀α β. (α -> Perhaps β) -> Perhaps α -> Perhaps β :=
+  λf. perhaps Nope f

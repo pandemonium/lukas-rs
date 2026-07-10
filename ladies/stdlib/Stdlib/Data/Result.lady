@@ -1,0 +1,47 @@
+Result ::= ∀e α. Fault e | Return α
+
+witness ∀α e. Display α + Display e |- Display (Result e α) :=
+  { display := λt.
+      deconstruct t into
+        Fault e  -> display e
+      | Return a -> display a
+  }
+
+witness ∀α e. Semigroup α |- Semigroup (Result e α) :=
+  { mappend := liftA2 mappend
+  }
+
+witness ∀α e. Monoid α |- Monoid (Result e α) :=
+  { mempty := Return mempty
+  }
+
+witness ∀e. Functor (Result e) :=
+  { fmap := λf. result Fault (compose Return f)
+  }
+
+witness ∀e. Applicative (Result e) :=
+  { pure  := Return
+    apply := λff fa.
+      deconstruct ff into
+        Return f -> fmap f fa
+      | Fault e  -> Fault e
+  }
+
+witness ∀e. Monad (Result e) :=
+  { bind := result Fault
+  }
+
+witness ∀e. Foldable (Result e) :=
+  { fold_right := λstep z. result (λ_. z) (λa. step a z)
+    fold_left  := λstep z. result (λ_. z) (λa. step z a)
+  }
+
+witness ∀e. Traversable (Result e) :=
+  { traverse := λf. result (compose pure Fault) (compose (fmap Return) f)
+  }
+
+result :: ∀α e z. (e -> z) -> (α -> z) -> Result e α -> z :=
+  λfault return ra.
+    deconstruct ra into
+      Fault e  -> fault e
+    | Return a -> return a

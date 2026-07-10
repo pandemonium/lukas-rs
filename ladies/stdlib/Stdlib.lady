@@ -1,159 +1,21 @@
-use Prelude.
-use State.
-use Control.
-use IO.
+module Prelude.
+module Control.
+module IO.
+module Data.
 
-List ::= ∀α. Nil | Cons α (List α)
+use Stdlib.Prelude.
+use Stdlib.Data.
+use Stdlib.Data.List.
+use Stdlib.Data.Perhaps.
+use Stdlib.Data.Result.
+use Stdlib.Control.State.
+use Stdlib.IO.
+(* class methods opened last so polymorphic bind/fold_left shadow the concrete leaks *)
+use Stdlib.Control.
 
-witness Functor List :=
-  { fmap := λf fa. List.map f fa
+signature Display ::= ∀α.
+  { display :: α -> Text
   }
-
-witness Foldable List :=
-  { fold_left  := λf. List.fold_left f
-    fold_right := λf. List.fold_right f
-  }
-
-witness Monad List :=
-  { bind := λf. List.bind f
-  }
-
-witness Applicative List :=
-  { pure  := λa. Cons a Nil
-    apply := λff fa.
-      List.bind (λf. List.map f fa) ff
-  }
-
-witness Traversable List :=
-  { traverse := λf xs.
-      deconstruct xs into
-        Nil -> pure Nil
-      | Cons a tail ->
-        liftA2 Cons (f a) (traverse f tail)
-  }
-
-witness ∀α. Display α |- Display (List α) :=
-  { display := λxs.
-      deconstruct xs into
-        Nil       -> "nil"
-      | Cons x ys -> "`x` : `ys`"
-  }
-
-module List:
-  head :: ∀α. List α -> Perhaps α :=
-    λxs. deconstruct xs into Cons a tail -> This a | otherwise -> Nope
-
-  tail :: ∀α. List α -> List α :=
-    λxs. deconstruct xs into Cons a tail -> tail | tail -> tail
-
-  fold_right :: ∀z α. (α -> z -> z) -> z -> List α -> z :=
-    λf z xs.
-      deconstruct xs into
-        Cons a tail -> f a (fold_right f z tail)
-      | Nil         -> z
-
-  fold_left :: ∀z α. (z -> α -> z) -> z -> List α -> z :=
-    λf z xs.
-      deconstruct xs into
-        Cons a tail -> fold_left f (f z a) tail
-      | Nil         -> z
-
-  map :: ∀α β. (α -> β) -> List α -> List β :=
-    λf. fold_right (compose Cons f) Nil
-
-  bind :: ∀α β. (α -> List β) -> List α -> List β :=
-    λf. fold_right (λx. append (f x)) Nil
-
-  cartesian :: ∀α β. List α -> List β -> List (α, β) :=
-    λxs ys. bind (λx. map (λy. x, y) ys) xs
-
-  zip :: ∀α β. List α -> List β -> List (α, β) := λxs ys.
-    deconstruct xs, ys into
-      Cons x xs, Cons y ys -> Cons (x, y) (zip xs ys)
-    | otherwise            -> Nil
-
-  append :: ∀α. List α -> List α -> List α :=
-    λxs ys. fold_right Cons ys xs
-
-  reverse :: ∀α. List α -> List α :=
-    fold_left (λz a. Cons a z) Nil
-
-  length :: ∀α. List α -> Int :=
-    fold_right (λa z. 1 + z) 0
-
-  count :: ∀α. (α -> Bool) -> List α -> Int :=
-    λp. fold_left (λz x. if p x then 1 + z else z) 0
-
-  filter :: ∀α. (α -> Bool) -> List α -> List α :=
-    λp. bind (λx. if p x then Cons x Nil else Nil)
-
-  flatten :: ∀α. List (List α) -> List α := λxs.
-    print_endline "flatten!"
-    bind id xs
-
-  tabulate :: ∀α. Int -> (Int -> α) -> List α :=
-    λc f.
-      let loop = λi xs.
-        if i < 0
-          then xs
-          else loop (i - 1) (Cons (f i) xs)
-      in loop (c - 1) Nil
-
-  concat :: List Text -> Text := λxs.
-    deconstruct xs into
-      Cons t tail -> "`t``concat tail`"
-    | Nil -> ""
-
-  singleton :: ∀α. α -> List α := λa. Cons a Nil
-
-
-Perhaps ::= ∀α. Nope | This α
-
-witness Functor Perhaps :=
-  { fmap := λf fa.
-      deconstruct fa into
-        This a -> This (f a)
-      | Nope   -> Nope
-  }
-
-witness Monad Perhaps :=
-  { bind := λf ma.
-      deconstruct ma into
-        This a -> f a
-      | Nope   -> Nope
-  }
-
-witness Applicative Perhaps :=
-  { pure  := λx. This x
-    apply := λap fa. Perhaps.bind (λf. Perhaps.map f fa) ap
-  }
-
-witness ∀α. Display α |- Display (Perhaps α) :=
-  { display := λt. prim_show t
-  }
-
-module Perhaps:
-  perhaps :: ∀α z. z -> (α -> z) -> Perhaps α -> z :=
-    λz f xa. deconstruct xa into This x -> f x | otherwise -> z
-
-  map :: ∀α β. (α -> β) -> Perhaps α -> Perhaps β :=
-    λf. perhaps Nope (compose This f)
-
-  bind :: ∀α β. (α -> Perhaps β) -> Perhaps α -> Perhaps β :=
-    λf. perhaps Nope f
-
-
-Result ::= ∀α e. Fault e | Return α
-
-module Result:
-  result :: ∀α e z. (e -> z) -> (α -> z) -> Result α e -> z :=
-    λfault return ra.
-      deconstruct ra into
-        Fault e  -> fault e
-      | Return a -> return a
-
-  map :: ∀α β e. (α -> β) -> Result α e -> Result β e :=
-    λf ra. result Fault (compose Return f) ra
 
 witness Semigroup Text :=
   { mappend := λp q. "`p``q`"
@@ -177,14 +39,6 @@ witness Eq Int :=
 
 witness Ord Int :=
   { lte := λp q. p <= q
-  }
-
-witness ∀α. Eq α |- Eq (List α) :=
-  { eq := λxs ys.
-      deconstruct xs, ys into
-        Cons x xs, Cons y ys -> eq x y and eq xs ys
-      | Nil, Nil             -> true
-      | otherwise            -> false
   }
 
 witness Display Text :=

@@ -1,0 +1,132 @@
+List ::= ∀α. Nil | Cons α (List α)
+
+
+witness Functor List :=
+  { fmap := λf xs.
+      deconstruct xs into
+        Nil       -> Nil
+      | Cons a tl -> Cons (f a) (fmap f tl)
+  }
+
+witness Foldable List :=
+  { fold_right := λf z xs.
+      deconstruct xs into
+        Nil       -> z
+      | Cons a tl -> f a (fold_right f z tl)
+    fold_left := λf z xs.
+      deconstruct xs into
+        Nil       -> z
+      | Cons a tl -> fold_left f (f z a) tl
+  }
+
+witness Monad List :=
+  { bind := λf xs.
+      deconstruct xs into
+        Nil       -> Nil
+      | Cons a tl -> append (f a) (bind f tl)
+  }
+
+witness Applicative List :=
+  { pure  := λa. Cons a Nil
+    apply := λff fa.
+      deconstruct ff into
+        Nil       -> Nil
+      | Cons f tl -> append (fmap f fa) (apply tl fa)
+  }
+
+witness Traversable List :=
+  { traverse := λf xs.
+      deconstruct xs into
+        Nil -> pure Nil
+      | Cons a tail ->
+        liftA2 Cons (f a) (traverse f tail)
+  }
+
+witness ∀α. Semigroup (List α) :=
+  { mappend := append
+  }
+
+witness ∀α. Monoid (List α) :=
+  { mempty := Nil
+  }
+
+witness ∀α. Display α |- Display (List α) :=
+  { display := λxs.
+      deconstruct xs into
+        Nil       -> "nil"
+      | Cons x ys -> "`x` : `ys`"
+  }
+
+witness ∀α. Eq α |- Eq (List α) :=
+  { eq := λxs ys.
+      deconstruct xs, ys into
+        Cons x xs, Cons y ys -> eq x y and eq xs ys
+      | Nil, Nil             -> true
+      | otherwise            -> false
+  }
+
+
+head :: ∀α. List α -> Perhaps α :=
+  λxs. deconstruct xs into Cons a tail -> This a | otherwise -> Nope
+
+tail :: ∀α. List α -> List α :=
+  λxs. deconstruct xs into Cons a tail -> tail | tail -> tail
+
+fold_right :: ∀z α. (α -> z -> z) -> z -> List α -> z :=
+  λf z xs.
+    deconstruct xs into
+      Cons a tail -> f a (fold_right f z tail)
+    | Nil         -> z
+
+fold_left :: ∀z α. (z -> α -> z) -> z -> List α -> z :=
+  λf z xs.
+    deconstruct xs into
+      Cons a tail -> fold_left f (f z a) tail
+    | Nil         -> z
+
+map :: ∀α β. (α -> β) -> List α -> List β :=
+  λf. fold_right (compose Cons f) Nil
+
+bind :: ∀α β. (α -> List β) -> List α -> List β :=
+  λf. fold_right (λx. append (f x)) Nil
+
+cartesian :: ∀α β. List α -> List β -> List (α, β) :=
+  λxs ys. bind (λx. map (λy. x, y) ys) xs
+
+zip :: ∀α β. List α -> List β -> List (α, β) := λxs ys.
+  deconstruct xs, ys into
+    Cons x xs, Cons y ys -> Cons (x, y) (zip xs ys)
+  | otherwise            -> Nil
+
+append :: ∀α. List α -> List α -> List α :=
+  λxs ys. fold_right Cons ys xs
+
+reverse :: ∀α. List α -> List α :=
+  fold_left (λz a. Cons a z) Nil
+
+length :: ∀α. List α -> Int :=
+  fold_right (λa z. 1 + z) 0
+
+count :: ∀α. (α -> Bool) -> List α -> Int :=
+  λp. fold_left (λz x. if p x then 1 + z else z) 0
+
+filter :: ∀α. (α -> Bool) -> List α -> List α :=
+  λp. bind (λx. if p x then Cons x Nil else Nil)
+
+flatten :: ∀α. List (List α) -> List α := λxs.
+  bind id xs
+
+tabulate :: ∀α. Int -> (Int -> α) -> List α :=
+  λc f.
+    let loop = λi xs.
+      if i < 0
+        then xs
+        else loop (i - 1) (Cons (f i) xs)
+    in loop (c - 1) Nil
+
+concat :: List Text -> Text := λxs.
+  deconstruct xs into
+    Cons t tail -> "`t``concat tail`"
+  | Nil -> ""
+
+singleton :: ∀α. α -> List α := λa. Cons a Nil
