@@ -1,0 +1,45 @@
+(* 11_broken_syntax -- known bugs in the layout / syntax surface. *)
+(* Each entry is a construct that SHOULD work but currently does not. The code *)
+(* is shown in comments -- it cannot be uncommented or this file would fail -- *)
+(* with the error it produces. The file itself compiles; `start` announces it. *)
+(* *)
+(* Deliberate RULES (correct rejections, NOT bugs) are listed here so they are *)
+(* not mistaken for the bugs below: *)
+(*   - a `let` value dropped onto its own line needs `in` at the `let` column; *)
+(*   - a following λ must share one lambda (λa b.), sit on the same line *)
+(*     (λa. λb.), or be indented under the previous -- never at the same column; *)
+(*   - an operator may only LEAD a continuation line (rule 2 in 10_syntax); *)
+(*     leaving it TRAILING at the end of a line is not legal; *)
+(*   - every `let` requires an `in`. *)
+(* *)
+(* Comment breakages are catalogued under ladies/known_bugs and left aside here. *)
+
+use Stdlib.
+
+(* 1. Operator continuation inside parentheses, e.g. as an argument. Rule 2 *)
+(*    should reach into the paren context (alignment still required, since a *)
+(*    paren context can hold a sequence), but it does not fire there. *)
+(*    Breaks: parse error, "expected )". *)
+(*        f (1 *)
+(*         + 2) *)
+
+(* 2. Operator continuation in the branches of an if. Breaks: parse error, *)
+(*    "expected Else" -- the continuation runs past the branch boundary. *)
+(*        if c *)
+(*          then 10 *)
+(*             + 20 *)
+(*          else 0 *)
+
+(* 3. Operator continuation whose operand is a parenthesised lambda applied to *)
+(*    an argument. Breaks: parse error, "unexpected input". Continuation over *)
+(*    ordinary applications -- sq 3 + sq 4 -- works fine. *)
+(*        (λx. x + 1) 10 *)
+(*      + (λy. y * 2) 20 *)
+
+(* 4. Records. A record VALUE projected with .field hits a type error, and a *)
+(*    record TYPE decl with its } on the last field's line fails to parse *)
+(*    (see ladies/known_bugs/brace_on_last_line). *)
+(*        { alpha := 1; beta := 2 }.alpha *)
+
+start :: Int -> Unit := λ_.
+  print_endline "11_broken_syntax: constructs that should work but currently do not."

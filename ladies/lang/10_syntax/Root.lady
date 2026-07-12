@@ -1,0 +1,130 @@
+(* A grand positive test of Marmelade's layout (offside) rules. *)
+(* Marmelade is layout-sensitive: indentation and line breaks carry meaning. *)
+(* Each declaration exercises one layout rule or quirk that IS supported, and *)
+(* `start` runs them all and prints each result. A clean run with the expected *)
+(* output is therefore a check on the whole layout surface at once. *)
+(* Comments here are all single-line on purpose: a block comment that spans *)
+(* several lines still desyncs the offside stack, so this test avoids those. *)
+
+use Stdlib.
+
+(* 1. A definition body may sit on the `:=` line ... *)
+same_line :: Int := 40 + 2
+
+(* ... or drop onto an indented block on the next line. *)
+indented_body :: Int :=
+  40 + 2
+
+(* 2. Application split across lines: head on one line, each argument on its *)
+(*    own line, indented past the head and aligned with the other arguments. *)
+add3 :: Int -> Int -> Int -> Int := λa b c. a + b + c
+
+applied_across_lines :: Int :=
+  add3
+    10
+    20
+    30
+
+(* 2b. A curried lambda may spread over lines: a following λ shares one lambda *)
+(*     (λa b.), sits on the same line (λa. λb.), or is indented under the last. *)
+curried :: Int -> Int -> Int :=
+  λa.
+    λb.
+      a + b
+
+(* 3. let ... in, inline ... *)
+inline_let :: Int := let x = 7 in x * 6
+
+(* ... with the bound value on its own indented block -- and when it drops onto *)
+(*     a line like this, `in` must begin the next line at the `let` column ... *)
+block_let :: Int :=
+  let x =
+        6 * 7
+  in x
+
+(* ... and nested, one binding per line. *)
+nested_let :: Int :=
+  let x = 6 in
+  let y = 7 in
+  x * y
+
+(* 5. Monadic do-notation: `let*` is bind; binders chain with `in`. *)
+do_notation :: Perhaps Int :=
+  let* a = This 20 in
+  let* b = This 22 in
+  This (a + b)
+
+(* 6. if / then / else, each part on its own indented line. *)
+conditional :: Text :=
+  if 1 + 1 = 2
+    then "arithmetic works"
+    else "call a mathematician"
+
+(* 7. deconstruct ... into: alternatives block-indented, led by `|`. *)
+classify :: Int -> Text := λn.
+  deconstruct n into
+    0 -> "zero"
+  | 1 -> "one"
+  | _ -> "many"
+
+(* 8. A multi-line body inside parentheses closes at the `)` on its last line, *)
+(*    with no dangling layout token leaking past it (here a suspended effect). *)
+squared_effect :: Int -> IO Int := λx. Suspend (λ_.
+  print_endline "  (running the suspended effect)"
+  x * x)
+
+(* 9. String interpolation: a `expr` splice is evaluated into the "..." literal. *)
+interpolated :: Int -> Text := λn. "the answer is `n`."
+
+(* 10. Nesting -- the constructs compose. Here a deconstruct arm holds a let *)
+(*     whose bound value feeds an if. *)
+digest :: Int -> Int := λn.
+  deconstruct n into
+    0 -> 0
+  | _ ->
+      let doubled = n + n
+      in if doubled = 0
+           then 0
+           else doubled + 1
+
+(* 11. deconstruct nested three deep: each inner match is block-indented under *)
+(*     the arm that introduces it. *)
+grade :: Int -> Text := λn.
+  deconstruct n into
+    0 -> "F"
+  | _ ->
+      deconstruct n into
+        1 -> "D"
+      | _ ->
+          deconstruct n into
+            2 -> "C"
+          | _ -> "A"
+
+(* 12. let* do-notation with a nested let ... in as one of the bound values; *)
+(*     the outer `in` sits on its own dedented line. *)
+chain :: Perhaps Int :=
+  let* a = This 10 in
+  let* b =
+        let base = a * 2 in
+        This (base + 1)
+  in This (a + b)
+
+(* Run everything. The body of `start` is itself a layout construct: a sequence *)
+(* of statements separated by newlines at one indentation level. *)
+start :: Int -> Unit := λ_.
+  print_endline (prim_show same_line)                     (* 42 *)
+  print_endline (prim_show indented_body)                 (* 42 *)
+  print_endline (prim_show applied_across_lines)          (* 60 *)
+  print_endline (prim_show (curried 20 22))               (* 42 *)
+  print_endline (prim_show inline_let)                    (* 42 *)
+  print_endline (prim_show block_let)                     (* 42 *)
+  print_endline (prim_show nested_let)                    (* 42 *)
+  print_endline (perhaps "nothing" prim_show do_notation) (* 42 *)
+  print_endline conditional                               (* arithmetic works *)
+  print_endline (classify 0)                              (* zero *)
+  print_endline (classify 5)                              (* many *)
+  let Suspend th = squared_effect 9 in print_endline (prim_show (th ()))
+  print_endline (interpolated 42)                         (* the answer is 42. *)
+  print_endline (prim_show (digest 5))                    (* 11 *)
+  print_endline (grade 3)                                 (* A *)
+  print_endline (perhaps "nothing" prim_show chain)       (* 31 *)

@@ -5,6 +5,7 @@ pub struct LexicalAnalyzer {
     location: SourceLocation,
     indentation_level: u32,
     indentation: Vec<u32>,
+    paren_marks: Vec<usize>,
     output: Vec<Token>,
 }
 
@@ -31,11 +32,6 @@ impl LexicalAnalyzer {
                     TokenKind::Keyword(Keyword::Let(BindingOperator::Applicative)),
                     remains,
                 ),
-                ['l', 'e', 't', remains @ ..] => self.emit(
-                    3,
-                    TokenKind::Keyword(Keyword::Let(BindingOperator::Identity)),
-                    remains,
-                ),
                 prefix @ [c, ..] if is_identifier_prefix(*c) => self.scan_identifier(prefix),
                 prefix @ [c, ..] if is_number_prefix(*c) => self.scan_number(prefix),
                 ['"', remains @ ..] => self.scan_text_literal(remains),
@@ -59,8 +55,14 @@ impl LexicalAnalyzer {
                 ['(', ')', remains @ ..] => {
                     self.emit(2, TokenKind::Literal(Literal::Unit), remains)
                 }
-                ['(', remains @ ..] => self.emit(1, TokenKind::LeftParen, remains),
-                [')', remains @ ..] => self.emit(1, TokenKind::RightParen, remains),
+                ['(', remains @ ..] => {
+                    self.paren_marks.push(self.indentation.len());
+                    self.emit(1, TokenKind::LeftParen, remains)
+                }
+                [')', remains @ ..] => {
+                    self.close_paren();
+                    self.emit(1, TokenKind::RightParen, remains)
+                }
                 ['{', remains @ ..] => self.emit(1, TokenKind::LeftBrace, remains),
                 ['}', remains @ ..] => self.emit(1, TokenKind::RightBrace, remains),
                 ['_', remains @ ..] => self.emit(1, TokenKind::Underscore, remains),
@@ -248,6 +250,14 @@ impl LexicalAnalyzer {
         self.emit_layout(next, Layout::Indent);
     }
 
+    fn close_paren(&mut self) {
+        if let Some(mark) = self.paren_marks.pop() {
+            while self.indentation.len() > mark {
+                self.indentation_level = self.indentation.pop().unwrap_or(self.indentation_level);
+            }
+        }
+    }
+
     // Which location is the location of an Indent or Dedent?
     fn emit_layout(&mut self, location: SourceLocation, indentation: Layout) {
         if let Some(last) = self.output.last_mut() {
@@ -305,6 +315,7 @@ impl Default for LexicalAnalyzer {
             location,
             indentation_level: location.column,
             indentation: Vec::default(),
+            paren_marks: Vec::default(),
             output: Vec::default(), // This could actually be something a lot bigger.
         }
     }
@@ -587,6 +598,7 @@ pub enum Keyword {
 impl Keyword {
     fn try_from_identifier(id: &str) -> Option<Self> {
         match id {
+            "let" => Some(Self::Let(BindingOperator::Identity)),
             "in" => Some(Self::In),
             "if" => Some(Self::If),
             "then" => Some(Self::Then),

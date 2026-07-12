@@ -266,6 +266,14 @@ pub struct Parser<'a> {
     offset: usize,
 }
 
+// Outcome of an indented block's close hook: either the body's own parse already closed the
+// block (by taking its `Dedent` as an operator continuation), or the block still needs the
+// ordinary close.
+enum BlockClose<A> {
+    Continued(A),
+    Plain(A),
+}
+
 impl<'a> Parser<'a> {
     pub fn from_tokens(remains: &'a [Token]) -> Self {
         Self { remains, offset: 0 }
@@ -928,21 +936,19 @@ impl<'a> Parser<'a> {
 
         Ok(ValueDeclarator {
             type_signature,
-            body: self
-                .parse_block(|parser| parser.parse_sequence())
-                .map(|body| {
-                    if let Expr::Lambda(pi, lambda) = body {
-                        Expr::RecursiveLambda(
-                            pi,
-                            SelfReferential {
-                                own_name: IdentifierPattern::from_path(pi, own_name),
-                                lambda,
-                            },
-                        )
-                    } else {
-                        body
-                    }
-                })?,
+            body: self.parse_expression_block().map(|body| {
+                if let Expr::Lambda(pi, lambda) = body {
+                    Expr::RecursiveLambda(
+                        pi,
+                        SelfReferential {
+                            own_name: IdentifierPattern::from_path(pi, own_name),
+                            lambda,
+                        },
+                    )
+                } else {
+                    body
+                }
+            })?,
         })
     }
 
@@ -1187,37 +1193,79 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // The skeleton of an indented block: consume the opening `Indent`, parse the body, then
+    // close. The only thing that varies is the moment *before* the close -- an ordinary
+    // block just closes, while an expression body may find that the closing `Dedent` is
+    // actually an operator continuation and carry on. That decision is `at_close`, handed
+    // the parsed body and the column its first token started on.
+    fn parse_block_with<F, A, C>(&mut self, parse_body: F, at_close: C) -> Result<A>
+    where
+        F: FnOnce(&mut Parser<'a>) -> Result<A>,
+        C: FnOnce(&mut Parser<'a>, A, u32) -> Result<BlockClose<A>>,
+    {
+        let _t = self.trace();
+
+        if !self.peek()?.is_indent() {
+            return parse_body(self);
+        }
+
+        self.consume()?; // the opening Indent
+        let body_column = self.peek()?.position.column;
+        let body = parse_body(self)?;
+
+        match at_close(self, body, body_column)? {
+            // The body already took the block's `Dedent` (as a continuation), so it is closed.
+            BlockClose::Continued(body) => Ok(body),
+            BlockClose::Plain(body) => {
+                let token = self.peek()?;
+                match token.kind {
+                    TokenKind::Layout(Layout::Dedent) | TokenKind::End => {
+                        self.advance(1);
+                        Ok(body)
+                    }
+                    // A `)` closes a block sitting inside parens: its last statement's line
+                    // ends with the `)`, so the lexer emits no Dedent there.
+                    TokenKind::RightParen => Ok(body),
+                    _ => Err(ParseError::Expected {
+                        expected: TokenKind::Layout(Layout::Dedent),
+                        found: token.kind.clone(),
+                        position: token.position,
+                    }),
+                }
+            }
+        }
+    }
+
+    // An ordinary block: nothing continues past the close.
     fn parse_block<F, A>(&mut self, parse_body: F) -> Result<A>
     where
         F: FnOnce(&mut Parser<'a>) -> Result<A>,
     {
-        let _t = self.trace();
+        self.parse_block_with(parse_body, |_, body, _| Ok(BlockClose::Plain(body)))
+    }
 
-        if self.peek()?.is_indent() {
-            self.consume()?;
-            let body = parse_body(self)?;
-            // This does not interact well with sequences because parse_sequence
-            // does not see a sequence separator anymore after this
-            //            tracing::trace!("parse_block: delete dedent");
-
-            // I am not happy about this
-            let token = self.peek()?;
-            if matches!(
-                token.kind,
-                TokenKind::Layout(Layout::Dedent) | TokenKind::End
-            ) {
-                self.advance(1);
-                Ok(body)
-            } else {
-                Err(ParseError::Expected {
-                    expected: TokenKind::Layout(Layout::Dedent),
-                    found: token.kind.clone(),
-                    position: token.position,
-                })
-            }
-        } else {
-            parse_body(self)
-        }
+    // An expression body aware of operator continuation. The `Dedent` that would close the
+    // block may instead be a binary operator hanging on the next line with its operand lined
+    // up under the body's first token. Because the block owns that `Dedent`, `at_close` looks
+    // ahead before it is taken: if it heads a continuation the hook consumes it (that `Dedent`
+    // also closes the block) and folds the operator in via the infix parser; otherwise the
+    // block closes normally.
+    fn parse_expression_block(&mut self) -> Result<Expr> {
+        self.parse_block_with(
+            |parser| parser.parse_sequence(),
+            |parser, body, body_column| {
+                if let [dedent, operator, operand, ..] = parser.remains()
+                    && dedent.is_dedent()
+                    && Operator::is_defined(&operator.kind)
+                    && operand.position.column == body_column
+                {
+                    parser.consume()?; // the Dedent -- ours, and it also closes the block
+                    Ok(BlockClose::Continued(parser.parse_expr_infix(body, 0)?))
+                } else {
+                    Ok(BlockClose::Plain(body))
+                }
+            },
+        )
     }
 
     fn parse_local_binding(&mut self, binding_operator: BindingOperator) -> Result<Expr> {
@@ -1231,7 +1279,7 @@ impl<'a> Parser<'a> {
             .map(IdentifierPattern::from)?;
 
         self.expect(TokenKind::Equals)?;
-        let bound = self.parse_block(|parser| parser.parse_sequence())?;
+        let bound = self.parse_expression_block()?;
 
         // Could introduce a little rec keyword
         let bound = if let Expr::Lambda(pi, lambda) = bound {
@@ -1252,7 +1300,7 @@ impl<'a> Parser<'a> {
         if self.peek()?.is_newline() {
             self.consume()?;
         }
-        let body = self.parse_block(|parser| parser.parse_sequence())?;
+        let body = self.parse_expression_block()?;
         Ok(Expr::Let(
             ParseInfo { location: position },
             Binding {
