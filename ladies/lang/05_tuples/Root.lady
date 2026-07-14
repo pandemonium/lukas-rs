@@ -1,18 +1,59 @@
-(* Tuples: construction, ordinal projection, and tuple patterns. *)
+(* Tuples: the `,` operator builds a tuple and needs NO enclosing parens. Parens *)
+(* appear here only to *group* a tuple that would otherwise be split -- e.g. a *)
+(* tuple passed as a single argument, `f (1, 2)`, vs `f 1, 2` = `(f 1), 2`. *)
 
+use Stdlib.
+
+(* polymorphic tuple type in the signature; the return tuple needs no parens *)
 swap :: ∀α β. (α, β) -> (β, α) :=
-  λ(a, b). (b, a)
+  λ(a, b). b, a
+
+mkPair :: ∀α β. α -> β -> (α, β) :=
+  λa b. a, b
+
+(* a 3-tuple parameter, destructured in the lambda head *)
+sum3 :: (Int, Int, Int) -> Int :=
+  λ(a, b, c). a + b + c
+
+(* a nested tuple type, destructured with a nested pattern *)
+sumNested :: ((Int, Int), Int) -> Int :=
+  λ((a, b), c). a + b + c
+
+dup :: Int -> (Int, Int) :=
+  λn. n, n
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
 
-  (* ordinal projection .0/.1/.2 ; expect 6 *)
+  (* bare tuples -- no enclosing parens -- plus ordinal projection *)
   let t = 1, 2, 3 in
-  print_endline (prim_show (t.0 + t.1 + t.2))
+  print_endline (prim_show (t.0 + t.1 + t.2))              (* 6 *)
 
-  (* swap then project ; expect 100 *)
-  let pair = swap (7, 100) in
-  print_endline (prim_show pair.0)
+  let p = 10, 20 in
+  print_endline (prim_show (p.0 + p.1))                    (* 30 *)
 
-  (* tuple pattern in deconstruct ; expect 12 *)
-  deconstruct (3, 4) into a, b -> print_endline (prim_show (a * b))
+  (* elements may be arbitrary expressions; `,` binds looser than + and * *)
+  let e = 1 + 1, 2 * 3 in
+  print_endline (prim_show (e.0 + e.1))                    (* 8 *)
+
+  let q = 1, 2, 3, 4 in
+  print_endline (prim_show q.3)                            (* 4 *)
+
+  (* tuple pattern in a let binding; the value is a bare tuple *)
+  let (a, b) = 5, 6 in
+  print_endline (prim_show (a + b))                        (* 11 *)
+
+  (* here the parens GROUP the tuple as one argument to swap *)
+  print_endline (prim_show (swap (7, 100)).0)             (* 100 *)
+
+  (* bare tuple as a deconstruct scrutinee *)
+  deconstruct 3, 4 into (a, b) -> print_endline (prim_show (a * b))   (* 12 *)
+
+  (* nested tuple pattern (parens group the inner tuple) *)
+  deconstruct (1, 2), 3 into
+    ((a, b), c) -> print_endline (prim_show (a + b + c))   (* 6 *)
+
+  print_endline (prim_show (mkPair 8 9).1)                 (* 9 *)
+  print_endline (prim_show (sum3 (1, 2, 3)))               (* 6 *)
+  print_endline (prim_show (sumNested ((1, 2), 3)))        (* 6 *)
+  print_endline (prim_show (dup 5).0)                      (* 5 *)

@@ -238,9 +238,19 @@ impl LexicalAnalyzer {
 
     fn dedent_and_emit(&mut self, next: SourceLocation) {
         if next.is_left_of(self.indentation_level) {
-            self.indentation_level = self.indentation.pop().unwrap();
-            self.emit_layout(next.at_column(self.indentation_level), Layout::Dedent);
-            self.dedent_and_emit(next);
+            let enclosing = self.indentation.pop().unwrap();
+            if next.is_right_of(enclosing) {
+                // `next` lands between the enclosing level and the one we are leaving, so it is
+                // a fresh indentation level -- not the enclosing block. Establish it here and
+                // stop; the enclosing level stays on the stack.
+                self.indentation.push(enclosing);
+                self.indentation_level = next.column;
+                self.emit_layout(next, Layout::Dedent);
+            } else {
+                self.indentation_level = enclosing;
+                self.emit_layout(next.at_column(enclosing), Layout::Dedent);
+                self.dedent_and_emit(next);
+            }
         }
     }
 
@@ -515,6 +525,16 @@ impl Operator {
             Self::Xor | Self::Or => 10,
 
             Self::Ascribe => 8,
+        }
+    }
+
+    // The precedence an operator must strictly beat to bind here -- its own precedence, minus
+    // one for a right-associative operator so its RHS can rebind at the same level.
+    pub const fn binding_precedence(&self) -> usize {
+        if self.is_right_associative() {
+            self.precedence() - 1
+        } else {
+            self.precedence()
         }
     }
 

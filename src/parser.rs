@@ -34,6 +34,20 @@ type RecordDeclarator = ast::RecordDeclarator<ParseInfo>;
 type CoproductDeclarator = ast::CoproductDeclarator<ParseInfo>;
 type CoproductConstructor = ast::CoproductConstructor<ParseInfo>;
 
+struct ExpressionContext {
+    precedence: usize,
+    anchor_column: u32,
+}
+
+impl ExpressionContext {
+    fn from_expression_prefix(prefix: &Expr, precedence: usize) -> Self {
+        Self {
+            precedence,
+            anchor_column: prefix.parse_info().location.column,
+        }
+    }
+}
+
 impl<Id> ast::Expr<ParseInfo, Id> {
     pub fn parse_info(&self) -> &ParseInfo {
         self.annotation()
@@ -264,14 +278,6 @@ impl TypeExprOperator {
 pub struct Parser<'a> {
     remains: &'a [Token],
     offset: usize,
-}
-
-// Outcome of an indented block's close hook: either the body's own parse already closed the
-// block (by taking its `Dedent` as an operator continuation), or the block still needs the
-// ordinary close.
-enum BlockClose<A> {
-    Continued(A),
-    Plain(A),
 }
 
 impl<'a> Parser<'a> {
@@ -1194,78 +1200,44 @@ impl<'a> Parser<'a> {
     }
 
     // The skeleton of an indented block: consume the opening `Indent`, parse the body, then
-    // close. The only thing that varies is the moment *before* the close -- an ordinary
-    // block just closes, while an expression body may find that the closing `Dedent` is
-    // actually an operator continuation and carry on. That decision is `at_close`, handed
-    // the parsed body and the column its first token started on.
-    fn parse_block_with<F, A, C>(&mut self, parse_body: F, at_close: C) -> Result<A>
-    where
-        F: FnOnce(&mut Parser<'a>) -> Result<A>,
-        C: FnOnce(&mut Parser<'a>, A, u32) -> Result<BlockClose<A>>,
-    {
-        let _t = self.trace();
-
-        if !self.peek()?.is_indent() {
-            return parse_body(self);
-        }
-
-        self.consume()?; // the opening Indent
-        let body_column = self.peek()?.position.column;
-        let body = parse_body(self)?;
-
-        match at_close(self, body, body_column)? {
-            // The body already took the block's `Dedent` (as a continuation), so it is closed.
-            BlockClose::Continued(body) => Ok(body),
-            BlockClose::Plain(body) => {
-                let token = self.peek()?;
-                match token.kind {
-                    TokenKind::Layout(Layout::Dedent) | TokenKind::End => {
-                        self.advance(1);
-                        Ok(body)
-                    }
-                    // A `)` closes a block sitting inside parens: its last statement's line
-                    // ends with the `)`, so the lexer emits no Dedent there.
-                    TokenKind::RightParen => Ok(body),
-                    _ => Err(ParseError::Expected {
-                        expected: TokenKind::Layout(Layout::Dedent),
-                        found: token.kind.clone(),
-                        position: token.position,
-                    }),
-                }
-            }
-        }
-    }
-
-    // An ordinary block: nothing continues past the close.
+    // close. A `)` closes a block sitting inside parens -- its last statement's line ends with
+    // the `)`, so the lexer emits no `Dedent` there.
     fn parse_block<F, A>(&mut self, parse_body: F) -> Result<A>
     where
         F: FnOnce(&mut Parser<'a>) -> Result<A>,
     {
-        self.parse_block_with(parse_body, |_, body, _| Ok(BlockClose::Plain(body)))
+        let _t = self.trace();
+
+        if self.peek()?.is_indent() {
+            self.consume()?; // the opening Indent
+            let body = parse_body(self)?;
+
+            let token = self.peek()?;
+            match token.kind {
+                TokenKind::Layout(Layout::Dedent) | TokenKind::End => {
+                    self.advance(1);
+                    Ok(body)
+                }
+                TokenKind::RightParen => Ok(body),
+                // An operator continuation on the body's last line consumed this block's
+                // closing `Dedent` (double duty: continue the expression and close the block).
+                // We are already back at the enclosing level, so the block is closed -- leave
+                // the enclosing-level separator for the caller.
+                TokenKind::Layout(Layout::Newline) => Ok(body),
+                _ => Err(ParseError::Expected {
+                    expected: TokenKind::Layout(Layout::Dedent),
+                    found: token.kind.clone(),
+                    position: token.position,
+                }),
+            }
+        } else {
+            parse_body(self)
+        }
     }
 
-    // An expression body aware of operator continuation. The `Dedent` that would close the
-    // block may instead be a binary operator hanging on the next line with its operand lined
-    // up under the body's first token. Because the block owns that `Dedent`, `at_close` looks
-    // ahead before it is taken: if it heads a continuation the hook consumes it (that `Dedent`
-    // also closes the block) and folds the operator in via the infix parser; otherwise the
-    // block closes normally.
+    // A block whose body is a sequence of expressions.
     fn parse_expression_block(&mut self) -> Result<Expr> {
-        self.parse_block_with(
-            |parser| parser.parse_sequence(),
-            |parser, body, body_column| {
-                if let [dedent, operator, operand, ..] = parser.remains()
-                    && dedent.is_dedent()
-                    && Operator::is_defined(&operator.kind)
-                    && operand.position.column == body_column
-                {
-                    parser.consume()?; // the Dedent -- ours, and it also closes the block
-                    Ok(BlockClose::Continued(parser.parse_expr_infix(body, 0)?))
-                } else {
-                    Ok(BlockClose::Plain(body))
-                }
-            },
-        )
+        self.parse_block(|parser| parser.parse_sequence())
     }
 
     fn parse_local_binding(&mut self, binding_operator: BindingOperator) -> Result<Expr> {
@@ -1511,7 +1483,8 @@ impl<'a> Parser<'a> {
         let _t = self.trace();
 
         let prefix = self.parse_expr_prefix()?;
-        self.parse_expr_infix(prefix, precedence)
+        let expr_context = ExpressionContext::from_expression_prefix(&prefix, precedence);
+        self.parse_expr_infix(prefix, expr_context)
     }
 
     fn parse_expr_prefix(&mut self) -> Result<Expr> {
@@ -1613,7 +1586,7 @@ impl<'a> Parser<'a> {
     }
 
     // All infices must be right of lhs.
-    fn parse_expr_infix(&mut self, lhs: Expr, context_precedence: usize) -> Result<Expr> {
+    fn parse_expr_infix(&mut self, lhs: Expr, expr_context: ExpressionContext) -> Result<Expr> {
         let _t = self.trace();
 
         let terminals = [
@@ -1637,6 +1610,25 @@ impl<'a> Parser<'a> {
         let is_terminal = |t| terminals.contains(t);
 
         match self.remains() {
+            // A binary operator on a laid-out following line continuing this expression: its
+            // operand lines up under the expression's leftmost leaf (`anchor_column`) and it
+            // outranks the current precedence. The leading layout token is either a `Newline`
+            // (a further continuation at the same level -- balance-neutral) or a `Dedent` (which
+            // would otherwise close the block; `parse_block` tolerates the borrow). Take it and
+            // the operator, and fold via `parse_operator` so precedence climbing places the
+            // operator at the right level.
+            [layout, operator_token, operand, ..]
+                if (layout.is_dedent() || layout.is_newline())
+                    && operand.position.column == expr_context.anchor_column
+                    && Operator::try_from(&operator_token.kind)
+                        .is_some_and(|op| op.binding_precedence() > expr_context.precedence) =>
+            {
+                let operator_position = *operator_token.location();
+                let operator = Operator::try_from(&operator_token.kind).expect("guard ensured Ok");
+                self.advance(2); // the layout token and the operator
+                self.parse_operator(lhs, operator, operator_position, expr_context)
+            }
+
             [t, ..] if t.is_dedent() && t.location().is_same_block(&lhs.parse_info().location) => {
                 // Ded, paired with this:
                 // self.advance(1); //the indent
@@ -1652,7 +1644,7 @@ impl<'a> Parser<'a> {
                 let operator = Operator::try_from(&t.kind).expect("msg");
                 // the operator
                 self.advance(1);
-                self.parse_operator(lhs, operator, *t.location(), context_precedence)
+                self.parse_operator(lhs, operator, *t.location(), expr_context)
             }
 
             // f
@@ -1664,20 +1656,20 @@ impl<'a> Parser<'a> {
             [t, u, ..]
                 if (t.is_indent() || t.is_newline())
                     && Self::is_expr_prefix(&u.kind)
-                    && Operator::Juxtaposition.precedence() > context_precedence
+                    && Operator::Juxtaposition.precedence() > expr_context.precedence
                     && u.position.is_descendant_of(lhs.position()) =>
             {
                 self.advance(1); //the indent
-                self.parse_juxtaposed(lhs, context_precedence)
+                self.parse_juxtaposed(lhs, expr_context)
             }
 
             // f x
             [t, u, ..]
                 if Self::is_expr_prefix(&t.kind)
                     && t.position.is_descendant_of(lhs.position())
-                    && Operator::Juxtaposition.precedence() > context_precedence =>
+                    && Operator::Juxtaposition.precedence() > expr_context.precedence =>
             {
-                self.parse_juxtaposed(lhs, context_precedence)
+                self.parse_juxtaposed(lhs, expr_context)
             }
 
             _ => Ok(lhs),
@@ -1717,7 +1709,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_juxtaposed(&mut self, lhs: Expr, context_precedence: usize) -> Result<Expr> {
+    fn parse_juxtaposed(&mut self, lhs: Expr, expr_context: ExpressionContext) -> Result<Expr> {
         let _t = self.trace();
 
         let rhs = self.parse_expression(Operator::Juxtaposition.precedence())?;
@@ -1730,7 +1722,7 @@ impl<'a> Parser<'a> {
                     argument: rhs.into(),
                 },
             ),
-            context_precedence,
+            expr_context,
         )
     }
 
@@ -1754,7 +1746,7 @@ impl<'a> Parser<'a> {
         lhs: Expr,
         operator: Operator,
         operator_position: SourceLocation,
-        context_precedence: usize,
+        expr_context: ExpressionContext,
     ) -> Result<Expr> {
         let _t = self.trace();
 
@@ -1764,7 +1756,7 @@ impl<'a> Parser<'a> {
             operator.precedence()
         };
 
-        if computed_precedence > context_precedence {
+        if computed_precedence > expr_context.precedence {
             match operator {
                 Operator::Ascribe => {
                     let type_signature = self
@@ -1792,21 +1784,21 @@ impl<'a> Parser<'a> {
 
                 Operator::Select => {
                     let lhs = self.parse_select_operator(lhs)?;
-                    self.parse_expr_infix(lhs, context_precedence)
+                    self.parse_expr_infix(lhs, expr_context)
                 }
 
                 Operator::Tuple => self.parse_tuple_expression(
                     lhs,
                     operator_position,
                     computed_precedence,
-                    context_precedence,
+                    expr_context,
                 ),
 
                 _ => self.parse_operator_default(
                     lhs,
                     operator,
                     operator_position,
-                    context_precedence,
+                    expr_context,
                     computed_precedence,
                 ),
             }
@@ -1823,7 +1815,7 @@ impl<'a> Parser<'a> {
         lhs: Expr,
         operator_position: SourceLocation,
         computed_precedence: usize,
-        context_precedence: usize,
+        expr_context: ExpressionContext,
     ) -> Result<Expr> {
         let rhs = self.parse_expression(computed_precedence)?;
         self.parse_expr_infix(
@@ -1833,7 +1825,7 @@ impl<'a> Parser<'a> {
                     elements: vec![lhs.into(), rhs.into()],
                 },
             ),
-            context_precedence,
+            expr_context,
         )
     }
 
@@ -1931,7 +1923,7 @@ impl<'a> Parser<'a> {
         lhs: Expr,
         operator: Operator,
         operator_position: SourceLocation,
-        context_precedence: usize,
+        expr_context: ExpressionContext,
         computed_precedence: usize,
     ) -> Result<Expr> {
         let _t = self.trace();
@@ -1958,7 +1950,7 @@ impl<'a> Parser<'a> {
                     argument: rhs.into(),
                 },
             ),
-            context_precedence,
+            expr_context,
         )
     }
 
@@ -2118,7 +2110,7 @@ impl<'a> Parser<'a> {
         // deconstruct
         let _deconstruct = *self.consume()?.location();
 
-        let scrutinee = self.parse_block(|parser| parser.parse_expression(0))?;
+        let scrutinee = self.parse_expression_block()?;
 
         self.expect(TokenKind::Keyword(Keyword::Into))?;
 
@@ -2178,7 +2170,7 @@ impl<'a> Parser<'a> {
         let pattern = self.parse_pattern()?.normalize();
 
         self.expect(TokenKind::Arrow)?;
-        let consequent = self.parse_block(|parser| parser.parse_sequence())?;
+        let consequent = self.parse_expression_block()?;
         let parse_info = *pattern.annotation();
         Ok(MatchClause {
             pattern: pattern.map_id(&|id| IdentifierPattern::from_path(parse_info, id)),
@@ -2368,7 +2360,7 @@ impl<'a> Parser<'a> {
 
         let position = self.expect(TokenKind::Keyword(Keyword::If))?.position;
 
-        let predicate = self.parse_block(|parser| parser.parse_sequence())?;
+        let predicate = self.parse_expression_block()?;
 
         self.parse_block(|parser| {
             if parser.peek()?.is_newline() {
@@ -2376,7 +2368,7 @@ impl<'a> Parser<'a> {
             }
             parser.expect(TokenKind::Keyword(Keyword::Then))?;
 
-            let consequent = parser.parse_block(|parser| parser.parse_sequence())?;
+            let consequent = parser.parse_expression_block()?;
 
             if parser.peek()?.is_newline() {
                 parser.advance(1);
@@ -2384,7 +2376,7 @@ impl<'a> Parser<'a> {
 
             parser.expect(TokenKind::Keyword(Keyword::Else))?;
 
-            let alternate = parser.parse_block(|parser| parser.parse_sequence())?;
+            let alternate = parser.parse_expression_block()?;
 
             Ok(Expr::If(
                 ParseInfo::from_position(position),
