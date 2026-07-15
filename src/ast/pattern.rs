@@ -267,6 +267,9 @@ where
         let Self { elements } = self;
         let mut elements = elements.iter();
 
+        // Parenthesise so a nested tuple pattern shows its shape: `((a, b), c)` rather than the
+        // flat-looking `a, b, c` (mirrors the parenthesised `Val::Product` display).
+        write!(f, "(")?;
         if let Some(element) = elements.next() {
             write!(f, "{element}")?;
         }
@@ -275,7 +278,7 @@ where
             write!(f, ", {element}")?;
         }
 
-        Ok(())
+        write!(f, ")")
     }
 }
 

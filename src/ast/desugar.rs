@@ -35,19 +35,6 @@ fn fresh_identifier_path() -> IdentifierPath {
 }
 
 impl phase::Expr<Parsed> {
-    pub fn lower_tuples(self) -> phase::Expr<Parsed> {
-        // can the pattern thing happen here?
-        self.map(&mut |e| match e {
-            ast::Expr::Tuple(a, tuple) => ast::Expr::Tuple(
-                a,
-                Tuple {
-                    elements: unspine_tuple(tuple.elements),
-                },
-            ),
-            otherwise => otherwise,
-        })
-    }
-
     pub fn lower_binding_operators(self) -> phase::Expr<Parsed> {
         self.map(&mut |e| match e {
             ast::Expr::Let(a, binding) => match binding.operator {
@@ -287,7 +274,6 @@ impl phase::Expr<Parsed> {
 
     pub fn desugar(&self) -> Expr {
         self.clone()
-            .lower_tuples()
             .lower_binding_operators()
             .lower_inline_patterns()
     }
@@ -314,20 +300,6 @@ impl phase::Expr<Parsed> {
             .into(),
         }
     }
-}
-
-fn unspine_tuple<A, Id>(elements: Vec<ast::Tree<A, Id>>) -> Vec<ast::Tree<A, Id>>
-where
-    A: Clone,
-    Id: Clone,
-{
-    elements
-        .into_iter()
-        .flat_map(|e| match (*e).clone() {
-            ast::Expr::Tuple(_, tuple) => unspine_tuple(tuple.elements.to_vec()),
-            atom => vec![atom.into()],
-        })
-        .collect()
 }
 
 impl phase::SymbolTable<Parsed> {

@@ -4261,14 +4261,24 @@ impl TypingContext {
                 }
             }
 
-            (Pattern::Tuple(pi, pattern), TypeStructure::Monotype(Type::Tuple(tuple)))
-                if pattern.elements.len() == tuple.arity() =>
-            {
-                let mut elements = Vec::with_capacity(tuple.arity());
-                let mut substitutions = Substitutions::default();
+            (Pattern::Tuple(pi, tuple), _) => {
+                // Synthesize a tuple type of the pattern's arity and unify it with the scrutinee,
+                // exactly as `infer_pattern_scrutinee` does for a variable scrutinee. A shape or
+                // arity mismatch -- e.g. a nested `((a, b), c)` against a flat `(Int, Int, Int)` --
+                // then surfaces as an ordinary `cannot unify` error rather than the catch-all
+                // panic below. On success the fresh element types carry the scrutinee's elements.
+                let element_types: Vec<Type> =
+                    tuple.elements.iter().map(|_| Type::fresh()).collect();
+                let unification = Type::Tuple(TupleType(element_types.clone()))
+                    .unified_with(scrutinee, &self.types)
+                    .map_err(|e| e.at(*pi))?;
+                self.substitute_mut(&unification);
 
-                for (pattern, scrutinee) in pattern.elements.iter().zip(tuple.elements()) {
-                    let (subst, element) = self.check_pattern(pattern, bindings, scrutinee)?;
+                let mut elements = Vec::with_capacity(tuple.elements.len());
+                let mut substitutions = unification;
+                for (pattern, element_type) in tuple.elements.iter().zip(&element_types) {
+                    let (subst, element) =
+                        self.check_pattern(pattern, bindings, &element_type.apply(&substitutions))?;
                     elements.push(element);
                     substitutions = substitutions.compose(&subst);
                 }

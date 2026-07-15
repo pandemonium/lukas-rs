@@ -1180,22 +1180,23 @@ impl<'a> Parser<'a> {
             }
 
             TypeExprOperator::Tuple => {
+                // Gather the comma-separated element types into one flat tuple, mirroring the
+                // value and pattern sides. Each element is parsed at tuple precedence so a `,`
+                // ends it, and a parenthesised group arrives as a single element -- so
+                // `((Int, Int), Int)` stays nested rather than collapsing to `(Int, Int, Int)`.
                 let position = self.consume()?.position;
-                let rhs = self.parse_type_expression(operator.precedence())?;
-
-                let tuple = match lhs {
-                    TypeExpression::Tuple(pi, TupleTypeExpr(mut elements)) => {
-                        elements.push(rhs);
-                        TypeExpression::Tuple(pi, TupleTypeExpr(elements))
-                    }
-
-                    lhs => TypeExpression::Tuple(
+                let mut elements = vec![lhs, self.parse_type_expression(operator.precedence())?];
+                while matches!(self.peek()?.kind, TokenKind::Comma) {
+                    self.consume()?; // the `,`
+                    elements.push(self.parse_type_expression(operator.precedence())?);
+                }
+                self.parse_type_expr_infix(
+                    TypeExpression::Tuple(
                         ParseInfo::from_position(position),
-                        TupleTypeExpr(vec![lhs, rhs]),
+                        TupleTypeExpr(elements),
                     ),
-                };
-
-                self.parse_type_expr_infix(tuple, context_precedence)
+                    context_precedence,
+                )
             }
         }
     }
@@ -1851,14 +1852,17 @@ impl<'a> Parser<'a> {
         computed_precedence: usize,
         expr_context: ExpressionContext,
     ) -> Result<Expr> {
-        let rhs = self.parse_expression(computed_precedence)?;
+        // The first `,` has already been consumed. Gather the comma-separated elements into one
+        // flat tuple, each element parsed just tight enough that a `,` ends it (`computed_precedence`
+        // is below tuple level). A parenthesised group arrives as one complete prefix and so counts
+        // as a single element -- which is what keeps `1, (2, 3)` distinct from the flat `1, 2, 3`.
+        let mut elements = vec![lhs.into(), self.parse_expression(computed_precedence)?.into()];
+        while matches!(self.peek()?.kind, TokenKind::Comma) {
+            self.advance(1); // the `,`
+            elements.push(self.parse_expression(computed_precedence)?.into());
+        }
         self.parse_expr_infix(
-            Expr::Tuple(
-                ParseInfo::from_position(operator_position),
-                Tuple {
-                    elements: vec![lhs.into(), rhs.into()],
-                },
-            ),
+            Expr::Tuple(ParseInfo::from_position(operator_position), Tuple { elements }),
             expr_context,
         )
     }
@@ -2286,14 +2290,18 @@ impl<'a> Parser<'a> {
 
         match self.remains() {
             [t, ..] if t.kind == TokenKind::Comma => {
-                // ,
-                self.advance(1);
-                let rhs = self.parse_pattern_prefix()?;
-                self.parse_pattern_infix(Pattern::Tuple(
-                    ParseInfo::from_position(*t.location()),
-                    TuplePattern {
-                        elements: vec![lhs, rhs],
-                    },
+                // Gather the comma-separated sub-patterns into one flat tuple, mirroring the value
+                // side (`parse_tuple_expression`). A parenthesised group is a single prefix, so
+                // `(a, b), c` binds the pair against a nested tuple rather than being flattened.
+                let position = *t.location();
+                let mut elements = vec![lhs];
+                while matches!(self.peek()?.kind, TokenKind::Comma) {
+                    self.advance(1); // the `,`
+                    elements.push(self.parse_pattern_prefix()?);
+                }
+                Ok(Pattern::Tuple(
+                    ParseInfo::from_position(position),
+                    TuplePattern { elements },
                 ))
             }
 
@@ -2452,7 +2460,7 @@ impl Pattern<ParseInfo, IdentifierPath> {
             Self::Tuple(pi, TuplePattern { elements }) => Self::Tuple(
                 *pi,
                 TuplePattern {
-                    elements: unspine_tuple_pattern(elements.clone()),
+                    elements: elements.iter().map(|p| p.normalize()).collect(),
                 },
             ),
 
@@ -2469,18 +2477,6 @@ impl Pattern<ParseInfo, IdentifierPath> {
             Self::Literally(..) | Self::Bind(..) => self.clone(),
         }
     }
-}
-
-fn unspine_tuple_pattern(
-    elements: Vec<Pattern<ParseInfo, IdentifierPath>>,
-) -> Vec<Pattern<ParseInfo, IdentifierPath>> {
-    elements
-        .into_iter()
-        .flat_map(|p| match p {
-            Pattern::Tuple(_, pattern) => unspine_tuple_pattern(pattern.elements),
-            atom => vec![atom],
-        })
-        .collect()
 }
 
 impl phase::TypeExpression<Parsed> {

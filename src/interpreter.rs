@@ -338,7 +338,9 @@ impl fmt::Display for Val {
                     .map(|el| el.to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
-                write!(f, "{elements}")
+                // Parenthesise so nesting is visible: `((1, 2), 3)` no longer prints as the flat
+                // `1, 2, 3`. (Products back both tuples and records at run time.)
+                write!(f, "({elements})")
             }
 
             Self::Variant(variant) => {

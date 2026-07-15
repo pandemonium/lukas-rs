@@ -57,3 +57,13 @@ start :: Int -> Unit := λ_.
   print_endline (prim_show (sum3 (1, 2, 3)))               (* 6 *)
   print_endline (prim_show (sumNested ((1, 2), 3)))        (* 6 *)
   print_endline (prim_show (dup 5).0)                      (* 5 *)
+
+  (* Nested tuples keep their shape: `(1, 2), 3` is a PAIR whose first element is *)
+  (* itself a pair, distinct from the flat triple `1, 2, 3`. Projection reaches *)
+  (* into the nesting, and prim_show parenthesises so the shape is visible. *)
+  let n = (1, 2), 3 in
+  print_endline (prim_show n.0)                            (* (1, 2) *)
+  print_endline (prim_show n.0.1)                          (* 2 *)
+  print_endline (prim_show n)                              (* ((1, 2), 3) *)
+  print_endline (prim_show (1, (2, 3)))                    (* (1, (2, 3)) *)
+  print_endline (prim_show (1, 2, 3))                      (* (1, 2, 3) *)
