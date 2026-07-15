@@ -34,6 +34,7 @@ type RecordDeclarator = ast::RecordDeclarator<ParseInfo>;
 type CoproductDeclarator = ast::CoproductDeclarator<ParseInfo>;
 type CoproductConstructor = ast::CoproductConstructor<ParseInfo>;
 
+#[derive(Clone, Copy)]
 struct ExpressionContext {
     precedence: usize,
     anchor_column: u32,
@@ -1610,16 +1611,22 @@ impl<'a> Parser<'a> {
         let is_terminal = |t| terminals.contains(t);
 
         match self.remains() {
-            // A binary operator on a laid-out following line continuing this expression: its
-            // operand lines up under the expression's leftmost leaf (`anchor_column`) and it
-            // outranks the current precedence. The leading layout token is either a `Newline`
-            // (a further continuation at the same level -- balance-neutral) or a `Dedent` (which
-            // would otherwise close the block; `parse_block` tolerates the borrow). Take it and
-            // the operator, and fold via `parse_operator` so precedence climbing places the
-            // operator at the right level.
+            // A binary operator on a laid-out following line continuing this expression: the
+            // operator hangs to the *left* of the expression's leftmost leaf (`anchor_column`)
+            // and it outranks the current precedence. An operator can never begin a statement or
+            // declaration, so a leading operator hanging left of the anchor is unambiguously a
+            // continuation. (The narrower "operand aligns under the anchor" is the common case --
+            // the operand always sits right of the operator, so operand-at-anchor implies
+            // operator-left-of-anchor -- but a parenthesized operand's leading `(` sits one
+            // column left of its own leaf, so we key off the operator, not the operand.) The
+            // leading layout token is either a `Newline` (a further continuation at the same
+            // level -- balance-neutral) or a `Dedent` (which would otherwise close the block;
+            // `parse_block` tolerates the borrow). Take it and the operator, and fold via
+            // `parse_operator` so precedence climbing places the operator at the right level.
             [layout, operator_token, operand, ..]
                 if (layout.is_dedent() || layout.is_newline())
-                    && operand.position.column == expr_context.anchor_column
+                    && operator_token.location().column < expr_context.anchor_column
+                    && Self::is_expr_prefix(&operand.kind)
                     && Operator::try_from(&operator_token.kind)
                         .is_some_and(|op| op.binding_precedence() > expr_context.precedence) =>
             {
@@ -1627,6 +1634,33 @@ impl<'a> Parser<'a> {
                 let operator = Operator::try_from(&operator_token.kind).expect("guard ensured Ok");
                 self.advance(2); // the layout token and the operator
                 self.parse_operator(lhs, operator, operator_position, expr_context)
+            }
+
+            // The same legal continuation (operator hangs left of the anchor leaf), but arriving
+            // `Indent`-led rather than Dedent/Newline-led: this happens when the operator, though
+            // left of the leaf, is still *right of the enclosing block's level* -- e.g. a
+            // continuation inside an `if` branch, whose block level sits at the branch keyword.
+            // The very same `operator.column < anchor_column` test keeps this to the legal
+            // hangs-left form and rejects an operator indented *past* the leaf. The borrowed
+            // `Indent` opens a fresh level the lexer closes with a matching `Dedent`; fold the
+            // continuation, then swallow that `Dedent` so the enclosing block's Indent/Dedent
+            // count stays balanced (locally -- no global counter). A `Dedent` already consumed as
+            // a further continuation leaves nothing to balance, hence the `is_dedent` guard.
+            [layout, operator_token, operand, ..]
+                if layout.is_indent()
+                    && operator_token.location().column < expr_context.anchor_column
+                    && Self::is_expr_prefix(&operand.kind)
+                    && Operator::try_from(&operator_token.kind)
+                        .is_some_and(|op| op.binding_precedence() > expr_context.precedence) =>
+            {
+                let operator_position = *operator_token.location();
+                let operator = Operator::try_from(&operator_token.kind).expect("guard ensured Ok");
+                self.advance(2); // the Indent and the operator
+                let folded = self.parse_operator(lhs, operator, operator_position, expr_context)?;
+                if self.peek()?.is_dedent() {
+                    self.advance(1); // balance the borrowed Indent
+                }
+                self.parse_expr_infix(folded, expr_context)
             }
 
             [t, ..] if t.is_dedent() && t.location().is_same_block(&lhs.parse_info().location) => {

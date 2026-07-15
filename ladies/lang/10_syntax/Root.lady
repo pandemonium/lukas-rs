@@ -32,6 +32,21 @@ curried :: Int -> Int -> Int :=
     λb.
       a + b
 
+(* 2c. An operator may LEAD a continuation line: it hangs to the LEFT of the *)
+(*     expression and its operand lines up under the leftmost leaf. Precedence *)
+(*     still climbs, so this is 2 + (3 * 4) = 14. (An operator indented PAST the *)
+(*     leaf, or left TRAILING at a line's end, is not a legal continuation.) *)
+op_led :: Int :=
+      2
+    + 3
+    * 4
+
+(* 2d. Parenthesised operands continue too, even though a group's leading `(` *)
+(*     sits one column left of the group's own leftmost leaf. *)
+op_paren :: Int :=
+      (add3 10 20 0)
+    + (add3 1 2 3)
+
 (* 3. let ... in, inline ... *)
 inline_let :: Int := let x = 7 in x * 6
 
@@ -59,6 +74,16 @@ conditional :: Text :=
   if 1 + 1 = 2
     then "arithmetic works"
     else "call a mathematician"
+
+(* 6b. A legal operator continuation (operator hangs left of the leaf) inside an *)
+(*     if branch stays within the branch. Here the continuation is more indented *)
+(*     than the branch's block level, so it arrives on an indented line, yet it *)
+(*     still folds into the branch rather than running past into `else`. *)
+branch_continuation :: Int :=
+  if 1 + 1 = 2
+    then 10
+       + 20
+    else 0
 
 (* 7. deconstruct ... into: alternatives block-indented, led by `|`. *)
 classify :: Int -> Text := λn.
@@ -115,12 +140,15 @@ start :: Int -> Unit := λ_.
   print_endline (prim_show same_line)                     (* 42 *)
   print_endline (prim_show indented_body)                 (* 42 *)
   print_endline (prim_show applied_across_lines)          (* 60 *)
+  print_endline (prim_show op_led)                        (* 14 *)
+  print_endline (prim_show op_paren)                      (* 36 *)
   print_endline (prim_show (curried 20 22))               (* 42 *)
   print_endline (prim_show inline_let)                    (* 42 *)
   print_endline (prim_show block_let)                     (* 42 *)
   print_endline (prim_show nested_let)                    (* 42 *)
   print_endline (perhaps "nothing" prim_show do_notation) (* 42 *)
   print_endline conditional                               (* arithmetic works *)
+  print_endline (prim_show branch_continuation)           (* 30 *)
   print_endline (classify 0)                              (* zero *)
   print_endline (classify 5)                              (* many *)
   let Suspend th = squared_effect 9 in print_endline (prim_show (th ()))
