@@ -21,9 +21,8 @@ use crate::{
         annotation::Annotated,
         constraints::{Witness, WitnessEnvironment},
         namer::{
-            self, CoproductSymbol, DependencyMatrix, FieldSymbol, Identifier, Named,
-            QualifiedName, RecordSymbol, SignatureSymbol, Symbol, SymbolName, TermSymbol,
-            TypeDefinition, TypeSymbol,
+            self, CoproductSymbol, DependencyMatrix, FieldSymbol, Identifier, Named, QualifiedName,
+            RecordSymbol, Symbol, SymbolName, TermSymbol, TypeDefinition, TypeSymbol,
         },
         pattern::{
             ConstructorPattern, Denotation, MatchClause, Pattern, Shape, StructPattern,
@@ -664,7 +663,12 @@ impl phase::SymbolTable<Named> {
             if let TypeDefinition::Signature(sig) =
                 &type_constructor.definition().defining_symbol.definition
             {
-                for field in sig.vtable.fields.iter().filter(|f| !is_super_field(&f.name)) {
+                for field in sig
+                    .vtable
+                    .fields
+                    .iter()
+                    .filter(|f| !is_super_field(&f.name))
+                {
                     let method_arity = field.type_signature.body.arrow_arity();
                     tracing::trace!("{} {method_arity}", field.name);
                     let method_dictionary_count = field.type_signature.constraints.len();
@@ -920,7 +924,8 @@ fn super_obligations(
     sig.supersignatures
         .iter()
         .map(|super_ce| {
-            let c = Constraint::from_constraint_expr(&params, super_ce, ctx).map_err(|e| *e.error)?;
+            let c =
+                Constraint::from_constraint_expr(&params, super_ce, ctx).map_err(|e| *e.error)?;
             Ok((super_field_name(&super_ce.class), c.apply(&subst)))
         })
         .collect()
@@ -929,7 +934,11 @@ fn super_obligations(
 /// The ordinal of a `$super$…` field within `dict`'s vtable record. Projections
 /// built here run *after* type inference, so they must carry the resolved
 /// ordinal directly (the interpreter/codegen only understand `Ordinal`).
-fn super_field_ordinal(dict: &Constraint, field: &parser::Identifier, ctx: &TypingContext) -> Option<usize> {
+fn super_field_ordinal(
+    dict: &Constraint,
+    field: &parser::Identifier,
+    ctx: &TypingContext,
+) -> Option<usize> {
     let tc = ctx
         .types
         .lookup(dict.constraint_type.applied_name())?
@@ -986,7 +995,9 @@ fn witness_record_fields_mut(
 ) -> Option<&mut Vec<(parser::Identifier, std::rc::Rc<Expr>)>> {
     match tree {
         Expr::Record(_, record) => Some(&mut record.fields),
-        Expr::Ascription(_, a) => witness_record_fields_mut(std::rc::Rc::make_mut(&mut a.ascribed_tree)),
+        Expr::Ascription(_, a) => {
+            witness_record_fields_mut(std::rc::Rc::make_mut(&mut a.ascribed_tree))
+        }
         Expr::RecursiveLambda(_, rec) => {
             witness_record_fields_mut(std::rc::Rc::make_mut(&mut rec.lambda.body))
         }
@@ -1006,7 +1017,9 @@ fn given_constraints(
 ) -> Typing<ConstraintSet> {
     match &symbol.type_signature {
         Some(signature) => {
-            let instantiated = signature.type_scheme(&HashMap::default(), ctx)?.instantiate();
+            let instantiated = signature
+                .type_scheme(&HashMap::default(), ctx)?
+                .instantiate();
             let subst = instantiated
                 .underlying
                 .unified_with(&term.tree.type_info().inferred_type, &ctx.types)
@@ -1072,8 +1085,11 @@ fn resolve_constraints(
     // wanted is its own parameter -- exactly the pre-supersignature behaviour, so
     // selectors (whose dictionary is an explicit argument, no inferred constraint)
     // and ordinary constrained functions are unaffected.
-    let given_parametric: Vec<Constraint> =
-        given.iter().filter(|c| c.is_parametric()).cloned().collect();
+    let given_parametric: Vec<Constraint> = given
+        .iter()
+        .filter(|c| c.is_parametric())
+        .cloned()
+        .collect();
 
     let mut params: Vec<Constraint> = Vec::new();
     let mut projections: Vec<(Constraint, Constraint, Vec<(usize, Type)>)> = Vec::new();
@@ -1366,7 +1382,10 @@ fn elaborate_constraint_method_placeholders(
             if is_super_field(&method) {
                 continue;
             }
-            constraint_signatures.insert(QualifiedName::new(c.name().module.clone(), method.as_str()), c);
+            constraint_signatures.insert(
+                QualifiedName::new(c.name().module.clone(), method.as_str()),
+                c,
+            );
         }
     }
 
@@ -2322,7 +2341,6 @@ impl Type {
             (lhs, rhs) if lhs == rhs => Ok(Substitutions::default()),
 
             (Self::Variable(p), ty) | (ty, Self::Variable(p)) => {
-
                 if ty.variables().contains(p) {
                     Err(TypeError::InfiniteType {
                         param: p.clone(),
@@ -2346,9 +2364,7 @@ impl Type {
                 let domain = lhs_dom.unified_with(rhs_dom, ctx)?;
                 let codomain = lhs_codom
                     .apply(&domain)
-                    .unified_with(
-                        &rhs_codom.apply(&domain), ctx
-                    )?;
+                    .unified_with(&rhs_codom.apply(&domain), ctx)?;
                 Ok(domain.compose(&codomain))
             }
 
@@ -2379,17 +2395,6 @@ impl Type {
                 Ok(subs)
             }
 
-            (Self::Coproduct(lhs), Self::Coproduct(rhs))
-                if lhs.cardinality() == rhs.cardinality() /*&& {
-                    let rhs_names = rhs.constructor_names().collect::<HashSet<_>>();
-                    lhs.constructor_names().all(|lhs| rhs_names.contains(lhs))
-                }*/ =>
-            {
-                // What in the flightrecorder?
-                // I never unify Coproducts?! Or is it that I never unify expanded types?
-                todo!()
-            }
-
             (
                 Self::Apply {
                     constructor: lhs_con,
@@ -2401,15 +2406,16 @@ impl Type {
                 },
             ) => {
                 let constructor = lhs_con.unified_with(rhs_con, ctx)?;
-                let argument = lhs_arg.apply(&constructor).unified_with(&rhs_arg.apply(&constructor), ctx)?;
+                let argument = lhs_arg
+                    .apply(&constructor)
+                    .unified_with(&rhs_arg.apply(&constructor), ctx)?;
                 Ok(constructor.compose(&argument))
             }
 
-            (lhs, rhs) => {
-//                panic!("{lhs} != {rhs}");
-                //panic!("unification failed: lhs {lhs} rhs {rhs}");
-                Err(TypeError::UnificationImpossible { lhs: lhs.clone(), rhs: rhs.clone() })
-            },
+            (lhs, rhs) => Err(TypeError::UnificationImpossible {
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+            }),
         }
     }
 }
