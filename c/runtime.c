@@ -65,25 +65,71 @@ bool val_eq(Value a, Value b) {
     }
 }
 
-Value prim_show(Value x) {
+// Render a value to a freshly malloc'd C string, mirroring the interpreter's
+// `Val` Display (the reference the `expected` files are generated from).
+static char *show_alloc(Value x);
+
+// A product (tuple or record) prints as `(e0, e1, …)`: elements comma-separated
+// and parenthesised, so nesting stays visible -- `((1, 2), 3)` rather than the
+// flat `1, 2, 3`. NB: constructor values share the TAG_TUPLE layout (name in
+// slot 0), so they too print in this shape -- see the note in prim_show.
+static char *show_tuple(Tuple *t) {
+    size_t n = t->len;
+    char **parts = malloc(n * sizeof *parts);
+    size_t total = 3; // '(' + ')' + '\0'
+    for (size_t i = 0; i < n; i++) {
+        parts[i] = show_alloc(t->elems[i]);
+        total += strlen(parts[i]) + (i ? 2 : 0); // ", " between elements
+    }
+
+    char *out = malloc(total);
+    char *p = out;
+    *p++ = '(';
+    for (size_t i = 0; i < n; i++) {
+        if (i) {
+            *p++ = ',';
+            *p++ = ' ';
+        }
+        size_t len = strlen(parts[i]);
+        memcpy(p, parts[i], len);
+        p += len;
+        free(parts[i]);
+    }
+    *p++ = ')';
+    *p = '\0';
+    free(parts);
+    return out;
+}
+
+static char *show_alloc(Value x) {
     char buf[32];
     switch (x.tag) {
     case TAG_INT:
         snprintf(buf, sizeof buf, "%lld", (long long)x.i);
-        return VText(strdup(buf));
+        return strdup(buf);
     case TAG_BOOL:
-        return VText(x.b ? "true" : "false");
+        return strdup(x.b ? "true" : "false");
     case TAG_CHAR:
         buf[0] = x.c;
         buf[1] = '\0';
-        return VText(strdup(buf));
+        return strdup(buf);
     case TAG_TEXT:
-        return x;
+        return strdup(x.s);
     case TAG_UNIT:
-        return VText("()");
+        return strdup("()");
+    case TAG_TUPLE:
+        return show_tuple(x.tup);
     default:
-        return VText("<value>");
+        return strdup("<value>");
     }
+}
+
+// NB: sum-type constructors are TAG_TUPLE with the constructor name in slot 0,
+// indistinguishable at runtime from a plain tuple, so `Some 5` currently renders
+// as `(Some, 5)` rather than the interpreter's `(Some 5)`. Disambiguating needs
+// a representation change (a distinct tag/marker); tuples and records are exact.
+Value prim_show(Value x) {
+    return VText(show_alloc(x));
 }
 
 Value prim_print_endline(Value x) {

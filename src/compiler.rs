@@ -111,6 +111,16 @@ impl Artifact {
     }
 }
 
+/// Which code generator `mc` runs, and therefore what language it emits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Backend {
+    /// Emit Chez Scheme source (the default).
+    #[default]
+    Scheme,
+    /// Emit C source, compiled to a native binary downstream (see `c/`).
+    Native,
+}
+
 #[derive(Clone, Debug, Parser)]
 pub struct Compiler {
     #[arg(long = "library")]
@@ -119,8 +129,12 @@ pub struct Compiler {
     #[arg(long = "source")]
     pub source_path: PathBuf,
 
-    #[arg(long = "scheme")]
-    pub scheme_file: Option<PathBuf>,
+    #[arg(long = "backend", value_enum, default_value_t = Backend::Scheme)]
+    pub backend: Backend,
+
+    /// Where to write the emitted source; prints to stdout if omitted.
+    #[arg(long = "output", short = 'o')]
+    pub output_file: Option<PathBuf>,
 }
 
 impl Compiler {
@@ -220,26 +234,43 @@ impl Compiler {
                 return Ok(());
             }
 
-            // Each module that declares foreign functions gets its `<Module>.ss`
-            // implementation resolved (source-dir first, then --library) and spliced
-            // into the emitted Scheme.
-            let mut foreign_files = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for foreign in &program.foreign_terms {
-                let module = &foreign.name.module;
-                if seen.insert(module.clone()) {
-                    // A companion foreign file is named by the module's fully-qualified
-                    // name: `Root.Stdlib` -> `Root.Stdlib.ss`, `Root` -> `Root.ss`. This
-                    // is unambiguous (no collision between same-named nested modules).
-                    foreign_files
-                        .push(self.get_source_path(&module.to_string(), Artifact::Foreign));
+            let mut code = CodeBuffer::default();
+            match self.backend {
+                Backend::Scheme => {
+                    // Each module that declares foreign functions gets its `<Module>.ss`
+                    // implementation resolved (source-dir first, then --library) and spliced
+                    // into the emitted Scheme.
+                    let mut foreign_files = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
+                    for foreign in &program.foreign_terms {
+                        let module = &foreign.name.module;
+                        if seen.insert(module.clone()) {
+                            // A companion foreign file is named by the module's
+                            // fully-qualified name: `Root.Stdlib` -> `Root.Stdlib.ss`,
+                            // `Root` -> `Root.ss`. This is unambiguous (no collision
+                            // between same-named nested modules).
+                            foreign_files
+                                .push(self.get_source_path(&module.to_string(), Artifact::Foreign));
+                        }
+                    }
+                    program.emit_scheme_code(&mut code, &foreign_files)?;
+                }
+                Backend::Native => {
+                    // C has no closures: convert them away and lambda-lift before
+                    // emitting. Dependency-resolvable order lives on the pre-closure
+                    // table, so eager top-level values initialise after what they read.
+                    let order = program
+                        .dependency_matrix()
+                        .in_resolvable_order()
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let lifted = program.closure_conversion().lambda_lift(&order);
+                    lifted.generate_code(&mut code).map_err(io::Error::other)?;
                 }
             }
 
-            let mut code = CodeBuffer::default();
-            program.emit_scheme_code(&mut code, &foreign_files)?;
-
-            if let Some(target) = &self.scheme_file {
+            if let Some(target) = &self.output_file {
                 code.write_to_file(target)?;
             } else {
                 println!("{}", code);

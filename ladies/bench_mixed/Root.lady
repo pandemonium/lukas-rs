@@ -1,0 +1,85 @@
+(* A mixed-feature compute microbenchmark.
+
+   Exercises, all together, in a single unit of `work`:
+     - integer arithmetic: + - * / %
+     - recursion over a hand-rolled linked List (range / map / fold)
+     - higher-order functions (map and fold take function arguments)
+     - a type class: `signature Monoid` + `witness Monoid Int`, consumed
+       through the constrained function `mconcat`
+     - algebraic data types + pattern matching (the `Expr` evaluator)
+     - records (construction, projection) and tuples (build + pattern)
+
+   A driver `loop` repeats `work` REPS times, threading a running checksum so
+   the optimiser cannot fold the work away. Everything is reduced mod a large
+   prime to keep values bounded (and to exercise `%` and `/`). The result is a
+   single Int printed after the `##TC` sentinel, so the timing harness can carve
+   and compare it across backends. Self-contained: no `use Stdlib`, so it stays
+   within the pure features the C backend supports. *)
+
+(* ---------- a linked list, with range / map / fold by hand ---------- *)
+List ::= ∀α. Nil | Cons α (List α)
+
+range :: Int -> Int -> List Int := λlo hi.
+  if hi < lo then Nil
+  else Cons lo (range (lo + 1) hi)
+
+map :: ∀α β. (α -> β) -> List α -> List β := λf xs.
+  deconstruct xs into
+    Nil          -> Nil
+  | Cons a rest  -> Cons (f a) (map f rest)
+
+fold :: ∀α β. (α -> β -> β) -> β -> List α -> β := λf z xs.
+  deconstruct xs into
+    Nil          -> z
+  | Cons a rest  -> f a (fold f z rest)
+
+(* ---------- a type class (Monoid) and one witness ---------- *)
+signature Monoid ::= ∀α.
+  { mempty  :: α
+    mappend :: α -> α -> α
+  }
+
+witness Monoid Int :=
+  { mempty  := 0
+    mappend := λp q. (p + q) % 1000000007
+  }
+
+mconcat :: ∀m. Monoid m |- List m -> m :=
+  λxs. fold (λa acc. mappend a acc) mempty xs
+
+(* ---------- an expression language + evaluator ---------- *)
+Expr ::= Lit Int | Add Expr Expr | Mul Expr Expr | Neg Expr
+
+eval :: Expr -> Int := λe.
+  deconstruct e into
+    Lit n    -> n
+  | Add a b  -> (eval a + eval b) % 1000000007
+  | Mul a b  -> (eval a * eval b) % 1000000007
+  | Neg a    -> 0 - eval a
+
+(* ---------- a record to bundle intermediate results ---------- *)
+Bundle ::=
+  { Total :: Int
+    Prod  :: Int
+  }
+
+(* ---------- the mixed unit of work, seeded so each call differs ---------- *)
+work :: Int -> Int := λseed.
+  let xs = range 1 20 in
+  let ys = map (λx. (x * seed + 7) % 9973) xs in
+  let s  = mconcat ys in
+  let e  = Mul (Add (Lit s) (Lit seed)) (Add (Lit 10) (Neg (Lit 3))) in
+  let ev = eval e in
+  let b  = { Total := s; Prod := ev } in
+  let pair = b.Total, b.Prod in
+  deconstruct pair into
+    (t, p) -> (t + p * 31) % 1000000007
+
+(* ---------- driver: repeat `work` REPS times, threading a checksum ---------- *)
+loop :: Int -> Int -> Int := λn acc.
+  if n < 1 then acc
+  else loop (n - 1) ((acc * 1000003 + work n) % 1000000007)
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (loop 2000000 1))

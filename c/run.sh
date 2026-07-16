@@ -20,23 +20,21 @@ dir="$1"
 name="$(basename "$dir")"
 work="$(mktemp -d)"
 
-# Generate C (the DUMP_C path prints IR + C to stderr; carve out the C).
-DUMP_C=1 cargo run -q --bin mc -- --library "$LIB" --source "$dir" \
-    >/dev/null 2>"$work/dump.txt"
-
-# No generated-C marker -> the front end or codegen bailed (a `todo!()`, a
-# panic, or a compile error) rather than the C compiler.
-if ! grep -q '^======== GENERATED C ========$' "$work/dump.txt"; then
-    if grep -q 'panicked' "$work/dump.txt"; then
+# Generate C straight to a file. mc prints "$$$$ …" (to stdout) on a front-end
+# or type error and panics (a codegen `todo!()`) to stderr; in either case no
+# output file is written, so an unwritten/empty file is our "generation failed".
+cargo run -q --bin mc -- --library "$LIB" --source "$dir" \
+    --backend native -o "$work/program.c" >"$work/out.txt" 2>"$work/err.txt"
+if [ ! -s "$work/program.c" ]; then
+    if grep -q 'panicked' "$work/err.txt"; then
         echo "[$name] GEN-PANIC"
-        grep 'panicked at' "$work/dump.txt" | head -1 | sed 's/^/  /'
+        grep 'panicked at' "$work/err.txt" | head -1 | sed 's/^/  /'
     else
         echo "[$name] GEN-ERR"
-        grep '^\$\$\$\$' "$work/dump.txt" | head -1 | sed 's/^/  /'
+        grep '^\$\$\$\$' "$work/out.txt" | head -1 | sed 's/^/  /'
     fi
     exit 1
 fi
-sed -n '/^======== GENERATED C ========$/,$p' "$work/dump.txt" | sed '1d' >"$work/program.c"
 
 if ! clang -std=c11 -I"$C_DIR" -o "$work/prog" "$C_DIR/runtime.c" "$work/program.c" 2>"$work/cc.err"; then
     echo "[$name] COMPILE-ERR"

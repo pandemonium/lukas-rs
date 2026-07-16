@@ -1998,11 +1998,6 @@ impl Constraint {
         self.constraint_type.variables()
     }
 
-    fn is_ground(&self) -> bool {
-        let variables = self.variables();
-        variables.is_empty()
-    }
-
     /// A constraint whose constrained type is a bare type variable (e.g. `Eq α`).
     /// No instance can ever match a bare variable, so such a constraint must be
     /// discharged by a dictionary *parameter*. Every other constraint -- ground
@@ -2051,10 +2046,6 @@ impl CoproductType {
         constructors.sort_by(|(t, _), (u, _)| t.cmp(u));
 
         Self(constructors)
-    }
-
-    fn cardinality(&self) -> usize {
-        self.0.len()
     }
 
     fn apply(&self, subs: &Substitutions) -> Self {
@@ -2585,23 +2576,6 @@ impl TypeConstructorDefinition {
             |constructor, param| Type::Apply {
                 constructor: constructor.into(),
                 argument: Type::Variable(type_parameters[&param.name].clone()).into(),
-            },
-        )
-    }
-
-    fn make_spine_expr(&self) -> phase::TypeExpression<Named> {
-        let pi = ParseInfo::default();
-        self.defining_symbol.type_parameters().iter().fold(
-            ast::TypeExpression::Constructor(pi, self.name.clone()),
-            |constructor, param| {
-                ast::TypeExpression::Apply(
-                    pi,
-                    ApplyTypeExpr {
-                        function: constructor.into(),
-                        argument: ast::TypeExpression::Parameter(pi, param.name.clone()).into(),
-                        phase: PhantomData,
-                    },
-                )
             },
         )
     }

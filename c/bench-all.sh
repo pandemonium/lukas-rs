@@ -63,14 +63,13 @@ for suite in $suites; do
         i=$((i + 1))
 
         # C backend: emit + compile.
-        DUMP_C=1 cargo run -q --bin mc -- --library "$LIB" --source "$d" \
-            >/dev/null 2>"$work/dump.txt"
-        grep -q '^======== GENERATED C ========$' "$work/dump.txt" || continue
-        sed -n '/^======== GENERATED C ========$/,$p' "$work/dump.txt" | sed '1d' >"$work/p_$i.c"
+        cargo run -q --bin mc -- --library "$LIB" --source "$d" \
+            --backend native -o "$work/p_$i.c" 2>/dev/null || continue
+        [ -s "$work/p_$i.c" ] || continue
         clang -std=c11 -I"$C_DIR" -O2 -o "$work/c_$i" "$work/p_$i.c" "$work/runtime.o" 2>/dev/null || continue
 
         # Chez backend: emit .ss; queue its compile into the single chez session.
-        cargo run -q --bin mc -- --library "$LIB" --source "$d" --scheme "$work/r_$i.ss" 2>/dev/null || continue
+        cargo run -q --bin mc -- --library "$LIB" --source "$d" -o "$work/r_$i.ss" 2>/dev/null || continue
         [ -f "$work/r_$i.ss" ] || continue
         printf '  (compile-file "%s")(make-boot-file "%s" (quote ("petite" "scheme")) "%s" "%s" "%s")\n' \
             "$work/r_$i.ss" "$work/b_$i.boot" "$work/runtime.so" "$work/r_$i.so" "$work/startup.so" \

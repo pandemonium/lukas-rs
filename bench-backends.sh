@@ -59,8 +59,7 @@ echo "building mc..."
 cargo build -q --bin mc 2>/dev/null || { echo "cargo build failed"; exit 1; }
 
 # ---------------- C backend (clang -O2) ----------------
-DUMP_C=1 cargo run -q --bin mc -- --library "$LIB" --source "$SRC" >/dev/null 2>"$work/dump.txt"
-sed -n '/^======== GENERATED C ========$/,$p' "$work/dump.txt" | sed '1d' >"$work/prog.c"
+cargo run -q --bin mc -- --library "$LIB" --source "$SRC" --backend native -o "$work/prog.c" 2>/dev/null
 if ! clang -std=c11 -I"$C_DIR" -O2 -o "$work/cprog" "$C_DIR/runtime.c" "$work/prog.c" 2>"$work/cc.err"; then
     echo "C backend: COMPILE-ERR"; cat "$work/cc.err"; exit 1
 fi
@@ -71,7 +70,7 @@ c_out="$(carve)"
 chez_time="n/a"
 chez_out=""
 if [ -n "$CHEZ_BIN" ] && [ -n "$PETITE_BIN" ] && [ -n "$BOOTDIR" ]; then
-    cargo run -q --bin mc -- --library "$LIB" --source "$SRC" --scheme "$work/root.ss" 2>/dev/null
+    cargo run -q --bin mc -- --library "$LIB" --source "$SRC" -o "$work/root.ss" 2>/dev/null
     cp "$SCHEME_DIR/runtime.sls" "$SCHEME_DIR/startup.ss" "$work/"
     SCHEMEHEAPDIRS="$BOOTDIR:" "$CHEZ_BIN" -q >/dev/null 2>&1 <<EOF
 (import (chezscheme))
