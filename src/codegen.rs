@@ -153,7 +153,8 @@ impl lambda_lift::Program {
     // runs the program's `start` entry point. Builtin definitions are omitted --
     // the runtime (`c/runtime.c`) provides them.
     pub fn generate_code(&self, out: &mut CodeBuffer) -> fmt::Result {
-        writeln!(out, "#include \"runtime.h\"\n")?;
+        writeln!(out, "#include \"runtime.h\"")?;
+        writeln!(out, "#include \"gc.h\"\n")?;
 
         // Forward declarations, so functions and globals can reference each
         // other (and themselves) regardless of definition order.
@@ -190,7 +191,33 @@ impl lambda_lift::Program {
         }
         writeln!(out, "}}\n")?;
 
+        // The GC's global-root table: the address of every top-level Value the
+        // collector must keep. Builtins are rooted inside the runtime, so only
+        // user globals go here. A one-element `{0}` avoids a zero-length array
+        // when the program has no top-level values of its own.
+        let user_globals = self
+            .globals
+            .iter()
+            .filter(|b| !is_builtin(&b.name))
+            .collect::<Vec<_>>();
+        writeln!(out, "Value *const gc_user_roots[] = {{")?;
+        if user_globals.is_empty() {
+            writeln!(out, "  0")?;
+        } else {
+            for TopLevelBinding { name, .. } in &user_globals {
+                writeln!(out, "  &{},", c_name(name))?;
+            }
+        }
+        writeln!(out, "}};")?;
+        writeln!(
+            out,
+            "const size_t gc_user_roots_count = {};\n",
+            user_globals.len()
+        )?;
+
         writeln!(out, "int main(void) {{")?;
+        writeln!(out, "  int gc_anchor;")?;
+        writeln!(out, "  gc_init(&gc_anchor);")?;
         writeln!(out, "  runtime_init();")?;
         writeln!(out, "  startup();")?;
         write!(out, "  ")?;

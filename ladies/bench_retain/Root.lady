@@ -1,0 +1,33 @@
+(* Retention benchmark: a large, long-lived structure kept live while a lot of
+   short-lived work churns on top of it. This is the case a generational
+   collector is built for -- the big list is tenured once, and minor collections
+   skip it entirely, whereas a single-generation collector re-marks it on every
+   collection. `keep` is threaded through `churn` so it stays live throughout.
+
+   `sum` is tail-recursive (accumulator): folding the 400k-element retained list
+   with the naive `a + sum rest` would recurse 400k deep and overflow the C
+   stack -- nothing to do with the GC, but it would crash the benchmark. *)
+
+List ::= ∀α. Nil | Cons α (List α)
+
+build :: Int -> List Int -> List Int := λn acc.
+  if n < 1 then acc else build (n - 1) (Cons (n % 1000) acc)
+
+sum :: List Int -> Int -> Int := λxs acc.
+  deconstruct xs into
+    Nil         -> acc
+  | Cons a rest -> sum rest ((a + acc) % 1000000007)
+
+range :: Int -> Int -> List Int := λlo hi.
+  if hi < lo then Nil else Cons lo (range (lo + 1) hi)
+
+churn :: List Int -> Int -> Int -> Int := λkeep n acc.
+  if n < 1 then acc
+  else churn keep (n - 1) ((acc + sum (range 1 (10 + n % 20)) 0) % 1000000007)
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  let keep = build 400000 Nil in     (* ~400k live nodes -> tenured old gen *)
+  let base = sum keep 0 in           (* touch it, keep it live *)
+  let c = churn keep 1000000 base in (* churn 1e6 rounds while keep stays live *)
+  print_endline (prim_show c)

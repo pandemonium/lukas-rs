@@ -41,6 +41,7 @@ cargo build -q --bin mc 2>/dev/null || { echo "cargo build failed"; exit 1; }
 # Shared build inputs: the C runtime object and the Chez runtime/startup, all
 # compiled once (per-program work reuses them).
 clang -std=c11 -I"$C_DIR" -O2 -c "$C_DIR/runtime.c" -o "$work/runtime.o"
+clang -std=c11 -I"$C_DIR" -O2 -c "$C_DIR/gc.c" -o "$work/gc.o"
 cp "$SCHEME_DIR/runtime.sls" "$SCHEME_DIR/startup.ss" "$work/"
 
 # ---------- phase 1: compile every program through both backends ----------
@@ -66,7 +67,7 @@ for suite in $suites; do
         cargo run -q --bin mc -- --library "$LIB" --source "$d" \
             --backend native -o "$work/p_$i.c" 2>/dev/null || continue
         [ -s "$work/p_$i.c" ] || continue
-        clang -std=c11 -I"$C_DIR" -O2 -o "$work/c_$i" "$work/p_$i.c" "$work/runtime.o" 2>/dev/null || continue
+        clang -std=c11 -I"$C_DIR" -O2 -o "$work/c_$i" "$work/p_$i.c" "$work/runtime.o" "$work/gc.o" 2>/dev/null || continue
 
         # Chez backend: emit .ss; queue its compile into the single chez session.
         cargo run -q --bin mc -- --library "$LIB" --source "$d" -o "$work/r_$i.ss" 2>/dev/null || continue

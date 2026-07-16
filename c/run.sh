@@ -36,7 +36,7 @@ if [ ! -s "$work/program.c" ]; then
     exit 1
 fi
 
-if ! clang -std=c11 -I"$C_DIR" -o "$work/prog" "$C_DIR/runtime.c" "$work/program.c" 2>"$work/cc.err"; then
+if ! clang -std=c11 -I"$C_DIR" -o "$work/prog" "$C_DIR/runtime.c" "$C_DIR/gc.c" "$work/program.c" 2>"$work/cc.err"; then
     echo "[$name] COMPILE-ERR"
     cat "$work/cc.err"
     exit 1

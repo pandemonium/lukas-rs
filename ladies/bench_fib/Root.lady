@@ -1,0 +1,10 @@
+(* Compute-bound, allocation-light benchmark: naive Fibonacci. Saturated
+   arithmetic goes straight to the primitives, so almost nothing is heap-
+   allocated -- this isolates raw generated-code speed from the collector. *)
+
+fib :: Int -> Int := λn.
+  if n < 2 then n else fib (n - 1) + fib (n - 2)
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (fib 42))

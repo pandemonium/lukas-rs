@@ -49,7 +49,7 @@ native)
     exit 1
   fi
 
-  clang -std=c11 -I"$C_DIR" -O2 -o "$BIN" "$C_DIR/runtime.c" "$ROOT_C"
+  clang -std=c11 -I"$C_DIR" -O2 -o "$BIN" "$C_DIR/runtime.c" "$C_DIR/gc.c" "$ROOT_C"
 
   echo "built:"
   echo "  $BIN"

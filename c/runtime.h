@@ -86,9 +86,8 @@ Value prim_print_endline(Value x);
 // Concatenate `n` text values (used by string interpolation).
 Value prim_str_concat(size_t n, ...);
 
-// Heap constructors (defined in runtime.c).
-Value mk_closure(Value (*code)(Value, Value), Value env);
-Value mk_tuple(size_t len, ...);
+// The heap constructors (`mk_closure`/`mk_tuple`) and the collector API live in
+// gc.h, since they are what the garbage collector manages.
 
 // Apply a closure value to an argument.
 static inline Value apply(Value f, Value x) { return f.clo->code(f, x); }

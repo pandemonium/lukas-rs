@@ -60,7 +60,7 @@ cargo build -q --bin mc 2>/dev/null || { echo "cargo build failed"; exit 1; }
 
 # ---------------- C backend (clang -O2) ----------------
 cargo run -q --bin mc -- --library "$LIB" --source "$SRC" --backend native -o "$work/prog.c" 2>/dev/null
-if ! clang -std=c11 -I"$C_DIR" -O2 -o "$work/cprog" "$C_DIR/runtime.c" "$work/prog.c" 2>"$work/cc.err"; then
+if ! clang -std=c11 -I"$C_DIR" -O2 -o "$work/cprog" "$C_DIR/runtime.c" "$C_DIR/gc.c" "$work/prog.c" 2>"$work/cc.err"; then
     echo "C backend: COMPILE-ERR"; cat "$work/cc.err"; exit 1
 fi
 c_time="$(timed "$work/cprog")"

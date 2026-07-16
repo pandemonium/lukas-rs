@@ -1,34 +1,11 @@
 #include "runtime.h"
 
+#include "gc.h" // mk_closure / mk_tuple
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-Value mk_closure(Value (*code)(Value, Value), Value env) {
-    Closure *c = malloc(sizeof *c);
-    c->code = code;
-    c->env = env;
-    Value v;
-    v.tag = TAG_CLOSURE;
-    v.clo = c;
-    return v;
-}
-
-Value mk_tuple(size_t len, ...) {
-    Tuple *t = malloc(sizeof *t + len * sizeof(Value));
-    t->len = len;
-    va_list ap;
-    va_start(ap, len);
-    for (size_t i = 0; i < len; i++) {
-        t->elems[i] = va_arg(ap, Value);
-    }
-    va_end(ap);
-    Value v;
-    v.tag = TAG_TUPLE;
-    v.tup = t;
-    return v;
-}
 
 // A curried binary builtin: stage 1 captures the first argument, stage 2
 // applies the primitive PRIM. These closures exist only for partial/higher-order
