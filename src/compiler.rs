@@ -202,6 +202,24 @@ impl Compiler {
 
             let program = resolved_symbols.elaborate_compilation_unit()?;
 
+            if std::env::var("DUMP_C").is_ok() {
+                // Dependency-resolvable order lives on the pre-closure table;
+                // lambda_lift emits globals in it so eager top-level values are
+                // initialised after the globals they read.
+                let order = program
+                    .dependency_matrix()
+                    .in_resolvable_order()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let lifted = program.clone().closure_conversion().lambda_lift(&order);
+                eprintln!("======== LAMBDA-LIFT IR ========\n{lifted}");
+                let mut c = CodeBuffer::default();
+                let _ = lifted.generate_code(&mut c);
+                eprintln!("======== GENERATED C ========\n{c}");
+                return Ok(());
+            }
+
             // Each module that declares foreign functions gets its `<Module>.ss`
             // implementation resolved (source-dir first, then --library) and spliced
             // into the emitted Scheme.

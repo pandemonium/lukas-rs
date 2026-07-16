@@ -6,38 +6,56 @@ use std::{
 
 use crate::{
     ast::{
-        Apply, Literal, ProductElement, Projection,
+        Apply, Literal,
         namer::{QualifiedName, Symbol, SymbolName},
     },
-    closed::{self, CaptureInfo, Closed, Expr, Identifier, LexicalLevel},
+    closed::{self, CaptureInfo, Closed, Expr, Identifier},
     parser::{self, IdentifierPath},
     phase,
+    typer::TypeInfo,
 };
 
 impl closed::SymbolTable {
-    pub fn lambda_lift(self) -> Program {
+    // `order` is the dependency-resolvable order of the symbols (computed on the
+    // pre-closure table, where the dependency matrix lives). Globals are emitted
+    // in it so that a top-level definition whose value is *eagerly* evaluated
+    // (e.g. `reverse := fold_left (flip Cons) Nil`) is initialised only after the
+    // globals it reads -- the same static-init order the interpreter uses.
+    pub fn lambda_lift(mut self, order: &[SymbolName]) -> Program {
+        // Two distinct outputs: `functions` are the hoisted anonymous lambdas
+        // (code taking env + parameter), while `globals` are the top-level
+        // definitions themselves (each a value expression -- typically a
+        // `MakeClosure` -- evaluated once). Codegen emits the former as C
+        // functions and the latter as initialized C globals; the distinction is
+        // erased if both share one list, so keep them apart.
         let mut functions = Vec::default();
+        let mut globals = Vec::default();
 
-        for (name, symbol) in self.symbols {
-            let SymbolName::Term(name) = name else {
-                panic!("All terms have term names")
+        // `in_resolvable_order` (whence `order` comes) lists every symbol, so we
+        // just walk it and pull each out -- the same idiom the interpreter and
+        // the Chez backend use. Names in `order` with no term symbol here
+        // (constraint methods, foreign terms) simply aren't found.
+        for name in order {
+            let Some(Symbol::Term(term)) = self.symbols.remove(name) else {
+                continue;
             };
-
-            if let Symbol::Term(term) = symbol {
-                let mut crane = Crane::new(term.name.clone());
-                let capture_info = term.body.annotation().clone();
-                let lifted = crane.lift_lambdas(term.body);
-                functions.extend(lifted.functions);
-                functions.push(LiftedFunction {
-                    name,
-                    code: lifted.body,
-                    capture_info,
-                });
-            }
+            let SymbolName::Term(name) = name.clone() else {
+                continue;
+            };
+            let mut crane = Crane::new(term.name.clone());
+            let type_info = term.body.annotation().type_info.clone();
+            let lifted = crane.lift_lambdas(term.body);
+            functions.extend(lifted.functions);
+            globals.push(TopLevelBinding {
+                name,
+                value: lifted.body,
+                type_info,
+            });
         }
 
         Program {
             functions,
+            globals,
             start: Expr::Apply(
                 CaptureInfo::dummy(),
                 Apply {
@@ -111,7 +129,7 @@ impl Crane {
                 )
             }
 
-            Expr::RecursiveLambda(capture_info, mut self_ref) => {
+            Expr::RecursiveLambda(capture_info, self_ref) => {
                 let lambda_name = self.fresh_name();
 
                 tracing::trace!(
@@ -119,17 +137,11 @@ impl Crane {
                     capture_info.type_info.inferred_type
                 );
 
-                // transform the local own_name into a global
-                self_ref.lambda.body = Rc::unwrap_or_clone(self_ref.lambda.body)
-                    .map(&mut |e| match e {
-                        Expr::Variable(ci, Identifier::Local(LexicalLevel(0))) => {
-                            Expr::Variable(ci, Identifier::Global(lambda_name.clone().into()))
-                        }
-
-                        otherwise => otherwise,
-                    })
-                    .into();
-
+                // Self-references stay `Identifier::SelfRef` in the body; codegen
+                // resolves them against this lifted function (recursive call, or a
+                // reconstructed closure over the env parameter). Free variables are
+                // already explicit as `Captured`, so the body needs no rewriting --
+                // lifting is now pure hoisting.
                 functions.push(LiftedFunction::from_lambda(
                     capture_info.clone(),
                     lambda_name.clone(),
@@ -145,15 +157,6 @@ impl Crane {
                     },
                 )
             }
-
-            Expr::Variable(capture_info, closed::Identifier::Captured(capture)) => Expr::Project(
-                capture_info.clone(),
-                Projection {
-                    base: Expr::Variable(capture_info, closed::Identifier::Local(LexicalLevel(0)))
-                        .into(),
-                    select: ProductElement::Ordinal(capture.index()),
-                },
-            ),
 
             otherwise => otherwise,
         });
@@ -171,8 +174,23 @@ pub struct ClosureInfo {
 
 #[derive(Debug, Clone)]
 pub struct Program {
+    /// Hoisted anonymous lambdas -- each is code taking an environment and a
+    /// parameter, emitted as a C function.
     pub functions: Vec<LiftedFunction>,
+    /// Top-level definitions -- each a value expression evaluated once, emitted
+    /// as an initialized C global.
+    pub globals: Vec<TopLevelBinding>,
     pub start: Expr,
+}
+
+/// A top-level definition (`name := value`). For a function definition `value`
+/// is a `MakeClosure` over one of the lifted `functions`; for a data definition
+/// it is a constant or other value expression.
+#[derive(Debug, Clone)]
+pub struct TopLevelBinding {
+    pub name: QualifiedName,
+    pub value: Expr,
+    pub type_info: TypeInfo,
 }
 
 #[derive(Debug, Clone)]
@@ -214,13 +232,32 @@ impl fmt::Display for ClosureInfo {
 
 impl fmt::Display for Program {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { functions, start } = self;
+        let Self {
+            functions,
+            globals,
+            start,
+        } = self;
 
         for function in functions {
             writeln!(f, "{function}")?;
         }
 
+        for global in globals {
+            writeln!(f, "{global}")?;
+        }
+
         writeln!(f, "start: {start}")
+    }
+}
+
+impl fmt::Display for TopLevelBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            name,
+            value,
+            type_info,
+        } = self;
+        write!(f, "global {name}::{} = {value}", type_info.inferred_type)
     }
 }
 

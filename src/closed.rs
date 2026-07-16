@@ -10,7 +10,7 @@ use crate::{
     },
     parser::ParseInfo,
     phase,
-    typer::{Type, TypeInfo, Types},
+    typer::{TupleType, Type, TypeInfo, Types},
 };
 
 pub struct Closed;
@@ -61,8 +61,17 @@ impl phase::SymbolTable<Types> {
 
 #[derive(Debug, Clone)]
 pub enum Identifier {
+    /// A binder within this frame: `Local(0)` is the parameter, `Local(1..)` are
+    /// inner `let`/pattern binders. No slot is reserved for self or env.
     Local(LexicalLevel),
+    /// A captured free variable -- field `idx` of this frame's environment.
+    /// The environment is addressed only through this variant; there is no
+    /// whole-environment `Local` slot.
     Captured(CaptureIndex),
+    /// The current closure, for recursion. Only appears in a recursive frame.
+    /// Applying it is a recursive call; capturing it embeds this closure in a
+    /// nested one.
+    SelfRef,
     Global(Box<QualifiedName>),
 }
 
@@ -70,6 +79,14 @@ pub enum Identifier {
 pub struct CaptureLayout {
     by_level: HashMap<LexicalLevel, CaptureIndex>,
     by_index: Vec<LexicalLevel>,
+    // Parallel to `by_index`: the type of each captured value, recorded from the
+    // referencing occurrence so the environment tuple can be typed. Forwarded up
+    // the capture chain by `resolve_sources`.
+    types: Vec<TypeInfo>,
+    // Parallel to `by_index`: how the *enclosing* frame sources each capture --
+    // its own local, or (transitively) one of its own captures. Populated by
+    // `resolve_sources` once this lambda's own body has been fully walked.
+    sources: Vec<Identifier>,
     next: CaptureIndex,
 }
 
@@ -80,6 +97,15 @@ impl LexicalLevel {
     fn rebase(self, scope: Self) -> Self {
         assert!(self.0 >= scope.0);
         Self(self.0 - scope.0)
+    }
+
+    // Local slot of a bound variable (parameter or inner binder) within its
+    // frame, numbered from 0. `Local(0)` is the parameter. In a recursive frame
+    // the self-reference occupies `scope` (the `own_name` level) but is *not* a
+    // local -- it is `Identifier::SelfRef` -- so the level one above `scope`
+    // (the parameter) still maps to `Local(0)`; hence the `-1` shift.
+    fn local_slot(self, scope: Self, is_recursive: bool) -> Self {
+        Self(self.rebase(scope).0 - usize::from(is_recursive))
     }
 
     fn is_outside_of(&self, scope: &LexicalLevel) -> bool {
@@ -107,18 +133,47 @@ impl CaptureLayout {
         slot
     }
 
-    fn resolve(&mut self, scope: LexicalLevel, level: LexicalLevel) -> Identifier {
+    fn resolve(
+        &mut self,
+        scope: LexicalLevel,
+        level: LexicalLevel,
+        is_recursive: bool,
+        ty: TypeInfo,
+    ) -> Identifier {
         if level.is_outside_of(&scope) {
             let index = self.by_level.get(&level).copied().unwrap_or_else(|| {
                 let slot = self.next_capture_index();
                 self.by_level.insert(level, slot);
                 self.by_index.push(level);
+                self.types.push(ty);
                 slot
             });
             Identifier::Captured(index)
+        } else if is_recursive && level == scope {
+            Identifier::SelfRef
         } else {
-            Identifier::Local(level.rebase(scope))
+            Identifier::Local(level.local_slot(scope, is_recursive))
         }
+    }
+
+    // Once this lambda's own captures are known, register each one against the
+    // enclosing lambda's layout too -- forwarding it as a further capture if the
+    // enclosing lambda doesn't own it either, so nesting of any depth resolves
+    // to a chain of direct locals/captures instead of a dangling absolute level.
+    fn resolve_sources(
+        &mut self,
+        enclosing_scope: LexicalLevel,
+        enclosing_is_recursive: bool,
+        enclosing_layout: &mut CaptureLayout,
+    ) {
+        self.sources = self
+            .by_index
+            .iter()
+            .zip(&self.types)
+            .map(|(level, ty)| {
+                enclosing_layout.resolve(enclosing_scope, *level, enclosing_is_recursive, ty.clone())
+            })
+            .collect();
     }
 }
 
@@ -136,21 +191,29 @@ impl CaptureInfo {
     }
 
     pub fn make_environment_tuple(&self) -> Expr {
-        let ci = Self::dummy();
-        Expr::Tuple(
-            ci.clone(),
-            Tuple {
-                elements: if let Some(captures) = &self.layout {
-                    captures
-                        .by_index
-                        .iter()
-                        .map(|level| Expr::Variable(ci.clone(), Identifier::Local(*level)).into())
-                        .collect()
-                } else {
-                    vec![]
-                },
-            },
-        )
+        let (elements, element_types) = match &self.layout {
+            Some(captures) => (
+                captures
+                    .sources
+                    .iter()
+                    .zip(&captures.types)
+                    .map(|(source, ty)| {
+                        Expr::Variable(ty.clone().empty_capture(), source.clone()).into()
+                    })
+                    .collect(),
+                captures
+                    .types
+                    .iter()
+                    .map(|ty| ty.inferred_type.clone())
+                    .collect(),
+            ),
+            None => (vec![], vec![]),
+        };
+        // The environment is an anonymous tuple of the captured values, so its
+        // type is their product.
+        let ci = TypeInfo::new(ParseInfo::default(), Type::Tuple(TupleType(element_types)))
+            .empty_capture();
+        Expr::Tuple(ci, Tuple { elements })
     }
 }
 
@@ -226,7 +289,9 @@ impl phase::Pattern<Types> {
 
             Pattern::Bind(ti, namer::Identifier::Bound(binding_level)) => Pattern::Bind(
                 ti.empty_capture(),
-                Identifier::Local(LexicalLevel(binding_level).rebase(lambda_level)),
+                Identifier::Local(
+                    LexicalLevel(binding_level).local_slot(lambda_level, is_recursive),
+                ),
             ),
 
             otherwise => panic!("illegal AST {otherwise:?}"),
@@ -257,10 +322,10 @@ impl phase::Expr<Types> {
         layout: &mut CaptureLayout,
     ) -> Expr {
         match self {
-            Self::Variable(ti, namer::Identifier::Bound(level)) => Expr::Variable(
-                ti.empty_capture(),
-                layout.resolve(lambda_level, LexicalLevel(level)),
-            ),
+            Self::Variable(ti, namer::Identifier::Bound(level)) => {
+                let id = layout.resolve(lambda_level, LexicalLevel(level), is_recursive, ti.clone());
+                Expr::Variable(ti.empty_capture(), id)
+            }
 
             Self::Variable(ti, namer::Identifier::Free(name)) => {
                 Expr::Variable(ti.empty_capture(), Identifier::Global(name))
@@ -277,16 +342,19 @@ impl phase::Expr<Types> {
                     lambda,
                 },
             ) => {
-                let mut layout = CaptureLayout::default();
+                let mut inner_layout = CaptureLayout::default();
                 let lambda = Lambda {
-                    parameter: Identifier::Local(LexicalLevel(1)),
-                    body: Self::go(lambda.body, LexicalLevel(own_name), true, &mut layout).into(),
+                    // self is SelfRef (not a local), so the parameter is Local(0).
+                    parameter: Identifier::Local(LexicalLevel(0)),
+                    body: Self::go(lambda.body, LexicalLevel(own_name), true, &mut inner_layout)
+                        .into(),
                 };
+                inner_layout.resolve_sources(lambda_level, is_recursive, layout);
 
                 Expr::RecursiveLambda(
-                    ti.with_capture_layout(layout),
+                    ti.with_capture_layout(inner_layout),
                     SelfReferential {
-                        own_name: Identifier::Local(LexicalLevel(0)),
+                        own_name: Identifier::SelfRef,
                         lambda,
                     },
                 )
@@ -299,12 +367,14 @@ impl phase::Expr<Types> {
                     body,
                 },
             ) => {
-                let mut layout = CaptureLayout::default();
+                let mut inner_layout = CaptureLayout::default();
                 let lambda = Lambda {
+                    // No self-reference in a plain lambda; the parameter is Local(0).
                     parameter: Identifier::Local(LexicalLevel(0)),
-                    body: Self::go(body, LexicalLevel(param_level), false, &mut layout),
+                    body: Self::go(body, LexicalLevel(param_level), false, &mut inner_layout),
                 };
-                Expr::Lambda(ti.with_capture_layout(layout), lambda)
+                inner_layout.resolve_sources(lambda_level, is_recursive, layout);
+                Expr::Lambda(ti.with_capture_layout(inner_layout), lambda)
             }
 
             Self::Apply(ti, the) => Expr::Apply(
@@ -326,7 +396,9 @@ impl phase::Expr<Types> {
             ) => Expr::Let(
                 ti.empty_capture(),
                 Binding {
-                    binder: Identifier::Local(LexicalLevel(binder_level).rebase(lambda_level)),
+                    binder: Identifier::Local(
+                        LexicalLevel(binder_level).local_slot(lambda_level, is_recursive),
+                    ),
                     operator,
                     bound: Self::go(bound, lambda_level, is_recursive, layout),
                     body: Self::go(body, lambda_level, is_recursive, layout),
@@ -463,6 +535,7 @@ impl fmt::Display for Identifier {
         match self {
             Self::Local(lexical_level) => write!(f, "Local({lexical_level})"),
             Self::Captured(capture_index) => write!(f, "Captured({capture_index})"),
+            Self::SelfRef => write!(f, "self"),
             Self::Global(qualified_name) => write!(f, "Global({qualified_name})"),
         }
     }

@@ -1,12 +1,16 @@
 use fmt::Write;
 use std::{fmt, fs, io, path};
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::{
-    ast::{Binding, Literal, ProductElement, namer::QualifiedName},
+    ast::{
+        BUILTIN_MODULE_NAME, Binding, Literal, ProductElement, STDLIB_MODULE_NAME, Segment,
+        namer::QualifiedName, pattern::Pattern,
+    },
     closed::{self, CaptureInfo, Closed, Identifier, LexicalLevel},
-    lambda_lift::{self, ClosureInfo, LiftedFunction},
+    lambda_lift::{self, ClosureInfo, LiftedFunction, TopLevelBinding},
     phase,
-    typer::{self, BaseType},
 };
 
 pub struct Codegen;
@@ -19,26 +23,55 @@ impl phase::Phase for Codegen {
 
 type Expr = phase::Expr<Codegen>;
 
-impl typer::Type {
-    fn try_as_arrow(&self) -> Option<(&Self, &Self)> {
-        match self {
-            Self::Arrow { domain, codomain } => Some((domain, codomain)),
-            _otherwise => None,
-        }
+// Naming for the C backend. Mirrors the strategy the Scheme backend uses --
+// builtin/foreign terms map to a fixed runtime name, everything else to its
+// qualified surface name -- but is kept independent of `chez.rs` (which is
+// Scheme-only) and always emits valid C identifiers.
+fn c_name(q: &QualifiedName) -> String {
+    if is_builtin(q) {
+        map_builtin_name(q).to_owned()
+    } else {
+        surface_name(q)
     }
+}
 
-    fn is_arrow(&self) -> bool {
-        matches!(self, Self::Arrow { .. })
-    }
+fn is_builtin(q: &QualifiedName) -> bool {
+    q.module.head == BUILTIN_MODULE_NAME || q.module.head == STDLIB_MODULE_NAME
+}
 
-    fn c_type_name(&self) -> String {
-        match self {
-            Self::Base(BaseType::Unit) => "void".to_owned(),
-            Self::Base(BaseType::Int) => "int64_t".to_owned(),
-            Self::Base(BaseType::Text) => "char *".to_owned(),
-            Self::Base(BaseType::Bool) => "bool".to_owned(),
-            _otherwise => format!("unknown_t /* {} */", self.to_string()),
-        }
+// Qualified name flattened to a C identifier: module path and member joined
+// with `_`. The lexer restricts identifiers to alphanumerics and `_`, and
+// operators reach `c_name` only as builtins (named via `map_builtin_name`), so
+// the join is already a valid C identifier.
+fn surface_name(q: &QualifiedName) -> String {
+    let mut parts = Vec::with_capacity(2 + q.module.tail.len());
+    parts.push(q.module.head.clone());
+    parts.extend_from_slice(q.module.tail.as_slice());
+    parts.push(q.member.as_str().to_owned());
+    parts.join("_")
+}
+
+// Runtime function names for builtin/foreign primitives -- these name the C
+// runtime the emitted code links against, so they must be valid C identifiers.
+fn map_builtin_name(q: &QualifiedName) -> &'static str {
+    match q.member.as_str() {
+        "print_endline" => "builtin_print_endline",
+        "prim_show" => "builtin_show",
+        "=" => "builtin_eq",
+        "-" => "builtin_sub",
+        "+" => "builtin_add",
+        "*" => "builtin_mul",
+        "/" => "builtin_div",
+        "%" => "builtin_mod",
+        "<" => "builtin_lt",
+        ">" => "builtin_gt",
+        "and" => "builtin_and",
+        "xor" => "builtin_xor",
+        "or" => "builtin_or",
+        ">=" => "builtin_ge",
+        "<=" => "builtin_le",
+        "text_fold_right" => "builtin_text_fold_right",
+        otherwise => panic!("unmapped builtin {otherwise:?}"),
     }
 }
 
@@ -76,63 +109,161 @@ impl fmt::Display for CodeBuffer {
     }
 }
 
+// If `head` names a builtin with a direct primitive form, return its C prim
+// name and arity. A *saturated* application of it can be emitted as a direct
+// call (`prim_add(x, y)`) instead of the allocating curried-closure `apply`
+// chain. text_fold_right has no prim form and stays curried.
+fn builtin_prim(head: &Expr) -> Option<(&'static str, usize)> {
+    let q = match head {
+        Expr::Variable(_, Identifier::Global(q)) => q.as_ref(),
+        Expr::InvokeBridge(_, the) => &the.qualified_name,
+        _otherwise => return None,
+    };
+    if !is_builtin(q) {
+        return None;
+    }
+    Some(match q.member.as_str() {
+        "+" => ("prim_add", 2),
+        "-" => ("prim_sub", 2),
+        "*" => ("prim_mul", 2),
+        "/" => ("prim_div", 2),
+        "%" => ("prim_mod", 2),
+        "=" => ("prim_eq", 2),
+        "<" => ("prim_lt", 2),
+        ">" => ("prim_gt", 2),
+        "<=" => ("prim_le", 2),
+        ">=" => ("prim_ge", 2),
+        "and" => ("prim_and", 2),
+        "or" => ("prim_or", 2),
+        "xor" => ("prim_xor", 2),
+        "prim_show" => ("prim_show", 1),
+        "print_endline" => ("prim_print_endline", 1),
+        _otherwise => return None,
+    })
+}
+
+// Fresh scrutinee temporaries for `deconstruct`. A monotonic counter keeps each
+// match's binding distinct from every other (including nested matches).
+static MATCH_ID: AtomicUsize = AtomicUsize::new(0);
+
 impl lambda_lift::Program {
+    // Emit a complete, self-contained C translation unit: every lifted lambda
+    // becomes a `Value f(Value self, Value arg)` function, every top-level
+    // definition a `Value` global initialised once in `startup`, and `main`
+    // runs the program's `start` entry point. Builtin definitions are omitted --
+    // the runtime (`c/runtime.c`) provides them.
     pub fn generate_code(&self, out: &mut CodeBuffer) -> fmt::Result {
-        for LiftedFunction {
-            name,
-            code,
-            capture_info,
-        } in &self.functions
-        {
-            let ty = &capture_info.type_info.inferred_type;
+        writeln!(out, "#include \"runtime.h\"\n")?;
 
-            tracing::trace!("generate_code: {name} :: {ty}");
-
-            match ty.try_as_arrow() {
-                Some((param, return_ty)) => {
-                    writeln!(
-                        out,
-                        "{} {} (void *env, {}) \n{{",
-                        if return_ty.is_arrow() {
-                            "Closure".to_owned()
-                        } else {
-                            return_ty.c_type_name()
-                        },
-                        name,
-                        param.c_type_name(),
-                    )?;
-
-                    self.compile_expr(code, out)?;
-                    writeln!(out, "\n}}\n")?;
-                }
-
-                _otherwise => todo!(),
+        // Forward declarations, so functions and globals can reference each
+        // other (and themselves) regardless of definition order.
+        for LiftedFunction { name, .. } in &self.functions {
+            writeln!(out, "Value {}(Value self, Value l0);", c_name(name))?;
+        }
+        for TopLevelBinding { name, .. } in &self.globals {
+            if !is_builtin(name) {
+                writeln!(out, "Value {};", c_name(name))?;
             }
         }
+        writeln!(out)?;
+
+        for LiftedFunction { name, code, .. } in &self.functions {
+            tracing::trace!("generate_code: {name}");
+            writeln!(out, "Value {}(Value self, Value l0) {{", c_name(name))?;
+            writeln!(out, "  (void)self; (void)l0;")?;
+            write!(out, "  return ")?;
+            self.compile_expr(code, out)?;
+            writeln!(out, ";\n}}\n")?;
+        }
+
+        // Globals may hold closures that name each other's code, but building a
+        // closure only takes the address of a function, so initialisation order
+        // is immaterial here.
+        writeln!(out, "void startup(void) {{")?;
+        for TopLevelBinding { name, value, .. } in &self.globals {
+            if is_builtin(name) {
+                continue;
+            }
+            write!(out, "  {} = ", c_name(name))?;
+            self.compile_expr(value, out)?;
+            writeln!(out, ";")?;
+        }
+        writeln!(out, "}}\n")?;
+
+        writeln!(out, "int main(void) {{")?;
+        writeln!(out, "  runtime_init();")?;
+        writeln!(out, "  startup();")?;
+        write!(out, "  ")?;
+        self.compile_expr(&self.start, out)?;
+        writeln!(out, ";")?;
+        writeln!(out, "  return 0;\n}}")?;
         Ok(())
     }
 
-    // What does this output?
+    // Compile an expression to a single C expression of type `Value`. Control
+    // constructs stay expressions: `if` is a ternary, `let` a GCC statement
+    // expression, sequencing the comma operator.
     fn compile_expr(&self, expr: &Expr, code: &mut CodeBuffer) -> fmt::Result {
         match expr {
             Expr::Variable(_, the) => write!(code, "{}", self.compile_var(the)),
-            Expr::InvokeBridge(_, the) => write!(code, "{}", the.qualified_name),
+            Expr::InvokeBridge(_, the) => write!(code, "{}", c_name(&the.qualified_name)),
             Expr::Constant(_, the) => write!(code, "{}", self.compile_constant(the)),
             Expr::RecursiveLambda(_, _the) => panic!("lambdas are lifted"),
             Expr::Lambda(_, _the) => panic!("lambdas are lifted"),
-            Expr::Apply(_, the) => self.compile_apply(the, code), // foo(x) or apply(closure, x)
+            Expr::Apply(_, the) => self.compile_apply(the, code),
             Expr::Let(_, the) => self.compile_let(the, code),
-            Expr::Tuple(_, _the) => todo!(),
-            Expr::Record(_, _the) => todo!(),
-            Expr::Inject(_, _the) => todo!(),
+            Expr::Tuple(_, the) => self.compile_tuple(&the.elements, code),
+            Expr::Record(_, the) => self.compile_record(the, code),
+            Expr::Inject(_, the) => self.compile_inject(the, code),
             Expr::Project(_, the) => self.compile_projection(the, code),
             Expr::Sequence(_, the) => self.compile_sequence(the, code),
-            Expr::Deconstruct(_, _the) => todo!(),
+            Expr::Deconstruct(_, the) => self.compile_deconstruct(the, code),
             Expr::If(_, the) => self.compile_if(the, code),
-            Expr::Interpolate(_, _the) => todo!(),
+            Expr::Interpolate(_, the) => self.compile_interpolate(&the.0, code),
             Expr::Ascription(_, the) => self.compile_expr(&the.ascribed_tree, code),
             Expr::MakeClosure(_, the) => self.compile_closure(the, code),
         }
+    }
+
+    fn compile_tuple(&self, elements: &[std::rc::Rc<Expr>], code: &mut CodeBuffer) -> fmt::Result {
+        write!(code, "mk_tuple({}", elements.len())?;
+        for element in elements {
+            write!(code, ", ")?;
+            self.compile_expr(element, code)?;
+        }
+        write!(code, ")")
+    }
+
+    // A constructor value (sum type) is a tuple whose slot 0 is the constructor
+    // tag and whose remaining slots are the arguments -- the same layout the
+    // Chez backend uses (tag at 0, args at 1+). The tag is the constructor's
+    // flattened name as text, matched by string equality in `Coproduct`
+    // patterns; nullary constructors are just a one-element tuple.
+    fn compile_inject(&self, the: &phase::Injection<Closed>, code: &mut CodeBuffer) -> fmt::Result {
+        write!(
+            code,
+            "mk_tuple({}, VText(\"{}\")",
+            1 + the.arguments.len(),
+            surface_name(&the.constructor)
+        )?;
+        for argument in &the.arguments {
+            write!(code, ", ")?;
+            self.compile_expr(argument, code)?;
+        }
+        write!(code, ")")
+    }
+
+    // A record is a positional product, exactly like a tuple: its fields are
+    // held in a canonical order (sorted by name at construction) and projection
+    // is already lowered to `Ordinal`, so the field labels carry no runtime
+    // weight -- we just emit the values in field order.
+    fn compile_record(&self, the: &phase::Record<Closed>, code: &mut CodeBuffer) -> fmt::Result {
+        write!(code, "mk_tuple({}", the.fields.len())?;
+        for (_label, value) in &the.fields {
+            write!(code, ", ")?;
+            self.compile_expr(value, code)?;
+        }
+        write!(code, ")")
     }
 
     fn compile_projection(
@@ -140,41 +271,175 @@ impl lambda_lift::Program {
         the: &phase::Projection<Closed>,
         code: &mut CodeBuffer,
     ) -> fmt::Result {
-        self.compile_expr(&the.base, code)?;
-        write!(code, "->")?;
         match &the.select {
-            ProductElement::Ordinal(i) => write!(code, "elements[{i}]"),
-            ProductElement::Name(id) => write!(code, "{id}"),
+            ProductElement::Ordinal(i) => {
+                write!(code, "proj(")?;
+                self.compile_expr(&the.base, code)?;
+                write!(code, ", {i})")
+            }
+            // Record projections are lowered to ordinals before codegen.
+            ProductElement::Name(_id) => panic!("named projections are lowered to ordinals"),
         }
     }
 
+    // `deconstruct scrutinee into <clauses>` compiles to a right-nested ternary
+    // over the clauses: each clause's refutable tests (guarding its position in
+    // the product/coproduct) gate a statement expression that binds its pattern
+    // variables and yields the consequent. The scrutinee is evaluated once into a
+    // fresh temporary. An exhausted match hits the runtime's `match_fail`.
+    fn compile_deconstruct(
+        &self,
+        the: &phase::Deconstruct<Closed>,
+        code: &mut CodeBuffer,
+    ) -> fmt::Result {
+        let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+        let scrutinee = format!("_scrut{id}");
+
+        write!(code, "({{ Value {scrutinee} = ")?;
+        self.compile_expr(&the.scrutinee, code)?;
+        write!(code, "; ")?;
+
+        for clause in &the.match_clauses {
+            let mut tests = Vec::new();
+            let mut binds = Vec::new();
+            self.collect_pattern(&clause.pattern, &scrutinee, &mut tests, &mut binds);
+
+            if tests.is_empty() {
+                write!(code, "true")?;
+            } else {
+                write!(code, "{}", tests.join(" && "))?;
+            }
+            write!(code, " ? ({{ ")?;
+            for (level, path) in &binds {
+                write!(code, "Value l{level} = {path}; ")?;
+            }
+            self.compile_expr(&clause.consequent, code)?;
+            write!(code, "; }}) : ")?;
+        }
+
+        write!(code, "match_fail(); }})")
+    }
+
+    // Walk a pattern against a C expression `path` for the value it matches,
+    // accumulating boolean `tests` (the refutable checks) and `binds` (each
+    // pattern variable's `Local` slot paired with the path that reaches it).
+    fn collect_pattern(
+        &self,
+        pattern: &phase::Pattern<Closed>,
+        path: &str,
+        tests: &mut Vec<String>,
+        binds: &mut Vec<(usize, String)>,
+    ) {
+        match pattern {
+            Pattern::Bind(_, Identifier::Local(LexicalLevel(level))) => {
+                binds.push((*level, path.to_owned()));
+            }
+            Pattern::Bind(_, other) => panic!("pattern binder must be a local: {other:?}"),
+
+            Pattern::Literally(_, literal) => {
+                tests.push(format!("val_eq({path}, {})", self.compile_constant(literal)));
+            }
+
+            Pattern::Tuple(_, the) => {
+                for (index, element) in the.elements.iter().enumerate() {
+                    self.collect_pattern(element, &format!("proj({path}, {index})"), tests, binds);
+                }
+            }
+
+            Pattern::Struct(_, the) => {
+                for (index, (_label, field)) in the.fields.iter().enumerate() {
+                    self.collect_pattern(field, &format!("proj({path}, {index})"), tests, binds);
+                }
+            }
+
+            // A constructor pattern: test the tag in slot 0 against the
+            // constructor's name, then match each argument against slot `1 + i`
+            // (mirroring `compile_inject`'s layout).
+            Pattern::Coproduct(_, the) => {
+                let Identifier::Global(constructor) = &the.constructor else {
+                    panic!("constructor pattern head must be a global: {:?}", the.constructor);
+                };
+                tests.push(format!(
+                    "val_eq(proj({path}, 0), VText(\"{}\"))",
+                    surface_name(constructor)
+                ));
+                for (index, argument) in the.arguments.iter().enumerate() {
+                    self.collect_pattern(
+                        argument,
+                        &format!("proj({path}, {})", index + 1),
+                        tests,
+                        binds,
+                    );
+                }
+            }
+        }
+    }
+
+    // Application. A saturated application of a primitive builtin lowers to a
+    // direct call (`prim_add(x, y)`) -- no intermediate closures, no allocation,
+    // no indirection. Everything else is the uniform `apply(closure, argument)`;
+    // since a builtin's value is still a curried closure, partial application
+    // and higher-order use fall through to this path unchanged.
     fn compile_apply(&self, the: &phase::Apply<Closed>, code: &mut CodeBuffer) -> fmt::Result {
-        match &*the.function {
-            Expr::Variable(_, name) => {
-                write!(
-                    code,
-                    "{}(",
-                    match name {
-                        Identifier::Local(LexicalLevel(level)) => format!("l{level}"),
-                        Identifier::Captured(capture) => format!("c{}", capture.index()),
-                        Identifier::Global(name) => name.to_string(),
+        // Flatten the application spine into (head, args-in-order).
+        let mut args: Vec<&Expr> = vec![&the.argument];
+        let mut head: &Expr = &the.function;
+        while let Expr::Apply(_, inner) = head {
+            args.push(&inner.argument);
+            head = &inner.function;
+        }
+        args.reverse();
+
+        if let Some((prim, arity)) = builtin_prim(head) {
+            if arity == args.len() {
+                write!(code, "{prim}(")?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(code, ", ")?;
                     }
-                )?;
-                self.compile_expr(&the.argument, code)?;
-                write!(code, ")")
-            }
-            _otherwise => {
-                write!(code, "apply(")?;
-                self.compile_expr(&the.function, code)?;
-                write!(code, ", ")?;
-                self.compile_expr(&the.argument, code)?;
-                write!(code, ")")
+                    self.compile_expr(arg, code)?;
+                }
+                return write!(code, ")");
             }
         }
+
+        // Generic path: one curried application; nested applies recurse here too.
+        write!(code, "apply(")?;
+        self.compile_expr(&the.function, code)?;
+        write!(code, ", ")?;
+        self.compile_expr(&the.argument, code)?;
+        write!(code, ")")
     }
 
-    fn compile_closure(&self, _the: &ClosureInfo, code: &mut CodeBuffer) -> fmt::Result {
-        writeln!(code, "VClo(???)")
+    // A closure value: the lifted function's code paired with a freshly built
+    // environment tuple of its captured values.
+    fn compile_closure(&self, the: &ClosureInfo, code: &mut CodeBuffer) -> fmt::Result {
+        write!(code, "mk_closure({}, ", c_name(&the.lifted_name))?;
+        self.compile_expr(&the.environment, code)?;
+        write!(code, ")")
+    }
+
+    // String interpolation concatenates its segments: literal text verbatim,
+    // embedded expressions rendered through `prim_show` (matching the Scheme
+    // backend's `string-append` + `show`).
+    fn compile_interpolate(
+        &self,
+        segments: &[Segment<CaptureInfo, Identifier>],
+        code: &mut CodeBuffer,
+    ) -> fmt::Result {
+        write!(code, "prim_str_concat({}", segments.len())?;
+        for segment in segments {
+            write!(code, ", ")?;
+            match segment {
+                Segment::Literal(_, literal) => write!(code, "{}", self.compile_constant(literal))?,
+                Segment::Expression(expr) => {
+                    write!(code, "prim_show(")?;
+                    self.compile_expr(expr, code)?;
+                    write!(code, ")")?;
+                }
+            }
+        }
+        write!(code, ")")
     }
 
     fn compile_sequence(
@@ -190,20 +455,21 @@ impl lambda_lift::Program {
     }
 
     fn compile_if(&self, the: &phase::IfThenElse<Closed>, code: &mut CodeBuffer) -> fmt::Result {
-        write!(code, "if (")?;
+        write!(code, "(as_bool(")?;
         self.compile_expr(&the.predicate, code)?;
-        writeln!(code, ") {{\n")?;
+        write!(code, ") ? ")?;
         self.compile_expr(&the.consequent, code)?;
-        writeln!(code, "\n}} else {{")?;
+        write!(code, " : ")?;
         self.compile_expr(&the.alternate, code)?;
-        writeln!(code, "}}")
+        write!(code, ")")
     }
 
     fn compile_var(&self, var: &Identifier) -> String {
         match var {
             Identifier::Local(LexicalLevel(level)) => format!("l{level}"),
-            Identifier::Captured(capture) => format!("c{}", capture.index()),
-            Identifier::Global(qualified_name) => qualified_name.to_string(), //escape this
+            Identifier::Captured(capture) => format!("env_get(self, {})", capture.index()),
+            Identifier::SelfRef => "self".to_owned(),
+            Identifier::Global(qualified_name) => c_name(qualified_name),
         }
     }
 
@@ -213,10 +479,12 @@ impl lambda_lift::Program {
             Literal::Text(x) => format!("VText(\"{x}\")"),
             Literal::Bool(x) => format!("VBool({x})"),
             Literal::Unit => "VUnit()".to_owned(),
-            Literal::Char(x) => format!("Vchar('{x}')"),
+            Literal::Char(x) => format!("VChar('{x}')"),
         }
     }
 
+    // `let l = bound in body` is a GCC statement expression: bind a local, then
+    // yield the body's value. Only `Local` binders occur here (see closed.rs).
     fn compile_let(
         &self,
         Binding {
@@ -227,19 +495,13 @@ impl lambda_lift::Program {
         }: &phase::Binding<Closed>,
         code: &mut CodeBuffer,
     ) -> fmt::Result {
-        let bound_ty = bound.annotation().type_info.inferred_type.c_type_name();
-        write!(
-            code,
-            "{bound_ty} {} = ",
-            match binder {
-                Identifier::Local(LexicalLevel(level)) => format!("l{level}"),
-                Identifier::Captured(..) => todo!(),
-                Identifier::Global(..) => todo!(),
-            }
-        )?;
+        let Identifier::Local(LexicalLevel(level)) = binder else {
+            panic!("let binder is always a local: {binder:?}");
+        };
+        write!(code, "({{ Value l{level} = ")?;
         self.compile_expr(bound, code)?;
-        writeln!(code, ";\n")?;
+        write!(code, "; ")?;
         self.compile_expr(body, code)?;
-        writeln!(code, ";\n")
+        write!(code, "; }})")
     }
 }
