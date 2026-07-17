@@ -57,6 +57,9 @@ pub enum NameError {
 
     #[error("Unknown module member {0}")]
     UnknownMember(ModuleMember),
+
+    #[error("`{0}` is private to its declaring module and cannot be referenced here")]
+    Private(IdentifierPath),
 }
 
 pub type Naming<A> = Result<A, Located<NameError>>;
@@ -537,7 +540,7 @@ impl RecordDeclarator<ParseInfo> {
         type_parameters: &[TypeVariable],
         name: &QualifiedName,
         origin: TypeOrigin,
-        opacity: Opacity,
+        opacity: Access,
     ) -> TypeSymbol<IdentifierPath> {
         TypeSymbol {
             definition: TypeDefinition::Record(self.as_record_symbol(type_parameters, name)),
@@ -562,7 +565,7 @@ impl CoproductDeclarator<ParseInfo> {
         name: &QualifiedName,
         constructors: Vec<ConstructorSymbol<IdentifierPath>>,
         origin: TypeOrigin,
-        opacity: Opacity,
+        opacity: Access,
     ) -> TypeSymbol<IdentifierPath> {
         TypeSymbol {
             definition: TypeDefinition::Coproduct(CoproductSymbol {
@@ -593,7 +596,14 @@ pub struct SymbolTable<A, GlobalName, LocalId> {
     pub signatures: HashSet<QualifiedName>,
     pub witnesses: HashSet<QualifiedName>,
 
-    pub constructor_opacity: HashMap<QualifiedName, Opacity>,
+    pub constructor_opacity: HashMap<QualifiedName, Access>,
+
+    /// Name-level visibility for members that aren't reachable everywhere.
+    /// Distinct from `constructor_opacity` (which hides a type's *structure*):
+    /// this hides the *name* itself. Only restricted members are recorded --
+    /// absence means `Access::Anywhere`. Currently populated for `foreign` term
+    /// and type declarations, which are private to their declaring module.
+    pub member_visibility: HashMap<SymbolName, Access>,
 }
 
 impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
@@ -607,6 +617,7 @@ impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
             signatures: HashSet::default(),
             witnesses: HashSet::default(),
             constructor_opacity: HashMap::default(),
+            member_visibility: HashMap::default(),
         }
     }
 }
@@ -614,7 +625,6 @@ impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
 #[derive(Debug, Clone)]
 pub struct ForeignTerm<GlobalName> {
     pub name: QualifiedName,
-    //This ought not be of A, but of ParseInfo because wtf does it buy?
     pub type_signature: TypeSignature<ParseInfo, GlobalName>,
 }
 
@@ -665,11 +675,16 @@ impl phase::SymbolTable<Desugared> {
                 (!name_expr.projections.is_empty() || names_a_real_member).then_some(name_expr)
             })?;
 
+        let qualified_name = resolved.qualified_name();
         let hidden = resolved.projections.is_empty()
-            && self
+            && (self
                 .constructor_opacity
-                .get(&resolved.qualified_name())
-                .is_some_and(|opacity| !opacity.is_visible_from(semantic_scope));
+                .get(&qualified_name)
+                .is_some_and(|opacity| !opacity.is_visible_from(semantic_scope))
+                || self
+                    .member_visibility
+                    .get(&SymbolName::Term(qualified_name))
+                    .is_some_and(|visibility| !visibility.is_visible_from(semantic_scope)));
 
         (!hidden).then_some(resolved)
     }
@@ -690,7 +705,7 @@ impl phase::SymbolTable<Desugared> {
         let mut search_order =
             prefix_chain(semantic_scope).chain(self.imports.iter().rev().cloned());
 
-        search_order
+        let resolved = search_order
             .find_map(|m| {
                 let owner = if let Some(parent) = id.clone().try_into_parent() {
                     parent.in_module(&m)
@@ -701,7 +716,20 @@ impl phase::SymbolTable<Desugared> {
                 search_space.contains(&owner).then_some(id.in_module(&m))
             })
             .and_then(|id| id.try_into_qualified_name())
-            .ok_or_else(|| NameError::UnknownName(id.clone()).at(pi))
+            .ok_or_else(|| NameError::UnknownName(id.clone()).at(pi))?;
+
+        // A `foreign` type is private to its declaring module: reject a reference
+        // from outside that module's subtree, even though the name resolves.
+        let private = self
+            .member_visibility
+            .get(&SymbolName::Type(resolved.clone()))
+            .is_some_and(|visibility| !visibility.is_visible_from(semantic_scope));
+
+        if private {
+            Err(NameError::Private(id.clone()).at(pi))
+        } else {
+            Ok(resolved)
+        }
     }
 }
 
@@ -765,10 +793,21 @@ impl phase::SymbolTable<Parsed> {
             let name = QualifiedName::new(module_path.clone(), name.as_str());
 
             let opacity = if opaque || matches!(origin, TypeOrigin::Foreign) {
-                Opacity::TransparentWithin(module_path.clone())
+                Access::Within(module_path.clone())
             } else {
-                Opacity::Transparent
+                Access::Anywhere
             };
+
+            // A `foreign` type is private to its declaring module: its *name* is
+            // not referenceable from outside (unlike an `opaque` type, whose name
+            // stays public and only its structure is hidden). This is what forces
+            // the foreign handle to be re-exported through a public wrapper.
+            if matches!(origin, TypeOrigin::Foreign) {
+                self.member_visibility.insert(
+                    SymbolName::Type(name.clone()),
+                    Access::Within(module_path.clone()),
+                );
+            }
 
             match declarator {
                 ast::TypeDeclarator::Record(_, record) => {
@@ -801,7 +840,7 @@ impl phase::SymbolTable<Parsed> {
                         // `resolve_free_term_name` can enforce it by constructor name.
                         // Only restricted constructors are indexed; transparent ones
                         // are always visible and need no entry.
-                        if !matches!(opacity, Opacity::Transparent) {
+                        if !matches!(opacity, Access::Anywhere) {
                             self.constructor_opacity
                                 .insert(constructor.name.clone(), opacity.clone());
                         }
@@ -897,6 +936,16 @@ impl phase::SymbolTable<Parsed> {
 
                 Declaration::Foreign(_, decl) => {
                     self.add_module_term_member(module_path.clone(), decl.name.clone());
+                    // A `foreign` function is an unsafe backend primitive, private
+                    // to its declaring module: callers reach it only through the
+                    // module's own (safe) public surface, never directly.
+                    self.member_visibility.insert(
+                        SymbolName::Term(QualifiedName::new(
+                            module_path.clone(),
+                            decl.name.as_str(),
+                        )),
+                        Access::Within(module_path.clone()),
+                    );
                     self.add_foreign_declaration(&module_path, decl);
                 }
             };
@@ -960,7 +1009,7 @@ impl phase::SymbolTable<Parsed> {
                     supersignatures: decl.constraints,
                 }),
                 origin: TypeOrigin::UserDefined,
-                opacity: Opacity::Transparent,
+                opacity: Access::Anywhere,
                 arity: decl.type_parameters.len(),
                 kind: compute_type_constructor_kind(&decl.type_parameters),
             },
@@ -1139,7 +1188,7 @@ impl<A> Symbol<A, QualifiedName, Identifier> {
 pub struct TypeSymbol<GlobalName> {
     pub definition: TypeDefinition<GlobalName>,
     pub origin: TypeOrigin,
-    pub opacity: Opacity,
+    pub opacity: Access,
     pub arity: usize,
     pub kind: Kind,
 }
@@ -1152,16 +1201,16 @@ pub enum TypeOrigin {
 }
 
 #[derive(Debug, Clone)]
-pub enum Opacity {
-    Transparent,
-    TransparentWithin(IdentifierPath),
+pub enum Access {
+    Anywhere,
+    Within(IdentifierPath),
 }
 
-impl Opacity {
+impl Access {
     pub fn is_visible_from(&self, semantic_scope: &IdentifierPath) -> bool {
         match self {
-            Self::Transparent => true,
-            Self::TransparentWithin(module) => prefix_chain(semantic_scope).any(|m| &m == module),
+            Self::Anywhere => true,
+            Self::Within(module) => prefix_chain(semantic_scope).any(|m| &m == module),
         }
     }
 }
@@ -2038,6 +2087,7 @@ impl phase::SymbolTable<Desugared> {
             signatures: self.signatures.clone(),
             witnesses: self.witnesses.clone(),
             constructor_opacity: self.constructor_opacity.clone(),
+            member_visibility: self.member_visibility.clone(),
         })
     }
 

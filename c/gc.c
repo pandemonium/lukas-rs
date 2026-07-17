@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 // ===========================================================================
 // Garbage collector: generational, conservative mark-sweep, non-moving, backed
@@ -186,7 +187,7 @@ static bool is_object(uintptr_t w) {
 static GcHeader *gc_young = NULL, *gc_old = NULL;
 static size_t gc_young_bytes = 0;      // young allocation since the last minor GC
 static size_t gc_old_bytes = 0;        // live bytes tenured in the old generation
-static size_t gc_nursery = 4u << 20;   // trigger a minor GC once the nursery fills
+static size_t gc_nursery = 16u << 20;  // trigger a minor GC once the nursery fills
 static size_t gc_major_at = 8u << 20;  // trigger a major GC once the old gen exceeds this
 static bool gc_on = false;
 static bool gc_major = false;          // is the in-progress collection a major one?
@@ -197,6 +198,14 @@ static void *gc_stack_bottom = NULL;
 // Statistics, reported at exit when MARM_GC_STATS is set.
 static unsigned long gc_minor_count = 0, gc_major_count = 0;
 static unsigned long long gc_total_bytes = 0;
+static double gc_time = 0.0;   // seconds spent inside gc_run
+static double gc_started = 0.0; // wall clock at gc_init
+
+static double now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
 
 // Mark worklist: explicit, so tracing a deep structure does not recurse (and
 // blow) the C stack.
@@ -274,6 +283,7 @@ static void free_object(GcHeader *h) {
 // One collection. `major` selects a full sweep of both generations; otherwise a
 // minor collection sweeps only the nursery, tenuring its survivors.
 static void gc_run(bool major) {
+    double t0 = now();
     if (major) gc_major_count++;
     else gc_minor_count++;
     gc_major = major;
@@ -331,6 +341,7 @@ static void gc_run(bool major) {
     }
 
     gc_major = false;
+    gc_time += now() - t0;
 }
 
 // Public entry: force a full collection.
@@ -379,14 +390,18 @@ static void *gc_new(size_t body, ObjKind kind) {
 }
 
 static void gc_report(void) {
+    double total = now() - gc_started;
     fprintf(stderr,
             "[gc] %lu minor, %lu major; %.1f MB allocated; live old %.1f MB; "
-            "nursery %zu KiB\n",
+            "nursery %zu KiB\n"
+            "[gc] gc %.3fs / total %.3fs -> mutator throughput %.1f%%\n",
             gc_minor_count, gc_major_count, gc_total_bytes / 1048576.0,
-            gc_old_bytes / 1048576.0, gc_nursery >> 10);
+            gc_old_bytes / 1048576.0, gc_nursery >> 10, gc_time, total,
+            total > 0 ? 100.0 * (total - gc_time) / total : 100.0);
 }
 
 void gc_init(void *stack_bottom) {
+    gc_started = now();
     gc_stack_bottom = stack_bottom;
     // Generation sizes are tunable (in KiB) for experimentation/benchmarking.
     const char *nursery = getenv("MARM_NURSERY");

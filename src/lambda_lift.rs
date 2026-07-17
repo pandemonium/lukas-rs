@@ -53,9 +53,20 @@ impl closed::SymbolTable {
             });
         }
 
+        // Foreign terms have no body to lift, so they never enter `globals`
+        // above (their symbol isn't a `Term` with an expression). Carry their
+        // names through so codegen can declare, initialise, and root the C
+        // globals that the companion `<Module>.c` file defines.
+        let foreign = self
+            .foreign_terms
+            .iter()
+            .map(|ext| ext.name.clone())
+            .collect();
+
         Program {
             functions,
             globals,
+            foreign,
             start: Expr::Apply(
                 CaptureInfo::dummy(),
                 Apply {
@@ -180,6 +191,10 @@ pub struct Program {
     /// Top-level definitions -- each a value expression evaluated once, emitted
     /// as an initialized C global.
     pub globals: Vec<TopLevelBinding>,
+    /// Foreign functions: names only, no body. Their curried closures are built
+    /// by a companion `<Module>.c` (via the `FOREIGN_DECL` macro); codegen emits
+    /// the matching `extern` global, its `startup` initialiser, and its GC root.
+    pub foreign: Vec<QualifiedName>,
     pub start: Expr,
 }
 
@@ -235,6 +250,7 @@ impl fmt::Display for Program {
         let Self {
             functions,
             globals,
+            foreign,
             start,
         } = self;
 
@@ -244,6 +260,10 @@ impl fmt::Display for Program {
 
         for global in globals {
             writeln!(f, "{global}")?;
+        }
+
+        for name in foreign {
+            writeln!(f, "foreign {name}")?;
         }
 
         writeln!(f, "start: {start}")

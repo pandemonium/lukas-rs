@@ -1,0 +1,22 @@
+(* Foreign functions on the C backend.
+
+   A `foreign f :: T` declaration gives Marmelade a name and a type but no body:
+   the implementation is supplied by the backend. For the C backend that means a
+   companion `Root.c` next to this file, where each foreign is written with the
+   `FOREIGN_DECL` macro (see the C file). The compiler emits the matching global,
+   initialises it at startup, and registers it as a GC root; calls go through the
+   ordinary curried-closure path, so partial application works like any other
+   Marmelade function. *)
+
+(* Integer square root: one argument, plain Int marshalling. *)
+foreign isqrt :: Int -> Int
+
+(* Exponentiation: two arguments, so the emitted closure is curried. *)
+foreign pow :: Int -> Int -> Int
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (isqrt 144))       (* 12 *)
+  print_endline (prim_show (pow 2 10))        (* 1024 *)
+  let powers_of_three = pow 3 in              (* partial application of a foreign *)
+  print_endline (prim_show (powers_of_three 4))   (* 81 *)

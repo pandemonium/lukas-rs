@@ -1,0 +1,42 @@
+use Stdlib.
+
+module Files:
+  foreign FILE                                (* opaque handle: a C FILE* smuggled as an Int *)
+  foreign prim_open       :: Text -> Text -> FILE
+  foreign prim_write_line :: FILE -> Text -> Unit
+  foreign prim_read_line  :: FILE -> Text
+  foreign prim_close      :: FILE -> Unit
+  (* The five names above are foreign, hence private to Files: no code outside *)
+  (* this module can name FILE or call a prim_. The only way in is the surface below. *)
+
+  opaque File ::= MkFile FILE                 (* the exported handle: name public, MkFile sealed *)
+
+  write_line :: Text -> File -> IO Unit := λline (MkFile h).
+    IO.suspend (λ_. prim_write_line h line)
+
+  read_line :: File -> IO Text := λ(MkFile h).
+    IO.suspend (λ_. prim_read_line h)
+
+  (* The bracket: opens, runs the callback with the wrapped handle, always closes. *)
+  with_file :: ∀a. Text -> Text -> (File -> IO a) -> IO a := λpath mode k.
+    let* h      = IO.suspend (λ_. prim_open path mode) in
+    let* result = k (MkFile h) in
+    let* _      = IO.suspend (λ_. prim_close h) in
+    pure result
+
+demo_path :: Text := "/tmp/marmelade_files_demo.txt"
+
+writer :: Files.File -> IO Unit := λf.
+  Files.write_line "hello from marmelade" f
+
+reader :: Files.File -> IO Text := λf.
+  Files.read_line f
+
+program :: IO Unit :=
+  let* _    = Files.with_file demo_path "w" writer in
+  let* line = Files.with_file demo_path "r" reader in
+  IO.output "read back: `line`"
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  IO.unsafeRunIO program

@@ -1,7 +1,7 @@
 use crate::{
     ast::{
         BUILTIN_MODULE_NAME, Kind, STDLIB_MODULE_NAME,
-        namer::{Opacity, QualifiedName, Symbol, TypeDefinition, TypeOrigin, TypeSymbol},
+        namer::{Access, QualifiedName, Symbol, TypeDefinition, TypeOrigin, TypeSymbol},
     },
     bridge::{Intrinsic, Lambda1, Lambda2, PartialRawLambda2, RawLambda1, RawLambda3},
     interpreter::{
@@ -188,35 +188,35 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
         TypeSymbol {
             definition: TypeDefinition::Builtin(BaseType::Int),
             origin: TypeOrigin::Builtin,
-            opacity: Opacity::Transparent,
+            opacity: Access::Anywhere,
             arity: 0,
             kind: Kind::Star,
         },
         TypeSymbol {
             definition: TypeDefinition::Builtin(BaseType::Text),
             origin: TypeOrigin::Builtin,
-            opacity: Opacity::Transparent,
+            opacity: Access::Anywhere,
             arity: 0,
             kind: Kind::Star,
         },
         TypeSymbol {
             definition: TypeDefinition::Builtin(BaseType::Bool),
             origin: TypeOrigin::Builtin,
-            opacity: Opacity::Transparent,
+            opacity: Access::Anywhere,
             arity: 0,
             kind: Kind::Star,
         },
         TypeSymbol {
             definition: TypeDefinition::Builtin(BaseType::Unit),
             origin: TypeOrigin::Builtin,
-            opacity: Opacity::Transparent,
+            opacity: Access::Anywhere,
             arity: 0,
             kind: Kind::Star,
         },
         TypeSymbol {
             definition: TypeDefinition::Builtin(BaseType::Char),
             origin: TypeOrigin::Builtin,
-            opacity: Opacity::Transparent,
+            opacity: Access::Anywhere,
             arity: 0,
             kind: Kind::Star,
         },

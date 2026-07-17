@@ -122,4 +122,196 @@ extern Value builtin_show;
 extern Value builtin_print_endline;
 extern Value builtin_text_fold_right;
 
+// --------------------------------------------------------------- foreign functions
+// A `foreign f :: T` declaration in a Marmelade module `M` is implemented in a
+// companion `M.c` with the `FOREIGN_DECL` macro. The compiler emits the matching
+// global, its initialiser call, and its GC root; the macro supplies the curried
+// closure and the marshalling to/from the boxed `Value`.
+//
+//   FOREIGN_DECL(ret_tag, M_f, arg_tag, name, ..., { C body returning ret })
+//
+// Arguments: the return type tag, the (mangled) function name `Module_member`,
+// then a `type_tag, name` pair per parameter (0, 1, or 2 supported), then a C
+// function body operating on the *unmarshalled* C values. Example:
+//
+//   FOREIGN_DECL(int64_t, Root_pow, int64_t, base, int64_t, exp, {
+//       int64_t acc = 1;
+//       while (exp-- > 0) acc *= base;
+//       return acc;
+//   })
+//
+// A tag names a C type plus a Value<->C conversion pair; `Value` is the escape
+// hatch (no marshalling) for anything the built-in tags don't cover. Add a tag
+// by defining its three macros.
+#define CTYPE_int64_t int64_t
+#define AS_int64_t(v) ((v).i)
+#define OF_int64_t(x) VInt(x)
+
+#define CTYPE_Bool bool
+#define AS_Bool(v) ((v).b)
+#define OF_Bool(x) VBool(x)
+
+#define CTYPE_Char char
+#define AS_Char(v) ((v).c)
+#define OF_Char(x) VChar(x)
+
+#define CTYPE_Text const char *
+#define AS_Text(v) ((v).s)
+#define OF_Text(x) VText(x)
+
+#define CTYPE_Value Value
+#define AS_Value(v) (v)
+#define OF_Value(x) (x)
+
+// Arity 0: a foreign constant. `NAME__init` computes the value once at startup.
+#define FOREIGN_DECL_0(RET, NAME, BODY)                                        \
+    static CTYPE_##RET NAME##_impl(void) BODY                                  \
+    Value NAME;                                                                \
+    Value NAME##__init(void) { return OF_##RET(NAME##_impl()); }
+
+// Arity 1: one closure stage forwards straight to the body.
+#define FOREIGN_DECL_1(RET, NAME, T1, A1, BODY)                                \
+    static CTYPE_##RET NAME##_impl(CTYPE_##T1 A1) BODY                         \
+    static Value NAME##_stage1(Value self, Value a1v) {                        \
+        (void)self;                                                            \
+        return OF_##RET(NAME##_impl(AS_##T1(a1v)));                            \
+    }                                                                          \
+    Value NAME;                                                                \
+    Value NAME##__init(void) { return mk_closure(NAME##_stage1, mk_tuple(0)); }
+
+// Arity 2: stage 1 captures the first argument, stage 2 applies the body.
+#define FOREIGN_DECL_2(RET, NAME, T1, A1, T2, A2, BODY)                        \
+    static CTYPE_##RET NAME##_impl(CTYPE_##T1 A1, CTYPE_##T2 A2) BODY          \
+    static Value NAME##_stage2(Value self, Value a2v) {                        \
+        return OF_##RET(NAME##_impl(AS_##T1(env_get(self, 0)), AS_##T2(a2v))); \
+    }                                                                          \
+    static Value NAME##_stage1(Value self, Value a1v) {                        \
+        (void)self;                                                            \
+        return mk_closure(NAME##_stage2, mk_tuple(1, a1v));                    \
+    }                                                                          \
+    Value NAME;                                                                \
+    Value NAME##__init(void) { return mk_closure(NAME##_stage1, mk_tuple(0)); }
+
+// Arities 3-6 follow the same shape: each stage k<N captures the arguments so
+// far (rebuilding the environment tuple) and returns the next stage; the final
+// stage unmarshals the whole environment plus the last argument and calls the
+// body. Higher arities are a mechanical continuation of this pattern.
+#define FOREIGN_DECL_3(RET, NAME, T1, A1, T2, A2, T3, A3, BODY)                \
+    static CTYPE_##RET NAME##_impl(CTYPE_##T1 A1, CTYPE_##T2 A2, CTYPE_##T3 A3) \
+        BODY                                                                   \
+    static Value NAME##_stage3(Value self, Value av) {                         \
+        return OF_##RET(NAME##_impl(AS_##T1(env_get(self, 0)),                 \
+                                    AS_##T2(env_get(self, 1)), AS_##T3(av)));  \
+    }                                                                          \
+    static Value NAME##_stage2(Value self, Value av) {                         \
+        return mk_closure(NAME##_stage3, mk_tuple(2, env_get(self, 0), av));   \
+    }                                                                          \
+    static Value NAME##_stage1(Value self, Value av) {                         \
+        (void)self;                                                            \
+        return mk_closure(NAME##_stage2, mk_tuple(1, av));                     \
+    }                                                                          \
+    Value NAME;                                                                \
+    Value NAME##__init(void) { return mk_closure(NAME##_stage1, mk_tuple(0)); }
+
+#define FOREIGN_DECL_4(RET, NAME, T1, A1, T2, A2, T3, A3, T4, A4, BODY)        \
+    static CTYPE_##RET NAME##_impl(CTYPE_##T1 A1, CTYPE_##T2 A2,               \
+                                   CTYPE_##T3 A3, CTYPE_##T4 A4) BODY          \
+    static Value NAME##_stage4(Value self, Value av) {                         \
+        return OF_##RET(NAME##_impl(                                           \
+            AS_##T1(env_get(self, 0)), AS_##T2(env_get(self, 1)),             \
+            AS_##T3(env_get(self, 2)), AS_##T4(av)));                          \
+    }                                                                          \
+    static Value NAME##_stage3(Value self, Value av) {                         \
+        return mk_closure(NAME##_stage4, mk_tuple(3, env_get(self, 0),         \
+                                                  env_get(self, 1), av));      \
+    }                                                                          \
+    static Value NAME##_stage2(Value self, Value av) {                         \
+        return mk_closure(NAME##_stage3, mk_tuple(2, env_get(self, 0), av));   \
+    }                                                                          \
+    static Value NAME##_stage1(Value self, Value av) {                         \
+        (void)self;                                                            \
+        return mk_closure(NAME##_stage2, mk_tuple(1, av));                     \
+    }                                                                          \
+    Value NAME;                                                                \
+    Value NAME##__init(void) { return mk_closure(NAME##_stage1, mk_tuple(0)); }
+
+#define FOREIGN_DECL_5(RET, NAME, T1, A1, T2, A2, T3, A3, T4, A4, T5, A5,      \
+                       BODY)                                                   \
+    static CTYPE_##RET NAME##_impl(CTYPE_##T1 A1, CTYPE_##T2 A2, CTYPE_##T3 A3, \
+                                   CTYPE_##T4 A4, CTYPE_##T5 A5) BODY          \
+    static Value NAME##_stage5(Value self, Value av) {                         \
+        return OF_##RET(NAME##_impl(                                           \
+            AS_##T1(env_get(self, 0)), AS_##T2(env_get(self, 1)),             \
+            AS_##T3(env_get(self, 2)), AS_##T4(env_get(self, 3)),             \
+            AS_##T5(av)));                                                     \
+    }                                                                          \
+    static Value NAME##_stage4(Value self, Value av) {                         \
+        return mk_closure(NAME##_stage5,                                       \
+                          mk_tuple(4, env_get(self, 0), env_get(self, 1),      \
+                                   env_get(self, 2), av));                     \
+    }                                                                          \
+    static Value NAME##_stage3(Value self, Value av) {                         \
+        return mk_closure(NAME##_stage4, mk_tuple(3, env_get(self, 0),         \
+                                                  env_get(self, 1), av));      \
+    }                                                                          \
+    static Value NAME##_stage2(Value self, Value av) {                         \
+        return mk_closure(NAME##_stage3, mk_tuple(2, env_get(self, 0), av));   \
+    }                                                                          \
+    static Value NAME##_stage1(Value self, Value av) {                         \
+        (void)self;                                                            \
+        return mk_closure(NAME##_stage2, mk_tuple(1, av));                     \
+    }                                                                          \
+    Value NAME;                                                                \
+    Value NAME##__init(void) { return mk_closure(NAME##_stage1, mk_tuple(0)); }
+
+#define FOREIGN_DECL_6(RET, NAME, T1, A1, T2, A2, T3, A3, T4, A4, T5, A5, T6,  \
+                       A6, BODY)                                               \
+    static CTYPE_##RET NAME##_impl(CTYPE_##T1 A1, CTYPE_##T2 A2, CTYPE_##T3 A3, \
+                                   CTYPE_##T4 A4, CTYPE_##T5 A5, CTYPE_##T6 A6) \
+        BODY                                                                   \
+    static Value NAME##_stage6(Value self, Value av) {                         \
+        return OF_##RET(NAME##_impl(                                           \
+            AS_##T1(env_get(self, 0)), AS_##T2(env_get(self, 1)),             \
+            AS_##T3(env_get(self, 2)), AS_##T4(env_get(self, 3)),             \
+            AS_##T5(env_get(self, 4)), AS_##T6(av)));                          \
+    }                                                                          \
+    static Value NAME##_stage5(Value self, Value av) {                         \
+        return mk_closure(NAME##_stage6,                                       \
+                          mk_tuple(5, env_get(self, 0), env_get(self, 1),      \
+                                   env_get(self, 2), env_get(self, 3), av));   \
+    }                                                                          \
+    static Value NAME##_stage4(Value self, Value av) {                         \
+        return mk_closure(NAME##_stage5,                                       \
+                          mk_tuple(4, env_get(self, 0), env_get(self, 1),      \
+                                   env_get(self, 2), av));                     \
+    }                                                                          \
+    static Value NAME##_stage3(Value self, Value av) {                         \
+        return mk_closure(NAME##_stage4, mk_tuple(3, env_get(self, 0),         \
+                                                  env_get(self, 1), av));      \
+    }                                                                          \
+    static Value NAME##_stage2(Value self, Value av) {                         \
+        return mk_closure(NAME##_stage3, mk_tuple(2, env_get(self, 0), av));   \
+    }                                                                          \
+    static Value NAME##_stage1(Value self, Value av) {                         \
+        (void)self;                                                            \
+        return mk_closure(NAME##_stage2, mk_tuple(1, av));                     \
+    }                                                                          \
+    Value NAME;                                                                \
+    Value NAME##__init(void) { return mk_closure(NAME##_stage1, mk_tuple(0)); }
+
+// Dispatch on argument count: the body is a single (final) argument, so a valid
+// call has 3, 5, 7, 9, 11, 13, or 15 arguments -> arity 0..6. Anything else
+// (an even count, or arity > 6) fails to match cleanly and is a compile error.
+#define FD_BADARITY(...)                                                       \
+    _Static_assert(0, "FOREIGN_DECL: expected (ret, name[, type, param]..., body), arity 0-6")
+#define FD_GET(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14,    \
+               _15, MACRO, ...)                                                \
+    MACRO
+#define FOREIGN_DECL(...)                                                      \
+    FD_GET(__VA_ARGS__, FOREIGN_DECL_6, FD_BADARITY, FOREIGN_DECL_5,           \
+           FD_BADARITY, FOREIGN_DECL_4, FD_BADARITY, FOREIGN_DECL_3,           \
+           FD_BADARITY, FOREIGN_DECL_2, FD_BADARITY, FOREIGN_DECL_1,           \
+           FD_BADARITY, FOREIGN_DECL_0, FD_BADARITY, FD_BADARITY)              \
+    (__VA_ARGS__)
+
 #endif // MARMELADE_RUNTIME_H

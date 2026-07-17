@@ -4,15 +4,16 @@
 #
 # Usage: c/run-all.sh [suite ...]
 #   With no args, runs the suites meant to pass end-to-end:
-#     examples stdlib_tests tc lang nested_deconstruct
+#     examples c_examples stdlib_tests tc lang nested_deconstruct
 #   Name suites explicitly to override, e.g.
 #     c/run-all.sh examples stdlib_tests
 #     c/run-all.sh known_bugs          # expected to fail; no `expected` files
 #
 # Env: TIMEOUT (per-program run cap, seconds; forwarded to c/run.sh).
 #
-# chez_examples are intentionally excluded: they use foreign functions provided
-# only as Scheme (`.ss`), which the C backend has no implementation for.
+# c_examples exercise the C backend's own foreign functions (a companion
+# `<Module>.c` per program, linked in by c/run.sh). chez_examples are excluded:
+# their foreign impls are Scheme (`.ss`), which the C backend cannot link.
 set -u
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"

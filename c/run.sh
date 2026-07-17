@@ -36,7 +36,15 @@ if [ ! -s "$work/program.c" ]; then
     exit 1
 fi
 
-if ! clang -std=c11 -I"$C_DIR" -o "$work/prog" "$C_DIR/runtime.c" "$C_DIR/gc.c" "$work/program.c" 2>"$work/cc.err"; then
+# Companion C files implementing this module's `foreign` declarations, if any:
+# one `<Module>.c` per module, living beside its `.lady` source.
+foreign_cs=""
+for f in "$dir"/*.c; do
+    [ -e "$f" ] && foreign_cs="$foreign_cs $f"
+done
+
+# shellcheck disable=SC2086 # $foreign_cs is an intentional list of paths.
+if ! clang -std=c11 -I"$C_DIR" -o "$work/prog" "$C_DIR/runtime.c" "$C_DIR/gc.c" $foreign_cs "$work/program.c" 2>"$work/cc.err"; then
     echo "[$name] COMPILE-ERR"
     cat "$work/cc.err"
     exit 1

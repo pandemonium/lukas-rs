@@ -55,6 +55,7 @@ impl phase::SymbolTable<Types> {
             signatures: self.signatures,
             witnesses: self.witnesses,
             constructor_opacity: self.constructor_opacity,
+            member_visibility: self.member_visibility,
         }
     }
 }

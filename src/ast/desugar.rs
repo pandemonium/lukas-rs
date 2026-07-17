@@ -331,6 +331,7 @@ impl phase::SymbolTable<Parsed> {
             signatures: self.signatures.clone(),
             witnesses: self.witnesses.clone(),
             constructor_opacity: self.constructor_opacity.clone(),
+            member_visibility: self.member_visibility.clone(),
         }
     }
 

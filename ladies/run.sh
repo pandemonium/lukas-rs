@@ -6,9 +6,12 @@
 # a failure. `known_bugs/` is a catalogue of expected-failure repros, so it is
 # deliberately NOT part of this aggregate.
 #
-# Known intentional red: lang/09_pattern_matching (a match-exhaustiveness bug we
-# keep exposed on purpose), so a green run is currently lang 8/9, everything
-# else full. Exit code is 0 only when every counted case passes.
+# Known intentional red in the lang panel: 09_pattern_matching (a match-
+# exhaustiveness bug we keep exposed on purpose) plus 10_syntax and
+# 11_broken_syntax (syntax-exploration repros with no `expected` output). So a
+# "green" run is currently lang 8/11, every other panel full -- including
+# c_examples, which run through the C backend (mc + companion `.c`), not the
+# interpreter. Exit code is 0 only when every counted case passes.
 set -u
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
@@ -16,7 +19,7 @@ ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 # Build once up front; each panel's own `cargo build` is then a no-op.
 cargo build -q --bin lukas 2>/dev/null || { echo "build failed"; exit 1; }
 
-PANELS="tc lang stdlib_tests examples"
+PANELS="tc lang stdlib_tests examples c_examples"
 
 total_pass=0
 total_count=0

@@ -166,6 +166,14 @@ impl lambda_lift::Program {
                 writeln!(out, "Value {};", c_name(name))?;
             }
         }
+
+        // Foreign globals live in the companion `<Module>.c` (defined by the
+        // `FOREIGN_DECL` macro alongside a `<name>__init` builder). Declare both
+        // here so the emitted code can reference the value and call the builder.
+        for name in &self.foreign {
+            writeln!(out, "extern Value {0};", c_name(name))?;
+            writeln!(out, "extern Value {0}__init(void);", c_name(name))?;
+        }
         writeln!(out)?;
 
         for LiftedFunction { name, code, .. } in &self.functions {
@@ -189,22 +197,29 @@ impl lambda_lift::Program {
             self.compile_expr(value, out)?;
             writeln!(out, ";")?;
         }
+        // Build each foreign closure from its companion-provided builder. Runs
+        // after `gc_init`/`runtime_init` (see `main`), so `mk_closure` is safe.
+        for name in &self.foreign {
+            writeln!(out, "  {0} = {0}__init();", c_name(name))?;
+        }
         writeln!(out, "}}\n")?;
 
         // The GC's global-root table: the address of every top-level Value the
         // collector must keep. Builtins are rooted inside the runtime, so only
-        // user globals go here. A one-element `{0}` avoids a zero-length array
-        // when the program has no top-level values of its own.
-        let user_globals = self
+        // user globals and foreign closures go here. A one-element `{0}` avoids a
+        // zero-length array when the program has no top-level values of its own.
+        let root_names = self
             .globals
             .iter()
-            .filter(|b| !is_builtin(&b.name))
+            .map(|b| &b.name)
+            .filter(|name| !is_builtin(name))
+            .chain(self.foreign.iter())
             .collect::<Vec<_>>();
         writeln!(out, "Value *const gc_user_roots[] = {{")?;
-        if user_globals.is_empty() {
+        if root_names.is_empty() {
             writeln!(out, "  0")?;
         } else {
-            for TopLevelBinding { name, .. } in &user_globals {
+            for name in &root_names {
                 writeln!(out, "  &{},", c_name(name))?;
             }
         }
@@ -212,7 +227,7 @@ impl lambda_lift::Program {
         writeln!(
             out,
             "const size_t gc_user_roots_count = {};\n",
-            user_globals.len()
+            root_names.len()
         )?;
 
         writeln!(out, "int main(void) {{")?;
