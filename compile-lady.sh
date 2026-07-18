@@ -2,54 +2,90 @@
 set -eu
 
 usage() {
-  echo "usage: $0 <source-path> [--backend scheme|native]" >&2
+  echo "usage: $0 <source-directory> [--backend scheme|native]" >&2
   exit 1
 }
 
-: "${LADY_LIBRARY:=./ladies/stdlib}"
-
-# --- arguments: one positional source path, plus an optional --backend ---
+# One positional source directory, plus an optional backend.
 BACKEND=scheme
 SOURCE_PATH=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --backend) [ "$#" -ge 2 ] || usage; BACKEND="$2"; shift 2 ;;
-    --backend=*) BACKEND="${1#--backend=}"; shift ;;
-    -*) echo "unknown option: $1" >&2; usage ;;
-    *) [ -z "$SOURCE_PATH" ] || usage; SOURCE_PATH="$1"; shift ;;
+    --backend)
+      [ "$#" -ge 2 ] || usage
+      BACKEND=$2
+      shift 2
+      ;;
+    --backend=*)
+      BACKEND=${1#--backend=}
+      shift
+      ;;
+    -*)
+      echo "unknown option: $1" >&2
+      usage
+      ;;
+    *)
+      [ -z "$SOURCE_PATH" ] || usage
+      SOURCE_PATH=$1
+      shift
+      ;;
   esac
 done
+
 [ -n "$SOURCE_PATH" ] || usage
+[ -d "$SOURCE_PATH" ] || {
+  echo "source directory does not exist: $SOURCE_PATH" >&2
+  exit 1
+}
+
+SOURCE_PATH="$(CDPATH= cd -- "$SOURCE_PATH" && pwd)"
+[ -f "$SOURCE_PATH/Root.lady" ] || {
+  echo "missing source file: $SOURCE_PATH/Root.lady" >&2
+  exit 1
+}
 
 NAME="$(basename -- "$SOURCE_PATH")"
-
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 BUILD_DIR="$ROOT_DIR/build/$NAME"
 SCHEME_DIR="$ROOT_DIR/scheme"
 C_DIR="$ROOT_DIR/c"
+: "${LADY_LIBRARY:=$ROOT_DIR/ladies/stdlib}"
 
 mkdir -p "$BUILD_DIR"
+cd "$ROOT_DIR"
+
+# Build the host compiler once up front, as c_panel.sh does.
+cargo build -q --bin mc 2>/dev/null || {
+  echo "build failed" >&2
+  exit 1
+}
 
 case "$BACKEND" in
 native)
-  # Emit C, then compile it against the runtime into a native binary. The
-  # binary is named after the source folder and, by default, dropped straight
-  # into that folder (e.g. ./ladies/booboo -> ./ladies/booboo/booboo).
+  # Emit C and link it with the runtime and any companion C files implementing
+  # foreign declarations in the source directory.
   ROOT_C="$BUILD_DIR/root.c"
   BIN="$SOURCE_PATH/$NAME"
 
-  cargo run --bin mc -- \
+  cargo run -q --bin mc -- \
     --library "$LADY_LIBRARY" \
     --source "$SOURCE_PATH" \
     --backend native \
     -o "$ROOT_C"
 
-  if [ ! -f "$ROOT_C" ]; then
-    echo "host compiler did not produce: $ROOT_C" >&2
+  if [ ! -s "$ROOT_C" ]; then
+    echo "host compiler did not produce C: $ROOT_C" >&2
     exit 1
   fi
 
-  clang -std=c11 -I"$C_DIR" -O2 -o "$BIN" "$C_DIR/runtime.c" "$C_DIR/gc.c" "$ROOT_C"
+  # Build the clang input list without losing quoting on pathnames.
+  set -- "$C_DIR/runtime.c" "$C_DIR/gc.c"
+  for foreign_c in "$SOURCE_PATH"/*.c; do
+    [ -e "$foreign_c" ] && set -- "$@" "$foreign_c"
+  done
+  set -- "$@" "$ROOT_C"
+
+  clang -std=c11 -I"$C_DIR" -O2 -o "$BIN" "$@"
 
   echo "built:"
   echo "  $BIN"
@@ -80,22 +116,22 @@ scheme)
     exit 1
   fi
 
-  if [ -z "$PETITE_BOOT" ]; then
-    echo "could not find petite.boot under $CHEZ_PREFIX/lib" >&2
+  if [ ! -f "$PETITE_BOOT" ]; then
+    echo "missing petite.boot: $PETITE_BOOT" >&2
     exit 1
   fi
 
-  cargo run --bin mc -- \
+  cargo run -q --bin mc -- \
     --library "$LADY_LIBRARY" \
     --source "$SOURCE_PATH" \
     -o "$ROOT_SS"
 
-  if [ ! -f "$ROOT_SS" ]; then
-    echo "host compiler did not produce: $ROOT_SS" >&2
+  if [ ! -s "$ROOT_SS" ]; then
+    echo "host compiler did not produce Scheme: $ROOT_SS" >&2
     exit 1
   fi
 
-  "$SCHEME_BIN" -q <<EOF
+  "$SCHEME_BIN" -q <<EOF_SCHEME
 (import (chezscheme))
 
 (library-directories
@@ -112,9 +148,9 @@ scheme)
                   "$SCHEME_DIR/runtime.so"
                   "$BUILD_DIR/root.so"
                   "$ROOT_DIR/scheme/startup.so"))
-EOF
+EOF_SCHEME
 
-  cat > "$RUN_SH" <<EOF
+  cat > "$RUN_SH" <<EOF_RUN
 #!/usr/bin/env sh
 set -eu
 
@@ -126,7 +162,7 @@ ROOT_BOOT="\$HERE/root.boot"
 export SCHEMEHEAPDIRS="\$(dirname -- "$PETITE_BOOT"):"
 
 exec "\$PETITE_BIN" -b "\$PETITE_BOOT" -b "\$ROOT_BOOT" "\$@"
-EOF
+EOF_RUN
 
   chmod +x "$RUN_SH"
 

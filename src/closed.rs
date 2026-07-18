@@ -128,6 +128,14 @@ impl CaptureIndex {
 }
 
 impl CaptureLayout {
+    /// The absolute lexical level each capture index refers to, in capture-index
+    /// order (which is *encounter* order, not lexical order). The C backend's
+    /// uncurrying sorts these to recover parameter order when flattening a
+    /// multi-argument function's frame into an N-ary worker.
+    pub fn captured_levels(&self) -> &[LexicalLevel] {
+        &self.by_index
+    }
+
     fn next_capture_index(&mut self) -> CaptureIndex {
         let slot = self.next;
         self.next.update();

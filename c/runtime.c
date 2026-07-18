@@ -106,7 +106,12 @@ static char *show_alloc(Value x) {
 // as `(Some, 5)` rather than the interpreter's `(Some 5)`. Disambiguating needs
 // a representation change (a distinct tag/marker); tuples and records are exact.
 Value prim_show(Value x) {
-    return VText(show_alloc(x));
+    // `show_alloc` returns a temporary malloc; hand its contents to the collector
+    // as an owned text and release the temporary.
+    char *s = show_alloc(x);
+    Value v = mk_text(s);
+    free(s);
+    return v;
 }
 
 Value prim_print_endline(Value x) {
@@ -136,7 +141,11 @@ Value prim_str_concat(size_t n, ...) {
     }
     buf[offset] = '\0';
     free(parts);
-    return VText(buf);
+    // `buf` is fully assembled before this point, so the collection that
+    // `mk_textn` may trigger cannot disturb it (it is a malloc, not a GC object).
+    Value result = mk_textn(buf, total);
+    free(buf);
+    return result;
 }
 
 Value match_fail(void) {

@@ -1,0 +1,2 @@
+#define ERRNO_SUCCESS 0
+#define ERRNO_ENOENT  1

@@ -9,7 +9,7 @@ use crate::{
         namer::QualifiedName, pattern::Pattern,
     },
     closed::{self, CaptureInfo, Closed, Identifier, LexicalLevel},
-    lambda_lift::{self, ClosureInfo, LiftedFunction, TopLevelBinding},
+    lambda_lift::{self, ClosureInfo, LiftedFunction, TopLevelBinding, Worker},
     phase,
 };
 
@@ -161,6 +161,10 @@ impl lambda_lift::Program {
         for LiftedFunction { name, .. } in &self.functions {
             writeln!(out, "Value {}(Value self, Value l0);", c_name(name))?;
         }
+        for Worker { name, params, .. } in &self.workers {
+            let signature = vec!["Value"; *params].join(", ");
+            writeln!(out, "Value {}_worker({});", c_name(name), signature)?;
+        }
         for TopLevelBinding { name, .. } in &self.globals {
             if !is_builtin(name) {
                 writeln!(out, "Value {};", c_name(name))?;
@@ -168,11 +172,19 @@ impl lambda_lift::Program {
         }
 
         // Foreign globals live in the companion `<Module>.c` (defined by the
-        // `FOREIGN_DECL` macro alongside a `<name>__init` builder). Declare both
-        // here so the emitted code can reference the value and call the builder.
+        // `FOREIGN_DECL` macro alongside a `<name>__init` builder and, for arity
+        // >= 1, an uncurried `<name>_worker`). Declare them here so the emitted
+        // code can reference the value, call the builder, and direct-call the
+        // worker at saturated call sites.
         for name in &self.foreign {
             writeln!(out, "extern Value {0};", c_name(name))?;
             writeln!(out, "extern Value {0}__init(void);", c_name(name))?;
+            if let Some(&arity) = self.arities.get(name) {
+                if arity > 0 {
+                    let params = vec!["Value"; arity].join(", ");
+                    writeln!(out, "extern Value {0}_worker({1});", c_name(name), params)?;
+                }
+            }
         }
         writeln!(out)?;
 
@@ -182,6 +194,23 @@ impl lambda_lift::Program {
             writeln!(out, "  (void)self; (void)l0;")?;
             write!(out, "  return ")?;
             self.compile_expr(code, out)?;
+            writeln!(out, ";\n}}\n")?;
+        }
+
+        // Uncurried workers: an N-ary function whose parameters are the flat frame
+        // `l0..l{N-1}`. No `self` -- these are closure-free, so their bodies carry
+        // no captures. `compile_apply` calls them directly at saturated call sites.
+        for Worker { name, params, body } in &self.workers {
+            let signature = (0..*params)
+                .map(|i| format!("Value l{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(out, "Value {}_worker({}) {{", c_name(name), signature)?;
+            for i in 0..*params {
+                write!(out, "  (void)l{i};")?;
+            }
+            write!(out, "\n  return ")?;
+            self.compile_expr(body, out)?;
             writeln!(out, ";\n}}\n")?;
         }
 
@@ -435,6 +464,23 @@ impl lambda_lift::Program {
         if let Some((prim, arity)) = builtin_prim(head) {
             if arity == args.len() {
                 write!(code, "{prim}(")?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(code, ", ")?;
+                    }
+                    self.compile_expr(arg, code)?;
+                }
+                return write!(code, ")");
+            }
+        }
+
+        // A *saturated* application of a known-arity function (currently the
+        // foreign functions) lowers to a direct call to its uncurried worker --
+        // no intermediate closures, no allocation. Under- or over-saturated calls
+        // fall through to the curried `apply` path below.
+        if let Expr::Variable(_, Identifier::Global(qualified_name)) = head {
+            if self.arities.get(qualified_name.as_ref()) == Some(&args.len()) {
+                write!(code, "{}_worker(", c_name(qualified_name.as_ref()))?;
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         write!(code, ", ")?;

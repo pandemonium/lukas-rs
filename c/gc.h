@@ -11,6 +11,12 @@
 Value mk_closure(Value (*code)(Value, Value), Value env);
 Value mk_tuple(size_t len, ...);
 
+// Owned (collectable) strings. Borrowed literals stay as `VText("...")` -- a bare
+// pointer into read-only data, never a GC object. `mk_text*` copy into the heap,
+// where the collector reclaims them once unreachable.
+Value mk_text(const char *src);
+Value mk_textn(const char *src, size_t len);
+
 // The emitted program must call `gc_init(&anchor)` as the first thing in `main`
 // -- `anchor` is any local, and its address marks the bottom of the stack the
 // collector scans -- and must define the global-root table below (every

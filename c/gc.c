@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 // ===========================================================================
@@ -32,7 +33,10 @@
 // live in a set updated the same way. There is no per-collection rebuild.
 // ===========================================================================
 
-typedef enum { OBJ_TUPLE, OBJ_CLOSURE } ObjKind;
+// OBJ_TEXT bodies are owned (heap) strings. They have no child Values, so they
+// need no tracing -- but they are collectable, unlike borrowed literal strings,
+// which live in the program's read-only data and are never GC objects at all.
+typedef enum { OBJ_TUPLE, OBJ_CLOSURE, OBJ_TEXT } ObjKind;
 
 // Prepended to every heap object; the Value's `tup`/`clo` points at the body
 // just past it, so HEADER/BODY convert between the two.
@@ -232,6 +236,10 @@ static void mark_obj(void *body) {
 static void mark_value(Value v) {
     if (v.tag == TAG_TUPLE) mark_obj(v.tup);
     else if (v.tag == TAG_CLOSURE) mark_obj(v.clo);
+    // A text is owned (a live OBJ_TEXT body) or borrowed (a literal in read-only
+    // data). `is_object` is exactly that distinction -- the &str/String test --
+    // so only owned strings are traced; borrowed ones are left alone.
+    else if (v.tag == TAG_TEXT && is_object((uintptr_t)v.s)) mark_obj((void *)v.s);
 }
 
 // A conservative root candidate: mark it only if it is exactly a live object.
@@ -242,12 +250,19 @@ static void mark_candidate(uintptr_t w) {
 static void gc_trace(void) {
     while (gc_work_len) {
         GcHeader *h = gc_work[--gc_work_len];
-        if (h->kind == OBJ_TUPLE) {
+        switch (h->kind) {
+        case OBJ_TUPLE: {
             Tuple *t = BODY(h);
             for (size_t i = 0; i < t->len; i++) mark_value(t->elems[i]);
-        } else {
+            break;
+        }
+        case OBJ_CLOSURE: {
             Closure *c = BODY(h);
             mark_value(c->env);
+            break;
+        }
+        case OBJ_TEXT:
+            break; // a string body holds no Values -- nothing to trace
         }
     }
 }
@@ -424,6 +439,24 @@ Value mk_closure(Value (*code)(Value, Value), Value env) {
     v.clo = c;
     return v;
 }
+
+// Copy `len` bytes into a fresh, collectable string body (NUL-terminated, so it
+// remains a valid C string for `strcmp`/`fputs`). `src` stays live across the
+// possible collection in `gc_reserve` because it is on the C stack, which the
+// collector scans conservatively.
+Value mk_textn(const char *src, size_t len) {
+    gc_reserve(sizeof(GcHeader) + len + 1);
+    char *body = gc_new(len + 1, OBJ_TEXT);
+    memcpy(body, src, len);
+    body[len] = '\0';
+    Value v;
+    v.tag = TAG_TEXT;
+    v.s = body;
+    return v;
+}
+
+// Copy a NUL-terminated C string into a collectable string body.
+Value mk_text(const char *src) { return mk_textn(src, strlen(src)); }
 
 Value mk_tuple(size_t len, ...) {
     size_t body = sizeof(Tuple) + len * sizeof(Value);

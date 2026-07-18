@@ -1,0 +1,38 @@
+foreign FILE
+foreign errno :: Int
+foreign fopen :: Text -> Text -> FILE
+foreign fclose :: FILE -> Unit
+
+opaque File ::= MkFile FILE
+
+Open_Mode ::= Reading | Writing | Read_Write | Append
+
+module Open_Mode:
+  (* Be able to combine these? *)
+  as_text :: Open_Mode -> Text := λmode.
+    deconstruct mode into
+      Readig     -> "r"
+    | Writing    -> "w"
+    | Read_Write -> "rw"
+    | Append     -> "a"
+
+
+Errno ::=
+    Success
+  | No_such_file_or_directory
+
+module Errno:
+  read :: IO Errno := 
+    let decode =
+    IO.suspend (λ_. errno)
+
+Fault ::= X
+
+module Fault:
+  try_from_errno :: IO (Perhaps Fault) := λerrno.
+
+module File:
+  open :: Text -> Open_Mode -> IO (Result Fault File) := λfile_path open_mode.
+    let mode_text = Open_Mode.as_text open_mode in
+    let* handle = IO.suspend (λ_. fopen file_path mode_text) in
+    pure (MkFile handle)

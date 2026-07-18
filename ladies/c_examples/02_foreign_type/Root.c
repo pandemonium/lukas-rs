@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <errno.h>
 
 // prim_open : Text -> Text -> FILE   (path, mode)
 FOREIGN_DECL(int64_t, Root_Files_prim_open, Text, path, Text, mode, {
@@ -22,9 +23,13 @@ FOREIGN_DECL(Value, Root_Files_prim_write_line, int64_t, h, Text, line, {
 })
 
 // prim_read_line : FILE -> Text   (newline stripped)
+// Returns a *borrowed* pointer; OF_Text copies it into a collectable heap text,
+// so there is nothing to malloc or free. Thebuffer is `static` (not a plain
+// local) because the macro copies it *after* this body returns -- a stack array
+// would be read past its lifetime.
 FOREIGN_DECL(Text, Root_Files_prim_read_line, int64_t, h, {
+    static char buf[256];
     FILE *f = (FILE *)(intptr_t)h;
-    char *buf = malloc(256);
     if (fgets(buf, 256, f) == NULL) {
         buf[0] = '\0';
     } else {
