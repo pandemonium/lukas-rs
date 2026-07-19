@@ -8,7 +8,11 @@ witness Functor IO :=
 witness Applicative IO :=
   { pure  := λa. Suspend (λ_. a)
     apply := λ(Suspend f) (Suspend a).
-      Suspend (λ_. (f ()) (a ()))
+      Suspend (λ_.
+        let aa = a () in
+        let ff = (f ()) in
+        ff aa
+      )
   }
 
 witness Monad IO :=

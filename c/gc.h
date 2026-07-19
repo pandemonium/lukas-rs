@@ -7,9 +7,22 @@
 #include "runtime.h"
 
 // Heap constructors (GC-managed). A lifted function is `Value code(Value self,
-// Value arg)`; a closure captures its environment as a tuple.
-Value mk_closure(Value (*code)(Value, Value), Value env);
+// Value arg)`; a closure stores its `nfree` captured values inline (passed
+// variadically, like `mk_tuple`).
+Value mk_closure(Value (*code)(Value, Value), size_t nfree, ...);
+// A closure that additionally carries an uncurried worker for its curried chain
+// (see `Closure` in runtime.h). `mk_closure(code, nfree, ...)` is
+// `mk_closure_n(code, NULL, 1, nfree, ...)`: a single-stage closure, no fast path.
+Value mk_closure_n(Value (*code)(Value, Value), Value (*worker)(Value, Value *),
+                   size_t arity, size_t nfree, ...);
 Value mk_tuple(size_t len, ...);
+
+// A constructor value (see `Data` in runtime.h): an integer tag plus `nfields`
+// inline field values (passed variadically). `data_len` recovers a live data
+// value's field count from its heap header -- used by the collector and `show`,
+// which are the only places the count isn't already known statically.
+Value mk_data(uint64_t tag, size_t nfields, ...);
+size_t data_len(Value v);
 
 // Owned (collectable) strings. Borrowed literals stay as `VText("...")` -- a bare
 // pointer into read-only data, never a GC object. `mk_text*` copy into the heap,

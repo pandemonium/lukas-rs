@@ -9,7 +9,7 @@ use crate::{
         namer::QualifiedName, pattern::Pattern,
     },
     closed::{self, CaptureInfo, Closed, Identifier, LexicalLevel},
-    lambda_lift::{self, ClosureInfo, LiftedFunction, TopLevelBinding, Worker},
+    lambda_lift::{self, ChainWorker, ClosureInfo, LiftedFunction, TopLevelBinding, Worker},
     phase,
 };
 
@@ -165,6 +165,9 @@ impl lambda_lift::Program {
             let signature = vec!["Value"; *params].join(", ");
             writeln!(out, "Value {}_worker({});", c_name(name), signature)?;
         }
+        for ChainWorker { head, .. } in &self.chain_workers {
+            writeln!(out, "Value {}_uworker(Value self, Value *args);", c_name(head))?;
+        }
         for TopLevelBinding { name, .. } in &self.globals {
             if !is_builtin(name) {
                 writeln!(out, "Value {};", c_name(name))?;
@@ -208,6 +211,22 @@ impl lambda_lift::Program {
             writeln!(out, "Value {}_worker({}) {{", c_name(name), signature)?;
             for i in 0..*params {
                 write!(out, "  (void)l{i};")?;
+            }
+            write!(out, "\n  return ")?;
+            self.compile_expr(body, out)?;
+            writeln!(out, ";\n}}\n")?;
+        }
+
+        // Chain workers: the uncurried entry a chain-head closure carries, run by
+        // `apply_n` when the head is applied to exactly `arity` arguments. `self`
+        // is the head closure (so `env_get(self, i)` still reads the chain's
+        // captures); the flattened parameters arrive in `args[0..arity]`, which we
+        // name `l0..l{arity-1}` to match the frame the flattened body expects.
+        for ChainWorker { head, arity, body } in &self.chain_workers {
+            writeln!(out, "Value {}_uworker(Value self, Value *args) {{", c_name(head))?;
+            write!(out, "  (void)self;")?;
+            for i in 0..*arity {
+                write!(out, " Value l{i} = args[{i}];")?;
             }
             write!(out, "\n  return ")?;
             self.compile_expr(body, out)?;
@@ -305,23 +324,33 @@ impl lambda_lift::Program {
         write!(code, ")")
     }
 
-    // A constructor value (sum type) is a tuple whose slot 0 is the constructor
-    // tag and whose remaining slots are the arguments -- the same layout the
-    // Chez backend uses (tag at 0, args at 1+). The tag is the constructor's
-    // flattened name as text, matched by string equality in `Coproduct`
-    // patterns; nullary constructors are just a one-element tuple.
+    // A constructor value (sum type) is a `Data` object: an integer tag (the
+    // constructor's ordinal within its type) followed by its arguments inline.
+    // Pattern matching compares the tag with `==` (see `Coproduct` below), so the
+    // tag need only be unique among its own type's constructors. Nullary
+    // constructors are just a tag with no fields.
     fn compile_inject(&self, the: &phase::Injection<Closed>, code: &mut CodeBuffer) -> fmt::Result {
         write!(
             code,
-            "mk_tuple({}, VText(\"{}\")",
-            1 + the.arguments.len(),
-            surface_name(&the.constructor)
+            "mk_data({}, {}",
+            self.constructor_tag(&the.constructor),
+            the.arguments.len()
         )?;
         for argument in &the.arguments {
             write!(code, ", ")?;
             self.compile_expr(argument, code)?;
         }
         write!(code, ")")
+    }
+
+    // The runtime tag for a constructor: its position within its sum type's
+    // constructor list, recorded by `lambda_lift`. Every `Inject`/`Coproduct`
+    // names a real sum-type constructor, so a miss is a compiler invariant break.
+    fn constructor_tag(&self, constructor: &QualifiedName) -> u64 {
+        *self
+            .constructor_tags
+            .get(constructor)
+            .unwrap_or_else(|| panic!("no constructor tag for {constructor}"))
     }
 
     // A record is a positional product, exactly like a tuple: its fields are
@@ -423,21 +452,18 @@ impl lambda_lift::Program {
                 }
             }
 
-            // A constructor pattern: test the tag in slot 0 against the
-            // constructor's name, then match each argument against slot `1 + i`
+            // A constructor pattern: test the integer tag against the
+            // constructor's ordinal, then match each argument against field `i`
             // (mirroring `compile_inject`'s layout).
             Pattern::Coproduct(_, the) => {
                 let Identifier::Global(constructor) = &the.constructor else {
                     panic!("constructor pattern head must be a global: {:?}", the.constructor);
                 };
-                tests.push(format!(
-                    "val_eq(proj({path}, 0), VText(\"{}\"))",
-                    surface_name(constructor)
-                ));
+                tests.push(format!("data_tag({path}) == {}", self.constructor_tag(constructor)));
                 for (index, argument) in the.arguments.iter().enumerate() {
                     self.collect_pattern(
                         argument,
-                        &format!("proj({path}, {})", index + 1),
+                        &format!("data_field({path}, {index})"),
                         tests,
                         binds,
                     );
@@ -491,7 +517,26 @@ impl lambda_lift::Program {
             }
         }
 
-        // Generic path: one curried application; nested applies recurse here too.
+        // Generic path. A multi-argument application of an unknown head (a curried
+        // function *value*, e.g. a parameter passed to a higher-order function)
+        // goes through `apply_n`, which dispatches straight to the head's
+        // uncurried worker when it carries one and is saturated -- skipping the
+        // intermediate currying-stage closures -- and otherwise falls back to
+        // applying one argument at a time. A single-argument application has no
+        // stage to skip, so it stays the leaner `apply`.
+        if args.len() >= 2 {
+            write!(code, "apply_n(")?;
+            self.compile_expr(head, code)?;
+            write!(code, ", {}, (Value[]){{", args.len())?;
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    write!(code, ", ")?;
+                }
+                self.compile_expr(arg, code)?;
+            }
+            return write!(code, "}})");
+        }
+
         write!(code, "apply(")?;
         self.compile_expr(&the.function, code)?;
         write!(code, ", ")?;
@@ -500,10 +545,33 @@ impl lambda_lift::Program {
     }
 
     // A closure value: the lifted function's code paired with a freshly built
-    // environment tuple of its captured values.
+    // environment tuple of its captured values. When the closure is the head of a
+    // non-recursive curried chain, it also carries its uncurried worker and arity
+    // (via `mk_closure_n`), so a saturated `apply_n` runs the chain in one flat
+    // frame instead of allocating a currying closure per stage.
     fn compile_closure(&self, the: &ClosureInfo, code: &mut CodeBuffer) -> fmt::Result {
-        write!(code, "mk_closure({}, ", c_name(&the.lifted_name))?;
-        self.compile_expr(&the.environment, code)?;
+        // The captured values live inline in the closure (a "flat" closure), so
+        // emit them directly as arguments to `mk_closure`/`mk_closure_n` -- one
+        // heap object, no separate environment tuple. The closure-conversion pass
+        // always builds the environment as a tuple, whose elements are exactly the
+        // captures in slot order.
+        let Expr::Tuple(_, env) = the.environment.as_ref() else {
+            panic!("closure environment is always a tuple");
+        };
+        let name = c_name(&the.lifted_name);
+        if let Some(&arity) = self.chain_heads.get(&the.lifted_name) {
+            write!(
+                code,
+                "mk_closure_n({name}, {name}_uworker, {arity}, {}",
+                env.elements.len()
+            )?;
+        } else {
+            write!(code, "mk_closure({name}, {}", env.elements.len())?;
+        }
+        for element in &env.elements {
+            write!(code, ", ")?;
+            self.compile_expr(element, code)?;
+        }
         write!(code, ")")
     }
 

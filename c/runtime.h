@@ -22,6 +22,7 @@
 typedef struct Value Value;
 typedef struct Closure Closure;
 typedef struct Tuple Tuple;
+typedef struct Data Data;
 
 typedef enum {
     TAG_INT,
@@ -31,6 +32,7 @@ typedef enum {
     TAG_CHAR,
     TAG_CLOSURE,
     TAG_TUPLE,
+    TAG_DATA,
 } Tag;
 
 struct Value {
@@ -42,17 +44,43 @@ struct Value {
         char c;
         Closure *clo;
         Tuple *tup;
+        Data *dat;
     };
 };
 
 struct Closure {
     Value (*code)(Value self, Value arg);
-    Value env; // a TAG_TUPLE Value holding the captured values
+    // Uncurried fast-path entry for a multi-stage curried chain. When `worker`
+    // is non-NULL, this closure is the head of a chain of `arity` stages and
+    // `worker(self, args)` runs all of them at once, given exactly `arity`
+    // arguments -- skipping the intermediate currying-stage closures that
+    // `code` would allocate one per stage. NULL (with arity 1) for an ordinary
+    // single-stage closure, which is applied through `code` alone.
+    Value (*worker)(Value self, Value *args);
+    size_t arity;
+    // The captured values are stored *inline* here (a "flat" closure) rather
+    // than in a separate environment tuple: one heap object per closure instead
+    // of two, and `env_get` is a single load. `nfree` is how many follow, so the
+    // collector knows how much of `caps` to trace.
+    size_t nfree;
+    Value caps[]; // flexible array member
 };
 
 struct Tuple {
     size_t len;
     Value elems[]; // flexible array member
+};
+
+// A constructor value of a sum type: a small integer `tag` (the constructor's
+// ordinal within its type -- unique among that type's constructors, which is all
+// a `deconstruct` ever tests) followed by its fields inline. This is leaner than
+// a tuple with a string-named tag in slot 0: no 16-byte tag slot, and pattern
+// matching compares an integer instead of running `strcmp`. The field count is
+// not stored -- it is recovered from the GC header's body size when needed (GC
+// tracing, `show`); see `data_len`.
+struct Data {
+    uint64_t tag;
+    Value fields[]; // flexible array member
 };
 
 // Value constructors.
@@ -95,11 +123,36 @@ Value prim_str_concat(size_t n, ...);
 // Apply a closure value to an argument.
 static inline Value apply(Value f, Value x) { return f.clo->code(f, x); }
 
+// Apply a closure value to `n` arguments at once (the flattened spine of a
+// nested application). When `f` is the head of a curried chain whose remaining
+// arity is exactly `n` and it carries an uncurried `worker`, dispatch straight
+// to the worker -- no intermediate currying-stage closures are allocated. Every
+// other shape (no worker, partial application `n < arity`, over-application
+// `n > arity`, or a plain single-stage closure) falls back to applying one
+// argument at a time through `code`, exactly reproducing the curried semantics.
+static inline Value apply_n(Value f, size_t n, Value *args) {
+    Closure *c = f.clo;
+    if (c->worker && c->arity == n) {
+        return c->worker(f, args);
+    }
+    Value r = f;
+    for (size_t i = 0; i < n; i++) {
+        r = apply(r, args[i]);
+    }
+    return r;
+}
+
 // i-th element of a tuple value (also used for record ordinals).
 static inline Value proj(Value t, size_t i) { return t.tup->elems[i]; }
 
-// i-th captured value, read out of a closure's own environment.
-#define env_get(self, i) ((self).clo->env.tup->elems[(i)])
+// A constructor value's tag (which constructor) and i-th field. Codegen knows
+// statically whether a value is a tuple or a constructor -- tuple/record access
+// uses `proj`, constructor access uses these -- so no runtime tag check here.
+#define data_tag(v) ((v).dat->tag)
+#define data_field(v, i) ((v).dat->fields[(i)])
+
+// i-th captured value, read out of a closure's own (inline) environment.
+#define env_get(self, i) ((self).clo->caps[(i)])
 
 // Aborts on a non-exhaustive `deconstruct`. Returns Value only so it can sit in
 // the tail of a ternary chain; it never actually returns.
@@ -186,7 +239,7 @@ extern Value builtin_text_fold_right;
     }                                                                                  \
     Value NAME##_worker(Value a1) { return box_##RET(NAME##_impl(unbox_##T1(a1))); }   \
     Value NAME;                                                                        \
-    Value NAME##__init(void) { return mk_closure(NAME##_stage1, mk_tuple(0)); }
+    Value NAME##__init(void) { return mk_closure(NAME##_stage1, 0); }
 
 // Arity 2: stage 1 captures the first argument, stage 2 applies the body.
 #define FOREIGN_DECL_2(RET, NAME, T1, A1, T2, A2, BODY)                                \
@@ -196,13 +249,13 @@ extern Value builtin_text_fold_right;
     }                                                                                  \
     static Value NAME##_stage1(Value self, Value a1v) {                                \
         (void)self;                                                                    \
-        return mk_closure(NAME##_stage2, mk_tuple(1, a1v));                            \
+        return mk_closure(NAME##_stage2, 1, a1v);                                      \
     }                                                                                  \
     Value NAME##_worker(Value a1, Value a2) {                                          \
         return box_##RET(NAME##_impl(unbox_##T1(a1), unbox_##T2(a2)));                 \
     }                                                                                  \
     Value NAME;                                                                        \
-    Value NAME##__init(void) { return mk_closure(NAME##_stage1, mk_tuple(0)); }
+    Value NAME##__init(void) { return mk_closure(NAME##_stage1, 0); }
 
 // Arities 3-6 follow the same shape: each stage k<N captures the arguments so
 // far (rebuilding the environment tuple) and returns the next stage; the final
@@ -220,14 +273,14 @@ extern Value builtin_text_fold_right;
                                     unbox_##T2(env_get(self, 1)), unbox_##T3(av)));    \
     }                                                                                  \
     static Value NAME##_stage2(Value self, Value av) {                                 \
-        return mk_closure(NAME##_stage3, mk_tuple(2, env_get(self, 0), av));           \
+        return mk_closure(NAME##_stage3, 2, env_get(self, 0), av);           \
     }                                                                                  \
     static Value NAME##_stage1(Value self, Value av) {                                 \
         (void)self;                                                                    \
-        return mk_closure(NAME##_stage2, mk_tuple(1, av));                             \
+        return mk_closure(NAME##_stage2, 1, av);                             \
     }                                                                                  \
     Value NAME;                                                                        \
-    Value NAME##__init(void) { return mk_closure(NAME##_stage1, mk_tuple(0)); }
+    Value NAME##__init(void) { return mk_closure(NAME##_stage1, 0); }
 
 #define FOREIGN_DECL_4(RET, NAME, T1, A1, T2, A2, T3, A3, T4, A4, BODY)                \
     static CTYPE_##RET NAME##_impl(CTYPE_##T1 A1, CTYPE_##T2 A2,                       \
@@ -242,18 +295,18 @@ extern Value builtin_text_fold_right;
             unbox_##T3(env_get(self, 2)), unbox_##T4(av)));                            \
     }                                                                                  \
     static Value NAME##_stage3(Value self, Value av) {                                 \
-        return mk_closure(NAME##_stage4, mk_tuple(3, env_get(self, 0),                 \
-                                                  env_get(self, 1), av));              \
+        return mk_closure(NAME##_stage4, 3, env_get(self, 0),                          \
+                                         env_get(self, 1), av);                        \
     }                                                                                  \
     static Value NAME##_stage2(Value self, Value av) {                                 \
-        return mk_closure(NAME##_stage3, mk_tuple(2, env_get(self, 0), av));           \
+        return mk_closure(NAME##_stage3, 2, env_get(self, 0), av);           \
     }                                                                                  \
     static Value NAME##_stage1(Value self, Value av) {                                 \
         (void)self;                                                                    \
-        return mk_closure(NAME##_stage2, mk_tuple(1, av));                             \
+        return mk_closure(NAME##_stage2, 1, av);                             \
     }                                                                                  \
     Value NAME;                                                                        \
-    Value NAME##__init(void) { return mk_closure(NAME##_stage1, mk_tuple(0)); }
+    Value NAME##__init(void) { return mk_closure(NAME##_stage1, 0); }
 
 #define FOREIGN_DECL_5(RET, NAME, T1, A1, T2, A2, T3, A3, T4, A4, T5, A5,              \
                        BODY)                                                           \
@@ -271,22 +324,22 @@ extern Value builtin_text_fold_right;
     }                                                                                  \
     static Value NAME##_stage4(Value self, Value av) {                                 \
         return mk_closure(NAME##_stage5,                                               \
-                          mk_tuple(4, env_get(self, 0), env_get(self, 1),              \
-                                   env_get(self, 2), av));                             \
+                          4, env_get(self, 0), env_get(self, 1),                       \
+                                   env_get(self, 2), av);                              \
     }                                                                                  \
     static Value NAME##_stage3(Value self, Value av) {                                 \
-        return mk_closure(NAME##_stage4, mk_tuple(3, env_get(self, 0),                 \
-                                                  env_get(self, 1), av));              \
+        return mk_closure(NAME##_stage4, 3, env_get(self, 0),                          \
+                                         env_get(self, 1), av);                        \
     }                                                                                  \
     static Value NAME##_stage2(Value self, Value av) {                                 \
-        return mk_closure(NAME##_stage3, mk_tuple(2, env_get(self, 0), av));           \
+        return mk_closure(NAME##_stage3, 2, env_get(self, 0), av);           \
     }                                                                                  \
     static Value NAME##_stage1(Value self, Value av) {                                 \
         (void)self;                                                                    \
-        return mk_closure(NAME##_stage2, mk_tuple(1, av));                             \
+        return mk_closure(NAME##_stage2, 1, av);                             \
     }                                                                                  \
     Value NAME;                                                                        \
-    Value NAME##__init(void) { return mk_closure(NAME##_stage1, mk_tuple(0)); }
+    Value NAME##__init(void) { return mk_closure(NAME##_stage1, 0); }
 
 #define FOREIGN_DECL_6(RET, NAME, T1, A1, T2, A2, T3, A3, T4, A4, T5, A5, T6,          \
                        A6, BODY)                                                       \
@@ -305,27 +358,27 @@ extern Value builtin_text_fold_right;
     }                                                                                  \
     static Value NAME##_stage5(Value self, Value av) {                                 \
         return mk_closure(NAME##_stage6,                                               \
-                          mk_tuple(5, env_get(self, 0), env_get(self, 1),              \
-                                   env_get(self, 2), env_get(self, 3), av));           \
+                          5, env_get(self, 0), env_get(self, 1),                       \
+                                   env_get(self, 2), env_get(self, 3), av);            \
     }                                                                                  \
     static Value NAME##_stage4(Value self, Value av) {                                 \
         return mk_closure(NAME##_stage5,                                               \
-                          mk_tuple(4, env_get(self, 0), env_get(self, 1),              \
-                                   env_get(self, 2), av));                             \
+                          4, env_get(self, 0), env_get(self, 1),                       \
+                                   env_get(self, 2), av);                              \
     }                                                                                  \
     static Value NAME##_stage3(Value self, Value av) {                                 \
-        return mk_closure(NAME##_stage4, mk_tuple(3, env_get(self, 0),                 \
-                                                  env_get(self, 1), av));              \
+        return mk_closure(NAME##_stage4, 3, env_get(self, 0),                          \
+                                         env_get(self, 1), av);                        \
     }                                                                                  \
     static Value NAME##_stage2(Value self, Value av) {                                 \
-        return mk_closure(NAME##_stage3, mk_tuple(2, env_get(self, 0), av));           \
+        return mk_closure(NAME##_stage3, 2, env_get(self, 0), av);           \
     }                                                                                  \
     static Value NAME##_stage1(Value self, Value av) {                                 \
         (void)self;                                                                    \
-        return mk_closure(NAME##_stage2, mk_tuple(1, av));                             \
+        return mk_closure(NAME##_stage2, 1, av);                             \
     }                                                                                  \
     Value NAME;                                                                        \
-    Value NAME##__init(void) { return mk_closure(NAME##_stage1, mk_tuple(0)); }
+    Value NAME##__init(void) { return mk_closure(NAME##_stage1, 0); }
 
 // Dispatch on argument count: the body is a single (final) argument, so a valid
 // call has 3, 5, 7, 9, 11, 13, or 15 arguments -> arity 0..6. Anything else

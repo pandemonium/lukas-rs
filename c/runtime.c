@@ -16,7 +16,7 @@
     }                                                                          \
     static Value NAME##_1(Value self, Value x) {                               \
         (void)self;                                                            \
-        return mk_closure(NAME##_2, mk_tuple(1, x));                           \
+        return mk_closure(NAME##_2, 1, x);                                     \
     }                                                                          \
     Value NAME
 
@@ -78,6 +78,46 @@ static char *show_tuple(Tuple *t) {
     return out;
 }
 
+// A constructor value prints as `#<tag>(fields…)` (or just `#<tag>` for a
+// nullary constructor). The runtime carries no constructor *names*, only the
+// integer tag, so `show` of a data value is a debugging aid rather than
+// source-faithful -- the previous string-tag layout printed the mangled name,
+// but nothing depends on that.
+static char *show_data(Value x) {
+    size_t n = data_len(x);
+    char tagbuf[24];
+    snprintf(tagbuf, sizeof tagbuf, "#%llu", (unsigned long long)data_tag(x));
+    if (n == 0) {
+        return strdup(tagbuf);
+    }
+    char **parts = malloc(n * sizeof *parts);
+    size_t total = strlen(tagbuf) + 3; // "(" + ")" + '\0'
+    for (size_t i = 0; i < n; i++) {
+        parts[i] = show_alloc(data_field(x, i));
+        total += strlen(parts[i]) + (i ? 2 : 0); // ", " between fields
+    }
+    char *out = malloc(total);
+    char *p = out;
+    size_t tlen = strlen(tagbuf);
+    memcpy(p, tagbuf, tlen);
+    p += tlen;
+    *p++ = '(';
+    for (size_t i = 0; i < n; i++) {
+        if (i) {
+            *p++ = ',';
+            *p++ = ' ';
+        }
+        size_t len = strlen(parts[i]);
+        memcpy(p, parts[i], len);
+        p += len;
+        free(parts[i]);
+    }
+    *p++ = ')';
+    *p = '\0';
+    free(parts);
+    return out;
+}
+
 static char *show_alloc(Value x) {
     char buf[32];
     switch (x.tag) {
@@ -96,6 +136,8 @@ static char *show_alloc(Value x) {
         return strdup("()");
     case TAG_TUPLE:
         return show_tuple(x.tup);
+    case TAG_DATA:
+        return show_data(x);
     default:
         return strdup("<value>");
     }
@@ -182,30 +224,29 @@ static Value tfr_3(Value self, Value s) {
 }
 static Value tfr_2(Value self, Value z) {
     Value f = env_get(self, 0);
-    return mk_closure(tfr_3, mk_tuple(2, f, z));
+    return mk_closure(tfr_3, 2, f, z);
 }
 static Value tfr_1(Value self, Value f) {
     (void)self;
-    return mk_closure(tfr_2, mk_tuple(1, f));
+    return mk_closure(tfr_2, 1, f);
 }
 Value builtin_text_fold_right;
 
 void runtime_init(void) {
-    Value empty = mk_tuple(0);
-    builtin_add = mk_closure(builtin_add_1, empty);
-    builtin_sub = mk_closure(builtin_sub_1, empty);
-    builtin_mul = mk_closure(builtin_mul_1, empty);
-    builtin_div = mk_closure(builtin_div_1, empty);
-    builtin_mod = mk_closure(builtin_mod_1, empty);
-    builtin_eq = mk_closure(builtin_eq_1, empty);
-    builtin_lt = mk_closure(builtin_lt_1, empty);
-    builtin_gt = mk_closure(builtin_gt_1, empty);
-    builtin_le = mk_closure(builtin_le_1, empty);
-    builtin_ge = mk_closure(builtin_ge_1, empty);
-    builtin_and = mk_closure(builtin_and_1, empty);
-    builtin_or = mk_closure(builtin_or_1, empty);
-    builtin_xor = mk_closure(builtin_xor_1, empty);
-    builtin_show = mk_closure(builtin_show_1, empty);
-    builtin_print_endline = mk_closure(builtin_print_endline_1, empty);
-    builtin_text_fold_right = mk_closure(tfr_1, empty);
+    builtin_add = mk_closure(builtin_add_1, 0);
+    builtin_sub = mk_closure(builtin_sub_1, 0);
+    builtin_mul = mk_closure(builtin_mul_1, 0);
+    builtin_div = mk_closure(builtin_div_1, 0);
+    builtin_mod = mk_closure(builtin_mod_1, 0);
+    builtin_eq = mk_closure(builtin_eq_1, 0);
+    builtin_lt = mk_closure(builtin_lt_1, 0);
+    builtin_gt = mk_closure(builtin_gt_1, 0);
+    builtin_le = mk_closure(builtin_le_1, 0);
+    builtin_ge = mk_closure(builtin_ge_1, 0);
+    builtin_and = mk_closure(builtin_and_1, 0);
+    builtin_or = mk_closure(builtin_or_1, 0);
+    builtin_xor = mk_closure(builtin_xor_1, 0);
+    builtin_show = mk_closure(builtin_show_1, 0);
+    builtin_print_endline = mk_closure(builtin_print_endline_1, 0);
+    builtin_text_fold_right = mk_closure(tfr_1, 0);
 }

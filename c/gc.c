@@ -36,7 +36,7 @@
 // OBJ_TEXT bodies are owned (heap) strings. They have no child Values, so they
 // need no tracing -- but they are collectable, unlike borrowed literal strings,
 // which live in the program's read-only data and are never GC objects at all.
-typedef enum { OBJ_TUPLE, OBJ_CLOSURE, OBJ_TEXT } ObjKind;
+typedef enum { OBJ_TUPLE, OBJ_CLOSURE, OBJ_TEXT, OBJ_DATA } ObjKind;
 
 // Prepended to every heap object; the Value's `tup`/`clo` points at the body
 // just past it, so HEADER/BODY convert between the two.
@@ -236,6 +236,7 @@ static void mark_obj(void *body) {
 static void mark_value(Value v) {
     if (v.tag == TAG_TUPLE) mark_obj(v.tup);
     else if (v.tag == TAG_CLOSURE) mark_obj(v.clo);
+    else if (v.tag == TAG_DATA) mark_obj(v.dat);
     // A text is owned (a live OBJ_TEXT body) or borrowed (a literal in read-only
     // data). `is_object` is exactly that distinction -- the &str/String test --
     // so only owned strings are traced; borrowed ones are left alone.
@@ -258,7 +259,13 @@ static void gc_trace(void) {
         }
         case OBJ_CLOSURE: {
             Closure *c = BODY(h);
-            mark_value(c->env);
+            for (size_t i = 0; i < c->nfree; i++) mark_value(c->caps[i]);
+            break;
+        }
+        case OBJ_DATA: {
+            Data *d = BODY(h);
+            size_t len = (h->body - sizeof(Data)) / sizeof(Value);
+            for (size_t i = 0; i < len; i++) mark_value(d->fields[i]);
             break;
         }
         case OBJ_TEXT:
@@ -429,14 +436,43 @@ void gc_init(void *stack_bottom) {
     gc_on = true;
 }
 
-Value mk_closure(Value (*code)(Value, Value), Value env) {
-    gc_reserve(sizeof(GcHeader) + sizeof(Closure));
-    Closure *c = gc_new(sizeof(Closure), OBJ_CLOSURE);
+// Shared builder: allocate a closure with `nfree` inline captures read from the
+// (already-started) `va_list`. `gc_reserve` runs before any capture is read, so
+// the captures are still live in the caller's argument area (conservatively
+// scanned) across the possible collection -- the same discipline as `mk_tuple`.
+static Value mk_closure_va(Value (*code)(Value, Value),
+                           Value (*worker)(Value, Value *), size_t arity,
+                           size_t nfree, va_list ap) {
+    size_t body = sizeof(Closure) + nfree * sizeof(Value);
+    gc_reserve(sizeof(GcHeader) + body);
+    Closure *c = gc_new(body, OBJ_CLOSURE);
     c->code = code;
-    c->env = env;
+    c->worker = worker;
+    c->arity = arity;
+    c->nfree = nfree;
+    for (size_t i = 0; i < nfree; i++) {
+        c->caps[i] = va_arg(ap, Value);
+    }
     Value v;
     v.tag = TAG_CLOSURE;
     v.clo = c;
+    return v;
+}
+
+Value mk_closure_n(Value (*code)(Value, Value), Value (*worker)(Value, Value *),
+                   size_t arity, size_t nfree, ...) {
+    va_list ap;
+    va_start(ap, nfree);
+    Value v = mk_closure_va(code, worker, arity, nfree, ap);
+    va_end(ap);
+    return v;
+}
+
+Value mk_closure(Value (*code)(Value, Value), size_t nfree, ...) {
+    va_list ap;
+    va_start(ap, nfree);
+    Value v = mk_closure_va(code, NULL, 1, nfree, ap);
+    va_end(ap);
     return v;
 }
 
@@ -473,4 +509,27 @@ Value mk_tuple(size_t len, ...) {
     v.tag = TAG_TUPLE;
     v.tup = t;
     return v;
+}
+
+Value mk_data(uint64_t tag, size_t nfields, ...) {
+    size_t body = sizeof(Data) + nfields * sizeof(Value);
+    gc_reserve(sizeof(GcHeader) + body);
+    Data *d = gc_new(body, OBJ_DATA);
+    d->tag = tag;
+    va_list ap;
+    va_start(ap, nfields);
+    for (size_t i = 0; i < nfields; i++) {
+        d->fields[i] = va_arg(ap, Value);
+    }
+    va_end(ap);
+    Value v;
+    v.tag = TAG_DATA;
+    v.dat = d;
+    return v;
+}
+
+// Field count of a live constructor value, recovered from its heap header's body
+// size (the count is not stored in the object itself).
+size_t data_len(Value v) {
+    return (HEADER(v.dat)->body - sizeof(Data)) / sizeof(Value);
 }

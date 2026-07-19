@@ -8,8 +8,13 @@
     )
   (import (chezscheme))
 
+  ;; Match the C runtime's `show`: a Marmelade Bool is a Scheme boolean, which
+  ;; `~a` would render as #t/#f -- render it as true/false instead. Other scalars
+  ;; already agree under ~a.
   (define (show x)
-    (format "~a" x))
+    (if (boolean? x)
+        (if x "true" "false")
+        (format "~a" x)))
 
   (define (print-endline x)
     (display x)

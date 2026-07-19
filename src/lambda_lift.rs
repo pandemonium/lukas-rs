@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    cell::Cell,
+    collections::{HashMap, HashSet},
     fmt,
     rc::Rc,
     sync::atomic::{AtomicU32, Ordering},
@@ -8,7 +9,7 @@ use std::{
 use crate::{
     ast::{
         Apply, Literal,
-        namer::{QualifiedName, Symbol, SymbolName},
+        namer::{QualifiedName, Symbol, SymbolName, TypeDefinition},
         pattern::MatchClause,
     },
     closed::{self, CaptureInfo, Closed, Expr, Identifier, LexicalLevel},
@@ -30,6 +31,22 @@ impl closed::SymbolTable {
         // `MakeClosure` -- evaluated once). Codegen emits the former as C
         // functions and the latter as initialized C globals; the distinction is
         // erased if both share one list, so keep them apart.
+        // Assign each sum-type constructor an integer tag: its position within
+        // its type's constructor list. A `deconstruct` only ever tests a value
+        // against its own type's constructors, so per-type ordinals are a sound
+        // discriminant. Built before the term symbols are drained below; type
+        // symbols stay in the table.
+        let mut constructor_tags: HashMap<QualifiedName, u64> = HashMap::default();
+        for symbol in self.symbols.values() {
+            if let Symbol::Type(type_symbol) = symbol {
+                if let TypeDefinition::Coproduct(coproduct) = &type_symbol.definition {
+                    for (tag, constructor) in coproduct.constructors.iter().enumerate() {
+                        constructor_tags.insert(constructor.name.clone(), tag as u64);
+                    }
+                }
+            }
+        }
+
         let mut functions = Vec::default();
         let mut globals = Vec::default();
 
@@ -79,12 +96,24 @@ impl closed::SymbolTable {
         // `arities` too, so codegen direct-calls them like the foreign ones).
         let workers = synthesize_workers(&functions, &globals, &mut arities);
 
+        // Uncurried workers attached to closure *values*: for every non-recursive
+        // curried chain, so a saturated `apply_n` of the closure runs the whole
+        // chain without allocating its per-stage currying closures (see below).
+        let chain_workers = synthesize_chain_workers(&functions);
+        let chain_heads = chain_workers
+            .iter()
+            .map(|w| (w.head.clone(), w.arity))
+            .collect();
+
         Program {
             functions,
             globals,
             foreign,
             arities,
             workers,
+            chain_workers,
+            chain_heads,
+            constructor_tags,
             start: Expr::Apply(
                 CaptureInfo::dummy(),
                 Apply {
@@ -309,6 +338,204 @@ fn synthesize_workers(
     workers
 }
 
+// Extract the environment-tuple element identifiers of a stage's `MakeClosure`.
+// `make_environment_tuple` always builds the environment as a tuple of bare
+// `Variable`s, so anything else means we can't reason about the chain and bail.
+fn env_identifiers(environment: &Expr) -> Option<Vec<Identifier>> {
+    let Expr::Tuple(_, tuple) = environment else {
+        return None;
+    };
+    tuple
+        .elements
+        .iter()
+        .map(|element| match element.as_ref() {
+            Expr::Variable(_, id) => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+// Flattens a non-recursive curried chain `S1 -> S2 -> ... -> Sk` into a single
+// k-ary frame. `stage_envs[s]` (for s in 2..=arity) holds the identifiers of
+// stage `s`'s environment tuple -- i.e. how stage `s-1`'s frame sources each of
+// stage `s`'s captures. `resolve(j, id)` rewrites an identifier as seen in stage
+// `j`'s frame into the flat worker frame, chasing captures outward through the
+// stage environments until they bottom out at a worker parameter (an outer
+// stage's own parameter) or one of the chain head's own captures (kept as a
+// `Captured`, read from the worker's `self`).
+struct ChainFlatten {
+    arity: usize,
+    stage_envs: Vec<Vec<Identifier>>,
+    failed: Cell<bool>,
+}
+
+impl ChainFlatten {
+    fn resolve(&self, stage: usize, id: &Identifier) -> Identifier {
+        match id {
+            // A stage's own parameter is `Local(0)`; it becomes worker parameter
+            // `stage - 1` (stage 1's parameter is arg 0, stage 2's is arg 1, ...).
+            Identifier::Local(LexicalLevel(0)) => Identifier::Local(LexicalLevel(stage - 1)),
+            // An inner binder of the innermost body (`let`/pattern), above the
+            // stage parameter, shifts past the `arity` flattened parameters.
+            Identifier::Local(LexicalLevel(level)) => {
+                Identifier::Local(LexicalLevel(self.arity - 1 + level))
+            }
+            // A capture of stage 1 is a capture of the head closure itself, so it
+            // stays a `Captured` read from the worker's `self`. A capture of a
+            // deeper stage is sourced by the enclosing stage's frame -- follow it.
+            Identifier::Captured(index) => {
+                if stage <= 1 {
+                    Identifier::Captured(*index)
+                } else {
+                    match self
+                        .stage_envs
+                        .get(stage)
+                        .and_then(|env| env.get(index.index()))
+                    {
+                        Some(source) => self.resolve(stage - 1, &source.clone()),
+                        None => {
+                            self.failed.set(true);
+                            Identifier::SelfRef
+                        }
+                    }
+                }
+            }
+            // A bare self-reference only makes sense for the head closure (stage
+            // 1). Anywhere deeper it would name a stage closure we have flattened
+            // away -- i.e. the chain recurses through a stage, which we can't
+            // uncurry -- so mark the whole attempt failed.
+            Identifier::SelfRef => {
+                if stage <= 1 {
+                    Identifier::SelfRef
+                } else {
+                    self.failed.set(true);
+                    Identifier::SelfRef
+                }
+            }
+            Identifier::Global(name) => Identifier::Global(name.clone()),
+        }
+    }
+
+    // Rewrite the innermost stage's body (in stage `arity`'s frame) into the flat
+    // worker frame. Mirrors `FrameRemap::flatten`: `Expr::map` does not descend
+    // into `MakeClosure` environments or rebind `Let`/pattern binders, so those
+    // are remapped explicitly.
+    fn flatten(&self, body: Expr) -> Expr {
+        let stage = self.arity;
+        body.map(&mut |e| match e {
+            Expr::Variable(a, id) => Expr::Variable(a, self.resolve(stage, &id)),
+            Expr::Let(a, mut binding) => {
+                binding.binder = self.resolve(stage, &binding.binder);
+                Expr::Let(a, binding)
+            }
+            Expr::Deconstruct(a, mut deconstruct) => {
+                deconstruct.match_clauses = deconstruct
+                    .match_clauses
+                    .into_iter()
+                    .map(|clause| MatchClause {
+                        pattern: clause.pattern.map_id(&|id| self.resolve(stage, &id)),
+                        consequent: clause.consequent,
+                    })
+                    .collect();
+                Expr::Deconstruct(a, deconstruct)
+            }
+            Expr::MakeClosure(a, mut info) => {
+                info.environment = Box::new(self.flatten((*info.environment).clone()));
+                Expr::MakeClosure(a, info)
+            }
+            other => other,
+        })
+    }
+}
+
+// Build a `ChainWorker` for every non-recursive curried chain, attaching an
+// uncurried worker to the chain's head closure value so a saturated `apply_n`
+// runs the whole chain in one flat frame with no intermediate closures.
+//
+// A "chain head" is a lifted function whose body is directly a `MakeClosure` of
+// another lifted function (i.e. it just returns the next curry stage) and which
+// is *not* itself an inner stage of a longer chain -- otherwise we would build
+// redundant workers for every suffix. Recursive chains (a `SelfRef` survives the
+// flatten) are left on the curried path.
+fn synthesize_chain_workers(functions: &[LiftedFunction]) -> Vec<ChainWorker> {
+    let fn_index: HashMap<&QualifiedName, usize> = functions
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (&f.name, i))
+        .collect();
+
+    // Every lifted function that appears as *the whole body* of another lifted
+    // function is an inner stage of that function's chain; only the topmost head
+    // of each chain should carry a worker.
+    let inner_stages: HashSet<&QualifiedName> = functions
+        .iter()
+        .filter_map(|f| match strip_ascription(&f.code) {
+            Expr::MakeClosure(_, info) if !info.is_recursive => Some(&info.lifted_name),
+            _ => None,
+        })
+        .collect();
+
+    let mut chain_workers = Vec::new();
+    for head in functions {
+        if inner_stages.contains(&head.name) {
+            continue;
+        }
+        if let Some((arity, body)) = try_flatten_chain(head, functions, &fn_index) {
+            chain_workers.push(ChainWorker {
+                head: head.name.clone(),
+                arity,
+                body,
+            });
+        }
+    }
+    chain_workers
+}
+
+// Walk the chain from `head`, collecting each stage's environment, then flatten
+// the innermost body. Returns `None` for a length-1 "chain" (nothing to
+// uncurry) or when the body cannot be soundly flattened (a stage recurses).
+fn try_flatten_chain(
+    head: &LiftedFunction,
+    functions: &[LiftedFunction],
+    fn_index: &HashMap<&QualifiedName, usize>,
+) -> Option<(usize, Expr)> {
+    // `stage_envs[s]` = stage s's environment identifiers (s >= 2); slots 0,1 are
+    // unused so indexing lines up with the 1-based stage numbering in `resolve`.
+    let mut stage_envs: Vec<Vec<Identifier>> = vec![Vec::new(), Vec::new()];
+    let mut current = head;
+    let mut arity = 1usize;
+
+    while let Expr::MakeClosure(_, info) = strip_ascription(&current.code) {
+        if info.is_recursive {
+            break;
+        }
+        let Some(&next) = fn_index.get(&info.lifted_name) else {
+            break;
+        };
+        let Some(env) = env_identifiers(&info.environment) else {
+            break;
+        };
+        stage_envs.push(env);
+        arity += 1;
+        current = &functions[next];
+    }
+
+    if arity < 2 {
+        return None;
+    }
+
+    let flatten = ChainFlatten {
+        arity,
+        stage_envs,
+        failed: Cell::new(false),
+    };
+    let body = flatten.flatten(current.code.clone());
+    if flatten.failed.get() {
+        return None;
+    }
+    Some((arity, body))
+}
+
 #[derive(Debug)]
 struct Crane {
     target_module: IdentifierPath,
@@ -425,7 +652,35 @@ pub struct Program {
     pub arities: HashMap<QualifiedName, usize>,
     /// Uncurried workers for the user functions in `arities`.
     pub workers: Vec<Worker>,
+    /// Uncurried workers attached to closure *values* (via `mk_closure_n`), one
+    /// per non-recursive curried chain of arity >= 2. `chain_heads` maps a
+    /// chain's stage-1 lifted-function name to its arity, so codegen knows which
+    /// `MakeClosure` sites to emit as `mk_closure_n` (with the worker) rather
+    /// than a plain `mk_closure`.
+    pub chain_workers: Vec<ChainWorker>,
+    pub chain_heads: HashMap<QualifiedName, usize>,
+    /// Runtime tag for each sum-type constructor: its ordinal within its type's
+    /// constructor list. Codegen emits it in `mk_data` and compares it in
+    /// constructor patterns (an integer test, replacing the old string tag).
+    pub constructor_tags: HashMap<QualifiedName, u64>,
     pub start: Expr,
+}
+
+/// An uncurried worker for a non-recursive curried chain `λa. λb. ... body`,
+/// attached to the chain's head closure value. Emitted with the uniform
+/// `apply_n` calling convention `Value <head>_uworker(Value self, Value *args)`
+/// -- `self` is the head closure (so `env_get(self, i)` still reads the chain's
+/// captures) and `args[0..arity]` are the flattened parameters. `body` is the
+/// innermost stage's body with every intermediate stage's binder and captured
+/// parameter substituted into this one flat frame, so running it allocates none
+/// of the currying-stage closures the curried `code` path would.
+#[derive(Debug, Clone)]
+pub struct ChainWorker {
+    /// The chain's stage-1 lifted-function name; the C worker is named
+    /// `<head>_uworker` and the head's `MakeClosure` carries a pointer to it.
+    pub head: QualifiedName,
+    pub arity: usize,
+    pub body: Expr,
 }
 
 /// A top-level definition (`name := value`). For a function definition `value`
@@ -499,6 +754,9 @@ impl fmt::Display for Program {
             foreign,
             arities: _,
             workers: _,
+            chain_workers: _,
+            chain_heads: _,
+            constructor_tags: _,
             start,
         } = self;
 
