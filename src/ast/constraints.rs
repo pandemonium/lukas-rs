@@ -85,6 +85,13 @@ impl WitnessEnvironment {
             .push(witness);
     }
 
+    /// The registered witness a given symbol name elaborates to, if any. Used by
+    /// constraint discharge to bind a witness's dictionary parameters in the same
+    /// order `resolve_witness` supplies its premises (see `premises`).
+    pub fn witness_named(&self, name: &QualifiedName) -> Option<&Witness> {
+        self.store.values().flatten().find(|w| &w.name == name)
+    }
+
     pub fn dependency_matrix(
         &self,
         ctx: &TypeEnvironment,

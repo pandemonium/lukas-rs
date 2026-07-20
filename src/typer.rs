@@ -1109,6 +1109,41 @@ fn resolve_constraints(
         }
     }
 
+    // If this term *is* a witness, its dictionary parameters must be bound in the
+    // exact order `resolve_witness` supplies the premise dictionaries at a use site
+    // -- i.e. the registered witness's `premises` Vec order. The `params` order
+    // above follows the *wanted* BTreeSet, which sorts by the class constructor
+    // first and only falls through to the (metavariable) argument when two
+    // constraints share a class. Those metavariables are numbered independently in
+    // the registration pass and this body pass, so two same-class premises
+    // (`Display α + Display e`) can come out reversed here relative to the caller,
+    // landing the dictionaries in swapped slots. Reorder `params` to follow the
+    // registered premises, translated into this body's metavariables by unifying
+    // the registered head against the body's head type. For single premises and
+    // for premises of distinct classes the two orders already agree, so this is a
+    // no-op except for the same-class case it exists to fix.
+    if let Some(witness) = witnesses.witness_named(symbol_name)
+        && let Ok(subst) = witness
+            .head
+            .constraint_type
+            .unified_with(&tree.type_info().inferred_type, &ctx.types)
+    {
+        // A witness's leading dictionary parameters *are* its premises, in premise
+        // order: the caller supplies exactly those, so bind exactly those. Start
+        // from the premises (fixing both order and, when the body only uses some of
+        // them, count -- an unused premise still needs its slot, or the caller's
+        // extra dictionary over-applies the witness), then append any wanted-derived
+        // param not among them (defensive; shouldn't arise for a witness).
+        let mut ordered: Vec<Constraint> =
+            witness.premises.iter().map(|c| c.apply(&subst)).collect();
+        for p in &params {
+            if !ordered.contains(p) {
+                ordered.push(p.clone());
+            }
+        }
+        params = ordered;
+    }
+
     tracing::trace!(
         "{symbol_name} params: {:?} projections {:?} resolvable {:?}",
         &params,
