@@ -33,6 +33,7 @@ typedef enum {
     TAG_CLOSURE,
     TAG_TUPLE,
     TAG_DATA,
+    TAG_OBJECT, // a GC object (Buffer/Mmap/Slice); GcHeader.kind selects its layout + tracing
 } Tag;
 
 struct Value {
@@ -45,6 +46,7 @@ struct Value {
         Closure *clo;
         Tuple *tup;
         Data *dat;
+        void *obj; // GC-object body (TAG_OBJECT), traced by GcHeader.kind
     };
 };
 
@@ -90,6 +92,7 @@ static inline Value VBool(bool x)       { Value v; v.tag = TAG_BOOL; v.b = x; re
 static inline Value VChar(char x)       { Value v; v.tag = TAG_CHAR; v.c = x; return v; }
 static inline Value VUnit_(void)        { Value v; v.tag = TAG_UNIT; v.i = 0; return v; }
 #define VUnit() (VUnit_())
+static inline Value VObject(void *p)    { Value v; v.tag = TAG_OBJECT; v.obj = p; return v; }
 
 // Truthiness of a Bool value, for `if`.
 static inline bool as_bool(Value v) { return v.b; }

@@ -209,6 +209,16 @@ impl WitnessEnvironment {
             return Ok(evidence.clone());
         }
 
+        // A variable-headed constraint (`Functor m`, `m` abstract) can only be
+        // discharged by an assumption -- a dictionary parameter of the enclosing
+        // declaration. No concrete witness applies: unifying one here would ground
+        // the abstract variable against the witness head, fabricating a nonsensical
+        // (often self-nested) dictionary. Fail instead, so the caller's param logic
+        // is forced to bind the parameter this premise needs.
+        if constraint.is_parametric() {
+            return Err(TypeError::NoWitness(constraint.clone()));
+        }
+
         let candidates = self
             .store
             .get(constraint.name())
@@ -272,6 +282,29 @@ impl WitnessEnvironment {
         }
 
         Err(TypeError::NoWitness(constraint.clone()))
+    }
+
+    /// The premises a witness for `constraint` would require, with the witness's
+    /// quantifier variables substituted to match the query. Lets the discharge
+    /// logic surface a resolvable constraint's *parametric* premises (e.g. the
+    /// `Functor m` behind `Functor (ExceptT m e)`) so the enclosing declaration
+    /// binds a dictionary parameter for them rather than having `resolve_witness`
+    /// ground the abstract premise. Empty if no witness head matches.
+    pub fn premises_of(&self, constraint: &Constraint, ctx: &TypeEnvironment) -> Vec<Constraint> {
+        let Some(candidates) = self.store.get(constraint.name()) else {
+            return Vec::new();
+        };
+        candidates
+            .iter()
+            .find_map(|witness| {
+                witness
+                    .head
+                    .constraint_type
+                    .unified_with(&constraint.constraint_type, ctx)
+                    .ok()
+                    .map(|subst| witness.premises.iter().map(|c| c.apply(&subst)).collect())
+            })
+            .unwrap_or_default()
     }
 }
 

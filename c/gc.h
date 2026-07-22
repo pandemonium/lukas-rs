@@ -40,4 +40,57 @@ void gc_collect(void);
 extern Value *const gc_user_roots[];
 extern const size_t gc_user_roots_count;
 
+// --------------------------------------------------------------- byte buffers
+// Three GC object kinds for byte handling (see gc.c). A Buffer is a mutable,
+// growable heap byte region; a Slice is an immutable view that borrows a Buffer
+// or an Mmap; an Mmap is a handle to a memory-mapped file whose region lives
+// outside the GC heap (released manually, never by the collector).
+Value  mk_buffer(size_t cap);
+void   buffer_put_u8(Value buf, uint8_t byte);   // in-place write; the handle is stable
+void   buffer_put_bytes(Value buf, const uint8_t *src, size_t n);
+void   buffer_put_16_le(Value buf, int64_t v);
+void   buffer_put_32_le(Value buf, int64_t v);
+void   buffer_put_64_le(Value buf, int64_t v);
+void   buffer_put_16_be(Value buf, int64_t v);
+void   buffer_put_32_be(Value buf, int64_t v);
+void   buffer_put_64_be(Value buf, int64_t v);
+void   buffer_put_slice(Value buf, Value slice);
+size_t buffer_len(Value buf);
+Value  buffer_move(Value buf); // -> Slice sharing the buffer's body (caller must not reuse buf)
+Value  buffer_copy(Value buf); // -> Slice over a fresh copy of the buffer's bytes
+Value  buffer_move_range(Value buf, size_t off, size_t n); // -> Result(Fault -1 | Return Slice); zero-copy [off,off+n), resets buf
+Value  buffer_copy_range(Value buf, size_t off, size_t n); // -> Result; independent copy of [off,off+n)
+
+Value   mk_slice(void *owner, size_t offset, size_t len);
+size_t  slice_len(Value slice);
+uint8_t slice_get_u8(Value slice, size_t i);
+Value   slice_sub(Value slice, size_t offset, size_t len);
+
+uint16_t slice_get_u16_le(Value slice, size_t off);
+uint32_t slice_get_u32_le(Value slice, size_t off);
+uint64_t slice_get_u64_le(Value slice, size_t off);
+int16_t  slice_get_i16_le(Value slice, size_t off);
+int32_t  slice_get_i32_le(Value slice, size_t off);
+int64_t  slice_get_i64_le(Value slice, size_t off);
+uint16_t slice_get_u16_be(Value slice, size_t off);
+uint32_t slice_get_u32_be(Value slice, size_t off);
+uint64_t slice_get_u64_be(Value slice, size_t off);
+int16_t  slice_get_i16_be(Value slice, size_t off);
+int32_t  slice_get_i32_be(Value slice, size_t off);
+int64_t  slice_get_i64_be(Value slice, size_t off);
+
+// Memory-mapped files. `mmap_open` returns a Result (Fault errno | Return Mmap);
+// `mmap_close` munmaps (idempotent); `mmap_read` copies a range out into a Slice.
+Value mmap_open(const char *path);
+void  mmap_close(Value mmap);
+Value mmap_read(Value mmap, size_t off, size_t n);   // copies out into a heap Slice
+Value mmap_slice(Value mmap, size_t off, size_t n);  // zero-copy Slice borrowing the region
+
+int64_t mmap_len(Value mmap);                        // direct mapped-region reads (Byte_Source Mmap)
+int64_t mmap_get_u8(Value mmap, int64_t i);
+bool    mmap_is_closed(Value mmap);
+
+// Write a slice's bytes to a file (truncating). Returns 0 on success, else errno.
+int64_t slice_write_file(Value slice, const char *path);
+
 #endif // MARMELADE_GC_H

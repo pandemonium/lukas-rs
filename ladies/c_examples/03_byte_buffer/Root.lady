@@ -1,0 +1,49 @@
+use Stdlib.
+
+(* Byte buffers, slices, and typed reads over the C runtime GC objects. *)
+(* The raw_* primitives are foreign, hence private to this module; the *)
+(* opaque Buffer/Slice handles and the surface below are the only way in. *)
+module Bytes:
+  foreign Raw_Buffer
+  foreign Raw_Slice
+
+  foreign raw_new_buffer :: Int -> Raw_Buffer
+  foreign raw_put_u8     :: Raw_Buffer -> Int -> Raw_Buffer
+  foreign raw_move       :: Raw_Buffer -> Raw_Slice
+  foreign raw_slice_len  :: Raw_Slice -> Int
+  foreign raw_get_u8     :: Raw_Slice -> Int -> Int
+  foreign raw_get_i32_le :: Raw_Slice -> Int -> Int
+
+  opaque Buffer ::= Buffer Raw_Buffer         (* mutable, growable: the write side *)
+  opaque Slice  ::= Slice Raw_Slice           (* immutable view: the read side *)
+
+  new_buffer :: Int -> Buffer := λcap. Buffer (raw_new_buffer cap)
+
+  (* put_u8 returns the possibly-relocated buffer, so it threads through. *)
+  put_u8 :: Int -> Buffer -> Buffer := λbyte (Buffer buf).
+    Buffer (raw_put_u8 buf byte)
+
+  (* move hands the buffer bytes to an immutable Slice, zero-copy. *)
+  finish :: Buffer -> Slice := λ(Buffer buf). Slice (raw_move buf)
+
+  length     :: Slice -> Int        := λ(Slice s). raw_slice_len s
+  get_u8     :: Slice -> Int -> Int := λ(Slice s) i. raw_get_u8 s i
+  get_i32_le :: Slice -> Int -> Int := λ(Slice s) off. raw_get_i32_le s off
+
+(* Build 'H' 'i' then the little-endian i32 0x01020304, then read it back. *)
+message :: Bytes.Slice :=
+  let b0 = Bytes.new_buffer 8      in
+  let b1 = Bytes.put_u8 72  b0     in
+  let b2 = Bytes.put_u8 105 b1     in
+  let b3 = Bytes.put_u8 4   b2     in
+  let b4 = Bytes.put_u8 3   b3     in
+  let b5 = Bytes.put_u8 2   b4     in
+  let b6 = Bytes.put_u8 1   b5     in
+  Bytes.finish b6
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline (prim_show (Bytes.length message))
+  print_endline (prim_show (Bytes.get_u8 message 0))
+  print_endline (prim_show (Bytes.get_u8 message 1))
+  print_endline (prim_show (Bytes.get_i32_le message 2))

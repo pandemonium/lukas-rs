@@ -2,6 +2,7 @@ module Prelude.
 module Control.
 module IO.
 module Data.
+module Binary.
 (* module Files. *)
 
 use Stdlib.Prelude.

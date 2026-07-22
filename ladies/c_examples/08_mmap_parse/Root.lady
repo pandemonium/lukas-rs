@@ -1,0 +1,104 @@
+use Stdlib.
+use Stdlib.Binary.
+
+(* Parse a small binary file format by mmapping it and reading through the Get *)
+(* monad: the source lives IN the monad (a Reader) alongside the cursor (State), *)
+(* so the reads are nullary -- no `s` threaded on every line -- and the source is *)
+(* supplied once, at `run_get`. A short/truncated input faults Out_of_bounds. *)
+(*                                                                             *)
+(* Format "MARM" (all big-endian):                                            *)
+(*   magic   : u32   = 'M''A''R''M'                                            *)
+(*   version : u8                                                             *)
+(*   count   : u16                                                            *)
+(*   then `count` records, each: id : u16, value : u32                        *)
+
+path :: Text := "/tmp/marm_records.bin"
+
+Record ::= MkRecord Int Int                    (* id, value *)
+Parsed ::= MkParsed Int Int Int (List Record)  (* magic, version, count, records *)
+
+(* ---- writing: lay the format down into a Buffer, immediate/IO ---- *)
+payload :: Put Unit :=
+  let* _ = put_u8     77 in       (* 'M' *)
+  let* _ = put_u8     65 in       (* 'A' *)
+  let* _ = put_u8     82 in       (* 'R' *)
+  let* _ = put_u8     77 in       (* 'M' *)
+  let* _ = put_u8     1  in       (* version *)
+  let* _ = put_u16_be 2  in       (* count *)
+  let* _ = put_u16_be 257  in     (* record 0: id  *)
+  let* _ = put_u32_be 42   in     (* record 0: val *)
+  let* _ = put_u16_be 514  in     (* record 1: id  *)
+  put_u32_be 1000                 (* record 1: val *)
+
+build :: IO Bytes :=
+  let* b = new_buffer 32 in
+  let* _ = run_put payload b in
+  move b
+
+(* ---- reading: the parser, in the Get monad. No source argument anywhere. ---- *)
+records :: Int -> Get Read_Error (List Record) := λn.
+  if n <= 0
+    then pure Nil
+    else
+      let* id   = u16_be in
+      let* val  = u32_be in
+      let* rest = records (n - 1) in
+      pure (Cons (MkRecord id val) rest)
+
+parse :: Get Read_Error Parsed :=
+  let* magic   = u32_be in
+  let* version = u8 in
+  let* count   = u16_be in
+  let* recs    = records count in
+  pure (MkParsed magic version count recs)
+
+sum_vals :: List Record -> Int := fold_right (λ(MkRecord _ v) acc. v + acc) 0
+
+print_recs :: List Record -> IO Unit := λrecs.
+  deconstruct recs into
+    Nil -> pure ()
+  | Cons (MkRecord id v) rest ->
+      let* _ = IO.output "`id`=`v`" in
+      print_recs rest
+
+print_parse :: Bytes -> IO Unit := λs.
+  deconstruct run_get parse s into
+    Fault _  -> IO.output "parse failed"
+  | Return p ->
+      let MkParsed magic version count recs = p in
+      let total = sum_vals recs in
+      let* _ = IO.output "magic `magic`" in
+      let* _ = IO.output "version `version`" in
+      let* _ = IO.output "count `count`" in
+      let* _ = print_recs recs in
+      IO.output "sum `total`"
+
+(* Run the same parser against only the first 8 bytes -- header but not records -- *)
+(* so the record loop runs the cursor off the end and faults. *)
+print_trunc :: Bytes -> IO Unit := λs.
+  deconstruct slice s 0 8 into
+    Fault _  -> IO.output "truncated: slice failed"
+  | Return sub ->
+      deconstruct run_get parse sub into
+        Fault _  -> IO.output "truncated: out of bounds"
+      | Return _ -> IO.output "truncated: unexpectedly ok"
+
+use_map :: Mmap -> IO (Result Mmap_Error Unit) := λm.
+  deconstruct view_all m into
+    Fault e  -> pure (Fault e)
+  | Return s ->
+      let* _ = print_parse s in
+      let* _ = print_trunc s in
+      pure (Return ())
+
+program :: IO Unit :=
+  let* payload = build in
+  let* _       = write_file payload path in
+  let* result  = with_mmap path use_map in
+  deconstruct result into
+    Fault _  -> IO.output "mmap-failed"
+  | Return _ -> pure ()
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  IO.unsafeRunIO program

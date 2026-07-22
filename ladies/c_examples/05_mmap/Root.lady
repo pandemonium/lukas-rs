@@ -1,0 +1,37 @@
+use Stdlib.
+use Stdlib.Binary.
+
+path :: Text := "/tmp/marm_mem_mmap.bin"
+
+(* Build a couple of bytes, write them to a file, mmap it, take a zero-copy Bytes *)
+(* view of a range, and read byte 0 back -- through the same Get path as the heap. *)
+(* Mmap_Error only appears at the view/open boundary; per-byte reads fault only *)
+(* out of bounds (Read_Error). *)
+payload :: Put Unit :=
+  let* _ = put_u8 222 in
+  put_u8 173
+
+build_payload :: IO Bytes :=
+  let* b = new_buffer 4 in
+  let* _ = run_put payload b in
+  move b
+
+read_first :: Get Read_Error Int := u8
+
+(* Inside the mapping: view the first two bytes, then read byte 0 through it. *)
+use_map :: Mmap -> IO (Result Mmap_Error (Result Read_Error Int)) := λm.
+  deconstruct view m 0 2 into
+    Fault e    -> pure (Fault e)
+  | Return bs  -> pure (Return (run_get read_first bs))
+
+program :: IO Unit :=
+  let* payload = build_payload in
+  let* _       = write_file payload path in
+  let* result  = with_mmap path use_map in
+  deconstruct result into
+    Fault _  -> IO.output "mmap-failed"
+  | Return r -> IO.output (display r)
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  IO.unsafeRunIO program

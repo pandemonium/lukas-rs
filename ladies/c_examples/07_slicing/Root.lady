@@ -1,0 +1,51 @@
+use Stdlib.
+use Stdlib.Binary.
+
+(* Build [10,20,30,40], then exercise the ranged Buffer -> Bytes producers *)
+(* (copy_range: independent; move_range: zero-copy) plus a further zero-copy *)
+(* slice of the moved bytes. Ranged producers fault Out_of_range; slice faults *)
+(* Out_of_bounds. *)
+payload :: Put Unit :=
+  let* _ = put_u8 10 in
+  let* _ = put_u8 20 in
+  let* _ = put_u8 30 in
+  put_u8 40
+
+fill :: IO Buffer :=
+  let* b = new_buffer 8 in
+  let* _ = run_put payload b in
+  pure b
+
+pair :: Get Read_Error Int :=
+  let* x = u8 in
+  let* y = u8 in
+  pure (x + y)
+
+(* Read a pair out of a Buffer-range result. *)
+buf_pair :: Result Buffer_Error Bytes -> Text := λr.
+  deconstruct r into
+    Fault _    -> "out of range"
+  | Return sub -> display (run_get pair sub)
+
+(* From a moved Bytes, take a zero-copy sub-slice and read a pair out of it. *)
+sliced_pair :: Result Buffer_Error Bytes -> Text := λr.
+  deconstruct r into
+    Fault _  -> "out of range"
+  | Return s ->
+      deconstruct slice s 1 2 into
+        Fault _    -> "out of bounds"
+      | Return sub -> display (run_get pair sub)
+
+program :: IO Unit :=
+  let* b   = fill in
+  let* c   = copy_range b 1 2 in   (* independent [20,30] -> 50 *)
+  let* _   = IO.output (buf_pair c) in
+  let* bad = copy_range b 3 5 in   (* off+len > len -> out of range *)
+  let* _   = IO.output (buf_pair bad) in
+  let* m   = move_range b 0 3 in   (* zero-copy [10,20,30]; resets b *)
+  let* _   = IO.output (buf_pair m) in     (* 10 + 20 = 30 *)
+  IO.output (sliced_pair m)                (* slice [1,2) = [20,30] -> 50 *)
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  IO.unsafeRunIO program

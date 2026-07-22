@@ -8,6 +8,12 @@
 #include <string.h>
 #include <time.h>
 
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 // ===========================================================================
 // Garbage collector: generational, conservative mark-sweep, non-moving, backed
 // by a slab allocator.
@@ -36,7 +42,26 @@
 // OBJ_TEXT bodies are owned (heap) strings. They have no child Values, so they
 // need no tracing -- but they are collectable, unlike borrowed literal strings,
 // which live in the program's read-only data and are never GC objects at all.
-typedef enum { OBJ_TUPLE, OBJ_CLOSURE, OBJ_TEXT, OBJ_DATA } ObjKind;
+typedef enum {
+    OBJ_TUPLE,
+    OBJ_CLOSURE,
+    OBJ_TEXT,
+    OBJ_DATA,
+    OBJ_BUFFER, // a stable handle {bytes, len, cap} onto an OBJ_BYTES body
+    OBJ_BYTES,  // raw byte body (leaf); a Buffer's bytes, grown by reallocation
+    OBJ_MMAP,   // handle to a memory-mapped region (region lives outside the heap)
+    OBJ_SLICE,  // immutable view; owner is an OBJ_BYTES body or an OBJ_MMAP handle
+} ObjKind;
+
+// Byte-handling bodies (all reached through TAG_OBJECT; GcHeader.kind picks which).
+// A Buffer is a STABLE handle onto a separate OBJ_BYTES body: growth reallocates
+// the body and updates the handle in place, so the handle's identity never moves
+// and a write has nothing to return. A Slice borrows an OBJ_BYTES body or an Mmap
+// handle through `owner` (a real GC-body pointer, so the tracer keeps it live)
+// plus an offset/length. An Mmap wraps a region that is NOT GC memory.
+typedef struct { void *bytes; size_t len; size_t cap; } Buffer;
+typedef struct { uint8_t *region; size_t len; bool closed; } Mmap;
+typedef struct { void *owner; size_t offset; size_t len; } Slice;
 
 // Prepended to every heap object; the Value's `tup`/`clo` points at the body
 // just past it, so HEADER/BODY convert between the two.
@@ -241,6 +266,7 @@ static void mark_value(Value v) {
     // data). `is_object` is exactly that distinction -- the &str/String test --
     // so only owned strings are traced; borrowed ones are left alone.
     else if (v.tag == TAG_TEXT && is_object((uintptr_t)v.s)) mark_obj((void *)v.s);
+    else if (v.tag == TAG_OBJECT) mark_obj(v.obj);
 }
 
 // A conservative root candidate: mark it only if it is exactly a live object.
@@ -269,7 +295,19 @@ static void gc_trace(void) {
             break;
         }
         case OBJ_TEXT:
-            break; // a string body holds no Values -- nothing to trace
+        case OBJ_BYTES: // raw bytes, no child Values
+        case OBJ_MMAP:  // region pointer + flags, no child Values
+            break;
+        case OBJ_BUFFER: {
+            Buffer *b = BODY(h);
+            mark_obj(b->bytes); // handle -> its bytes body
+            break;
+        }
+        case OBJ_SLICE: {
+            Slice *s = BODY(h);
+            mark_obj(s->owner); // owner is a live OBJ_BYTES body or OBJ_MMAP handle
+            break;
+        }
         }
     }
 }
@@ -532,4 +570,245 @@ Value mk_data(uint64_t tag, size_t nfields, ...) {
 // size (the count is not stored in the object itself).
 size_t data_len(Value v) {
     return (HEADER(v.dat)->body - sizeof(Data)) / sizeof(Value);
+}
+
+// ----------------------------------------------------------------- byte buffers
+Value mk_buffer(size_t cap) {
+    if (cap == 0) cap = 16;
+    gc_reserve(sizeof(GcHeader) + cap);
+    void *body = gc_new(cap, OBJ_BYTES); // stays live on the stack across the next reserve
+    gc_reserve(sizeof(GcHeader) + sizeof(Buffer));
+    Buffer *b = gc_new(sizeof(Buffer), OBJ_BUFFER);
+    b->bytes = body;
+    b->len = 0;
+    b->cap = cap;
+    return VObject(b);
+}
+
+// A write is a side effect -- nothing to return. The handle never moves: on
+// overflow we reallocate the *body* and update the handle in place. `bv` stays
+// live on the stack across the collection `gc_new` may trigger, and the handle
+// keeps the old body live through its trace, so the memcpy source survives.
+void buffer_put_u8(Value bv, uint8_t byte) {
+    Buffer *b = bv.obj;
+    if (b->len == b->cap) {
+        size_t ncap = b->cap * 2;
+        gc_reserve(sizeof(GcHeader) + ncap);
+        void *nbody = gc_new(ncap, OBJ_BYTES);
+        b = bv.obj;
+        memcpy(nbody, b->bytes, b->len);
+        b->bytes = nbody;
+        b->cap = ncap;
+    }
+    ((uint8_t *)b->bytes)[b->len++] = byte;
+}
+
+void buffer_put_bytes(Value bv, const uint8_t *src, size_t n) {
+    for (size_t i = 0; i < n; i++) buffer_put_u8(bv, src[i]);
+}
+
+size_t buffer_len(Value bv) { return ((Buffer *)bv.obj)->len; }
+
+// Typed writes: append a width's worth of bytes in the given order. Signed and
+// unsigned share the same bytes, so one entry per (width, endianness).
+#define BUFFER_PUT_LE(NAME, N)                                                          \
+    void NAME(Value bv, int64_t v) {                                                    \
+        uint64_t u = (uint64_t)v;                                                       \
+        for (size_t k = 0; k < (N); k++) buffer_put_u8(bv, (uint8_t)(u >> (8 * k)));    \
+    }
+#define BUFFER_PUT_BE(NAME, N)                                                          \
+    void NAME(Value bv, int64_t v) {                                                    \
+        uint64_t u = (uint64_t)v;                                                       \
+        for (size_t k = 0; k < (N); k++)                                                \
+            buffer_put_u8(bv, (uint8_t)(u >> (8 * ((N) - 1 - k))));                     \
+    }
+BUFFER_PUT_LE(buffer_put_16_le, 2)
+BUFFER_PUT_LE(buffer_put_32_le, 4)
+BUFFER_PUT_LE(buffer_put_64_le, 8)
+BUFFER_PUT_BE(buffer_put_16_be, 2)
+BUFFER_PUT_BE(buffer_put_32_be, 4)
+BUFFER_PUT_BE(buffer_put_64_be, 8)
+
+// Append a slice's bytes (slice_len/slice_get_u8 are declared in gc.h, defined below).
+void buffer_put_slice(Value bv, Value sv) {
+    size_t n = slice_len(sv);
+    for (size_t i = 0; i < n; i++) buffer_put_u8(bv, slice_get_u8(sv, i));
+}
+
+Value mk_slice(void *owner, size_t offset, size_t len) {
+    // `owner` is a body pointer; it sits on the stack (conservatively scanned), so
+    // it survives the collection `gc_reserve` may trigger.
+    gc_reserve(sizeof(GcHeader) + sizeof(Slice));
+    Slice *s = gc_new(sizeof(Slice), OBJ_SLICE);
+    s->owner = owner;
+    s->offset = offset;
+    s->len = len;
+    return VObject(s);
+}
+
+// Hand the buffer's body to a Slice, then reseed the handle with a fresh empty
+// body so it no longer aliases the bytes it gave away.
+Value buffer_move(Value bv) {
+    Buffer *b = bv.obj;
+    size_t len = b->len;
+    void *body = b->bytes; // handed off below; stays live on the stack meanwhile
+    gc_reserve(sizeof(GcHeader) + 16);
+    void *fresh = gc_new(16, OBJ_BYTES);
+    b = bv.obj;
+    b->bytes = fresh;
+    b->len = 0;
+    b->cap = 16;
+    return mk_slice(body, 0, len);
+}
+
+Value buffer_copy(Value bv) {
+    size_t n = ((Buffer *)bv.obj)->len;
+    gc_reserve(sizeof(GcHeader) + (n ? n : 1));
+    void *body = gc_new(n ? n : 1, OBJ_BYTES);
+    Buffer *b = bv.obj; // re-fetch after the possible collection
+    memcpy(body, b->bytes, n);
+    return mk_slice(body, 0, n);
+}
+
+static const uint8_t *slice_base(Slice *s) {
+    GcHeader *h = HEADER(s->owner);
+    if (h->kind == OBJ_BYTES) return (const uint8_t *)s->owner + s->offset;
+    return ((Mmap *)s->owner)->region + s->offset; // OBJ_MMAP
+}
+
+size_t slice_len(Value sv) { return ((Slice *)sv.obj)->len; }
+
+uint8_t slice_get_u8(Value sv, size_t i) { return slice_base(sv.obj)[i]; }
+
+Value slice_sub(Value sv, size_t off, size_t len) {
+    Slice *s = sv.obj;
+    return mk_slice(s->owner, s->offset + off, len); // shares the owner
+}
+
+#define SLICE_GET_LE(NAME, TYPE, N)                                                    \
+    TYPE NAME(Value sv, size_t off) {                                                  \
+        const uint8_t *p = slice_base(sv.obj) + off;                                    \
+        uint64_t v = 0;                                                                \
+        for (size_t k = 0; k < (N); k++) v |= (uint64_t)p[k] << (8 * k);               \
+        return (TYPE)v;                                                                \
+    }
+#define SLICE_GET_BE(NAME, TYPE, N)                                                    \
+    TYPE NAME(Value sv, size_t off) {                                                  \
+        const uint8_t *p = slice_base(sv.obj) + off;                                    \
+        uint64_t v = 0;                                                                \
+        for (size_t k = 0; k < (N); k++) v = (v << 8) | p[k];                          \
+        return (TYPE)v;                                                                \
+    }
+SLICE_GET_LE(slice_get_u16_le, uint16_t, 2)
+SLICE_GET_LE(slice_get_u32_le, uint32_t, 4)
+SLICE_GET_LE(slice_get_u64_le, uint64_t, 8)
+SLICE_GET_LE(slice_get_i16_le, int16_t, 2)
+SLICE_GET_LE(slice_get_i32_le, int32_t, 4)
+SLICE_GET_LE(slice_get_i64_le, int64_t, 8)
+SLICE_GET_BE(slice_get_u16_be, uint16_t, 2)
+SLICE_GET_BE(slice_get_u32_be, uint32_t, 4)
+SLICE_GET_BE(slice_get_u64_be, uint64_t, 8)
+SLICE_GET_BE(slice_get_i16_be, int16_t, 2)
+SLICE_GET_BE(slice_get_i32_be, int32_t, 4)
+SLICE_GET_BE(slice_get_i64_be, int64_t, 8)
+
+// ----------------------------------------------------------------- memory maps
+// Result ordinals follow `Result ::= Fault e | Return a` -> Fault = 0, Return = 1.
+// (Verify against codegen's constructor numbering before wiring the stdlib.)
+static Value result_return(Value x) { return mk_data(1, 1, x); }
+static Value result_fault(Value e) { return mk_data(0, 1, e); }
+
+// Ranged Buffer -> Bytes producers. Like buffer_move/buffer_copy but for a
+// sub-range [off, off+n); Fault(-1) if that range runs past the buffer's length.
+Value buffer_move_range(Value bv, size_t off, size_t n) {
+    Buffer *b = bv.obj;
+    if (off + n > b->len) return result_fault(VInt(-1));
+    void *body = b->bytes; // handed off below; stays live on the stack meanwhile
+    gc_reserve(sizeof(GcHeader) + 16);
+    void *fresh = gc_new(16, OBJ_BYTES);
+    b = bv.obj;
+    b->bytes = fresh;
+    b->len = 0;
+    b->cap = 16;
+    return result_return(mk_slice(body, off, n));
+}
+
+Value buffer_copy_range(Value bv, size_t off, size_t n) {
+    Buffer *b = bv.obj;
+    if (off + n > b->len) return result_fault(VInt(-1));
+    gc_reserve(sizeof(GcHeader) + (n ? n : 1));
+    void *body = gc_new(n ? n : 1, OBJ_BYTES);
+    b = bv.obj; // re-fetch after the possible collection
+    memcpy(body, (const uint8_t *)b->bytes + off, n);
+    return result_return(mk_slice(body, 0, n));
+}
+
+static Value mk_mmap(uint8_t *region, size_t len) {
+    gc_reserve(sizeof(GcHeader) + sizeof(Mmap));
+    Mmap *m = gc_new(sizeof(Mmap), OBJ_MMAP);
+    m->region = region;
+    m->len = len;
+    m->closed = false;
+    return VObject(m);
+}
+
+Value mmap_open(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return result_fault(VInt(errno));
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        int e = errno;
+        close(fd);
+        return result_fault(VInt(e));
+    }
+    size_t len = (size_t)st.st_size;
+    void *region = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd); // the mapping outlives the fd
+    if (region == MAP_FAILED) return result_fault(VInt(errno));
+    return result_return(mk_mmap(region, len));
+}
+
+void mmap_close(Value mv) {
+    Mmap *m = mv.obj;
+    if (!m->closed) {
+        munmap(m->region, m->len);
+        m->closed = true;
+    }
+}
+
+Value mmap_read(Value mv, size_t off, size_t n) {
+    Mmap *m = mv.obj;
+    if (m->closed || off + n > m->len) return result_fault(VInt(-1));
+    Value bufv = mk_buffer(n);
+    Buffer *b = bufv.obj;
+    m = mv.obj; // re-fetch after the possible collection in mk_buffer
+    memcpy(b->bytes, m->region + off, n);
+    b->len = n;
+    return result_return(buffer_move(bufv));
+}
+
+// Zero-copy view into a mapped region: a Slice whose owner is the Mmap handle
+// itself (no copy -- `slice_base` reads straight from `region`). Valid only
+// while the mapping is open; reading it after mmap_close faults on the unmapped
+// pages. Returns Result (Fault errno | Return Slice).
+Value mmap_slice(Value mv, size_t off, size_t n) {
+    Mmap *m = mv.obj;
+    if (m->closed || off + n > m->len) return result_fault(VInt(-1));
+    return result_return(mk_slice(m, off, n)); // owner = the OBJ_MMAP handle
+}
+
+// Direct reads on a mapped region (for Byte_Source Mmap -- zero-copy, no Slice).
+int64_t mmap_len(Value mv) { return (int64_t)((Mmap *)mv.obj)->len; }
+int64_t mmap_get_u8(Value mv, int64_t i) { return (int64_t)((Mmap *)mv.obj)->region[i]; }
+bool    mmap_is_closed(Value mv) { return ((Mmap *)mv.obj)->closed; }
+
+// Write a slice's bytes to `path` (truncating). Returns 0 on success, else errno.
+int64_t slice_write_file(Value sv, const char *path) {
+    Slice *s = sv.obj;
+    FILE *f = fopen(path, "wb");
+    if (!f) return errno;
+    size_t w = fwrite(slice_base(s), 1, s->len, f);
+    int err = (w == s->len) ? 0 : -1;
+    fclose(f);
+    return err;
 }

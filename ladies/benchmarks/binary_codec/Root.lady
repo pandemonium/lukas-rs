@@ -1,0 +1,138 @@
+use Stdlib.
+use Stdlib.Binary.
+
+(* Binary-codec benchmark: a ~10 MB, three-level-deep format round-tripped many *)
+(* times through the Get and Put monads, to profile the read/write hot paths. *)
+(*                                                                             *)
+(*   File   = magic u32 , [Block]                                              *)
+(*   Block  = id u32     , [Group]                                             *)
+(*   Group  = id u32     , [Record]                                            *)
+(*   Record = key u32    , val u64                                            *)
+(*                                                                             *)
+(* A list is length-prefixed (u32 count, then that many elements). Sizing:     *)
+(* n_blocks * n_groups * n_records records, 12 bytes each. *)
+
+n_blocks  :: Int := 30
+n_groups  :: Int := 100
+n_records :: Int := 300
+reps      :: Int := 5
+
+Record ::= MkRecord Int Int
+Group  ::= MkGroup Int (List Record)
+Block  ::= MkBlock Int (List Group)
+File   ::= MkFile Int (List Block)
+
+count :: ∀a. List a -> Int := fold_right (λ_ n. n + 1) 0
+
+(* ---- generic length-prefixed list of Get / Put ---- *)
+put_list :: ∀a. (a -> Put Unit) -> List a -> Put Unit := λput_elem xs.
+  let* _ = put_u32_be (count xs) in
+  put_each put_elem xs
+
+put_each :: ∀a. (a -> Put Unit) -> List a -> Put Unit := λput_elem xs.
+  deconstruct xs into
+    Nil          -> pure ()
+  | Cons a rest  -> let* _ = put_elem a in put_each put_elem rest
+
+get_list :: ∀a. Get Read_Error a -> Get Read_Error (List a) := λget_elem.
+  let* n = u32_be in
+  get_n get_elem n
+
+get_n :: ∀a. Get Read_Error a -> Int -> Get Read_Error (List a) := λget_elem n.
+  if n <= 0
+    then pure Nil
+    else
+      let* x    = get_elem in
+      let* rest = get_n get_elem (n - 1) in
+      pure (Cons x rest)
+
+(* ---- the format ---- *)
+put_record :: Record -> Put Unit := λ(MkRecord k v).
+  let* _ = put_u32_be k in
+  put_u64_be v
+
+get_record :: Get Read_Error Record :=
+  let* k = u32_be in
+  let* v = u64_be in
+  pure (MkRecord k v)
+
+put_group :: Group -> Put Unit := λ(MkGroup id rs).
+  let* _ = put_u32_be id in
+  put_list put_record rs
+
+get_group :: Get Read_Error Group :=
+  let* id = u32_be in
+  let* rs = get_list get_record in
+  pure (MkGroup id rs)
+
+put_block :: Block -> Put Unit := λ(MkBlock id gs).
+  let* _ = put_u32_be id in
+  put_list put_group gs
+
+get_block :: Get Read_Error Block :=
+  let* id = u32_be in
+  let* gs = get_list get_group in
+  pure (MkBlock id gs)
+
+put_file :: File -> Put Unit := λ(MkFile magic bs).
+  let* _ = put_u32_be magic in
+  put_list put_block bs
+
+get_file :: Get Read_Error File :=
+  let* magic = u32_be in
+  let* bs = get_list get_block in
+  pure (MkFile magic bs)
+
+(* ---- deterministic data generation ---- *)
+gen_records :: Int -> List Record := λn.
+  if n <= 0 then Nil
+  else Cons (MkRecord n (n * 3 + 7)) (gen_records (n - 1))
+
+gen_groups :: Int -> List Group := λn.
+  if n <= 0 then Nil
+  else Cons (MkGroup n (gen_records n_records)) (gen_groups (n - 1))
+
+gen_blocks :: Int -> List Block := λn.
+  if n <= 0 then Nil
+  else Cons (MkBlock n (gen_groups n_groups)) (gen_blocks (n - 1))
+
+gen_file :: File := MkFile 1296126541 (gen_blocks n_blocks)
+
+(* ---- checksum, so the parse isn't dead code ---- *)
+sum_records :: List Record -> Int := fold_right (λ(MkRecord k v) acc. (acc + k + v) % 1000000007) 0
+sum_groups  :: List Group  -> Int := fold_right (λ(MkGroup _ rs) acc. (acc + sum_records rs) % 1000000007) 0
+sum_blocks  :: List Block  -> Int := fold_right (λ(MkBlock _ gs) acc. (acc + sum_groups gs) % 1000000007) 0
+checksum    :: File -> Int := λ(MkFile _ bs). sum_blocks bs
+
+(* ---- build the initial buffer once ---- *)
+initial :: IO Bytes :=
+  let* b = new_buffer 12000000 in
+  let* _ = run_put (put_file gen_file) b in
+  move b
+
+(* ---- one round-trip: parse the bytes, checksum, re-serialize ---- *)
+one_iter :: Bytes -> IO Int := λbytes.
+  deconstruct (run_get get_file bytes) into
+    Fault _  -> pure 0
+  | Return f ->
+      let chk = checksum f in
+      let* b2 = new_buffer 12000000 in
+      let* _  = run_put (put_file f) b2 in
+      let* _  = move b2 in
+      pure (chk + len bytes)
+
+loop :: Int -> Bytes -> Int -> IO Int := λn bytes acc.
+  if n < 1 then pure acc
+  else
+    let* delta = one_iter bytes in
+    loop (n - 1) bytes ((acc + delta) % 1000000007)
+
+program :: IO Unit :=
+  let* bytes = initial in
+  let* _     = IO.output (display (len bytes)) in
+  let* result = loop reps bytes 1 in
+  IO.output (display result)
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  IO.unsafeRunIO program

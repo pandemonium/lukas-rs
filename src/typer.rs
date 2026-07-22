@@ -1073,10 +1073,43 @@ fn resolve_constraints(
 
     // The wanted (inferred) constraints split into variable-headed (`Eq α`, which
     // no instance can match) and instance-resolvable (`Eq Int`, `Eq (List α)`).
-    let (wanted_parametric, resolvable) = constraints
+    let (mut wanted_parametric, resolvable) = constraints
         .clone()
         .into_iter()
         .partition::<Vec<_>, _>(|c| c.is_parametric());
+
+    // A resolvable constraint like `Functor (ExceptT m e)` is discharged through a
+    // witness whose premises can themselves be parametric (`Functor m`, `m`
+    // abstract). Such a premise is only satisfiable from a dictionary parameter
+    // (projected from a given), yet it never appears among the *wanted* set, so the
+    // param logic below would skip it and `resolve_witness` would ground it against
+    // a concrete witness head -- a fabricated dictionary. Surface those parametric
+    // premises (transitively) as wanted, so a given (`Monad m`) is bound as a
+    // parameter and the premise is projected out of it.
+    {
+        // Seed from the resolvable constraints *and* the super-obligations (a
+        // `Monoid (Perhaps α)` witness must fill a `$super$Semigroup` =
+        // `Semigroup (Perhaps α)`, whose `Semigroup α` premise likewise projects
+        // out of the `Monoid α` parameter).
+        let mut worklist = resolvable.clone();
+        worklist.extend(super_obligations.iter().map(|(_, c)| c.clone()));
+        let mut seen: Vec<Constraint> = Vec::new();
+        while let Some(c) = worklist.pop() {
+            if seen.contains(&c) {
+                continue;
+            }
+            seen.push(c.clone());
+            for premise in witnesses.premises_of(&c, &ctx.types) {
+                if premise.is_parametric() {
+                    if !wanted_parametric.contains(&premise) {
+                        wanted_parametric.push(premise);
+                    }
+                } else {
+                    worklist.push(premise);
+                }
+            }
+        }
+    }
 
     // Parameters are driven by the *wanted* (inferred) constraints -- a term only
     // needs a dictionary parameter for a class its body actually uses. The given

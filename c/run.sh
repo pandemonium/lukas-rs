@@ -42,6 +42,11 @@ foreign_cs=""
 for f in "$dir"/*.c; do
     [ -e "$f" ] && foreign_cs="$foreign_cs $f"
 done
+# ...and the companions living beside stdlib modules in the library tree
+# (e.g. Stdlib/Memory.c beside Memory.lady). Harmless to link even when unused.
+for f in $(find "$LIB" -name '*.c' 2>/dev/null); do
+    foreign_cs="$foreign_cs $f"
+done
 
 # shellcheck disable=SC2086 # $foreign_cs is an intentional list of paths.
 if ! clang -std=c11 -I"$C_DIR" -o "$work/prog" "$C_DIR/runtime.c" "$C_DIR/gc.c" $foreign_cs "$work/program.c" 2>"$work/cc.err"; then

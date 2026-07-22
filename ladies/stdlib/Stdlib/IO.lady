@@ -9,8 +9,8 @@ witness Applicative IO :=
   { pure  := λa. Suspend (λ_. a)
     apply := λ(Suspend f) (Suspend a).
       Suspend (λ_.
-        let aa = a () in
         let ff = (f ()) in
+        let aa = a () in
         ff aa
       )
   }

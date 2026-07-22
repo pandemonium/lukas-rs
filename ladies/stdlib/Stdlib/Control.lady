@@ -43,6 +43,43 @@ module ExceptT:
   run :: ∀m : *->* e α. ExceptT m e α -> m (Result e α) :=
     λ(MkExceptT result). result
 
+  lift :: ∀m : *->* e α. Monad m |- m α -> ExceptT m e α :=
+    λma. MkExceptT (fmap Return ma)
+
+  throw :: ∀m : *->* e α. Monad m |- e -> ExceptT m e α :=
+    λe. MkExceptT (pure (Fault e))
+
+  from_result :: ∀m : *->* e α. Monad m |- Result e α -> ExceptT m e α :=
+    λr. MkExceptT (pure r)
+
+  (* Run the action; on a fault hand the error to the handler (which may recover *)
+  (* into a different error type f), otherwise pass the value through. *)
+  catch :: ∀m : *->* e f α. Monad m |- ExceptT m e α -> (e -> ExceptT m f α) -> ExceptT m f α :=
+    λ(MkExceptT ma) handler.
+      MkExceptT (bind (result (λe. run (handler e)) (λa. pure (Return a))) ma)
+
+  (* Reify a fault into the value: a failing action becomes a non-failing one *)
+  (* returning Return a or Fault e, so the outcome can be deconstructed. Keeps *)
+  (* the monad's error type (it simply never faults now) -- a free outer error *)
+  (* would leave an ambiguous type variable at every use site. *)
+  try :: ∀m : *->* e α. Monad m |- ExceptT m e α -> ExceptT m e (Result e α) :=
+    λx. catch (fmap Return x) (λe. pure (Fault e))
+
+witness ∀m : *->* e. Functor m |- Functor (ExceptT m e) :=
+  { fmap := λf (MkExceptT ma). MkExceptT (fmap (fmap f) ma)
+  }
+
+witness ∀m : *->* e. Monad m |- Applicative (ExceptT m e) :=
+  { pure  := λa. MkExceptT (pure (Return a))
+    apply := λ(MkExceptT mf) (MkExceptT ma).
+      MkExceptT (bind (result (λe. pure (Fault e)) (λf. fmap (fmap f) ma)) mf)
+  }
+
+witness ∀m : *->* e. Monad m |- Monad (ExceptT m e) :=
+  { bind := λk (MkExceptT ma).
+      MkExceptT (bind (result (λe. pure (Fault e)) (λa. ExceptT.run (k a))) ma)
+  }
+
 fold_map :: ∀t : *->* α m. Monoid m + Foldable t |- (α -> m) -> t α -> m := λf.
   fold_right (compose mappend f) mempty
 

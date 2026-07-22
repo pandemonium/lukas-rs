@@ -1,0 +1,45 @@
+use Stdlib.
+use Stdlib.Binary.
+
+(* Write bytes into a Buffer (immediate, IO), move to an immutable Bytes, then *)
+(* read them back in the Get monad -- the source and cursor live in the monad, so *)
+(* the reads are nullary and fail only out of bounds. *)
+payload :: Put Unit :=
+  let* _ = put_u8 72  in
+  let* _ = put_u8 105 in
+  put_u8 1
+
+built :: IO Bytes :=
+  let* b = new_buffer 8 in
+  let* _ = run_put payload b in
+  move b
+
+(* A reader: two bytes then their sum. The cursor advances automatically. *)
+pair :: Get Read_Error Int :=
+  let* a = u8 in
+  let* b = u8 in
+  pure (a + b)
+
+(* A typed read: the first two bytes as one big-endian u16. *)
+wide :: Get Read_Error Int := u16_be
+
+(* Reading a fourth byte runs the cursor past the 3 written -- faults. *)
+over :: Get Read_Error Int :=
+  let* _ = u8 in
+  let* _ = u8 in
+  let* _ = u8 in
+  u8
+
+sh :: Result Read_Error Int -> Text := λr.
+  deconstruct r into Return n -> display n | Fault _ -> "oob"
+
+program :: IO Unit :=
+  let* s = built in
+  let* _ = IO.output (display (len s)) in
+  let* _ = IO.output (sh (run_get pair s)) in
+  let* _ = IO.output (sh (run_get wide s)) in
+  IO.output (sh (run_get over s))
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  IO.unsafeRunIO program

@@ -43,9 +43,13 @@ for dir in "$ROOT_DIR"/ladies/"$PANEL"/*/; do
       status="COMPILE-ERR"
     fi
   else
-    # Companion C for this module's `foreign` declarations, if any.
+    # Companion C for `foreign` declarations: this program's own dir, plus every
+    # stdlib module companion under $LIB. A `use Stdlib.` now pulls in modules
+    # (e.g. Memory) whose foreign bindings initialise in `startup`, so their
+    # companions must be linked even when the program never calls them (harmless
+    # when unused). Mirrors c/run.sh.
     foreign_cs=""
-    for f in "$dir"/*.c; do
+    for f in "$dir"/*.c $(find "$LIB" -name '*.c' 2>/dev/null); do
       [ -e "$f" ] && foreign_cs="$foreign_cs $f"
     done
 
