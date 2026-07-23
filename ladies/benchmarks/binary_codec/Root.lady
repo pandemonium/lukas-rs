@@ -15,7 +15,7 @@ use Stdlib.Binary.
 n_blocks  :: Int := 30
 n_groups  :: Int := 100
 n_records :: Int := 300
-reps      :: Int := 5
+reps      :: Int := 13
 
 Record ::= MkRecord Int Int
 Group  ::= MkGroup Int (List Record)

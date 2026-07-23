@@ -330,6 +330,12 @@ impl lambda_lift::Program {
     // tag need only be unique among its own type's constructors. Nullary
     // constructors are just a tag with no fields.
     fn compile_inject(&self, the: &phase::Injection<Closed>, code: &mut CodeBuffer) -> fmt::Result {
+        // A newtype (single-ctor single-field) is erased: the wrapper IS its field,
+        // so emit the sole argument directly -- no `Data` box. A saturated `Inject`
+        // of a newtype always has exactly one argument.
+        if self.newtype_constructors.contains(&the.constructor) {
+            return self.compile_expr(&the.arguments[0], code);
+        }
         write!(
             code,
             "mk_data({}, {}",
@@ -459,14 +465,24 @@ impl lambda_lift::Program {
                 let Identifier::Global(constructor) = &the.constructor else {
                     panic!("constructor pattern head must be a global: {:?}", the.constructor);
                 };
-                tests.push(format!("data_tag({path}) == {}", self.constructor_tag(constructor)));
-                for (index, argument) in the.arguments.iter().enumerate() {
-                    self.collect_pattern(
-                        argument,
-                        &format!("data_field({path}, {index})"),
-                        tests,
-                        binds,
-                    );
+                // A newtype pattern is erased: the value IS its single field, so
+                // there is no tag to test and the field matches against the
+                // scrutinee itself -- `λ(Buffer b). e` lowers to `λb. e`.
+                if self.newtype_constructors.contains(constructor) {
+                    self.collect_pattern(&the.arguments[0], path, tests, binds);
+                } else {
+                    tests.push(format!(
+                        "data_tag({path}) == {}",
+                        self.constructor_tag(constructor)
+                    ));
+                    for (index, argument) in the.arguments.iter().enumerate() {
+                        self.collect_pattern(
+                            argument,
+                            &format!("data_field({path}, {index})"),
+                            tests,
+                            binds,
+                        );
+                    }
                 }
             }
         }

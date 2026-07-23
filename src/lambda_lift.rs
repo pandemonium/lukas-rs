@@ -37,11 +37,24 @@ impl closed::SymbolTable {
         // discriminant. Built before the term symbols are drained below; type
         // symbols stay in the table.
         let mut constructor_tags: HashMap<QualifiedName, u64> = HashMap::default();
+        // A single-constructor, single-field coproduct is a *newtype*: a zero-cost
+        // wrapper whose runtime representation is its field's. Record its
+        // constructor so codegen erases the box -- an `Inject` of it becomes the
+        // field itself, a constructor pattern becomes an identity bind (no tag
+        // test). Because the synthesized smart constructor `λp. Inject(C, [p])` also
+        // flows through the same `Inject` site, `fmap C` collapses to `fmap id` for
+        // free (see notes/newtype-erasure.md).
+        let mut newtype_constructors: HashSet<QualifiedName> = HashSet::default();
         for symbol in self.symbols.values() {
             if let Symbol::Type(type_symbol) = symbol {
                 if let TypeDefinition::Coproduct(coproduct) = &type_symbol.definition {
                     for (tag, constructor) in coproduct.constructors.iter().enumerate() {
                         constructor_tags.insert(constructor.name.clone(), tag as u64);
+                    }
+                    if let [only] = coproduct.constructors.as_slice() {
+                        if only.signature.len() == 1 {
+                            newtype_constructors.insert(only.name.clone());
+                        }
                     }
                 }
             }
@@ -114,6 +127,7 @@ impl closed::SymbolTable {
             chain_workers,
             chain_heads,
             constructor_tags,
+            newtype_constructors,
             start: Expr::Apply(
                 CaptureInfo::dummy(),
                 Apply {
@@ -663,6 +677,10 @@ pub struct Program {
     /// constructor list. Codegen emits it in `mk_data` and compares it in
     /// constructor patterns (an integer test, replacing the old string tag).
     pub constructor_tags: HashMap<QualifiedName, u64>,
+    /// Constructors of single-ctor single-field types (newtypes), whose box codegen
+    /// erases: an `Inject` becomes the field itself; a constructor pattern binds the
+    /// field to the scrutinee directly (no tag test, no `data_field`).
+    pub newtype_constructors: HashSet<QualifiedName>,
     pub start: Expr,
 }
 
@@ -757,6 +775,7 @@ impl fmt::Display for Program {
             chain_workers: _,
             chain_heads: _,
             constructor_tags: _,
+            newtype_constructors: _,
             start,
         } = self;
 

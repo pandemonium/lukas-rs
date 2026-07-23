@@ -216,7 +216,15 @@ static bool is_object(uintptr_t w) {
 static GcHeader *gc_young = NULL, *gc_old = NULL;
 static size_t gc_young_bytes = 0;      // young allocation since the last minor GC
 static size_t gc_old_bytes = 0;        // live bytes tenured in the old generation
-static size_t gc_nursery = 16u << 20;  // trigger a minor GC once the nursery fills
+static size_t gc_nursery = 256u << 20; // trigger a minor GC once the nursery fills.
+// 256 MiB (was 16 MiB): high-churn workloads (e.g. the binary_codec benchmark)
+// pay a per-collection fixed cost (a full conservative stack scan) plus
+// false-tenuring of transient garbage that is live when a too-frequent minor GC
+// fires. A nursery comfortably larger than the working set lets transients die
+// young -- measured ~2x total speedup on binary_codec (24s -> 12s), plateauing
+// past 256 MiB. NB there is a *valley* around 32-64 MiB (worse than 16) where
+// tenuring is pathological, so a moderate bump would regress; jump past it.
+// Tunable per run via MARM_NURSERY (KiB).
 static size_t gc_major_at = 8u << 20;  // trigger a major GC once the old gen exceeds this
 static bool gc_on = false;
 static bool gc_major = false;          // is the in-progress collection a major one?

@@ -226,7 +226,11 @@ impl Compiler {
                     .into_iter()
                     .cloned()
                     .collect::<Vec<_>>();
-                let lifted = program.clone().closure_conversion().lambda_lift(&order);
+                let lifted = program
+                    .clone()
+                    .simplify()
+                    .closure_conversion()
+                    .lambda_lift(&order);
                 eprintln!("======== LAMBDA-LIFT IR ========\n{lifted}");
                 let mut c = CodeBuffer::default();
                 let _ = lifted.generate_code(&mut c);
@@ -265,7 +269,7 @@ impl Compiler {
                         .into_iter()
                         .cloned()
                         .collect::<Vec<_>>();
-                    let lifted = program.closure_conversion().lambda_lift(&order);
+                    let lifted = program.simplify().closure_conversion().lambda_lift(&order);
                     lifted.generate_code(&mut code).map_err(io::Error::other)?;
                 }
             }
