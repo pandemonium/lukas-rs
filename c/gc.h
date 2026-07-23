@@ -24,6 +24,31 @@ Value mk_tuple(size_t len, ...);
 Value mk_data(uint64_t tag, size_t nfields, ...);
 size_t data_len(Value v);
 
+// Fixed-arity constructors for the common small field counts. Codegen knows the
+// count statically and emits these to skip the variadic `va_list`/copy-loop tax
+// (and let the reserve+bump path inline); the variadic forms above remain the
+// fallback for larger arities. See gc.c.
+Value mk_data0(uint64_t tag);
+Value mk_data1(uint64_t tag, Value f0);
+Value mk_data2(uint64_t tag, Value f0, Value f1);
+Value mk_data3(uint64_t tag, Value f0, Value f1, Value f2);
+Value mk_data4(uint64_t tag, Value f0, Value f1, Value f2, Value f3);
+Value mk_tuple0(void);
+Value mk_tuple1(Value e0);
+Value mk_tuple2(Value e0, Value e1);
+Value mk_tuple3(Value e0, Value e1, Value e2);
+Value mk_tuple4(Value e0, Value e1, Value e2, Value e3);
+Value mk_closure0(Value (*code)(Value, Value));
+Value mk_closure1(Value (*code)(Value, Value), Value c0);
+Value mk_closure2(Value (*code)(Value, Value), Value c0, Value c1);
+Value mk_closure3(Value (*code)(Value, Value), Value c0, Value c1, Value c2);
+Value mk_closure4(Value (*code)(Value, Value), Value c0, Value c1, Value c2, Value c3);
+Value mk_closure_n0(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity);
+Value mk_closure_n1(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity, Value c0);
+Value mk_closure_n2(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity, Value c0, Value c1);
+Value mk_closure_n3(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity, Value c0, Value c1, Value c2);
+Value mk_closure_n4(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity, Value c0, Value c1, Value c2, Value c3);
+
 // Owned (collectable) strings. Borrowed literals stay as `VText("...")` -- a bare
 // pointer into read-only data, never a GC object. `mk_text*` copy into the heap,
 // where the collector reclaims them once unreachable.

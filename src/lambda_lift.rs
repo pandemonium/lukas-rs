@@ -302,9 +302,16 @@ fn synthesize_workers(
                 _ => break,
             }
         }
-        if arity < 2 {
-            continue;
-        }
+        // arity is always >= 1 here (stage0 is a 1-arg closure). We used to require
+        // arity >= 2 -- an uncurried worker's original purpose was skipping the
+        // currying-stage closures a chain allocates, and a 1-arg function has none.
+        // But a worker also makes a *saturated* call a DIRECT C call instead of an
+        // indirect `apply` through the closure pointer, and for a 1-arg self-
+        // recursive function (e.g. `fib`) that indirect `blr`-per-call is the
+        // dominant cost -- clang can inline/TCO the direct recursive call but not the
+        // indirect one. So arity 1 is now worth a worker too. The closed-frame check
+        // below (`params.len() != arity - 1`, i.e. 0 captures for arity 1) still
+        // rejects any 1-arg function that isn't closure-free.
 
         let inner = &functions[fn_index[current]];
         let levels = inner

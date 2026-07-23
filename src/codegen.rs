@@ -316,9 +316,20 @@ impl lambda_lift::Program {
     }
 
     fn compile_tuple(&self, elements: &[std::rc::Rc<Expr>], code: &mut CodeBuffer) -> fmt::Result {
-        write!(code, "mk_tuple({}", elements.len())?;
+        // Fixed-arity `mk_tupleN(e0, ..)` for small tuples (no variadic tax); the
+        // `mk_tuple(N, e0, ..)` fallback carries the count for larger ones.
+        let mut written = if elements.len() <= 4 {
+            write!(code, "mk_tuple{}(", elements.len())?;
+            false
+        } else {
+            write!(code, "mk_tuple({}", elements.len())?;
+            true
+        };
         for element in elements {
-            write!(code, ", ")?;
+            if written {
+                write!(code, ", ")?;
+            }
+            written = true;
             self.compile_expr(element, code)?;
         }
         write!(code, ")")
@@ -336,12 +347,15 @@ impl lambda_lift::Program {
         if self.newtype_constructors.contains(&the.constructor) {
             return self.compile_expr(&the.arguments[0], code);
         }
-        write!(
-            code,
-            "mk_data({}, {}",
-            self.constructor_tag(&the.constructor),
-            the.arguments.len()
-        )?;
+        let tag = self.constructor_tag(&the.constructor);
+        let n = the.arguments.len();
+        // The tag always precedes the fields, so fields keep their leading comma
+        // in both forms; only the callee name / count prefix differs.
+        if n <= 4 {
+            write!(code, "mk_data{n}({tag}")?;
+        } else {
+            write!(code, "mk_data({tag}, {n}")?;
+        }
         for argument in &the.arguments {
             write!(code, ", ")?;
             self.compile_expr(argument, code)?;
@@ -364,9 +378,18 @@ impl lambda_lift::Program {
     // is already lowered to `Ordinal`, so the field labels carry no runtime
     // weight -- we just emit the values in field order.
     fn compile_record(&self, the: &phase::Record<Closed>, code: &mut CodeBuffer) -> fmt::Result {
-        write!(code, "mk_tuple({}", the.fields.len())?;
+        let mut written = if the.fields.len() <= 4 {
+            write!(code, "mk_tuple{}(", the.fields.len())?;
+            false
+        } else {
+            write!(code, "mk_tuple({}", the.fields.len())?;
+            true
+        };
         for (_label, value) in &the.fields {
-            write!(code, ", ")?;
+            if written {
+                write!(code, ", ")?;
+            }
+            written = true;
             self.compile_expr(value, code)?;
         }
         write!(code, ")")
@@ -575,14 +598,19 @@ impl lambda_lift::Program {
             panic!("closure environment is always a tuple");
         };
         let name = c_name(&the.lifted_name);
+        let n = env.elements.len();
+        // Fixed-arity closure builders for small capture counts; the leading
+        // code/worker/arity always precede, so captures keep their leading comma.
         if let Some(&arity) = self.chain_heads.get(&the.lifted_name) {
-            write!(
-                code,
-                "mk_closure_n({name}, {name}_uworker, {arity}, {}",
-                env.elements.len()
-            )?;
+            if n <= 4 {
+                write!(code, "mk_closure_n{n}({name}, {name}_uworker, {arity}")?;
+            } else {
+                write!(code, "mk_closure_n({name}, {name}_uworker, {arity}, {n}")?;
+            }
+        } else if n <= 4 {
+            write!(code, "mk_closure{n}({name}")?;
         } else {
-            write!(code, "mk_closure({name}, {}", env.elements.len())?;
+            write!(code, "mk_closure({name}, {n}")?;
         }
         for element in &env.elements {
             write!(code, ", ")?;

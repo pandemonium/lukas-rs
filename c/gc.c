@@ -177,7 +177,10 @@ static void bit_clear(uintptr_t slot) {
 }
 
 // Allocate a fresh slab for size class `c` and thread its slots onto the free-list.
-static void grow_class(size_t c) {
+// `cold`/`noinline`: this fires only when a size class runs dry (once per thousands
+// of allocations), so keeping it out of line shrinks `gc_new`'s hot-path frame --
+// which in turn lets `gc_new` itself inline into the fixed-arity constructors below.
+static __attribute__((noinline, cold)) void grow_class(size_t c) {
     size_t ss = c * 16;
     Slab *s = aligned_alloc(SLAB_SIZE, SLAB_SIZE);
     uintptr_t base = (uintptr_t)s;
@@ -605,6 +608,106 @@ Value mk_data(uint64_t tag, size_t nfields, ...) {
     va_end(ap);
     return VObject(d);
 }
+
+// ---------------------------------------------- fixed-arity constructors
+// Codegen knows a constructor/tuple/closure's field count statically, so for the
+// common small arities it emits these instead of the variadic `mk_*` above. That
+// drops the whole `va_list` setup + field-copy loop (measured ~14% of allocation
+// cost on a cons-heavy loop), and -- since `alloc_body` and the now-slim `gc_new`
+// are `static inline`d in -- folds the reserve+bump path into one flat body with
+// no second call. GC safety is identical to the variadic path: the field/capture
+// arguments live in this frame across the collection `gc_reserve` may trigger, and
+// the collector scans the stack (and setjmp-spilled registers) conservatively.
+static inline void *alloc_body(size_t body, ObjKind kind) {
+    gc_reserve(sizeof(GcHeader) + body);
+    return gc_new(body, kind);
+}
+
+Value mk_data0(uint64_t tag) {
+    Data *d = alloc_body(sizeof(Data), OBJ_DATA);
+    d->tag = tag;
+    return VObject(d);
+}
+Value mk_data1(uint64_t tag, Value f0) {
+    Data *d = alloc_body(sizeof(Data) + 1 * sizeof(Value), OBJ_DATA);
+    d->tag = tag, d->fields[0] = f0;
+    return VObject(d);
+}
+Value mk_data2(uint64_t tag, Value f0, Value f1) {
+    Data *d = alloc_body(sizeof(Data) + 2 * sizeof(Value), OBJ_DATA);
+    d->tag = tag, d->fields[0] = f0, d->fields[1] = f1;
+    return VObject(d);
+}
+Value mk_data3(uint64_t tag, Value f0, Value f1, Value f2) {
+    Data *d = alloc_body(sizeof(Data) + 3 * sizeof(Value), OBJ_DATA);
+    d->tag = tag, d->fields[0] = f0, d->fields[1] = f1, d->fields[2] = f2;
+    return VObject(d);
+}
+Value mk_data4(uint64_t tag, Value f0, Value f1, Value f2, Value f3) {
+    Data *d = alloc_body(sizeof(Data) + 4 * sizeof(Value), OBJ_DATA);
+    d->tag = tag, d->fields[0] = f0, d->fields[1] = f1, d->fields[2] = f2, d->fields[3] = f3;
+    return VObject(d);
+}
+
+Value mk_tuple0(void) {
+    Tuple *t = alloc_body(sizeof(Tuple), OBJ_TUPLE);
+    t->len = 0;
+    return VObject(t);
+}
+Value mk_tuple1(Value e0) {
+    Tuple *t = alloc_body(sizeof(Tuple) + 1 * sizeof(Value), OBJ_TUPLE);
+    t->len = 1, t->elems[0] = e0;
+    return VObject(t);
+}
+Value mk_tuple2(Value e0, Value e1) {
+    Tuple *t = alloc_body(sizeof(Tuple) + 2 * sizeof(Value), OBJ_TUPLE);
+    t->len = 2, t->elems[0] = e0, t->elems[1] = e1;
+    return VObject(t);
+}
+Value mk_tuple3(Value e0, Value e1, Value e2) {
+    Tuple *t = alloc_body(sizeof(Tuple) + 3 * sizeof(Value), OBJ_TUPLE);
+    t->len = 3, t->elems[0] = e0, t->elems[1] = e1, t->elems[2] = e2;
+    return VObject(t);
+}
+Value mk_tuple4(Value e0, Value e1, Value e2, Value e3) {
+    Tuple *t = alloc_body(sizeof(Tuple) + 4 * sizeof(Value), OBJ_TUPLE);
+    t->len = 4, t->elems[0] = e0, t->elems[1] = e1, t->elems[2] = e2, t->elems[3] = e3;
+    return VObject(t);
+}
+
+// Closure builders. `_nK` carries an uncurried worker (arity from the chain); the
+// plain `K` form is the single-stage closure (`worker = NULL`, `arity = 1`).
+Value mk_closure_n0(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity) {
+    Closure *c = alloc_body(sizeof(Closure), OBJ_CLOSURE);
+    c->code = code, c->worker = worker, c->arity = arity, c->nfree = 0;
+    return VObject(c);
+}
+Value mk_closure_n1(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity, Value c0) {
+    Closure *c = alloc_body(sizeof(Closure) + 1 * sizeof(Value), OBJ_CLOSURE);
+    c->code = code, c->worker = worker, c->arity = arity, c->nfree = 1, c->caps[0] = c0;
+    return VObject(c);
+}
+Value mk_closure_n2(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity, Value c0, Value c1) {
+    Closure *c = alloc_body(sizeof(Closure) + 2 * sizeof(Value), OBJ_CLOSURE);
+    c->code = code, c->worker = worker, c->arity = arity, c->nfree = 2, c->caps[0] = c0, c->caps[1] = c1;
+    return VObject(c);
+}
+Value mk_closure_n3(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity, Value c0, Value c1, Value c2) {
+    Closure *c = alloc_body(sizeof(Closure) + 3 * sizeof(Value), OBJ_CLOSURE);
+    c->code = code, c->worker = worker, c->arity = arity, c->nfree = 3, c->caps[0] = c0, c->caps[1] = c1, c->caps[2] = c2;
+    return VObject(c);
+}
+Value mk_closure_n4(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity, Value c0, Value c1, Value c2, Value c3) {
+    Closure *c = alloc_body(sizeof(Closure) + 4 * sizeof(Value), OBJ_CLOSURE);
+    c->code = code, c->worker = worker, c->arity = arity, c->nfree = 4,
+    c->caps[0] = c0, c->caps[1] = c1, c->caps[2] = c2, c->caps[3] = c3;
+    return VObject(c);
+}
+Value mk_closure0(Value (*code)(Value, Value)) { return mk_closure_n0(code, NULL, 1); }
+Value mk_closure1(Value (*code)(Value, Value), Value c0) { return mk_closure_n1(code, NULL, 1, c0); }
+Value mk_closure2(Value (*code)(Value, Value), Value c0, Value c1) { return mk_closure_n2(code, NULL, 1, c0, c1); }
+Value mk_closure3(Value (*code)(Value, Value), Value c0, Value c1, Value c2) { return mk_closure_n3(code, NULL, 1, c0, c1, c2); }
+Value mk_closure4(Value (*code)(Value, Value), Value c0, Value c1, Value c2, Value c3) { return mk_closure_n4(code, NULL, 1, c0, c1, c2, c3); }
 
 // Field count of a live constructor value, recovered from its heap header's body
 // size (the count is not stored in the object itself).
