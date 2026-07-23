@@ -24,6 +24,36 @@ typedef struct Closure Closure;
 typedef struct Tuple Tuple;
 typedef struct Data Data;
 
+// A Marmelade value is a single tagged 64-bit word. The low 3 bits discriminate:
+//
+//   xxx0   pointer to a heap body -- its kind (closure/tuple/data/text/object)
+//          is recovered from the body's `GcHeader.kind`. Bodies are >= 8-byte
+//          aligned, so a real pointer always has its low 3 bits clear.
+//   x001   Int   -- 61-bit signed, stored as `(n << 3) | 1`
+//   x011   Bool  -- `(b << 3) | 3`
+//   x101   Char  -- `(c << 3) | 5`
+//   x111   Unit  -- the constant 7
+//
+// Every immediate is odd; every pointer is even, so `w & 1` alone tells them
+// apart. Keeping `Value` register-sized (one word, returned in one register) is
+// what lets clang sibling-call-optimise the recursive `apply` that loop fusion
+// buries -- a 16-byte struct return blocks that TCO and overflows the stack.
+// See notes/tagged-value.md.
+struct Value {
+    uint64_t w;
+};
+
+// Low-3-bit immediate tags (`w & TAGMASK` for an odd word).
+#define TAGMASK  7u
+#define IMM_INT  1u
+#define IMM_BOOL 3u
+#define IMM_CHAR 5u
+#define IMM_UNIT 7u
+
+// The logical kind of a value, for the runtime's own dispatch (`val_eq`,
+// `prim_show`). Immediates decode from the low bits; for a pointer the kind
+// comes from the heap header, so `value_tag` lives in gc.c where that header is
+// visible. Codegen never sees this enum -- it calls typed accessors directly.
 typedef enum {
     TAG_INT,
     TAG_TEXT,
@@ -35,20 +65,7 @@ typedef enum {
     TAG_DATA,
     TAG_OBJECT, // a GC object (Buffer/Mmap/Slice); GcHeader.kind selects its layout + tracing
 } Tag;
-
-struct Value {
-    Tag tag;
-    union {
-        int64_t i;
-        const char *s;
-        bool b;
-        char c;
-        Closure *clo;
-        Tuple *tup;
-        Data *dat;
-        void *obj; // GC-object body (TAG_OBJECT), traced by GcHeader.kind
-    };
-};
+Tag value_tag(Value v);
 
 struct Closure {
     Value (*code)(Value self, Value arg);
@@ -85,36 +102,53 @@ struct Data {
     Value fields[]; // flexible array member
 };
 
-// Value constructors.
-static inline Value VInt(int64_t x)     { Value v; v.tag = TAG_INT;  v.i = x; return v; }
-static inline Value VText(const char *s){ Value v; v.tag = TAG_TEXT; v.s = s; return v; }
-static inline Value VBool(bool x)       { Value v; v.tag = TAG_BOOL; v.b = x; return v; }
-static inline Value VChar(char x)       { Value v; v.tag = TAG_CHAR; v.c = x; return v; }
-static inline Value VUnit_(void)        { Value v; v.tag = TAG_UNIT; v.i = 0; return v; }
-#define VUnit() (VUnit_())
-static inline Value VObject(void *p)    { Value v; v.tag = TAG_OBJECT; v.obj = p; return v; }
+// Owned (heap) text. Declared here so `VText` can build one; defined in gc.c.
+// In this stage every text literal is copied to the heap on construction (the
+// borrowed-literal optimisation is Stage 1b -- see notes/tagged-value.md).
+Value mk_text(const char *src);
 
-// Truthiness of a Bool value, for `if`.
-static inline bool as_bool(Value v) { return v.b; }
+// Value constructors. Immediates pack into the word; a text literal becomes an
+// owned heap string; `VObject` just carries the (already 8-aligned) body pointer.
+static inline Value VInt(int64_t x)     { return (Value){((uint64_t)x << 3) | IMM_INT}; }
+static inline Value VText(const char *s){ return mk_text(s); }
+static inline Value VBool(bool x)       { return (Value){((uint64_t)(x ? 1u : 0u) << 3) | IMM_BOOL}; }
+static inline Value VChar(char x)       { return (Value){((uint64_t)(uint8_t)x << 3) | IMM_CHAR}; }
+static inline Value VUnit_(void)        { return (Value){IMM_UNIT}; }
+#define VUnit() (VUnit_())
+static inline Value VObject(void *p)    { return (Value){(uint64_t)(uintptr_t)p}; }
+
+// Immediate decoders. `as_int` sign-extends via an arithmetic right shift.
+static inline int64_t as_int(Value v)  { return (int64_t)v.w >> 3; }
+static inline bool    as_bool(Value v) { return (v.w >> 3) & 1u; } // truthiness, for `if`
+static inline char    as_char(Value v) { return (char)((v.w >> 3) & 0xFFu); }
+
+// Pointer decoders. A pointer value's word *is* the body pointer.
+static inline void     *as_ptr(Value v)     { return (void *)(uintptr_t)v.w; }
+static inline Closure  *as_closure(Value v) { return (Closure *)(uintptr_t)v.w; }
+static inline Tuple    *as_tuple(Value v)   { return (Tuple *)(uintptr_t)v.w; }
+static inline Data     *as_data(Value v)    { return (Data *)(uintptr_t)v.w; }
+static inline const char *as_text(Value v)  { return (const char *)(uintptr_t)v.w; }
 
 // Primitive operations behind the builtins. Codegen emits direct calls to these
 // for *saturated* applications, bypassing the curried closures (and their heap
 // allocation) entirely. The `builtin_*` closure values below remain for partial
 // application and higher-order use (e.g. passing `+` to a fold).
 bool val_eq(Value a, Value b);
-static inline Value prim_add(Value a, Value b) { return VInt(a.i + b.i); }
-static inline Value prim_sub(Value a, Value b) { return VInt(a.i - b.i); }
-static inline Value prim_mul(Value a, Value b) { return VInt(a.i * b.i); }
-static inline Value prim_div(Value a, Value b) { return VInt(a.i / b.i); }
-static inline Value prim_mod(Value a, Value b) { return VInt(a.i % b.i); }
-static inline Value prim_lt(Value a, Value b) { return VBool(a.i < b.i); }
-static inline Value prim_gt(Value a, Value b) { return VBool(a.i > b.i); }
-static inline Value prim_le(Value a, Value b) { return VBool(a.i <= b.i); }
-static inline Value prim_ge(Value a, Value b) { return VBool(a.i >= b.i); }
+// Arithmetic is untag -> compute -> retag. Int is 61-bit, so overflow wraps
+// (OCaml-style, no check); the codec's fields fit, full-width lands in Stage 2.
+static inline Value prim_add(Value a, Value b) { return VInt(as_int(a) + as_int(b)); }
+static inline Value prim_sub(Value a, Value b) { return VInt(as_int(a) - as_int(b)); }
+static inline Value prim_mul(Value a, Value b) { return VInt(as_int(a) * as_int(b)); }
+static inline Value prim_div(Value a, Value b) { return VInt(as_int(a) / as_int(b)); }
+static inline Value prim_mod(Value a, Value b) { return VInt(as_int(a) % as_int(b)); }
+static inline Value prim_lt(Value a, Value b) { return VBool(as_int(a) < as_int(b)); }
+static inline Value prim_gt(Value a, Value b) { return VBool(as_int(a) > as_int(b)); }
+static inline Value prim_le(Value a, Value b) { return VBool(as_int(a) <= as_int(b)); }
+static inline Value prim_ge(Value a, Value b) { return VBool(as_int(a) >= as_int(b)); }
 static inline Value prim_eq(Value a, Value b) { return VBool(val_eq(a, b)); }
-static inline Value prim_and(Value a, Value b) { return VBool(a.b && b.b); }
-static inline Value prim_or(Value a, Value b) { return VBool(a.b || b.b); }
-static inline Value prim_xor(Value a, Value b) { return VBool(a.b != b.b); }
+static inline Value prim_and(Value a, Value b) { return VBool(as_bool(a) && as_bool(b)); }
+static inline Value prim_or(Value a, Value b) { return VBool(as_bool(a) || as_bool(b)); }
+static inline Value prim_xor(Value a, Value b) { return VBool(as_bool(a) != as_bool(b)); }
 Value prim_show(Value x);
 Value prim_print_endline(Value x);
 // Concatenate `n` text values (used by string interpolation).
@@ -124,7 +158,7 @@ Value prim_str_concat(size_t n, ...);
 // gc.h, since they are what the garbage collector manages.
 
 // Apply a closure value to an argument.
-static inline Value apply(Value f, Value x) { return f.clo->code(f, x); }
+static inline Value apply(Value f, Value x) { return as_closure(f)->code(f, x); }
 
 // Apply a closure value to `n` arguments at once (the flattened spine of a
 // nested application). When `f` is the head of a curried chain whose remaining
@@ -134,7 +168,7 @@ static inline Value apply(Value f, Value x) { return f.clo->code(f, x); }
 // `n > arity`, or a plain single-stage closure) falls back to applying one
 // argument at a time through `code`, exactly reproducing the curried semantics.
 static inline Value apply_n(Value f, size_t n, Value *args) {
-    Closure *c = f.clo;
+    Closure *c = as_closure(f);
     if (c->worker && c->arity == n) {
         return c->worker(f, args);
     }
@@ -146,16 +180,16 @@ static inline Value apply_n(Value f, size_t n, Value *args) {
 }
 
 // i-th element of a tuple value (also used for record ordinals).
-static inline Value proj(Value t, size_t i) { return t.tup->elems[i]; }
+static inline Value proj(Value t, size_t i) { return as_tuple(t)->elems[i]; }
 
 // A constructor value's tag (which constructor) and i-th field. Codegen knows
 // statically whether a value is a tuple or a constructor -- tuple/record access
 // uses `proj`, constructor access uses these -- so no runtime tag check here.
-#define data_tag(v) ((v).dat->tag)
-#define data_field(v, i) ((v).dat->fields[(i)])
+#define data_tag(v) (as_data(v)->tag)
+#define data_field(v, i) (as_data(v)->fields[(i)])
 
 // i-th captured value, read out of a closure's own (inline) environment.
-#define env_get(self, i) ((self).clo->caps[(i)])
+#define env_get(self, i) (as_closure(self)->caps[(i)])
 
 // Aborts on a non-exhaustive `deconstruct`. Returns Value only so it can sit in
 // the tail of a ternary chain; it never actually returns.
@@ -205,19 +239,19 @@ extern Value builtin_text_fold_right;
 // for anything the built-in tags don't cover. Add a tag by defining its three
 // macros: `CTYPE_<tag>`, `box_<tag>`, `unbox_<tag>`.
 #define CTYPE_int64_t int64_t
-#define unbox_int64_t(v) ((v).i)
+#define unbox_int64_t(v) (as_int(v))
 #define box_int64_t(x) VInt(x)
 
 #define CTYPE_Bool bool
-#define unbox_Bool(v) ((v).b)
+#define unbox_Bool(v) (as_bool(v))
 #define box_Bool(x) VBool(x)
 
 #define CTYPE_Char char
-#define unbox_Char(v) ((v).c)
+#define unbox_Char(v) (as_char(v))
 #define box_Char(x) VChar(x)
 
 #define CTYPE_Text const char *
-#define unbox_Text(v) ((v).s)
+#define unbox_Text(v) (as_text(v))
 // Copy the returned C string into a collectable heap text: a foreign function
 // hands back a *borrowed* pointer (a stack or static buffer), never ownership of
 // a malloc. `mk_text` takes the owning copy the collector then manages.

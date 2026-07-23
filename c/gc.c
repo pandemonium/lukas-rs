@@ -225,7 +225,13 @@ static size_t gc_nursery = 256u << 20; // trigger a minor GC once the nursery fi
 // past 256 MiB. NB there is a *valley* around 32-64 MiB (worse than 16) where
 // tenuring is pathological, so a moderate bump would regress; jump past it.
 // Tunable per run via MARM_NURSERY (KiB).
-static size_t gc_major_at = 8u << 20;  // trigger a major GC once the old gen exceeds this
+// A major fires once the old gen exceeds `gc_major_at`, recomputed after each
+// major as max(live_old * 2, gc_major_floor). Both are set in gc_init; see the
+// note there for why the floor matters.
+static size_t gc_major_at = 0;
+static size_t gc_major_floor = 0;
+// The floor defaults to this many nurseries' worth of bytes.
+#define MAJOR_FLOOR_NURSERIES 4
 static bool gc_on = false;
 static bool gc_major = false;          // is the in-progress collection a major one?
 static bool gc_generational = true;    // MARM_NOGEN=1 forces a full sweep every GC
@@ -266,19 +272,42 @@ static void mark_obj(void *body) {
     }
 }
 
-static void mark_value(Value v) {
-    if (v.tag == TAG_TUPLE) mark_obj(v.tup);
-    else if (v.tag == TAG_CLOSURE) mark_obj(v.clo);
-    else if (v.tag == TAG_DATA) mark_obj(v.dat);
-    // A text is owned (a live OBJ_TEXT body) or borrowed (a literal in read-only
-    // data). `is_object` is exactly that distinction -- the &str/String test --
-    // so only owned strings are traced; borrowed ones are left alone.
-    else if (v.tag == TAG_TEXT && is_object((uintptr_t)v.s)) mark_obj((void *)v.s);
-    else if (v.tag == TAG_OBJECT) mark_obj(v.obj);
+// The logical kind of a value, for the runtime's own dispatch. Immediates decode
+// from the low bits; a pointer's kind comes from its heap header. Defined here
+// (not in runtime.h) because only gc.c sees `GcHeader`/`ObjKind`.
+Tag value_tag(Value v) {
+    if (v.w & 1) {
+        switch (v.w & TAGMASK) {
+        case IMM_INT:  return TAG_INT;
+        case IMM_BOOL: return TAG_BOOL;
+        case IMM_CHAR: return TAG_CHAR;
+        default:       return TAG_UNIT; // IMM_UNIT
+        }
+    }
+    switch (HEADER(as_ptr(v))->kind) {
+    case OBJ_TEXT:    return TAG_TEXT;
+    case OBJ_TUPLE:   return TAG_TUPLE;
+    case OBJ_CLOSURE: return TAG_CLOSURE;
+    case OBJ_DATA:    return TAG_DATA;
+    default:          return TAG_OBJECT; // buffer / bytes / mmap / slice
+    }
 }
 
-// A conservative root candidate: mark it only if it is exactly a live object.
+static void mark_value(Value v) {
+    // A precise Value: immediates (Int/Bool/Char/Unit) are odd; every even word
+    // is a heap body pointer, save 0 (an uninitialised root). No `is_object`
+    // membership probe here -- this is the hot trace path, and children of live
+    // objects are always valid. (Stage 1b's static-text descriptors will be the
+    // one even non-heap case; they get handled when introduced.)
+    if (!v.w || (v.w & 1)) return;
+    mark_obj(as_ptr(v));
+}
+
+// A conservative root candidate: mark it only if it is exactly a live object. An
+// odd word can never be a body pointer (bodies are 8-aligned), which also skips
+// tagged immediates that happen to sit on the stack -- no false-positive match.
 static void mark_candidate(uintptr_t w) {
+    if (w & 1) return;
     if (is_object(w)) mark_obj((void *)w);
 }
 
@@ -385,7 +414,8 @@ static void gc_run(bool major) {
         }
         gc_young_bytes = young_live;
         gc_old_bytes = old_live;
-        gc_major_at = gc_old_bytes * 2 < (8u << 20) ? (8u << 20) : gc_old_bytes * 2;
+        size_t twice = gc_old_bytes * 2;
+        gc_major_at = twice < gc_major_floor ? gc_major_floor : twice;
     } else {
         // Tenure the survivors: move them from the nursery into the old list.
         GcHeader *h = gc_young;
@@ -475,7 +505,21 @@ void gc_init(void *stack_bottom) {
     const char *nursery = getenv("MARM_NURSERY");
     const char *major = getenv("MARM_MAJOR");
     if (nursery) gc_nursery = (size_t)strtoull(nursery, NULL, 10) << 10;
-    if (major) gc_major_at = (size_t)strtoull(major, NULL, 10) << 10;
+    // Major-GC trigger: after each major, gc_major_at = max(live_old * 2, floor).
+    // The `* 2` (Appel's rule) keeps a major's cost proportional to the live set
+    // once it is large; the FLOOR makes major *frequency* track allocation when
+    // the live set is small. Without a floor, a flat-memory program that tenures a
+    // large transient structure each iteration majors every ~live bytes of
+    // tenuring -- often less than one nursery -- reclaiming almost nothing per
+    // (live-set-sized) collection (measured: the binary_codec aggressive build did
+    // 9-31 near-empty majors and ran 2.7x slower than its leaky self). Flooring at
+    // a few nurseries lets that garbage accumulate to a worthwhile slice first.
+    // The floor must be computed *after* the nursery is resolved, and it persists
+    // across the post-major recompute above (unlike a one-shot gc_major_at seed).
+    // MARM_MAJOR (KiB) overrides the floor.
+    gc_major_floor = (size_t)MAJOR_FLOOR_NURSERIES * gc_nursery;
+    if (major) gc_major_floor = (size_t)strtoull(major, NULL, 10) << 10;
+    gc_major_at = gc_major_floor;
     if (getenv("MARM_NOGEN")) gc_generational = false;
     if (getenv("MARM_NOGC")) gc_disabled = true;
     if (getenv("MARM_GC_STATS")) atexit(gc_report);
@@ -499,10 +543,7 @@ static Value mk_closure_va(Value (*code)(Value, Value),
     for (size_t i = 0; i < nfree; i++) {
         c->caps[i] = va_arg(ap, Value);
     }
-    Value v;
-    v.tag = TAG_CLOSURE;
-    v.clo = c;
-    return v;
+    return VObject(c);
 }
 
 Value mk_closure_n(Value (*code)(Value, Value), Value (*worker)(Value, Value *),
@@ -531,10 +572,7 @@ Value mk_textn(const char *src, size_t len) {
     char *body = gc_new(len + 1, OBJ_TEXT);
     memcpy(body, src, len);
     body[len] = '\0';
-    Value v;
-    v.tag = TAG_TEXT;
-    v.s = body;
-    return v;
+    return VObject(body);
 }
 
 // Copy a NUL-terminated C string into a collectable string body.
@@ -551,10 +589,7 @@ Value mk_tuple(size_t len, ...) {
         t->elems[i] = va_arg(ap, Value);
     }
     va_end(ap);
-    Value v;
-    v.tag = TAG_TUPLE;
-    v.tup = t;
-    return v;
+    return VObject(t);
 }
 
 Value mk_data(uint64_t tag, size_t nfields, ...) {
@@ -568,16 +603,13 @@ Value mk_data(uint64_t tag, size_t nfields, ...) {
         d->fields[i] = va_arg(ap, Value);
     }
     va_end(ap);
-    Value v;
-    v.tag = TAG_DATA;
-    v.dat = d;
-    return v;
+    return VObject(d);
 }
 
 // Field count of a live constructor value, recovered from its heap header's body
 // size (the count is not stored in the object itself).
 size_t data_len(Value v) {
-    return (HEADER(v.dat)->body - sizeof(Data)) / sizeof(Value);
+    return (HEADER(as_ptr(v))->body - sizeof(Data)) / sizeof(Value);
 }
 
 // ----------------------------------------------------------------- byte buffers
@@ -598,12 +630,12 @@ Value mk_buffer(size_t cap) {
 // live on the stack across the collection `gc_new` may trigger, and the handle
 // keeps the old body live through its trace, so the memcpy source survives.
 void buffer_put_u8(Value bv, uint8_t byte) {
-    Buffer *b = bv.obj;
+    Buffer *b = as_ptr(bv);
     if (b->len == b->cap) {
         size_t ncap = b->cap * 2;
         gc_reserve(sizeof(GcHeader) + ncap);
         void *nbody = gc_new(ncap, OBJ_BYTES);
-        b = bv.obj;
+        b = as_ptr(bv);
         memcpy(nbody, b->bytes, b->len);
         b->bytes = nbody;
         b->cap = ncap;
@@ -615,7 +647,7 @@ void buffer_put_bytes(Value bv, const uint8_t *src, size_t n) {
     for (size_t i = 0; i < n; i++) buffer_put_u8(bv, src[i]);
 }
 
-size_t buffer_len(Value bv) { return ((Buffer *)bv.obj)->len; }
+size_t buffer_len(Value bv) { return ((Buffer *)as_ptr(bv))->len; }
 
 // Typed writes: append a width's worth of bytes in the given order. Signed and
 // unsigned share the same bytes, so one entry per (width, endianness).
@@ -657,12 +689,12 @@ Value mk_slice(void *owner, size_t offset, size_t len) {
 // Hand the buffer's body to a Slice, then reseed the handle with a fresh empty
 // body so it no longer aliases the bytes it gave away.
 Value buffer_move(Value bv) {
-    Buffer *b = bv.obj;
+    Buffer *b = as_ptr(bv);
     size_t len = b->len;
     void *body = b->bytes; // handed off below; stays live on the stack meanwhile
     gc_reserve(sizeof(GcHeader) + 16);
     void *fresh = gc_new(16, OBJ_BYTES);
-    b = bv.obj;
+    b = as_ptr(bv);
     b->bytes = fresh;
     b->len = 0;
     b->cap = 16;
@@ -670,10 +702,10 @@ Value buffer_move(Value bv) {
 }
 
 Value buffer_copy(Value bv) {
-    size_t n = ((Buffer *)bv.obj)->len;
+    size_t n = ((Buffer *)as_ptr(bv))->len;
     gc_reserve(sizeof(GcHeader) + (n ? n : 1));
     void *body = gc_new(n ? n : 1, OBJ_BYTES);
-    Buffer *b = bv.obj; // re-fetch after the possible collection
+    Buffer *b = as_ptr(bv); // re-fetch after the possible collection
     memcpy(body, b->bytes, n);
     return mk_slice(body, 0, n);
 }
@@ -684,25 +716,25 @@ static const uint8_t *slice_base(Slice *s) {
     return ((Mmap *)s->owner)->region + s->offset; // OBJ_MMAP
 }
 
-size_t slice_len(Value sv) { return ((Slice *)sv.obj)->len; }
+size_t slice_len(Value sv) { return ((Slice *)as_ptr(sv))->len; }
 
-uint8_t slice_get_u8(Value sv, size_t i) { return slice_base(sv.obj)[i]; }
+uint8_t slice_get_u8(Value sv, size_t i) { return slice_base(as_ptr(sv))[i]; }
 
 Value slice_sub(Value sv, size_t off, size_t len) {
-    Slice *s = sv.obj;
+    Slice *s = as_ptr(sv);
     return mk_slice(s->owner, s->offset + off, len); // shares the owner
 }
 
 #define SLICE_GET_LE(NAME, TYPE, N)                                                    \
     TYPE NAME(Value sv, size_t off) {                                                  \
-        const uint8_t *p = slice_base(sv.obj) + off;                                    \
+        const uint8_t *p = slice_base(as_ptr(sv)) + off;                                    \
         uint64_t v = 0;                                                                \
         for (size_t k = 0; k < (N); k++) v |= (uint64_t)p[k] << (8 * k);               \
         return (TYPE)v;                                                                \
     }
 #define SLICE_GET_BE(NAME, TYPE, N)                                                    \
     TYPE NAME(Value sv, size_t off) {                                                  \
-        const uint8_t *p = slice_base(sv.obj) + off;                                    \
+        const uint8_t *p = slice_base(as_ptr(sv)) + off;                                    \
         uint64_t v = 0;                                                                \
         for (size_t k = 0; k < (N); k++) v = (v << 8) | p[k];                          \
         return (TYPE)v;                                                                \
@@ -729,12 +761,12 @@ static Value result_fault(Value e) { return mk_data(0, 1, e); }
 // Ranged Buffer -> Bytes producers. Like buffer_move/buffer_copy but for a
 // sub-range [off, off+n); Fault(-1) if that range runs past the buffer's length.
 Value buffer_move_range(Value bv, size_t off, size_t n) {
-    Buffer *b = bv.obj;
+    Buffer *b = as_ptr(bv);
     if (off + n > b->len) return result_fault(VInt(-1));
     void *body = b->bytes; // handed off below; stays live on the stack meanwhile
     gc_reserve(sizeof(GcHeader) + 16);
     void *fresh = gc_new(16, OBJ_BYTES);
-    b = bv.obj;
+    b = as_ptr(bv);
     b->bytes = fresh;
     b->len = 0;
     b->cap = 16;
@@ -742,11 +774,11 @@ Value buffer_move_range(Value bv, size_t off, size_t n) {
 }
 
 Value buffer_copy_range(Value bv, size_t off, size_t n) {
-    Buffer *b = bv.obj;
+    Buffer *b = as_ptr(bv);
     if (off + n > b->len) return result_fault(VInt(-1));
     gc_reserve(sizeof(GcHeader) + (n ? n : 1));
     void *body = gc_new(n ? n : 1, OBJ_BYTES);
-    b = bv.obj; // re-fetch after the possible collection
+    b = as_ptr(bv); // re-fetch after the possible collection
     memcpy(body, (const uint8_t *)b->bytes + off, n);
     return result_return(mk_slice(body, 0, n));
 }
@@ -777,7 +809,7 @@ Value mmap_open(const char *path) {
 }
 
 void mmap_close(Value mv) {
-    Mmap *m = mv.obj;
+    Mmap *m = as_ptr(mv);
     if (!m->closed) {
         munmap(m->region, m->len);
         m->closed = true;
@@ -785,11 +817,11 @@ void mmap_close(Value mv) {
 }
 
 Value mmap_read(Value mv, size_t off, size_t n) {
-    Mmap *m = mv.obj;
+    Mmap *m = as_ptr(mv);
     if (m->closed || off + n > m->len) return result_fault(VInt(-1));
     Value bufv = mk_buffer(n);
-    Buffer *b = bufv.obj;
-    m = mv.obj; // re-fetch after the possible collection in mk_buffer
+    Buffer *b = as_ptr(bufv);
+    m = as_ptr(mv); // re-fetch after the possible collection in mk_buffer
     memcpy(b->bytes, m->region + off, n);
     b->len = n;
     return result_return(buffer_move(bufv));
@@ -800,19 +832,19 @@ Value mmap_read(Value mv, size_t off, size_t n) {
 // while the mapping is open; reading it after mmap_close faults on the unmapped
 // pages. Returns Result (Fault errno | Return Slice).
 Value mmap_slice(Value mv, size_t off, size_t n) {
-    Mmap *m = mv.obj;
+    Mmap *m = as_ptr(mv);
     if (m->closed || off + n > m->len) return result_fault(VInt(-1));
     return result_return(mk_slice(m, off, n)); // owner = the OBJ_MMAP handle
 }
 
 // Direct reads on a mapped region (for Byte_Source Mmap -- zero-copy, no Slice).
-int64_t mmap_len(Value mv) { return (int64_t)((Mmap *)mv.obj)->len; }
-int64_t mmap_get_u8(Value mv, int64_t i) { return (int64_t)((Mmap *)mv.obj)->region[i]; }
-bool    mmap_is_closed(Value mv) { return ((Mmap *)mv.obj)->closed; }
+int64_t mmap_len(Value mv) { return (int64_t)((Mmap *)as_ptr(mv))->len; }
+int64_t mmap_get_u8(Value mv, int64_t i) { return (int64_t)((Mmap *)as_ptr(mv))->region[i]; }
+bool    mmap_is_closed(Value mv) { return ((Mmap *)as_ptr(mv))->closed; }
 
 // Write a slice's bytes to `path` (truncating). Returns 0 on success, else errno.
 int64_t slice_write_file(Value sv, const char *path) {
-    Slice *s = sv.obj;
+    Slice *s = as_ptr(sv);
     FILE *f = fopen(path, "wb");
     if (!f) return errno;
     size_t w = fwrite(slice_base(s), 1, s->len, f);

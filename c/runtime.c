@@ -29,14 +29,15 @@
     Value NAME
 
 bool val_eq(Value a, Value b) {
-    if (a.tag != b.tag) {
+    Tag ta = value_tag(a);
+    if (ta != value_tag(b)) {
         return false;
     }
-    switch (a.tag) {
-    case TAG_INT:  return a.i == b.i;
-    case TAG_BOOL: return a.b == b.b;
-    case TAG_CHAR: return a.c == b.c;
-    case TAG_TEXT: return strcmp(a.s, b.s) == 0;
+    switch (ta) {
+    case TAG_INT:  return as_int(a) == as_int(b);
+    case TAG_BOOL: return as_bool(a) == as_bool(b);
+    case TAG_CHAR: return as_char(a) == as_char(b);
+    case TAG_TEXT: return strcmp(as_text(a), as_text(b)) == 0;
     case TAG_UNIT: return true;
     default:       return false;
     }
@@ -120,22 +121,22 @@ static char *show_data(Value x) {
 
 static char *show_alloc(Value x) {
     char buf[32];
-    switch (x.tag) {
+    switch (value_tag(x)) {
     case TAG_INT:
-        snprintf(buf, sizeof buf, "%lld", (long long)x.i);
+        snprintf(buf, sizeof buf, "%lld", (long long)as_int(x));
         return strdup(buf);
     case TAG_BOOL:
-        return strdup(x.b ? "true" : "false");
+        return strdup(as_bool(x) ? "true" : "false");
     case TAG_CHAR:
-        buf[0] = x.c;
+        buf[0] = as_char(x);
         buf[1] = '\0';
         return strdup(buf);
     case TAG_TEXT:
-        return strdup(x.s);
+        return strdup(as_text(x));
     case TAG_UNIT:
         return strdup("()");
     case TAG_TUPLE:
-        return show_tuple(x.tup);
+        return show_tuple(as_tuple(x));
     case TAG_DATA:
         return show_data(x);
     default:
@@ -157,7 +158,7 @@ Value prim_show(Value x) {
 }
 
 Value prim_print_endline(Value x) {
-    fputs(x.s, stdout);
+    fputs(as_text(x), stdout);
     fputc('\n', stdout);
     return VUnit();
 }
@@ -169,8 +170,8 @@ Value prim_str_concat(size_t n, ...) {
     va_start(ap, n);
     for (size_t i = 0; i < n; i++) {
         Value v = va_arg(ap, Value);
-        parts[i] = v.s;
-        total += strlen(v.s);
+        parts[i] = as_text(v);
+        total += strlen(parts[i]);
     }
     va_end(ap);
 
@@ -216,7 +217,7 @@ UNOP(builtin_print_endline, prim_print_endline);
 static Value tfr_3(Value self, Value s) {
     Value f = env_get(self, 0);
     Value acc = env_get(self, 1);
-    const char *str = s.s;
+    const char *str = as_text(s);
     for (size_t k = strlen(str); k-- > 0;) {
         acc = apply(apply(f, VChar(str[k])), acc);
     }
