@@ -103,7 +103,10 @@ impl phase::SymbolTable<Types> {
                             &inlinables
                         };
                         let body = simplify_term(term.body, inls);
-                        if dump.as_deref().is_some_and(|f| term.name.to_string().contains(f)) {
+                        if dump
+                            .as_deref()
+                            .is_some_and(|f| term.name.to_string().contains(f))
+                        {
                             eprintln!("==== {} ====\n{}\n", term.name, body);
                         }
                         Symbol::Term(TermSymbol {
@@ -204,9 +207,7 @@ fn build_inlinables(
 
     let inlinables = terms
         .iter()
-        .filter(|(name, body)| {
-            within_budget(body, INLINE_BUDGET) && !recursive.contains(*name)
-        })
+        .filter(|(name, body)| within_budget(body, INLINE_BUDGET) && !recursive.contains(*name))
         .map(|(name, body)| ((*name).clone(), Rc::new((*body).clone())))
         .collect();
 
@@ -217,11 +218,13 @@ fn build_inlinables(
 /// -- i.e. a real loop. (An unused self-binder is not recursion; `derecursify` drops it.)
 fn contains_recursion<A>(expr: &Expr<A, Identifier>) -> bool {
     match expr {
-        Expr::RecursiveLambda(_, SelfReferential { own_name: Identifier::Bound(level), lambda })
-            if mentions_level(&lambda.body, *level) =>
-        {
-            true
-        }
+        Expr::RecursiveLambda(
+            _,
+            SelfReferential {
+                own_name: Identifier::Bound(level),
+                lambda,
+            },
+        ) if mentions_level(&lambda.body, *level) => true,
         _ => children(expr).into_iter().any(|c| contains_recursion(c)),
     }
 }
@@ -265,7 +268,10 @@ fn within_budget<A>(expr: &Expr<A, Identifier>, budget: usize) -> bool {
 /// (and any other structural fold that does not care which slot a child sits in).
 fn children<A>(expr: &Expr<A, Identifier>) -> Vec<&Tree<A, Identifier>> {
     match expr {
-        Expr::Variable(..) | Expr::InvokeBridge(..) | Expr::Constant(..) | Expr::MakeClosure(..) => {
+        Expr::Variable(..)
+        | Expr::InvokeBridge(..)
+        | Expr::Constant(..)
+        | Expr::MakeClosure(..) => {
             vec![]
         }
         Expr::RecursiveLambda(_, SelfReferential { lambda, .. }) => vec![&lambda.body],
@@ -277,12 +283,25 @@ fn children<A>(expr: &Expr<A, Identifier>) -> Vec<&Tree<A, Identifier>> {
         Expr::Inject(_, Injection { arguments, .. }) => arguments.iter().collect(),
         Expr::Project(_, Projection { base, .. }) => vec![base],
         Expr::Sequence(_, Sequence { this, and_then }) => vec![this, and_then],
-        Expr::Deconstruct(_, Deconstruct { scrutinee, match_clauses }) => {
+        Expr::Deconstruct(
+            _,
+            Deconstruct {
+                scrutinee,
+                match_clauses,
+            },
+        ) => {
             let mut cs = vec![scrutinee];
             cs.extend(match_clauses.iter().map(|clause| &clause.consequent));
             cs
         }
-        Expr::If(_, IfThenElse { predicate, consequent, alternate }) => {
+        Expr::If(
+            _,
+            IfThenElse {
+                predicate,
+                consequent,
+                alternate,
+            },
+        ) => {
             vec![predicate, consequent, alternate]
         }
         Expr::Interpolate(_, Interpolate(segments)) => segments
@@ -349,7 +368,9 @@ where
             Expr::Project(a, Projection { base, select }) => Expr::Project(
                 a.clone(),
                 Projection {
-                    base: self.try_head(base, depth).unwrap_or_else(|| go(base, depth)),
+                    base: self
+                        .try_head(base, depth)
+                        .unwrap_or_else(|| go(base, depth)),
                     select: select.clone(),
                 },
             ),
@@ -362,19 +383,29 @@ where
                 },
             ),
 
-            Expr::RecursiveLambda(a, SelfReferential { own_name, lambda }) => Expr::RecursiveLambda(
-                a.clone(),
-                SelfReferential {
-                    own_name: own_name.clone(),
-                    lambda: Lambda {
-                        parameter: lambda.parameter.clone(),
-                        // own_name binds at `depth`, the parameter at `depth + 1`.
-                        body: go(&lambda.body, depth + 2),
+            Expr::RecursiveLambda(a, SelfReferential { own_name, lambda }) => {
+                Expr::RecursiveLambda(
+                    a.clone(),
+                    SelfReferential {
+                        own_name: own_name.clone(),
+                        lambda: Lambda {
+                            parameter: lambda.parameter.clone(),
+                            // own_name binds at `depth`, the parameter at `depth + 1`.
+                            body: go(&lambda.body, depth + 2),
+                        },
                     },
-                },
-            ),
+                )
+            }
 
-            Expr::Let(a, Binding { binder, operator, bound, body }) => Expr::Let(
+            Expr::Let(
+                a,
+                Binding {
+                    binder,
+                    operator,
+                    bound,
+                    body,
+                },
+            ) => Expr::Let(
                 a.clone(),
                 Binding {
                     binder: binder.clone(),
@@ -387,7 +418,13 @@ where
             // Scrutinee position: like head/base, it is an elimination site -- a
             // known constructor here lets case-of-known-constructor fire and cancel
             // the box (this is what collapses the `MkGet`/State machinery).
-            Expr::Deconstruct(a, Deconstruct { scrutinee, match_clauses }) => Expr::Deconstruct(
+            Expr::Deconstruct(
+                a,
+                Deconstruct {
+                    scrutinee,
+                    match_clauses,
+                },
+            ) => Expr::Deconstruct(
                 a.clone(),
                 Deconstruct {
                     scrutinee: self
@@ -416,11 +453,20 @@ where
             Expr::Record(a, Record { fields }) => Expr::Record(
                 a.clone(),
                 Record {
-                    fields: fields.iter().map(|(k, v)| (k.clone(), go(v, depth))).collect(),
+                    fields: fields
+                        .iter()
+                        .map(|(k, v)| (k.clone(), go(v, depth)))
+                        .collect(),
                 },
             ),
 
-            Expr::Inject(a, Injection { constructor, arguments }) => Expr::Inject(
+            Expr::Inject(
+                a,
+                Injection {
+                    constructor,
+                    arguments,
+                },
+            ) => Expr::Inject(
                 a.clone(),
                 Injection {
                     constructor: constructor.clone(),
@@ -436,7 +482,14 @@ where
                 },
             ),
 
-            Expr::If(a, IfThenElse { predicate, consequent, alternate }) => Expr::If(
+            Expr::If(
+                a,
+                IfThenElse {
+                    predicate,
+                    consequent,
+                    alternate,
+                },
+            ) => Expr::If(
                 a.clone(),
                 IfThenElse {
                     predicate: go(predicate, depth),
@@ -458,15 +511,19 @@ where
                 ),
             ),
 
-            Expr::Ascription(a, TypeAscription { ascribed_tree, type_signature }) => {
-                Expr::Ascription(
-                    a.clone(),
-                    TypeAscription {
-                        ascribed_tree: go(ascribed_tree, depth),
-                        type_signature: type_signature.clone(),
-                    },
-                )
-            }
+            Expr::Ascription(
+                a,
+                TypeAscription {
+                    ascribed_tree,
+                    type_signature,
+                },
+            ) => Expr::Ascription(
+                a.clone(),
+                TypeAscription {
+                    ascribed_tree: go(ascribed_tree, depth),
+                    type_signature: type_signature.clone(),
+                },
+            ),
 
             leaf @ (Expr::Variable(..)
             | Expr::InvokeBridge(..)
@@ -543,17 +600,14 @@ where
         // (`compile_expr(ascribed_tree)`), and the type is already on the node
         // annotation. Removing them uncovers the lambda / constructor an ascription
         // wraps, which is what every elimination rule below needs to see.
-        Expr::Ascription(_, ascription) => {
-            (true, Rc::unwrap_or_clone(ascription.ascribed_tree))
-        }
+        Expr::Ascription(_, ascription) => (true, Rc::unwrap_or_clone(ascription.ascribed_tree)),
 
         // derecursify: every top-level combinator is elaborated as a self-referential
         // lambda (`#L := λ…`), but the ones we inline never use their self-binder. Drop
         // it so the plain-lambda beta rules can fire. The self binder sits at level `L`
         // (its own depth) with the parameter at `L+1`; removing it slides everything
         // above `L` down by one, so the parameter lands at `L` -- a normal lambda.
-        Expr::RecursiveLambda(a, SelfReferential { own_name, lambda })
-            if matches!(&own_name, Identifier::Bound(l) if !mentions_level(&lambda.body, *l)) =>
+        Expr::RecursiveLambda(a, SelfReferential { own_name, lambda }) if matches!(&own_name, Identifier::Bound(l) if !mentions_level(&lambda.body, *l)) =>
         {
             let Identifier::Bound(l) = own_name else {
                 unreachable!("guarded by the match arm")
@@ -623,18 +677,34 @@ where
                     argument: Rc::new(shift(&argument, level, 1)),
                 },
             );
-            (true, rewrap_let(la, binding.binder, binding.operator, binding.bound, floated))
+            (
+                true,
+                rewrap_let(la, binding.binder, binding.operator, binding.bound, floated),
+            )
         }
 
         Expr::Project(a, projection) if is_floatable_let(&projection.base) => {
             let Projection { base, select } = projection;
             let (la, binding, _level) = open_let(base);
-            let floated = Expr::Project(a, Projection { base: binding.body, select });
-            (true, rewrap_let(la, binding.binder, binding.operator, binding.bound, floated))
+            str::from_utf8(v)
+            let floated = Expr::Project(
+                a,
+                Projection {
+                    base: binding.body,
+                    select,
+                },
+            );
+            (
+                true,
+                rewrap_let(la, binding.binder, binding.operator, binding.bound, floated),
+            )
         }
 
         Expr::Deconstruct(a, deconstruct) if is_floatable_let(&deconstruct.scrutinee) => {
-            let Deconstruct { scrutinee, match_clauses } = deconstruct;
+            let Deconstruct {
+                scrutinee,
+                match_clauses,
+            } = deconstruct;
             let (la, binding, level) = open_let(scrutinee);
             let floated = Expr::Deconstruct(
                 a,
@@ -649,7 +719,10 @@ where
                         .collect(),
                 },
             );
-            (true, rewrap_let(la, binding.binder, binding.operator, binding.bound, floated))
+            (
+                true,
+                rewrap_let(la, binding.binder, binding.operator, binding.bound, floated),
+            )
         }
 
         // let-forwarding: substitute a value-bound `let` into its uses when every use
@@ -716,13 +789,21 @@ fn all_uses_eliminated<A>(expr: &Expr<A, Identifier>, level: usize) -> bool {
             eliminated_head(function, level) && all_uses_eliminated(argument, level)
         }
         Expr::Project(_, Projection { base, .. }) => eliminated_head(base, level),
-        Expr::Deconstruct(_, Deconstruct { scrutinee, match_clauses }) => {
+        Expr::Deconstruct(
+            _,
+            Deconstruct {
+                scrutinee,
+                match_clauses,
+            },
+        ) => {
             eliminated_head(scrutinee, level)
                 && match_clauses
                     .iter()
                     .all(|clause| all_uses_eliminated(&clause.consequent, level))
         }
-        other => children(other).into_iter().all(|c| all_uses_eliminated(c, level)),
+        other => children(other)
+            .into_iter()
+            .all(|c| all_uses_eliminated(c, level)),
     }
 }
 
@@ -783,7 +864,15 @@ where
             },
         ),
 
-        Expr::Let(a, Binding { binder, operator, bound, body }) => Expr::Let(
+        Expr::Let(
+            a,
+            Binding {
+                binder,
+                operator,
+                bound,
+                body,
+            },
+        ) => Expr::Let(
             a.clone(),
             Binding {
                 binder: on_binder(binder),
@@ -803,11 +892,20 @@ where
         Expr::Record(a, Record { fields }) => Expr::Record(
             a.clone(),
             Record {
-                fields: fields.iter().map(|(k, v)| (k.clone(), go(v, depth))).collect(),
+                fields: fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), go(v, depth)))
+                    .collect(),
             },
         ),
 
-        Expr::Inject(a, Injection { constructor, arguments }) => Expr::Inject(
+        Expr::Inject(
+            a,
+            Injection {
+                constructor,
+                arguments,
+            },
+        ) => Expr::Inject(
             a.clone(),
             Injection {
                 constructor: constructor.clone(),
@@ -831,7 +929,13 @@ where
             },
         ),
 
-        Expr::Deconstruct(a, Deconstruct { scrutinee, match_clauses }) => Expr::Deconstruct(
+        Expr::Deconstruct(
+            a,
+            Deconstruct {
+                scrutinee,
+                match_clauses,
+            },
+        ) => Expr::Deconstruct(
             a.clone(),
             Deconstruct {
                 scrutinee: go(scrutinee, depth),
@@ -848,7 +952,14 @@ where
             },
         ),
 
-        Expr::If(a, IfThenElse { predicate, consequent, alternate }) => Expr::If(
+        Expr::If(
+            a,
+            IfThenElse {
+                predicate,
+                consequent,
+                alternate,
+            },
+        ) => Expr::If(
             a.clone(),
             IfThenElse {
                 predicate: go(predicate, depth),
@@ -870,7 +981,13 @@ where
             ),
         ),
 
-        Expr::Ascription(a, TypeAscription { ascribed_tree, type_signature }) => Expr::Ascription(
+        Expr::Ascription(
+            a,
+            TypeAscription {
+                ascribed_tree,
+                type_signature,
+            },
+        ) => Expr::Ascription(
             a.clone(),
             TypeAscription {
                 ascribed_tree: go(ascribed_tree, depth),
@@ -904,7 +1021,13 @@ fn is_closed_atom<A>(expr: &Expr<A, Identifier>) -> bool {
 fn is_floatable_let<A>(tree: &Tree<A, Identifier>) -> bool {
     matches!(
         &**tree,
-        Expr::Let(_, Binding { binder: Identifier::Bound(_), .. })
+        Expr::Let(
+            _,
+            Binding {
+                binder: Identifier::Bound(_),
+                ..
+            }
+        )
     )
 }
 
@@ -965,9 +1088,10 @@ where
         // ordinal (`dict.&1`), not by name. Record fields are stored in sorted label
         // order (see `Record::from_fields`), so ordinal `i` is field `i`. This is the
         // case that fires on an inlined witness -- the heart of the dictionary collapse.
-        (Expr::Record(_, Record { fields }), ProductElement::Ordinal(index)) => {
-            (*index < fields.len()).then(|| project_field(fields, *index)).flatten()
-        }
+        (Expr::Record(_, Record { fields }), ProductElement::Ordinal(index)) => (*index
+            < fields.len())
+        .then(|| project_field(fields, *index))
+        .flatten(),
 
         _ => None,
     }
@@ -1156,7 +1280,11 @@ where
         return Some(Rc::unwrap_or_clone(consequent.clone()));
     };
 
-    if levels.iter().enumerate().any(|(i, &level)| level != base + i) {
+    if levels
+        .iter()
+        .enumerate()
+        .any(|(i, &level)| level != base + i)
+    {
         return None;
     }
 
@@ -1279,12 +1407,15 @@ where
             },
         ),
 
-        Expr::Let(a, Binding {
-            binder,
-            operator,
-            bound,
-            body,
-        }) => Expr::Let(
+        Expr::Let(
+            a,
+            Binding {
+                binder,
+                operator,
+                bound,
+                body,
+            },
+        ) => Expr::Let(
             a.clone(),
             Binding {
                 binder: on_binder(binder),
@@ -1308,10 +1439,13 @@ where
             },
         ),
 
-        Expr::Inject(a, Injection {
-            constructor,
-            arguments,
-        }) => Expr::Inject(
+        Expr::Inject(
+            a,
+            Injection {
+                constructor,
+                arguments,
+            },
+        ) => Expr::Inject(
             a.clone(),
             Injection {
                 constructor: constructor.clone(),
@@ -1335,10 +1469,13 @@ where
             },
         ),
 
-        Expr::Deconstruct(a, Deconstruct {
-            scrutinee,
-            match_clauses,
-        }) => Expr::Deconstruct(
+        Expr::Deconstruct(
+            a,
+            Deconstruct {
+                scrutinee,
+                match_clauses,
+            },
+        ) => Expr::Deconstruct(
             a.clone(),
             Deconstruct {
                 scrutinee: go(scrutinee),
@@ -1352,11 +1489,14 @@ where
             },
         ),
 
-        Expr::If(a, IfThenElse {
-            predicate,
-            consequent,
-            alternate,
-        }) => Expr::If(
+        Expr::If(
+            a,
+            IfThenElse {
+                predicate,
+                consequent,
+                alternate,
+            },
+        ) => Expr::If(
             a.clone(),
             IfThenElse {
                 predicate: go(predicate),
@@ -1371,17 +1511,22 @@ where
                 segments
                     .iter()
                     .map(|segment| match segment {
-                        Segment::Literal(sa, literal) => Segment::Literal(sa.clone(), literal.clone()),
+                        Segment::Literal(sa, literal) => {
+                            Segment::Literal(sa.clone(), literal.clone())
+                        }
                         Segment::Expression(expr) => Segment::Expression(go(expr)),
                     })
                     .collect(),
             ),
         ),
 
-        Expr::Ascription(a, TypeAscription {
-            ascribed_tree,
-            type_signature,
-        }) => Expr::Ascription(
+        Expr::Ascription(
+            a,
+            TypeAscription {
+                ascribed_tree,
+                type_signature,
+            },
+        ) => Expr::Ascription(
             a.clone(),
             TypeAscription {
                 ascribed_tree: go(ascribed_tree),
@@ -1402,10 +1547,13 @@ where
     A: Clone,
 {
     match pattern {
-        Pattern::Coproduct(a, ConstructorPattern {
-            constructor,
-            arguments,
-        }) => Pattern::Coproduct(
+        Pattern::Coproduct(
+            a,
+            ConstructorPattern {
+                constructor,
+                arguments,
+            },
+        ) => Pattern::Coproduct(
             a.clone(),
             ConstructorPattern {
                 constructor: on_binder(constructor),
@@ -1419,7 +1567,10 @@ where
         Pattern::Tuple(a, TuplePattern { elements }) => Pattern::Tuple(
             a.clone(),
             TuplePattern {
-                elements: elements.iter().map(|p| walk_pattern(p, on_binder)).collect(),
+                elements: elements
+                    .iter()
+                    .map(|p| walk_pattern(p, on_binder))
+                    .collect(),
             },
         ),
 
@@ -1450,9 +1601,11 @@ mod tests {
     }
 
     fn free_id(name: &str) -> Identifier {
-        Identifier::Free(Box::new(crate::ast::namer::QualifiedName::from_root_symbol(
-            crate::parser::Identifier::from_str(name),
-        )))
+        Identifier::Free(Box::new(
+            crate::ast::namer::QualifiedName::from_root_symbol(
+                crate::parser::Identifier::from_str(name),
+            ),
+        ))
     }
 
     fn free(name: &str) -> Tree<(), Identifier> {
@@ -1474,7 +1627,13 @@ mod tests {
     }
 
     fn apply(f: Tree<(), Identifier>, x: Tree<(), Identifier>) -> E {
-        Expr::Apply((), Apply { function: f, argument: x })
+        Expr::Apply(
+            (),
+            Apply {
+                function: f,
+                argument: x,
+            },
+        )
     }
 
     fn simplify(e: E) -> E {
@@ -1561,11 +1720,17 @@ mod tests {
             panic!("expected deconstruct")
         };
         // scrutinee #0 stays (below threshold)
-        assert!(matches!(&*d.scrutinee, Expr::Variable((), Identifier::Bound(0))));
+        assert!(matches!(
+            &*d.scrutinee,
+            Expr::Variable((), Identifier::Bound(0))
+        ));
         let Pattern::Coproduct((), cp) = &d.match_clauses[0].pattern else {
             panic!("expected coproduct pattern")
         };
-        assert!(matches!(cp.arguments[0], Pattern::Bind((), Identifier::Bound(5))));
+        assert!(matches!(
+            cp.arguments[0],
+            Pattern::Bind((), Identifier::Bound(5))
+        ));
         assert!(matches!(
             &*d.match_clauses[0].consequent,
             Expr::Variable((), Identifier::Bound(5))
@@ -1578,13 +1743,24 @@ mod tests {
     fn substitute_atom_replaces_binder_and_decrements_deeper_uses() {
         // body = (#2, #1); substitute g for level 1 -> (#1, g)
         //   #1 is the binder -> g;  #2 is deeper (2 > 1) -> #1
-        let body = Rc::new(Expr::Tuple((), Tuple { elements: vec![var(2), var(1)] }));
+        let body = Rc::new(Expr::Tuple(
+            (),
+            Tuple {
+                elements: vec![var(2), var(1)],
+            },
+        ));
         let g = Expr::Variable((), free_id("g"));
         let Expr::Tuple((), t) = substitute_atom(&body, 1, &g) else {
             panic!("expected tuple")
         };
-        assert!(matches!(&*t.elements[0], Expr::Variable((), Identifier::Bound(1))));
-        assert!(matches!(&*t.elements[1], Expr::Variable((), Identifier::Free(_))));
+        assert!(matches!(
+            &*t.elements[0],
+            Expr::Variable((), Identifier::Bound(1))
+        ));
+        assert!(matches!(
+            &*t.elements[1],
+            Expr::Variable((), Identifier::Free(_))
+        ));
     }
 
     #[test]
@@ -1603,7 +1779,10 @@ mod tests {
     fn beta_substitutes_closed_atom_keeping_spine() {
         // (λ#0. #0) g  ->  g   (closed atom substituted, not let-bound)
         let e = apply(lam(0, var(0)), free("g"));
-        assert!(matches!(simplify(e), Expr::Variable((), Identifier::Free(_))));
+        assert!(matches!(
+            simplify(e),
+            Expr::Variable((), Identifier::Free(_))
+        ));
     }
 
     // ---- let-float ----
@@ -1647,7 +1826,13 @@ mod tests {
         };
         assert!(matches!(
             &*inner.argument,
-            Expr::Lambda((), Lambda { parameter: Identifier::Bound(1), .. })
+            Expr::Lambda(
+                (),
+                Lambda {
+                    parameter: Identifier::Bound(1),
+                    ..
+                }
+            )
         ));
     }
 
@@ -1656,7 +1841,12 @@ mod tests {
     #[test]
     fn forwards_value_let_into_projection_and_cancels() {
         // let #0 = (7, 8) in #0.&1  ->  (7, 8).&1  ->  8
-        let pair = Rc::new(Expr::Tuple((), Tuple { elements: vec![int(7), int(8)] }));
+        let pair = Rc::new(Expr::Tuple(
+            (),
+            Tuple {
+                elements: vec![int(7), int(8)],
+            },
+        ));
         let e = Expr::Let(
             (),
             Binding {
@@ -1665,7 +1855,10 @@ mod tests {
                 bound: pair,
                 body: Rc::new(Expr::Project(
                     (),
-                    Projection { base: var(0), select: ProductElement::Ordinal(1) },
+                    Projection {
+                        base: var(0),
+                        select: ProductElement::Ordinal(1),
+                    },
                 )),
             },
         );
@@ -1684,7 +1877,10 @@ mod tests {
                 body: free("k"),
             },
         );
-        assert!(matches!(simplify(e), Expr::Variable((), Identifier::Free(_))));
+        assert!(matches!(
+            simplify(e),
+            Expr::Variable((), Identifier::Free(_))
+        ));
     }
 
     #[test]
@@ -1697,7 +1893,12 @@ mod tests {
                 binder: Identifier::Bound(0),
                 operator: BindingOperator::Identity,
                 bound: int(9),
-                body: Rc::new(Expr::Tuple((), Tuple { elements: vec![var(0), var(0)] })),
+                body: Rc::new(Expr::Tuple(
+                    (),
+                    Tuple {
+                        elements: vec![var(0), var(0)],
+                    },
+                )),
             },
         );
         assert!(matches!(simplify(e), Expr::Let(..)));
@@ -1708,16 +1909,25 @@ mod tests {
         // substitute (#7,) for level 0 in  λ#1. #0
         //   -> λ#0. (#8,)   -- binder #1 drops to #0; the value, used one binder deep,
         //      shifts its free level #7 up to #8.
-        let value = Rc::new(Expr::Tuple((), Tuple { elements: vec![var(7)] }));
+        let value = Rc::new(Expr::Tuple(
+            (),
+            Tuple {
+                elements: vec![var(7)],
+            },
+        ));
         let body = lam(1, var(0));
-        let Expr::Lambda((), Lambda { parameter, body }) = substitute_value(&body, 0, &value) else {
+        let Expr::Lambda((), Lambda { parameter, body }) = substitute_value(&body, 0, &value)
+        else {
             panic!("expected lambda")
         };
         assert!(matches!(parameter, Identifier::Bound(0)));
         let Expr::Tuple((), t) = &*body else {
             panic!("expected tuple")
         };
-        assert!(matches!(&*t.elements[0], Expr::Variable((), Identifier::Bound(8))));
+        assert!(matches!(
+            &*t.elements[0],
+            Expr::Variable((), Identifier::Bound(8))
+        ));
     }
 
     // ---- beta-to-let ----
@@ -1733,7 +1943,10 @@ mod tests {
         };
         assert!(matches!(binding.binder, Identifier::Bound(0)));
         assert!(matches!(&*binding.bound, Expr::Apply(..)));
-        assert!(matches!(&*binding.body, Expr::Variable((), Identifier::Bound(0))));
+        assert!(matches!(
+            &*binding.body,
+            Expr::Variable((), Identifier::Bound(0))
+        ));
     }
 
     #[test]
@@ -1752,7 +1965,9 @@ mod tests {
             Projection {
                 base: Rc::new(Expr::Tuple(
                     (),
-                    Tuple { elements: vec![int(10), int(20)] },
+                    Tuple {
+                        elements: vec![int(10), int(20)],
+                    },
                 )),
                 select: ProductElement::Ordinal(1),
             },
@@ -1781,7 +1996,9 @@ mod tests {
     // ---- case-of-known-constructor ----
 
     fn ctor(name: &str) -> crate::ast::namer::QualifiedName {
-        crate::ast::namer::QualifiedName::from_root_symbol(crate::parser::Identifier::from_str(name))
+        crate::ast::namer::QualifiedName::from_root_symbol(crate::parser::Identifier::from_str(
+            name,
+        ))
     }
 
     #[test]
@@ -1818,7 +2035,12 @@ mod tests {
                     ],
                 },
             ),
-            consequent: Rc::new(Expr::Tuple((), Tuple { elements: vec![var(0), var(1)] })),
+            consequent: Rc::new(Expr::Tuple(
+                (),
+                Tuple {
+                    elements: vec![var(0), var(1)],
+                },
+            )),
         };
         let e = Expr::Deconstruct(
             (),
@@ -1832,12 +2054,18 @@ mod tests {
             panic!("expected outer let")
         };
         assert!(matches!(outer.binder, Identifier::Bound(0)));
-        assert!(matches!(&*outer.bound, Expr::Constant((), Literal::Int(10))));
+        assert!(matches!(
+            &*outer.bound,
+            Expr::Constant((), Literal::Int(10))
+        ));
         let Expr::Let((), inner) = &*outer.body else {
             panic!("expected inner let")
         };
         assert!(matches!(inner.binder, Identifier::Bound(1)));
-        assert!(matches!(&*inner.bound, Expr::Constant((), Literal::Int(20))));
+        assert!(matches!(
+            &*inner.bound,
+            Expr::Constant((), Literal::Int(20))
+        ));
         assert!(matches!(&*inner.body, Expr::Tuple(..)));
     }
 
@@ -1846,7 +2074,10 @@ mod tests {
         // deconstruct Nil { Nil -> 42 | Cons #0 #1 -> #0 } -> 42
         let scrutinee = Rc::new(Expr::Inject(
             (),
-            Injection { constructor: ctor("Nil"), arguments: vec![] },
+            Injection {
+                constructor: ctor("Nil"),
+                arguments: vec![],
+            },
         ));
         let nil_clause = MatchClause {
             pattern: Pattern::Coproduct(
@@ -1889,7 +2120,9 @@ mod tests {
         // binders are used in non-elimination position, so the chain stays intact.
         let scrutinee = Rc::new(Expr::Tuple(
             (),
-            Tuple { elements: vec![var(5), lam(0, var(0))] },
+            Tuple {
+                elements: vec![var(5), lam(0, var(0))],
+            },
         ));
         let clause = MatchClause {
             pattern: Pattern::Tuple(
@@ -1901,7 +2134,12 @@ mod tests {
                     ],
                 },
             ),
-            consequent: Rc::new(Expr::Tuple((), Tuple { elements: vec![var(5), var(6)] })),
+            consequent: Rc::new(Expr::Tuple(
+                (),
+                Tuple {
+                    elements: vec![var(5), var(6)],
+                },
+            )),
         };
         let e = Expr::Deconstruct(
             (),
@@ -1914,13 +2152,25 @@ mod tests {
             panic!("expected outer let")
         };
         assert!(matches!(outer.binder, Identifier::Bound(5)));
-        assert!(matches!(&*outer.bound, Expr::Variable((), Identifier::Bound(5))));
+        assert!(matches!(
+            &*outer.bound,
+            Expr::Variable((), Identifier::Bound(5))
+        ));
         let Expr::Let((), inner) = &*outer.body else {
             panic!("expected inner let")
         };
         assert!(matches!(inner.binder, Identifier::Bound(6)));
         // shifted lambda still has its own binder at #0 (below threshold 5)
-        assert!(matches!(&*inner.bound, Expr::Lambda((), Lambda { parameter: Identifier::Bound(0), .. })));
+        assert!(matches!(
+            &*inner.bound,
+            Expr::Lambda(
+                (),
+                Lambda {
+                    parameter: Identifier::Bound(0),
+                    ..
+                }
+            )
+        ));
     }
 
     #[test]
@@ -1928,7 +2178,10 @@ mod tests {
         // deconstruct (Pair 1 2) { #0 -> #0 } -> let #0 = Pair 1 2 in #0
         let scrutinee = Rc::new(Expr::Inject(
             (),
-            Injection { constructor: ctor("Pair"), arguments: vec![int(1), int(2)] },
+            Injection {
+                constructor: ctor("Pair"),
+                arguments: vec![int(1), int(2)],
+            },
         ));
         let clause = MatchClause {
             pattern: Pattern::Bind((), Identifier::Bound(0)),
@@ -1936,7 +2189,10 @@ mod tests {
         };
         let e = Expr::Deconstruct(
             (),
-            Deconstruct { scrutinee, match_clauses: vec![clause] },
+            Deconstruct {
+                scrutinee,
+                match_clauses: vec![clause],
+            },
         );
         let Expr::Let((), binding) = simplify(e) else {
             panic!("expected let")
@@ -1950,7 +2206,10 @@ mod tests {
         // A nested constructor sub-pattern is not a simple bind, so bail.
         let scrutinee = Rc::new(Expr::Inject(
             (),
-            Injection { constructor: ctor("Wrap"), arguments: vec![int(1)] },
+            Injection {
+                constructor: ctor("Wrap"),
+                arguments: vec![int(1)],
+            },
         ));
         let clause = MatchClause {
             pattern: Pattern::Coproduct(
@@ -1970,7 +2229,10 @@ mod tests {
         };
         let e = Expr::Deconstruct(
             (),
-            Deconstruct { scrutinee, match_clauses: vec![clause] },
+            Deconstruct {
+                scrutinee,
+                match_clauses: vec![clause],
+            },
         );
         assert!(matches!(simplify(e), Expr::Deconstruct(..)));
     }
