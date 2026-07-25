@@ -12,11 +12,12 @@ use thiserror::Error;
 
 use crate::{
     ast::{
-        self, Apply, ApplyTypeExpr, ArrowTypeExpr, BUILTIN_MODULE_NAME, Binding, CompilationUnit,
-        ConstraintExpression, CoproductDeclarator, Declaration, Deconstruct, IdentifierPattern,
-        IfThenElse, Injection, Kind, Lambda, ModuleDeclarator, ProductElement, Projection,
-        ROOT_MODULE_NAME, Record, RecordDeclarator, STDLIB_MODULE_NAME, SelfReferential, Sequence,
-        Tuple, TupleTypeExpr, TypeAscription, TypeExpression, TypeSignature, TypeVariable,
+        self, Apply, ApplyTypeExpr, Array, ArrowTypeExpr, BUILTIN_MODULE_NAME, Binding,
+        CompilationUnit, ConstraintExpression, CoproductDeclarator, Declaration, Deconstruct,
+        IdentifierPattern, IfThenElse, Injection, Kind, Lambda, ModuleDeclarator, ProductElement,
+        Projection, ROOT_MODULE_NAME, Record, RecordDeclarator, STDLIB_MODULE_NAME,
+        SelfReferential, Sequence, Tuple, TupleTypeExpr, TypeAscription, TypeExpression,
+        TypeSignature, TypeVariable,
         desugar::Desugared,
         pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern},
     },
@@ -1220,12 +1221,12 @@ pub enum TypeDefinition<GlobalName> {
     Record(RecordSymbol<GlobalName>),
     Signature(SignatureSymbol<GlobalName>),
     Coproduct(CoproductSymbol<GlobalName>),
-    Builtin(BaseType),
+    BaseType(BaseType),
 }
 
 impl<GlobalName> TypeDefinition<GlobalName> {
     pub fn is_base_type(&self) -> bool {
-        matches!(self, Self::Builtin(..))
+        matches!(self, Self::BaseType(..))
     }
 
     pub fn qualified_name(&self) -> QualifiedName {
@@ -1233,7 +1234,7 @@ impl<GlobalName> TypeDefinition<GlobalName> {
             Self::Record(the) => the.name.clone(),
             Self::Signature(the) => the.vtable.name.clone(),
             Self::Coproduct(the) => the.name.clone(),
-            Self::Builtin(the) => the.qualified_name(),
+            Self::BaseType(the) => the.qualified_name(),
         }
     }
 }
@@ -1244,7 +1245,7 @@ impl TypeSymbol<QualifiedName> {
             TypeDefinition::Record(symbol) => symbol.name.clone(),
             TypeDefinition::Signature(symbol) => symbol.vtable.name.clone(),
             TypeDefinition::Coproduct(symbol) => symbol.name.clone(),
-            TypeDefinition::Builtin(base_type) => base_type.qualified_name(),
+            TypeDefinition::BaseType(base_type) => base_type.qualified_name(),
         }
     }
 
@@ -1253,7 +1254,7 @@ impl TypeSymbol<QualifiedName> {
             TypeDefinition::Record(sym) => &sym.type_parameters,
             TypeDefinition::Signature(sym) => &sym.vtable.type_parameters,
             TypeDefinition::Coproduct(sym) => &sym.type_parameters,
-            TypeDefinition::Builtin(..) => &[],
+            TypeDefinition::BaseType(..) => &[],
         }
     }
 }
@@ -1613,6 +1614,11 @@ impl phase::Expr<Desugared> {
                 node.resolve(names, symbols, semantic_scope)?,
             )),
 
+            Self::Array(pi, node) => Ok(Expr::Array(
+                *pi,
+                node.resolve(names, symbols, semantic_scope)?,
+            )),
+
             Self::Project(pi, node) => Ok(Expr::Project(
                 *pi,
                 node.resolve(names, symbols, semantic_scope)?,
@@ -1815,6 +1821,23 @@ impl phase::Injection<Desugared> {
             constructor: self.constructor.clone(),
             arguments: self
                 .arguments
+                .iter()
+                .map(|e| e.resolve(names, symbols, semantic_scope).map(|e| e.into()))
+                .collect::<Naming<_>>()?,
+        })
+    }
+}
+
+impl phase::Array<Desugared> {
+    fn resolve(
+        &self,
+        names: &mut DeBruijn,
+        symbols: &ParserSymbolTable,
+        semantic_scope: &IdentifierPath,
+    ) -> Naming<phase::Array<Named>> {
+        Ok(Array {
+            elements: self
+                .elements
                 .iter()
                 .map(|e| e.resolve(names, symbols, semantic_scope).map(|e| e.into()))
                 .collect::<Naming<_>>()?,
@@ -2196,8 +2219,16 @@ impl phase::SymbolTable<Desugared> {
                         kind: symbol.kind.clone(),
                     },
 
-                    TypeDefinition::Builtin(base_type) => TypeSymbol {
-                        definition: TypeDefinition::Builtin(*base_type),
+                    TypeDefinition::BaseType(BaseType::Array) => TypeSymbol {
+                        definition: TypeDefinition::BaseType(BaseType::Array),
+                        origin: symbol.origin,
+                        opacity: symbol.opacity.clone(),
+                        arity: symbol.arity,
+                        kind: Kind::Arrow(Kind::Star.into(), Kind::Star.into()),
+                    },
+
+                    TypeDefinition::BaseType(base_type) => TypeSymbol {
+                        definition: TypeDefinition::BaseType(base_type.clone()),
                         origin: symbol.origin,
                         opacity: symbol.opacity.clone(),
                         arity: symbol.arity,

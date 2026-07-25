@@ -25,7 +25,7 @@ use std::{
 
 use crate::{
     ast::{
-        Apply, Binding, Deconstruct, Expr, IfThenElse, Injection, Interpolate, Lambda,
+        Apply, Array, Binding, Deconstruct, Expr, IfThenElse, Injection, Interpolate, Lambda,
         ProductElement, Projection, Record, Segment, SelfReferential, Sequence, Tree, Tuple,
         TypeAscription,
         namer::{Identifier, QualifiedName, Symbol, TermSymbol},
@@ -281,6 +281,7 @@ fn children<A>(expr: &Expr<A, Identifier>) -> Vec<&Tree<A, Identifier>> {
         Expr::Tuple(_, Tuple { elements }) => elements.iter().collect(),
         Expr::Record(_, Record { fields }) => fields.iter().map(|(_, v)| v).collect(),
         Expr::Inject(_, Injection { arguments, .. }) => arguments.iter().collect(),
+        Expr::Array(_, Array { elements }) => elements.iter().collect(),
         Expr::Project(_, Projection { base, .. }) => vec![base],
         Expr::Sequence(_, Sequence { this, and_then }) => vec![this, and_then],
         Expr::Deconstruct(
@@ -471,6 +472,13 @@ where
                 Injection {
                     constructor: constructor.clone(),
                     arguments: arguments.iter().map(|e| go(e, depth)).collect(),
+                },
+            ),
+
+            Expr::Array(a, Array { elements }) => Expr::Array(
+                a.clone(),
+                Array {
+                    elements: elements.iter().map(|e| go(e, depth)).collect(),
                 },
             ),
 
@@ -686,7 +694,6 @@ where
         Expr::Project(a, projection) if is_floatable_let(&projection.base) => {
             let Projection { base, select } = projection;
             let (la, binding, _level) = open_let(base);
-            str::from_utf8(v)
             let floated = Expr::Project(
                 a,
                 Projection {
@@ -910,6 +917,13 @@ where
             Injection {
                 constructor: constructor.clone(),
                 arguments: arguments.iter().map(|e| go(e, depth)).collect(),
+            },
+        ),
+
+        Expr::Array(a, Array { elements }) => Expr::Array(
+            a.clone(),
+            Array {
+                elements: elements.iter().map(|e| go(e, depth)).collect(),
             },
         ),
 
@@ -1450,6 +1464,13 @@ where
             Injection {
                 constructor: constructor.clone(),
                 arguments: arguments.iter().map(&go).collect(),
+            },
+        ),
+
+        Expr::Array(a, Array { elements }) => Expr::Array(
+            a.clone(),
+            Array {
+                elements: elements.iter().map(&go).collect(),
             },
         ),
 

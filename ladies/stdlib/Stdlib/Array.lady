@@ -1,0 +1,39 @@
+foreign len :: forall a. Array a -> Int
+foreign get_element :: forall a. Array a -> Int -> Perhaps a
+
+witness From Int Text :=
+  { from := λthis. "`this`"
+  }
+
+witness Foldable Array :=
+  { fold_right := λstep initial as.
+      let loop = λi acc.
+        if i < 0 then
+          acc
+        else
+          deconstruct get_element as i into
+            This x -> loop (i - 1) (step x acc)
+          | Nope   -> loop (i - 1) acc
+      in
+        loop (len as - 1) initial
+
+    fold_left := λstep initial as.
+      let length = len as in
+      let loop = λi acc.
+        if i >= length then
+          acc
+        else
+          deconstruct get_element as i into
+            This x -> loop (i + 1) (step acc x)
+          | Nope   -> loop (i + 1) acc
+      in
+        loop 0 initial
+  }
+
+witness ∀a. From (Array a) (List a) :=
+  { from := fold_right Cons Nil
+  }
+
+xs :: List Int := from [ 1; 2; 3 ]
+
+hello :: Text := from 10

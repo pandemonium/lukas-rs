@@ -1,0 +1,26 @@
+use Stdlib.
+
+(* How do I mention the Tuple2 type? It does not have a name. *)
+(* witness ∀α β. Display α + Display β |- α, β := *)
+(*   { display := λ(a, b). "`a`, `b`" *)
+(*   } *)
+
+Quux ::=
+  { Value :: Int
+    Label :: Text
+  }
+
+witness Display Quux :=
+  { display := λ({ Value: value; Label: label }).
+      "`label`: `value`"
+  }
+
+start := λ_.
+  print_endline "##TC"
+  let xs =
+    [ { Value := 1 * 2; Label := "a" }
+      { Value := 2 * 3; Label := "b" }
+      { Value := 3 * 4; Label := "c" }
+    ]
+  in
+    print_endline "text: `from xs :: List Quux`"

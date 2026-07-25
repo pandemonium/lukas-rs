@@ -5,10 +5,10 @@ use thiserror::Error;
 
 use crate::{
     ast::{
-        self, Apply, ApplyTypeExpr, ArrowTypeExpr, Binding, ConstraintExpression, Declaration,
-        Deconstruct, FieldDeclarator, ForeignDeclaration, IdentifierPattern, IfThenElse,
-        Interpolate, Kind, Lambda, ModuleDeclaration, ModuleDeclarator, Projection, Record,
-        SelfReferential, Sequence, SignatureDeclaration, Tree, Tuple, TupleTypeExpr,
+        self, Apply, ApplyTypeExpr, Array, ArrowTypeExpr, Binding, ConstraintExpression,
+        Declaration, Deconstruct, FieldDeclarator, ForeignDeclaration, IdentifierPattern,
+        IfThenElse, Interpolate, Kind, Lambda, ModuleDeclaration, ModuleDeclarator, Projection,
+        Record, SelfReferential, Sequence, SignatureDeclaration, Tree, Tuple, TupleTypeExpr,
         TypeAscription, TypeDeclaration, TypeDeclarator, TypeExpression, TypeSignature,
         TypeVariable, UseDeclaration, ValueDeclaration, ValueDeclarator, WitnessDeclaration,
         namer::{QualifiedName, TypeOrigin},
@@ -41,7 +41,7 @@ struct ExpressionContext {
 }
 
 impl ExpressionContext {
-    fn from_expression_prefix(prefix: &Expr, precedence: usize) -> Self {
+    fn from_prefix(prefix: &Expr, precedence: usize) -> Self {
         Self {
             precedence,
             anchor_column: prefix.parse_info().location.column,
@@ -1292,7 +1292,7 @@ impl<'a> Parser<'a> {
         // the `{`
         self.advance(1);
         self.strip_layout()?;
-        let column = *self.peek()?.location();
+        let position = *self.peek()?.location();
 
         let mut fields = vec![];
         while self.peek()?.kind != TokenKind::RightBrace {
@@ -1307,8 +1307,38 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::RightBrace)?;
 
         Ok(Expr::Record(
-            ParseInfo::from_position(column),
+            ParseInfo::from_position(position),
             Record::from_fields(&fields),
+        ))
+    }
+
+    fn parse_array(&mut self) -> Result<Expr> {
+        let _t = self.trace();
+
+        // the '['
+        self.advance(1);
+        self.strip_layout()?;
+        let position = *self.peek()?.location();
+
+        let mut elements = Vec::default();
+
+        // Not sure this is entirely correct yet
+        while self.peek()?.kind != TokenKind::RightBracket {
+            let element = self.parse_expression(0)?;
+            self.strip_layout()?;
+
+            elements.push(element.into());
+
+            if self.peek()?.kind == TokenKind::Semicolon {
+                self.consume()?;
+                self.strip_layout()?;
+            }
+        }
+
+        self.expect(TokenKind::RightBracket)?;
+        Ok(Expr::Array(
+            ParseInfo::from_position(position),
+            Array { elements },
         ))
     }
 
@@ -1485,7 +1515,7 @@ impl<'a> Parser<'a> {
         let _t = self.trace();
 
         let prefix = self.parse_expr_prefix()?;
-        let expr_context = ExpressionContext::from_expression_prefix(&prefix, precedence);
+        let expr_context = ExpressionContext::from_prefix(&prefix, precedence);
         self.parse_expr_infix(prefix, expr_context)
     }
 
@@ -1495,13 +1525,13 @@ impl<'a> Parser<'a> {
         match self.remains() {
             [
                 Token {
-                    kind: TokenKind::Literal(lit),
+                    kind: TokenKind::Literal(literal),
                     position,
                 },
                 ..,
             ] => {
                 self.advance(1);
-                self.parse_literal(lit, position)
+                self.parse_literal(literal, position)
             }
 
             [
@@ -1522,6 +1552,14 @@ impl<'a> Parser<'a> {
                 },
                 ..,
             ] => self.parse_record(),
+
+            [
+                Token {
+                    kind: TokenKind::LeftBracket,
+                    ..
+                },
+                ..,
+            ] => self.parse_array(),
 
             [t, ..] if t.is_keyword(Keyword::Lambda) => self.parse_lambda(),
 
@@ -1572,6 +1610,7 @@ impl<'a> Parser<'a> {
                 | TokenKind::Assign
                 | TokenKind::Colon
                 | TokenKind::RightBrace
+                | TokenKind::RightBracket
                 | TokenKind::Pipe
                 | TokenKind::End
                 | TokenKind::Keyword(
@@ -1856,13 +1895,19 @@ impl<'a> Parser<'a> {
         // flat tuple, each element parsed just tight enough that a `,` ends it (`computed_precedence`
         // is below tuple level). A parenthesised group arrives as one complete prefix and so counts
         // as a single element -- which is what keeps `1, (2, 3)` distinct from the flat `1, 2, 3`.
-        let mut elements = vec![lhs.into(), self.parse_expression(computed_precedence)?.into()];
+        let mut elements = vec![
+            lhs.into(),
+            self.parse_expression(computed_precedence)?.into(),
+        ];
         while matches!(self.peek()?.kind, TokenKind::Comma) {
             self.advance(1); // the `,`
             elements.push(self.parse_expression(computed_precedence)?.into());
         }
         self.parse_expr_infix(
-            Expr::Tuple(ParseInfo::from_position(operator_position), Tuple { elements }),
+            Expr::Tuple(
+                ParseInfo::from_position(operator_position),
+                Tuple { elements },
+            ),
             expr_context,
         )
     }

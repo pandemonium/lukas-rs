@@ -186,39 +186,46 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
 
     let types = vec![
         TypeSymbol {
-            definition: TypeDefinition::Builtin(BaseType::Int),
+            definition: TypeDefinition::BaseType(BaseType::Int),
             origin: TypeOrigin::Builtin,
             opacity: Access::Anywhere,
             arity: 0,
             kind: Kind::Star,
         },
         TypeSymbol {
-            definition: TypeDefinition::Builtin(BaseType::Text),
+            definition: TypeDefinition::BaseType(BaseType::Text),
             origin: TypeOrigin::Builtin,
             opacity: Access::Anywhere,
             arity: 0,
             kind: Kind::Star,
         },
         TypeSymbol {
-            definition: TypeDefinition::Builtin(BaseType::Bool),
+            definition: TypeDefinition::BaseType(BaseType::Bool),
             origin: TypeOrigin::Builtin,
             opacity: Access::Anywhere,
             arity: 0,
             kind: Kind::Star,
         },
         TypeSymbol {
-            definition: TypeDefinition::Builtin(BaseType::Unit),
+            definition: TypeDefinition::BaseType(BaseType::Unit),
             origin: TypeOrigin::Builtin,
             opacity: Access::Anywhere,
             arity: 0,
             kind: Kind::Star,
         },
         TypeSymbol {
-            definition: TypeDefinition::Builtin(BaseType::Char),
+            definition: TypeDefinition::BaseType(BaseType::Char),
             origin: TypeOrigin::Builtin,
             opacity: Access::Anywhere,
             arity: 0,
             kind: Kind::Star,
+        },
+        TypeSymbol {
+            definition: TypeDefinition::BaseType(BaseType::Array),
+            origin: TypeOrigin::Builtin,
+            opacity: Access::Anywhere,
+            arity: 1,
+            kind: Kind::Arrow(Kind::Star.into(), Kind::Star.into()),
         },
     ];
 

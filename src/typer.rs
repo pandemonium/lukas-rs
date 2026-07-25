@@ -15,9 +15,10 @@ use tracing::instrument;
 
 use crate::{
     ast::{
-        self, Apply, ApplyTypeExpr, ArrowTypeExpr, Binding, ConstraintExpression, Deconstruct,
-        IfThenElse, Injection, Kind, Lambda, Literal, ProductElement, Projection, Record, Segment,
-        SelfReferential, Sequence, Tree, Tuple, TupleTypeExpr, TypeAscription, TypeExpression,
+        self, Apply, Array, ArrowTypeExpr, Binding, ConstraintExpression,
+        Deconstruct, IfThenElse, Injection, Kind, Lambda, Literal, ProductElement, Projection,
+        Record, Segment, SelfReferential, Sequence, Tree, Tuple, TupleTypeExpr, TypeAscription,
+        TypeExpression,
         annotation::Annotated,
         constraints::{Witness, WitnessEnvironment},
         namer::{
@@ -30,7 +31,7 @@ use crate::{
         },
     },
     compiler::{Located, LocatedError},
-    parser::{self, IdentifierPath, ParseInfo, Parsed},
+    parser::{self, ParseInfo},
     phase::{self, Phase},
 };
 
@@ -2021,7 +2022,7 @@ impl Type {
         match self {
             Type::Apply { constructor, .. } => constructor.applied_name(),
             Type::Constructor(name) => name,
-            _otherwise => todo!(),
+            otherwise => panic!("{otherwise}"),
         }
     }
 }
@@ -2160,8 +2161,8 @@ pub enum Type {
     },
     Tuple(TupleType),
     Record(RecordType),
-    // Could this be used as the backing for Opaque types? A zero arity coproduct
     Coproduct(CoproductType),
+    Array(Box<Type>),
     Constructor(namer::QualifiedName),
     Apply {
         constructor: Box<Type>,
@@ -2173,11 +2174,13 @@ impl Type {
     pub fn kind(&self, ctx: &TypeEnvironment) -> Result<Kind, TypeError> {
         match self {
             Self::Variable(tp) => Ok(tp.kind().clone()),
+            Self::Base(BaseType::Array) => Ok(Kind::Arrow(Kind::Star.into(), Kind::Star.into())),
             Self::Base(..) => Ok(Kind::Star),
             Self::Arrow { .. } => Ok(Kind::Star),
             Self::Tuple(..) => Ok(Kind::Star),
             Self::Record(..) => Ok(Kind::Star),
             Self::Coproduct(..) => Ok(Kind::Star),
+            Self::Array(..) => Ok(Kind::Arrow(Kind::Star.into(), Kind::Star.into())),
             Self::Constructor(name) => ctx
                 .lookup(name)
                 .ok_or_else(|| TypeError::UndefinedType(name.clone()))
@@ -2189,60 +2192,9 @@ impl Type {
             } => {
                 let k1 = constructor.kind(ctx)?;
                 let k2 = argument.kind(ctx)?;
+                //println!("kind: k1 {constructor}; k2 {argument}");
                 k1.apply(k2)
             }
-        }
-    }
-
-    pub fn reify(&self, type_param_map: &[parser::Identifier]) -> phase::TypeExpression<Parsed> {
-        let pi = ParseInfo::default();
-
-        let reified_name =
-            |qn: &QualifiedName| IdentifierPath::new(&qn.clone().into_identifier_path().tail[0]);
-
-        match self {
-            Self::Variable(MetaVariable(p, _)) => {
-                TypeExpression::Parameter(pi, type_param_map[*p as usize].clone())
-            }
-            Self::Base(BaseType::Int) => {
-                TypeExpression::Constructor(pi, IdentifierPath::new("Int"))
-            }
-            Self::Base(BaseType::Text) => {
-                TypeExpression::Constructor(pi, IdentifierPath::new("Text"))
-            }
-            Self::Base(BaseType::Bool) => {
-                TypeExpression::Constructor(pi, IdentifierPath::new("Bool"))
-            }
-            Self::Base(BaseType::Unit) => {
-                TypeExpression::Constructor(pi, IdentifierPath::new("Unit"))
-            }
-            Self::Base(BaseType::Char) => {
-                TypeExpression::Constructor(pi, IdentifierPath::new("Char"))
-            }
-            Self::Arrow { domain, codomain } => TypeExpression::Arrow(
-                pi,
-                ArrowTypeExpr {
-                    domain: domain.reify(type_param_map).into(),
-                    codomain: codomain.reify(type_param_map).into(),
-                },
-            ),
-            Self::Tuple(..) => todo!(),
-            Self::Record(..) => todo!(),
-            Self::Coproduct(..) => todo!(),
-            Self::Constructor(qualified_name) => {
-                TypeExpression::Constructor(pi, reified_name(qualified_name))
-            }
-            Self::Apply {
-                constructor,
-                argument,
-            } => TypeExpression::Apply(
-                pi,
-                ApplyTypeExpr {
-                    function: constructor.reify(type_param_map).into(),
-                    argument: argument.reify(type_param_map).into(),
-                    phase: PhantomData,
-                },
-            ),
         }
     }
 
@@ -2350,7 +2302,7 @@ impl Type {
                 }
             }
 
-            Self::Base(b) => Self::Base(*b),
+            Self::Base(b) => Self::Base(b.clone()),
 
             Self::Arrow { domain, codomain } => Self::Arrow {
                 domain: domain.apply(subs).into(),
@@ -2368,6 +2320,8 @@ impl Type {
             Self::Record(record) => Self::Record(record.apply(subs)),
 
             Self::Coproduct(coproduct) => Self::Coproduct(coproduct.apply(subs)),
+
+            Self::Array(element_type) => Self::Array(element_type.apply(subs).into()),
 
             Self::Constructor(..) => self.clone(),
 
@@ -2455,6 +2409,7 @@ impl Type {
                 Ok(subs)
             }
 
+            //            (Self::Array(tu), Self::Array(tv)) => tu.unified_with(tv, ctx),
             (
                 Self::Apply {
                     constructor: lhs_con,
@@ -2472,21 +2427,27 @@ impl Type {
                 Ok(constructor.compose(&argument))
             }
 
-            (lhs, rhs) => Err(TypeError::UnificationImpossible {
-                lhs: lhs.clone(),
-                rhs: rhs.clone(),
-            }),
+            (lhs, rhs) => {
+                //panic!("lhs {lhs:?}; rhs {rhs:?}");
+                //println!("lhs {lhs:?}; rhs {rhs:?}");
+
+                Err(TypeError::UnificationImpossible {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                })
+            }
         }
     }
 }
 
-#[derive(Copy, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BaseType {
     Int,
     Text,
     Bool,
     Unit,
     Char,
+    Array,
 }
 
 impl BaseType {
@@ -2497,6 +2458,7 @@ impl BaseType {
             Self::Bool => "Bool",
             Self::Unit => "Unit",
             Self::Char => "Char",
+            Self::Array => "Array",
         }
     }
 
@@ -2660,10 +2622,10 @@ impl TypeConstructorDefinition {
     }
 
     fn as_base_type(&self) -> Option<Type> {
-        if let TypeDefinition::Builtin(base_type) = self.defining_symbol.definition {
-            Some(Type::Base(base_type))
-        } else {
-            None
+        match &self.defining_symbol.definition {
+            TypeDefinition::BaseType(BaseType::Array) => None,
+            TypeDefinition::BaseType(base_type) => Some(Type::Base(base_type.clone())),
+            _otherwise => None,
         }
     }
 
@@ -2773,14 +2735,14 @@ impl TypeConstructor {
     }
 
     fn from_symbol(symbol: &TypeSymbol<namer::QualifiedName>) -> Self {
-        if let TypeDefinition::Builtin(base_type) = &symbol.definition {
+        if let TypeDefinition::BaseType(base_type) = &symbol.definition {
             Self::Elaborated(ElaboratedTypeConstructor {
                 definition: TypeConstructorDefinition {
                     name: symbol.qualified_name(),
                     instantiated_params: HashMap::default(),
                     defining_symbol: symbol.clone(),
                 },
-                structure: TypeStructure::Monotype(Type::Base(*base_type)),
+                structure: TypeStructure::Monotype(Type::Base(base_type.clone())),
             })
         } else {
             Self::Unelaborated(TypeConstructorDefinition {
@@ -2908,7 +2870,7 @@ impl TypeDefinition<QualifiedName> {
             Self::Coproduct(coproduct) => Ok(TypeStructure::Monotype(
                 coproduct.synthesize_type(type_param_map, ctx)?,
             )),
-            Self::Builtin(base_type) => Ok(TypeStructure::Monotype(Type::Base(*base_type))),
+            Self::BaseType(base_type) => Ok(TypeStructure::Monotype(Type::Base(base_type.clone()))),
         }
     }
 }
@@ -3844,6 +3806,8 @@ impl TypingContext {
 
             UntypedExpr::Inject(pi, constructor) => self.infer_inject(*pi, constructor),
 
+            UntypedExpr::Array(pi, array) => self.infer_array(*pi, array),
+
             UntypedExpr::Project(pi, projection) => self.infer_projection(*pi, projection),
 
             UntypedExpr::Sequence(_pi, sequence) => self.infer_sequence(sequence),
@@ -4464,6 +4428,56 @@ impl TypingContext {
                 },
             ),
         ))
+    }
+
+    #[instrument]
+    fn infer_array(&mut self, pi: ParseInfo, array: &phase::Array<Named>) -> Typing {
+        if let Some(first_element) = array.elements.first() {
+            let mut elements = Vec::with_capacity(array.elements.len());
+            let Typed {
+                mut substitutions,
+                mut constraints,
+                tree,
+            } = self.infer_expr(&first_element)?;
+
+            let mut array_element_type = tree.type_info().inferred_type.clone();
+            elements.push(tree.into());
+
+            for element in &array.elements[1..] {
+                let element = self.infer_expr(&element)?;
+                let unifier = array_element_type
+                    .unified_with(&element.tree.type_info().inferred_type, &self.types)
+                    .map_err(|e| e.at(pi))?;
+
+                substitutions = substitutions
+                    .compose(&unifier)
+                    .compose(&element.substitutions);
+                constraints = constraints.union(element.constraints.apply(&substitutions));
+
+                array_element_type = array_element_type.apply(&substitutions);
+                elements.push(element.tree.apply(&substitutions).into());
+            }
+
+            Ok(Typed::computed(
+                substitutions,
+                constraints,
+                Expr::Array(
+                    pi.with_inferred_type(
+                        //Type::Array(array_element_type.into()),
+                        Type::Apply {
+                            constructor: Type::Constructor(QualifiedName::builtin("Array")).into(),
+                            argument: array_element_type.into(),
+                        },
+                    ),
+                    Array { elements },
+                ),
+            ))
+        } else {
+            Ok(Typed::constant(Expr::Array(
+                pi.with_inferred_type(Type::Array(Type::fresh().into())),
+                Array { elements: vec![] },
+            )))
+        }
     }
 
     #[instrument]
@@ -5358,6 +5372,10 @@ impl fmt::Display for Type {
                 write!(f, "{constructor_rendering}")
             }
 
+            Self::Array(array_element_type) => {
+                write!(f, "[{array_element_type}]")
+            }
+
             Self::Constructor(name) => write!(f, "{name}"),
 
             Self::Apply {
@@ -5406,6 +5424,7 @@ impl fmt::Display for BaseType {
             Self::Bool => write!(f, "Bool"),
             Self::Unit => write!(f, "Unit"),
             Self::Char => write!(f, "Char"),
+            Self::Array => write!(f, "Array"),
         }
     }
 }

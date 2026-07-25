@@ -2,8 +2,8 @@ use std::{collections::HashMap, fmt, rc::Rc};
 
 use crate::{
     ast::{
-        self, Apply, Binding, Deconstruct, IfThenElse, Injection, Lambda, Projection, Record,
-        Segment, SelfReferential, Sequence, Tuple, TypeAscription,
+        self, Apply, Array, Binding, Deconstruct, IfThenElse, Injection, Lambda, Projection,
+        Record, Segment, SelfReferential, Sequence, Tuple, TypeAscription,
         annotation::Annotated,
         namer::{self, QualifiedName, Symbol, TermSymbol},
         pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern},
@@ -180,7 +180,12 @@ impl CaptureLayout {
             .iter()
             .zip(&self.types)
             .map(|(level, ty)| {
-                enclosing_layout.resolve(enclosing_scope, *level, enclosing_is_recursive, ty.clone())
+                enclosing_layout.resolve(
+                    enclosing_scope,
+                    *level,
+                    enclosing_is_recursive,
+                    ty.clone(),
+                )
             })
             .collect();
     }
@@ -332,7 +337,8 @@ impl phase::Expr<Types> {
     ) -> Expr {
         match self {
             Self::Variable(ti, namer::Identifier::Bound(level)) => {
-                let id = layout.resolve(lambda_level, LexicalLevel(level), is_recursive, ti.clone());
+                let id =
+                    layout.resolve(lambda_level, LexicalLevel(level), is_recursive, ti.clone());
                 Expr::Variable(ti.empty_capture(), id)
             }
 
@@ -442,6 +448,17 @@ impl phase::Expr<Types> {
                     constructor: the.constructor,
                     arguments: the
                         .arguments
+                        .into_iter()
+                        .map(|e| Self::go(e, lambda_level, is_recursive, layout))
+                        .collect(),
+                },
+            ),
+
+            Self::Array(ti, the) => Expr::Array(
+                ti.empty_capture(),
+                Array {
+                    elements: the
+                        .elements
                         .into_iter()
                         .map(|e| Self::go(e, lambda_level, is_recursive, layout))
                         .collect(),

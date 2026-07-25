@@ -104,6 +104,13 @@ impl Expr {
                 .into(),
             )),
 
+            Self::Array(_, the) => Ok(Val::Array(
+                the.elements
+                    .iter()
+                    .map(|e| e.reduce(env))
+                    .collect::<Interpretation<_>>()?,
+            )),
+
             Self::Project(_, the) => match (the.base.reduce(env)?, &the.select) {
                 (Val::Product(values), ProductElement::Ordinal(index)) => {
                     Ok(values[*index].clone())
@@ -341,6 +348,17 @@ impl fmt::Display for Val {
                 // Parenthesise so nesting is visible: `((1, 2), 3)` no longer prints as the flat
                 // `1, 2, 3`. (Products back both tuples and records at run time.)
                 write!(f, "({elements})")
+            }
+
+            Self::Array(elements) => {
+                let elements = elements
+                    .iter()
+                    .map(|el| el.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // Parenthesise so nesting is visible: `((1, 2), 3)` no longer prints as the flat
+                // `1, 2, 3`. (Products back both tuples and records at run time.)
+                write!(f, "[{elements}]")
             }
 
             Self::Variant(variant) => {

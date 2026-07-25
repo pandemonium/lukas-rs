@@ -6,6 +6,12 @@
 
 #include "runtime.h"
 
+Value result_return(Value x);
+Value result_fault(Value e);
+
+Value perhaps_this(Value x);
+Value perhaps_nope();
+
 // Heap constructors (GC-managed). A lifted function is `Value code(Value self,
 // Value arg)`; a closure stores its `nfree` captured values inline (passed
 // variadically, like `mk_tuple`).

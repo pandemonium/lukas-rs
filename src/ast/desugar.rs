@@ -5,8 +5,9 @@ use std::{
 
 use crate::{
     ast::{
-        self, Apply, Binding, Deconstruct, IdentifierPattern, IfThenElse, Injection, Interpolate,
-        Lambda, Projection, Record, SelfReferential, Sequence, Tree, Tuple, TypeAscription,
+        self, Apply, Array, Binding, Deconstruct, IdentifierPattern, IfThenElse, Injection,
+        Interpolate, Lambda, Projection, Record, SelfReferential, Sequence, Tree, Tuple,
+        TypeAscription,
         namer::{Symbol, SymbolTable, TermSymbol},
         pattern::MatchClause,
     },
@@ -206,6 +207,12 @@ impl phase::Expr<Parsed> {
                 Injection {
                     constructor: the.constructor,
                     arguments: the.arguments.into_iter().map(Self::recurse).collect(),
+                },
+            ),
+            ast::Expr::Array(a, the) => Expr::Array(
+                a,
+                Array {
+                    elements: the.elements.into_iter().map(Self::recurse).collect(),
                 },
             ),
             ast::Expr::Project(a, the) => Expr::Project(

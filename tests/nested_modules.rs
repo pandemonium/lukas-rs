@@ -11,7 +11,7 @@ use std::{fs, path::PathBuf};
 
 use lukas::{
     ast::{self, ROOT_MODULE_NAME, namer::QualifiedName},
-    compiler::Compiler,
+    compiler::{self, Compiler},
     parser::IdentifierPath,
 };
 
@@ -29,7 +29,8 @@ fn eval_tree(test_name: &str, files: &[(&str, &str)]) -> Result<String, String> 
     let compiler = Compiler {
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: dir,
-        scheme_file: None,
+        backend: compiler::Backend::Native,
+        output_file: None,
     };
 
     let env = compiler
@@ -96,10 +97,7 @@ fn use_top_level_then_open_nested_path() {
 /// obscure I/O failure buried elsewhere.
 #[test]
 fn missing_module_file_is_a_load_error() {
-    let files = [(
-        "Root.lady",
-        "module Gone.\nstart :: Int -> Int := λ_. 0\n",
-    )];
+    let files = [("Root.lady", "module Gone.\nstart :: Int -> Int := λ_. 0\n")];
     let result = eval_tree("missing_module", &files);
     assert!(
         result

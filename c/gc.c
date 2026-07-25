@@ -858,8 +858,11 @@ SLICE_GET_BE(slice_get_i64_be, int64_t, 8)
 // ----------------------------------------------------------------- memory maps
 // Result ordinals follow `Result ::= Fault e | Return a` -> Fault = 0, Return = 1.
 // (Verify against codegen's constructor numbering before wiring the stdlib.)
-static Value result_return(Value x) { return mk_data(1, 1, x); }
-static Value result_fault(Value e) { return mk_data(0, 1, e); }
+Value result_return(Value x) { return mk_data(1, 1, x); }
+Value result_fault(Value e) { return mk_data(0, 1, e); }
+
+Value perhaps_this(Value x) { return mk_data(1, 1, x); }
+Value perhaps_nope() { return mk_data(0, 1, VUnit()); }
 
 // Ranged Buffer -> Bytes producers. Like buffer_move/buffer_copy but for a
 // sub-range [off, off+n); Fault(-1) if that range runs past the buffer's length.

@@ -38,6 +38,7 @@ where
                 Expr::Record(a, node) => Expr::Record(f(a), node.map_annotation(&f)),
                 Expr::Tuple(a, node) => Expr::Tuple(f(a), node.map_annotation(&f)),
                 Expr::Inject(a, node) => Expr::Inject(f(a), node.map_annotation(&f)),
+                Expr::Array(a, node) => Expr::Array(f(a), node.map_annotation(&f)),
                 Expr::Project(a, node) => Expr::Project(f(a), node.map_annotation(&f)),
                 Expr::Sequence(a, node) => Expr::Sequence(f(a), node.map_annotation(&f)),
                 Expr::Deconstruct(a, node) => Expr::Deconstruct(f(a), node.map_annotation(&f)),
@@ -204,6 +205,23 @@ where
                 .iter()
                 .map(|expr| expr.map_annotation(f))
                 .collect(),
+        }
+    }
+}
+
+impl<A, B, Id> Annotated<A, B, Id> for Array<A, Id>
+where
+    Id: Clone,
+{
+    type Output = Array<B, Id>;
+
+    fn map_annotation<F>(&self, f: &F) -> Self::Output
+    where
+        F: Fn(&A) -> B,
+    {
+        let Self { elements } = self;
+        Array {
+            elements: elements.iter().map(|expr| expr.map_annotation(f)).collect(),
         }
     }
 }

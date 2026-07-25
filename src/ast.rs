@@ -387,6 +387,7 @@ pub enum Expr<A, Id> {
     Tuple(A, Tuple<A, Id>),
     Record(A, Record<A, Id>),
     Inject(A, Injection<A, Id>),
+    Array(A, Array<A, Id>),
     Project(A, Projection<A, Id>),
     Sequence(A, Sequence<A, Id>),
     Deconstruct(A, Deconstruct<A, Id>),
@@ -409,6 +410,7 @@ impl<A, Id> Expr<A, Id> {
             | Self::Record(a, ..)
             | Self::Tuple(a, ..)
             | Self::Inject(a, ..)
+            | Self::Array(a, ..)
             | Self::Project(a, ..)
             | Self::Sequence(a, ..)
             | Self::Deconstruct(a, ..)
@@ -686,6 +688,11 @@ pub struct Injection<A, Id> {
 }
 
 #[derive(Debug, Clone)]
+pub struct Array<A, Id> {
+    pub elements: Vec<Tree<A, Id>>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Sequence<A, Id> {
     pub this: Tree<A, Id>,
     pub and_then: Tree<A, Id>,
@@ -717,6 +724,7 @@ where
                     }
                 )
             }
+            Self::Array(_, x) => write!(f, "[{x}]"),
             Self::Project(_, x) => write!(f, "{}.{}", x.base, x.select),
             Self::Sequence(_, x) => write!(f, "{}; {}", x.this, x.and_then),
             Self::Deconstruct(_, x) => write!(f, "{x}"),
@@ -725,6 +733,21 @@ where
             Self::Ascription(_, x) => write!(f, "{}::{}", x.ascribed_tree, x.type_signature),
             Self::MakeClosure(_, x) => write!(f, "mk_clo {x}."),
         }
+    }
+}
+
+impl<A, Id> fmt::Display for Array<A, Id>
+where
+    A: fmt::Display,
+    Id: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Array { elements } = self;
+        writeln!(f, "[")?;
+        for element in elements {
+            writeln!(f, "{element}")?;
+        }
+        writeln!(f, "]")
     }
 }
 

@@ -1,6 +1,10 @@
 List ::= ∀α. Nil | Cons α (List α)
 
 
+witness ∀t : *->* α. Foldable t |- From (t α) (List α) :=
+  { from := fold_right Cons Nil
+  }
+
 witness Functor List :=
   { fmap := λf xs.
       deconstruct xs into
@@ -53,8 +57,8 @@ witness ∀α. Monoid (List α) :=
 witness ∀α. Display α |- Display (List α) :=
   { display := λxs.
       deconstruct xs into
-        Nil       -> "nil"
-      | Cons x ys -> "`x` : `ys`"
+        Nil       -> ""
+      | Cons x xs -> "`x`; `xs`"
   }
 
 witness ∀α. Eq α |- Eq (List α) :=
@@ -64,7 +68,6 @@ witness ∀α. Eq α |- Eq (List α) :=
       | Nil, Nil             -> true
       | otherwise            -> false
   }
-
 
 head :: ∀α. List α -> Perhaps α :=
   λxs. deconstruct xs into Cons a tail -> This a | otherwise -> Nope

@@ -33,6 +33,8 @@ pub enum Val {
 
     Product(Vec<Val>),
 
+    Array(Vec<Val>),
+
     Variant(Box<VariantVal>),
 }
 
@@ -726,6 +728,10 @@ impl Expr {
                     k: k.into(),
                 },
             ),
+
+            Self::Array(_, the) => {
+                Suspension::eval_and(&the.elements[0], environment.shared(), todo!())
+            }
 
             Self::Record(_, the) => Suspension::eval_and(
                 &the.fields[0].1,

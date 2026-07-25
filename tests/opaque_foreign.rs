@@ -10,7 +10,7 @@ use std::{fs, path::PathBuf};
 
 use lukas::{
     ast::{self, ROOT_MODULE_NAME, namer::QualifiedName},
-    compiler::Compiler,
+    compiler::{self, Compiler},
     parser::IdentifierPath,
 };
 
@@ -25,7 +25,8 @@ fn eval_start(test_name: &str, source: &str) -> Result<String, String> {
     let compiler = Compiler {
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: dir,
-        scheme_file: None,
+        backend: compiler::Backend::Native,
+        output_file: None,
     };
 
     let env = compiler
@@ -52,10 +53,7 @@ consume :: File -> Int := λ_. 42
 start :: Int -> Int := λ_. 42
 "#;
 
-    assert_eq!(
-        eval_start("foreign_usable", source),
-        Ok("42".to_string())
-    );
+    assert_eq!(eval_start("foreign_usable", source), Ok("42".to_string()));
 }
 
 /// Two distinct foreign types must NOT unify. Both are (internally) empty
@@ -103,10 +101,7 @@ module Stack:
 start :: Int -> Int := λ_. Stack.unwrap (Stack.make 7)
 "#;
 
-    assert_eq!(
-        eval_start("opaque_crosses", source),
-        Ok("7".to_string())
-    );
+    assert_eq!(eval_start("opaque_crosses", source), Ok("7".to_string()));
 }
 
 /// An opaque type's constructor may NOT be named from outside the declaring
@@ -172,8 +167,5 @@ module Stack:
 start :: Int -> Int := λ_. Stack.unwrap (Stack.Inner.make 9)
 "#;
 
-    assert_eq!(
-        eval_start("opaque_submodule", source),
-        Ok("9".to_string())
-    );
+    assert_eq!(eval_start("opaque_submodule", source), Ok("9".to_string()));
 }

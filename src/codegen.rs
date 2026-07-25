@@ -1,4 +1,5 @@
 use fmt::Write;
+use std::rc::Rc;
 use std::{fmt, fs, io, path};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -166,7 +167,11 @@ impl lambda_lift::Program {
             writeln!(out, "Value {}_worker({});", c_name(name), signature)?;
         }
         for ChainWorker { head, .. } in &self.chain_workers {
-            writeln!(out, "Value {}_uworker(Value self, Value *args);", c_name(head))?;
+            writeln!(
+                out,
+                "Value {}_uworker(Value self, Value *args);",
+                c_name(head)
+            )?;
         }
         for TopLevelBinding { name, .. } in &self.globals {
             if !is_builtin(name) {
@@ -223,7 +228,11 @@ impl lambda_lift::Program {
         // captures); the flattened parameters arrive in `args[0..arity]`, which we
         // name `l0..l{arity-1}` to match the frame the flattened body expects.
         for ChainWorker { head, arity, body } in &self.chain_workers {
-            writeln!(out, "Value {}_uworker(Value self, Value *args) {{", c_name(head))?;
+            writeln!(
+                out,
+                "Value {}_uworker(Value self, Value *args) {{",
+                c_name(head)
+            )?;
             write!(out, "  (void)self;")?;
             for i in 0..*arity {
                 write!(out, " Value l{i} = args[{i}];")?;
@@ -305,6 +314,7 @@ impl lambda_lift::Program {
             Expr::Tuple(_, the) => self.compile_tuple(&the.elements, code),
             Expr::Record(_, the) => self.compile_record(the, code),
             Expr::Inject(_, the) => self.compile_inject(the, code),
+            Expr::Array(_, the) => self.compile_array(&the.elements, code),
             Expr::Project(_, the) => self.compile_projection(the, code),
             Expr::Sequence(_, the) => self.compile_sequence(the, code),
             Expr::Deconstruct(_, the) => self.compile_deconstruct(the, code),
@@ -315,7 +325,7 @@ impl lambda_lift::Program {
         }
     }
 
-    fn compile_tuple(&self, elements: &[std::rc::Rc<Expr>], code: &mut CodeBuffer) -> fmt::Result {
+    fn compile_tuple(&self, elements: &[Rc<Expr>], code: &mut CodeBuffer) -> fmt::Result {
         // Fixed-arity `mk_tupleN(e0, ..)` for small tuples (no variadic tax); the
         // `mk_tuple(N, e0, ..)` fallback carries the count for larger ones.
         let mut written = if elements.len() <= 4 {
@@ -333,6 +343,10 @@ impl lambda_lift::Program {
             self.compile_expr(element, code)?;
         }
         write!(code, ")")
+    }
+
+    fn compile_array(&self, elements: &[Rc<Expr>], code: &mut CodeBuffer) -> fmt::Result {
+        self.compile_tuple(elements, code)
     }
 
     // A constructor value (sum type) is a `Data` object: an integer tag (the
@@ -466,7 +480,10 @@ impl lambda_lift::Program {
             Pattern::Bind(_, other) => panic!("pattern binder must be a local: {other:?}"),
 
             Pattern::Literally(_, literal) => {
-                tests.push(format!("val_eq({path}, {})", self.compile_constant(literal)));
+                tests.push(format!(
+                    "val_eq({path}, {})",
+                    self.compile_constant(literal)
+                ));
             }
 
             Pattern::Tuple(_, the) => {
@@ -486,7 +503,10 @@ impl lambda_lift::Program {
             // (mirroring `compile_inject`'s layout).
             Pattern::Coproduct(_, the) => {
                 let Identifier::Global(constructor) = &the.constructor else {
-                    panic!("constructor pattern head must be a global: {:?}", the.constructor);
+                    panic!(
+                        "constructor pattern head must be a global: {:?}",
+                        the.constructor
+                    );
                 };
                 // A newtype pattern is erased: the value IS its single field, so
                 // there is no tag to test and the field matches against the
@@ -633,6 +653,7 @@ impl lambda_lift::Program {
             match segment {
                 Segment::Literal(_, literal) => write!(code, "{}", self.compile_constant(literal))?,
                 Segment::Expression(expr) => {
+                    // todo: this is wrong -- it must call display. Is that already in expr?
                     write!(code, "prim_show(")?;
                     self.compile_expr(expr, code)?;
                     write!(code, ")")?;

@@ -65,6 +65,8 @@ impl LexicalAnalyzer {
                 }
                 ['{', remains @ ..] => self.emit(1, TokenKind::LeftBrace, remains),
                 ['}', remains @ ..] => self.emit(1, TokenKind::RightBrace, remains),
+                ['[', remains @ ..] => self.emit(1, TokenKind::LeftBracket, remains),
+                [']', remains @ ..] => self.emit(1, TokenKind::RightBracket, remains),
                 ['_', remains @ ..] => self.emit(1, TokenKind::Underscore, remains),
                 ['|', remains @ ..] => self.emit(1, TokenKind::Pipe, remains),
                 [';', remains @ ..] => self.emit(1, TokenKind::Semicolon, remains),
@@ -400,6 +402,8 @@ pub enum TokenKind {
     RightParen,     // )
     LeftBrace,      // {
     RightBrace,     // }
+    LeftBracket,    // [
+    RightBracket,   // ]
     Underscore,     // _
     Pipe,           // |
     DoubleQuote,    // "
@@ -735,6 +739,8 @@ impl fmt::Display for TokenKind {
             Self::LeftParen => write!(f, "("),
             Self::RightParen => write!(f, ")"),
             Self::LeftBrace => write!(f, "{{"),
+            Self::LeftBracket => write!(f, "["),
+            Self::RightBracket => write!(f, "]"),
             Self::RightBrace => write!(f, "}}"),
             Self::Underscore => write!(f, "_"),
             Self::Pipe => write!(f, "|"),

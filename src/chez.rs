@@ -270,6 +270,15 @@ impl phase::Expr<Erased> {
                 writeln!(code, ")")?;
             }
 
+            ast::Expr::Array(_, the) => {
+                write!(code, "(vector")?;
+                for el in &the.elements {
+                    write!(code, " ")?;
+                    el.emit(code)?;
+                }
+                write!(code, ")")?
+            }
+
             ast::Expr::Project(_, the) => {
                 write!(code, "(vector-ref ")?;
                 the.base.emit(code)?;

@@ -17,6 +17,7 @@ pub type Record<P> = ast::Record<<P as Phase>::Annotation, <P as Phase>::TermId>
 pub type Tuple<P> = ast::Tuple<<P as Phase>::Annotation, <P as Phase>::TermId>;
 pub type Projection<P> = ast::Projection<<P as Phase>::Annotation, <P as Phase>::TermId>;
 pub type Injection<P> = ast::Injection<<P as Phase>::Annotation, <P as Phase>::TermId>;
+pub type Array<P> = ast::Array<<P as Phase>::Annotation, <P as Phase>::TermId>;
 pub type Sequence<P> = ast::Sequence<<P as Phase>::Annotation, <P as Phase>::TermId>;
 pub type Deconstruct<P> = ast::Deconstruct<<P as Phase>::Annotation, <P as Phase>::TermId>;
 pub type IfThenElse<P> = ast::IfThenElse<<P as Phase>::Annotation, <P as Phase>::TermId>;

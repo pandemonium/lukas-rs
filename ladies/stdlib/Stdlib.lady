@@ -3,6 +3,7 @@ module Control.
 module IO.
 module Data.
 module Binary.
+module Array.
 (* module Files. *)
 
 use Stdlib.Prelude.
@@ -14,6 +15,10 @@ use Stdlib.Control.State.
 use Stdlib.IO.
 (* class methods opened last so polymorphic bind/fold_left shadow the concrete leaks *)
 use Stdlib.Control.
+
+signature From ::= ∀α β.
+  { from :: α -> β
+  }
 
 signature Display ::= ∀α.
   { display :: α -> Text

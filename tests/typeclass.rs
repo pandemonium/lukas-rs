@@ -9,7 +9,7 @@ use std::{fs, path::PathBuf};
 
 use lukas::{
     ast::{self, ROOT_MODULE_NAME, namer::QualifiedName},
-    compiler::Compiler,
+    compiler::{self, Compiler},
     parser::IdentifierPath,
 };
 
@@ -23,7 +23,8 @@ fn eval_start(test_name: &str, source: &str) -> Result<String, String> {
     let compiler = Compiler {
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: dir,
-        scheme_file: None,
+        backend: compiler::Backend::Native,
+        output_file: None,
     };
 
     let env = compiler
