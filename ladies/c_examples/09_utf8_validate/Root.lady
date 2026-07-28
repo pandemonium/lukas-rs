@@ -1,0 +1,47 @@
+use Stdlib.
+use Stdlib.Binary.
+use Stdlib.Text.Utf8.
+
+(* Exercises Text.from_bytes: build a Bytes view from raw byte values and hand it *)
+(* to the C UTF-8 validator (a branchless RFC-3629 DFA). Valid input decodes to a *)
+(* Text (`This`); the first ill-formed sequence yields `Nope`. We cover ASCII, the *)
+(* 2/3/4-byte lengths, and the classic rejects: a lone continuation, an overlong *)
+(* encoding, a UTF-16 surrogate, and a truncated multibyte tail. *)
+
+(* Append every byte value in the array to the buffer, in order. *)
+put_all :: Array Int -> Put Unit := λxs.
+  fold_left (λacc x. let* _ = acc in put_u8 x) (pure ()) xs
+
+(* Materialise an array of byte values into a Bytes view (buffer -> move). *)
+bytes_of :: Array Int -> IO Bytes := λxs.
+  let* b = new_buffer 16 in
+  let* _ = run_put (put_all xs) b in
+  move b
+
+(* Validate one case two ways -- the C fast path (Text.from_bytes) and the pure *)
+(* Get-monad reference validator (Utf8.is_valid) -- and show they agree. *)
+check :: Array Int -> IO Unit := λxs.
+  let* bs = bytes_of xs in
+  let get = if is_valid bs then "valid" else "invalid" in
+  deconstruct Text.from_bytes bs into
+    This t -> IO.output "ok `t` (get=`get`)"
+  | Nope   -> IO.output "invalid (get=`get`)"
+
+program :: IO Unit :=
+  let* _ = check [72; 105] in                     (* "Hi"  -- ASCII                *)
+  let* _ = check [0xC3; 0xA9] in                  (* "é"   -- 2-byte               *)
+  let* _ = check [0xE2; 0x82; 0xAC] in            (* "€"   -- 3-byte               *)
+  let* _ = check [0xF0; 0x9F; 0x98; 0x80] in      (* "😀"  -- 4-byte               *)
+  let* _ = check [72; 0xC3; 0xA9; 33] in          (* "Hé!" -- mixed ASCII+2-byte   *)
+  let* _ = check [0x80] in                        (* lone continuation byte        *)
+  let* _ = check [0xC0; 0x80] in                  (* overlong NUL (illegal lead C0)*)
+  let* _ = check [0xE0; 0x80; 0x80] in            (* overlong 3-byte (E0, b1<0xA0) *)
+  let* _ = check [0xED; 0xA0; 0x80] in            (* UTF-16 surrogate U+D800       *)
+  let* _ = check [0xF0; 0x80; 0x80; 0x80] in      (* overlong 4-byte (F0, b1<0x90) *)
+  let* _ = check [0xF4; 0x90; 0x80; 0x80] in      (* > U+10FFFF (F4, b1>0x8F)       *)
+  let* _ = check [0xF0; 0x9F; 0x98] in            (* truncated 4-byte (3 of 4)     *)
+  check [0xE2; 0x82]                              (* truncated 3-byte sequence     *)
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  IO.unsafeRunIO program

@@ -83,21 +83,15 @@ print_trunc :: Bytes -> IO Unit := λs.
         Fault _  -> IO.output "truncated: out of bounds"
       | Return _ -> IO.output "truncated: unexpectedly ok"
 
-use_map :: Mmap -> IO (Result Mmap_Error Unit) := λm.
-  deconstruct view_all m into
-    Fault e  -> pure (Fault e)
-  | Return s ->
-      let* _ = print_parse s in
-      let* _ = print_trunc s in
-      pure (Return ())
-
 program :: IO Unit :=
   let* payload = build in
   let* _       = write_file payload path in
-  let* result  = with_mmap path use_map in
+  let* result  = mmap path in         (* map the whole file straight to Bytes *)
   deconstruct result into
     Fault _  -> IO.output "mmap-failed"
-  | Return _ -> pure ()
+  | Return s ->
+      let* _ = print_parse s in
+      print_trunc s
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"

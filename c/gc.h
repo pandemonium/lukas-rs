@@ -6,6 +6,42 @@
 
 #include "runtime.h"
 
+// Heap-object kind (selects a body's layout + tracing). Exposed here -- not
+// gc.c-private -- so the emitted code can build static text descriptors for
+// borrowed string literals (see notes/tagged-value.md, Stage 1b).
+typedef enum {
+    OBJ_TUPLE,
+    OBJ_CLOSURE,
+    OBJ_TEXT,
+    OBJ_DATA,
+    OBJ_BUFFER, // a stable handle {bytes, len, cap} onto an OBJ_BYTES body
+    OBJ_BYTES,  // raw byte body (leaf); a Buffer's bytes, grown by reallocation
+    OBJ_MMAP,   // handle to a memory-mapped region (region lives outside the heap)
+    OBJ_SLICE,  // immutable view; owner is an OBJ_BYTES body or an OBJ_MMAP handle
+} ObjKind;
+
+// Prepended to every heap object; a Value pointer names the body just past the
+// header, so HEADER/BODY convert between the two.
+typedef struct GcHeader {
+    struct GcHeader *next; // intrusive list within a generation
+    size_t body;           // body size in bytes
+    uint8_t mark;
+    uint8_t kind; // ObjKind
+    uint8_t old;  // 0 = young (nursery), 1 = tenured, MARM_ETERNAL = static
+} GcHeader;
+
+#define BODY(h) ((void *)((h) + 1))
+#define HEADER(p) (((GcHeader *)(p)) - 1)
+
+// A `GcHeader.old` sentinel marking a static, never-collected object: a borrowed
+// string literal's descriptor, emitted `const` into .rodata by codegen. It is
+// not in any slab or the large-object set (so `is_object` is false for it and
+// the conservative scan and sweep never see it); the one place the precise
+// tracer can reach it -- as a child Value of a heap object -- is guarded in
+// `mark_obj`, which early-returns on this sentinel (crucial: the descriptor is
+// `const`, so its `mark` bit must never be written).
+#define MARM_ETERNAL 2
+
 Value result_return(Value x);
 Value result_fault(Value e);
 
@@ -123,5 +159,11 @@ bool    mmap_is_closed(Value mmap);
 
 // Write a slice's bytes to a file (truncating). Returns 0 on success, else errno.
 int64_t slice_write_file(Value slice, const char *path);
+
+// Validate a Bytes view (OBJ_SLICE) as UTF-8; on success copy it into an owned
+// heap Text. Returns `This text` (Perhaps tag 1) or `Nope` (tag 0).
+Value utf8_from_slice(Value slice);
+// Validate only (no allocation): true iff the whole view is well-formed UTF-8.
+bool utf8_slice_is_valid(Value slice);
 
 #endif // MARMELADE_GC_H

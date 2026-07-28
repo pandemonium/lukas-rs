@@ -32,8 +32,9 @@ impl LexicalAnalyzer {
                     TokenKind::Keyword(Keyword::Let(BindingOperator::Applicative)),
                     remains,
                 ),
-                prefix @ [c, ..] if is_identifier_prefix(*c) => self.scan_identifier(prefix),
-                prefix @ [c, ..] if is_number_prefix(*c) => self.scan_number(prefix),
+                [c, ..] if is_identifier_prefix(*c) => self.scan_identifier(input),
+                ['0', 'x', ..] => self.scan_hex_number(input),
+                [c, ..] if is_number_prefix(*c) => self.scan_number(input),
                 ['"', remains @ ..] => self.scan_text_literal(remains),
                 ['\'', c, '\'', remains @ ..] => {
                     self.emit(1, TokenKind::Literal(Literal::Char(*c)), remains)
@@ -287,6 +288,23 @@ impl LexicalAnalyzer {
         }
     }
 
+    fn scan_hex_number<'a>(&mut self, prefix: &'a [char]) -> &'a [char] {
+        let (prefix, remains) =
+            prefix.split_at(2 + prefix.iter().skip(2/* 0x */).take_while(|c| c.is_ascii_hexdigit()).count());
+
+        // This has to be able to fail the tokenization here
+        let prefix = prefix.iter().skip(2).collect::<String>();
+        let num = i64::from_str_radix(&prefix, 16).unwrap();
+
+        self.emit(
+            2/* 0x */ + prefix.len() as u32,
+            TokenKind::Literal(Literal::Integer(num)),
+            remains,
+        );
+
+        remains
+    }
+
     fn scan_number<'a>(&mut self, prefix: &'a [char]) -> &'a [char] {
         let (prefix, remains) =
             prefix.split_at(prefix.iter().take_while(|c| c.is_ascii_digit()).count());
@@ -302,6 +320,11 @@ impl LexicalAnalyzer {
 
         remains
     }
+}
+
+#[test]
+fn foo() {
+    assert_eq!(0xabcd, "0xabcd".parse::<i64>().unwrap());
 }
 
 const fn is_special_symbol(c: char) -> bool {

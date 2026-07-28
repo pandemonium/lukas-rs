@@ -2409,7 +2409,6 @@ impl Type {
                 Ok(subs)
             }
 
-            //            (Self::Array(tu), Self::Array(tv)) => tu.unified_with(tv, ctx),
             (
                 Self::Apply {
                     constructor: lhs_con,

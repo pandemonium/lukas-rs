@@ -1,0 +1,137 @@
+use Stdlib.Prelude.
+use Stdlib.Data.List.
+use Stdlib.Data.Perhaps.
+use Stdlib.Binary.
+
+(* The C fast path (Text.c -> gc.c utf8_from_slice): a branchless RFC-3629 DFA that *)
+(* validates and, on success, materialises an owned Text. `Bytes` erases to its raw *)
+(* slice, so the value crosses to C as the slice directly -- no unwrap needed. *)
+foreign raw_text_from_bytes :: Bytes -> Perhaps Text
+
+(* Validate-only fast path (no allocation, no materialised Text). *)
+foreign raw_is_valid :: Bytes -> Bool
+
+(* Validate raw bytes as UTF-8, materialising a Text on success or Nope on the *)
+(* first ill-formed sequence. The pure-Marmelade reference validator is Utf8.is_valid. *)
+from_bytes :: Bytes -> Perhaps Text :=
+  raw_text_from_bytes
+
+(* Native validity check (does not copy). Utf8.is_valid is the Get-monad twin. *)
+is_valid :: Bytes -> Bool :=
+  raw_is_valid
+
+foldr :: ∀α z. (α -> z -> z) -> z -> Text -> z :=
+  λf z fa. text_fold_right f z fa
+
+foldl :: ∀α z. (z -> α -> z) -> z -> Text -> z :=
+  λf z fa. text_fold_right (λc g z. g (f z c)) id fa z
+
+to_list :: Text -> List Char :=
+  foldr Cons Nil
+
+from_list :: List Char -> Text := λcs.
+  deconstruct cs into
+    Cons c tail -> "`c``from_list tail`"
+  | Nil -> ""
+
+module Utf8:
+  Fault ::=
+    Invalid_char_sequence (Array Int)
+  | Read_error Read_Error
+  | Internal_error
+
+  Char_Width := (* https://tools.ietf.org/html/rfc3629 *)
+    [ (* 1  2  3  4  5  6  7  8  9  A  B  C  D  E  F *)
+      1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; (* 0 *)
+      1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; (* 1 *)
+      1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; (* 2 *)
+      1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; (* 3 *)
+      1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; (* 4 *)
+      1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; (* 5 *)
+      1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; (* 6 *)
+      1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; (* 7 *)
+      0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; (* 8 *)
+      0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; (* 9 *)
+      0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; (* A *)
+      0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; (* B *)
+      0; 0; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2; (* C *)
+      2; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2; (* D *)
+      3; 3; 3; 3; 3; 3; 3; 3; 3; 3; 3; 3; 3; 3; 3; 3; (* E *)
+      4; 4; 4; 4; 4; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0  (* F *)
+    ]
+
+  char_width :: Int -> Perhaps Int :=
+    Array.get_element Char_Width
+
+  opaque Validation_Run ::=
+    { Valid   :: Bytes
+      Remains :: Bytes
+    }
+
+  validate_bytes :: Bytes -> Validation_Run := λbytes.
+    { Valid   := bytes
+      Remains := bytes
+    }
+
+  (* A single byte read, lifted from the reader's Read_Error into our Fault so it *)
+  (* can be sequenced alongside the validation faults below (one error channel). *)
+  byte :: Get Fault Int := map_error Read_error u8
+
+  (* A continuation byte is 0x80..0xBF (10xxxxxx). raw_get_u8 hands back an *)
+  (* UNSIGNED 0..255, so this is a plain range test -- not the signed `>= -64` trick. *)
+  is_cont :: Int -> Bool := λb. (b >= 0x80) and (b <= 0xBF)
+
+  (* Well-formed 3-byte sequence (RFC 3629): b2 is a continuation, and the b1 range *)
+  (* depends on the lead -- E0 bars the overlong floor (b1 >= 0xA0), ED bars the *)
+  (* UTF-16 surrogate range (b1 <= 0x9F), E1..EC and EE..EF take a plain continuation. *)
+  valid3 :: Int -> Int -> Int -> Bool := λb0 b1 b2.
+    is_cont b2 and ((b0 = 0xE0 and b1 >= 0xA0 and b1 <= 0xBF) or (b0 = 0xED and b1 >= 0x80 and b1 <= 0x9F) or (b0 >= 0xE1 and b0 <= 0xEC and is_cont b1) or (b0 >= 0xEE and b0 <= 0xEF and is_cont b1))
+
+  (* Well-formed 4-byte sequence: b2,b3 continuations; F0 bars the overlong floor *)
+  (* (b1 >= 0x90), F4 bars code points past U+10FFFF (b1 <= 0x8F), F1..F3 plain. *)
+  valid4 :: Int -> Int -> Int -> Int -> Bool := λb0 b1 b2 b3.
+    is_cont b2 and is_cont b3 and ((b0 = 0xF0 and b1 >= 0x90 and b1 <= 0xBF) or (b0 = 0xF4 and b1 >= 0x80 and b1 <= 0x8F) or (b0 >= 0xF1 and b0 <= 0xF3 and is_cont b1))
+
+  (* Validate from the cursor to EOF. `position >= length` is the clean-boundary *)
+  (* termination (all input consumed => valid); a continuation read that runs off *)
+  (* the end faults Out_of_bounds (a truncated tail => invalid). The `Unit ->` is *)
+  (* the value-recursion workaround -- a nullary Get can't yet name itself. *)
+  walk :: Unit -> Get Fault Unit := λ_.
+    let* pos = Binary.position in
+    let* len = Binary.length in
+    if pos >= len then pure ()
+    else
+      let* b0 = byte in
+      if b0 < 0x80 then walk ()
+      else deconstruct char_width b0 into
+        This 2 ->
+          let* b1 = byte in
+          if is_cont b1 then walk ()
+          else fail (Invalid_char_sequence [b0; b1])
+
+      | This 3 ->
+          let* b1 = byte in
+          let* b2 = byte in
+          if valid3 b0 b1 b2 then walk ()
+          else fail (Invalid_char_sequence [b0; b1; b2])
+
+      | This 4 ->
+          let* b1 = byte in
+          let* b2 = byte in
+          let* b3 = byte in
+          if valid4 b0 b1 b2 b3 then walk ()
+          else fail (Invalid_char_sequence [b0; b1; b2; b3])
+
+      | otherwise ->
+          fail Internal_error (* width 0/1 with the high bit set: an illegal lead byte *)
+
+  (* Is the whole Bytes well-formed UTF-8? The pure-Marmelade reference validator, *)
+  (* run through the Get monad; the C `from_bytes` fast path agrees with it. *)
+  is_valid :: Bytes -> Bool := λbytes.
+    deconstruct run_get (walk ()) bytes into
+      Return _ -> true
+    | Fault _  -> false
+
+into_bytes :: Buffer -> IO (Perhaps Text) := λbuffer.
+  let* bytes = Binary.move buffer in
+  pure Nope

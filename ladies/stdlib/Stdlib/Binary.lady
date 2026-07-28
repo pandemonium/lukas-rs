@@ -3,8 +3,8 @@
 (* append-only writer. Mmap: mapped file. *)
 (* Reading is done in the Get monad: the source (Bytes) AND the cursor both live *)
 (* in the monad (a Reader over State over error), so reads are nullary and pure. *)
-(* Writes mutate the Buffer in place (immediate, IO, via Byte_Sink). Mmap reads *)
-(* collapse through Bytes via `view`; Mmap_Error only appears at the view/open boundary. *)
+(* Writes mutate the Buffer in place (immediate, IO, via Byte_Sink). A mapped *)
+(* file maps straight to Bytes via `mmap`; Mmap_Error only appears at the open. *)
 
 use Stdlib.Control.
 use Stdlib.Control.State.
@@ -51,7 +51,6 @@ foreign raw_write_file :: Raw_Bytes -> Text -> Int
 
 opaque Buffer ::= Buffer Raw_Buffer
 opaque Bytes  ::= Bytes Raw_Bytes
-opaque Mmap   ::= Mmap Raw_Mmap
 
 Read_Error   ::= Out_of_bounds
 Mmap_Error   ::= Mmap_io Int
@@ -78,6 +77,13 @@ slice :: Bytes -> Int -> Int -> Result Read_Error Bytes := λ(Bytes s) off n.
     then Return (Bytes (raw_sub s off n))
     else Fault Out_of_bounds
 
+(* Split at `n` into (prefix [0, n), suffix [n, len)) -- two zero-copy sub-views *)
+(* sharing the same backing. Faults if `n` is outside [0, len]. *)
+split_at :: Bytes -> Int -> Result Read_Error (Bytes, Bytes) := λ(Bytes s) n.
+  if (0 <= n) and (n <= raw_slice_len s)
+    then Return (Bytes (raw_sub s 0 n), Bytes (raw_sub s n (raw_slice_len s - n)))
+    else Fault Out_of_bounds
+
 (* Read `width` bytes at the cursor with `rd`, advancing by `width`; fault *)
 (* (without advancing) if the read would run past `len`. Built through the monad *)
 (* interface -- lift/modify/throw/pure -- never the transformer's constructors; *)
@@ -94,7 +100,58 @@ read_at :: Int -> Int -> (Int -> Int) -> ExceptT (State Int) Read_Error Int :=
 new_buffer :: Int -> IO Buffer := λcap. IO.suspend (λ_. Buffer (raw_new_buffer cap))
 
 move :: Buffer -> IO Bytes := λ(Buffer b). IO.suspend (λ_. Bytes (raw_move b))
+
 copy :: Buffer -> IO Bytes := λ(Buffer b). IO.suspend (λ_. Bytes (raw_copy b))
+
+module Bytes:
+  length :: Bytes -> Int := len
+
+  slice :: Bytes -> Int -> Int -> Bytes := λ(Bytes bytes) from to.
+    Bytes (raw_sub bytes from to)
+
+  (* Unchecked split at `n` -> (prefix, suffix); caller ensures 0 <= n <= length. *)
+  split_at :: Bytes -> Int -> (Bytes, Bytes) := λ(Bytes bytes) n.
+    (Bytes (raw_sub bytes 0 n), Bytes (raw_sub bytes n (raw_slice_len bytes - n)))
+
+  get_u8 :: Bytes -> Int -> Int := λ(Bytes bytes).
+    raw_get_u8 bytes
+
+  get_u16_le :: Bytes -> Int -> Int := λ(Bytes bytes).
+    raw_get_u16_le bytes
+
+  get_u32_le :: Bytes -> Int -> Int := λ(Bytes bytes).
+    raw_get_u32_le bytes
+
+  get_u64_le :: Bytes -> Int -> Int := λ(Bytes bytes).
+    raw_get_u64_le bytes
+
+  get_i16_le :: Bytes -> Int -> Int := λ(Bytes bytes).
+    raw_get_i16_le bytes
+
+  get_i32_le :: Bytes -> Int -> Int := λ(Bytes bytes).
+    raw_get_i32_le bytes
+
+  get_i64_le :: Bytes -> Int -> Int := λ(Bytes bytes).
+    raw_get_i64_le bytes
+
+  get_u16_be :: Bytes -> Int -> Int := λ(Bytes bytes).
+    raw_get_u16_be bytes
+
+  get_u32_be :: Bytes -> Int -> Int := λ(Bytes bytes).
+    raw_get_u32_be bytes
+
+  get_u64_be :: Bytes -> Int -> Int := λ(Bytes bytes).
+    raw_get_u64_be bytes
+
+  get_i16_be :: Bytes -> Int -> Int := λ(Bytes bytes).
+    raw_get_i16_be bytes
+
+  get_i32_be :: Bytes -> Int -> Int := λ(Bytes bytes).
+    raw_get_i32_be bytes
+
+  get_i64_be :: Bytes -> Int -> Int := λ(Bytes bytes).
+    raw_get_i64_be bytes
+
 
 (* Ranged variants: hand out only [off, off+n). `move_range` is zero-copy (and *)
 (* resets the buffer, like `move`); `copy_range` makes an independent copy. Both *)
@@ -115,30 +172,20 @@ copy_range :: Buffer -> Int -> Int -> IO (Result Buffer_Error Bytes) := λ(Buffe
 write_file :: Bytes -> Text -> IO Int := λ(Bytes s) path.
   IO.suspend (λ_. raw_write_file s path)
 
-close_mmap :: Mmap -> IO Unit := λ(Mmap m). IO.suspend (λ_. raw_mmap_close m)
-
-(* Zero-copy view of a mapped range as Bytes (borrows the region; valid only *)
-(* while the mapping is open). Faults (Mmap_io) if the range is out of the *)
-(* mapping or it is closed. Reads then go through the Get monad. *)
-view :: Mmap -> Int -> Int -> Result Mmap_Error Bytes := λ(Mmap m) off n.
-  deconstruct raw_mmap_slice m off n into
-    Return raw -> Return (Bytes raw)
-  | Fault code -> Fault (Mmap_io code)
-
-(* Byte length of the mapped region (fixed once opened, so total). *)
-mmap_size :: Mmap -> Int := λ(Mmap m). raw_mmap_len m
-
-(* Zero-copy view of the whole mapped region. *)
-view_all :: Mmap -> Result Mmap_Error Bytes := λm. view m 0 (mmap_size m)
-
-with_mmap :: ∀a. Text -> (Mmap -> IO (Result Mmap_Error a)) -> IO (Result Mmap_Error a) := λpath k.
-  let* opened = IO.suspend (λ_. fmap Mmap (raw_mmap_open path)) in
+(* Map a whole file to Bytes. There is no handle and nothing to close: the *)
+(* mapping's lifetime is the GC's -- the Bytes borrows the region (its owner is *)
+(* the mapping, which the collector traces), so it stays valid as long as the *)
+(* Bytes (or anything sliced from it) is reachable, and is unmapped once nothing *)
+(* references it. Map it, slice and dice the Bytes, let it go; a borrowed view *)
+(* may safely escape into any structure. Faults (Mmap_io) only at the open. *)
+mmap :: Text -> IO (Result Mmap_Error Bytes) := λpath.
+  let* opened = IO.suspend (λ_. raw_mmap_open path) in
   deconstruct opened into
     Fault code -> pure (Fault (Mmap_io code))
   | Return m   ->
-      let* result = k m in
-      let* _      = close_mmap m in
-      pure result
+      deconstruct raw_mmap_slice m 0 (raw_mmap_len m) into
+        Return raw -> pure (Return (Bytes raw))
+      | Fault code -> pure (Fault (Mmap_io code))
 
 (* ----------------------------------------------------------------- The Get monad *)
 (* Get carries the Bytes in the monad (a Reader) alongside the cursor (State), so *)
@@ -160,6 +207,8 @@ witness ∀e. Applicative (Get e) :=
 witness ∀e. Monad (Get e) :=
   { bind := λk (MkGet g). MkGet (λs. bind (λa. run_get_t (k a) s) (g s))
   }
+
+(* All of these should be in a module Get. *)
 
 (* Supply the source and run the parser from cursor 0. *)
 run_get :: ∀e a. Get e a -> Bytes -> Result e a := λ(MkGet f) s.
@@ -184,9 +233,24 @@ i64_be :: Get Read_Error Int := MkGet (λ(Bytes s). read_at 8 (raw_slice_len s) 
 (* Get-level primitives: the parser's own access to source, cursor and failure, *)
 (* so combinators are written in Get -- never back in the bare ExceptT layer. *)
 fail     :: ∀e a. e -> Get e a    := λe. MkGet (λ_. ExceptT.throw e)
+
+(* Lift a Get's error type along `via`: `map_error Read_error u8 :: Get Fault Int`. *)
+(* This is `withExceptT` specialised to Get -- re-raise the fault through the *)
+(* mapping so a reader can be embedded where the caller uses a wider error type. *)
+(* Keeps the layers separate: reads stay at Read_Error and are mapped at the *)
+(* boundary, rather than coupling the primitives to some caller's error type. *)
+map_error :: ∀d e a. (d -> e) -> Get d a -> Get e a := λvia (MkGet g).
+  MkGet (λs. ExceptT.catch (g s) (λd. ExceptT.throw (via d)))
 source   :: ∀e. Get e Bytes       := MkGet (λs. pure s)
 position :: ∀e. Get e Int         := MkGet (λ_. ExceptT.lift get)
 skip     :: ∀e. Int -> Get e Unit := λn. MkGet (λ_. ExceptT.lift (modify (λp. p + n)))
+length   :: ∀e. Get e Int         := MkGet (λ(Bytes bytes). pure (raw_slice_len bytes))
+
+(* This is not cheap. *)
+empty :: ∀e. Get e Bool :=
+  let* pos = position in
+  let* len = length in
+  pure (pos < len)
 
 (* Read n raw bytes at the cursor as a zero-copy sub-view (get_bytes = slice + *)
 (* advance) -- now entirely in Get, no source threading. *)

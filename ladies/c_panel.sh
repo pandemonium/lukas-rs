@@ -23,7 +23,7 @@ LIB="$ROOT_DIR/ladies/stdlib"
 C_DIR="$ROOT_DIR/c"
 : "${TIMEOUT:=20}"
 
-cargo build -q --bin mc 2>/dev/null || { echo "build failed"; exit 1; }
+cargo build -q --release --bin mc 2>/dev/null || { echo "build failed"; exit 1; }
 
 for dir in "$ROOT_DIR"/ladies/"$PANEL"/*/; do
   [ -f "$dir/Root.lady" ] || continue
@@ -32,7 +32,7 @@ for dir in "$ROOT_DIR"/ladies/"$PANEL"/*/; do
 
   # Front end: emit C. No output file written means a parse/type error ($$$$) or
   # a codegen panic.
-  cargo run -q --bin mc -- --library "$LIB" --source "$dir" \
+  "$ROOT_DIR/target/release/mc" --library "$LIB" --source "$dir" \
     --backend native -o "$work/program.c" >"$work/out.txt" 2>"$work/err.txt"
 
   prog=""

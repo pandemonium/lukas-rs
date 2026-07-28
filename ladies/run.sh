@@ -18,7 +18,7 @@ set -u
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 # Build once up front; each panel's own `cargo build` is then a no-op.
-cargo build -q --bin mc 2>/dev/null || { echo "build failed"; exit 1; }
+cargo build -q --release --bin mc 2>/dev/null || { echo "build failed"; exit 1; }
 
 PANELS="tc lang stdlib_tests examples c_examples"
 

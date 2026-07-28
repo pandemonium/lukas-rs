@@ -39,19 +39,12 @@
 // live in a set updated the same way. There is no per-collection rebuild.
 // ===========================================================================
 
-// OBJ_TEXT bodies are owned (heap) strings. They have no child Values, so they
-// need no tracing -- but they are collectable, unlike borrowed literal strings,
-// which live in the program's read-only data and are never GC objects at all.
-typedef enum {
-    OBJ_TUPLE,
-    OBJ_CLOSURE,
-    OBJ_TEXT,
-    OBJ_DATA,
-    OBJ_BUFFER, // a stable handle {bytes, len, cap} onto an OBJ_BYTES body
-    OBJ_BYTES,  // raw byte body (leaf); a Buffer's bytes, grown by reallocation
-    OBJ_MMAP,   // handle to a memory-mapped region (region lives outside the heap)
-    OBJ_SLICE,  // immutable view; owner is an OBJ_BYTES body or an OBJ_MMAP handle
-} ObjKind;
+// `ObjKind`, `GcHeader`, and the `HEADER`/`BODY` macros now live in gc.h (shared
+// with the emitted code, which needs them to build static text descriptors for
+// borrowed string literals -- see notes/tagged-value.md Stage 1b). OBJ_TEXT
+// bodies are owned (heap) strings with no child Values (no tracing); borrowed
+// literals live in .rodata behind a MARM_ETERNAL descriptor and are never GC
+// objects at all.
 
 // Byte-handling bodies (all reached through TAG_OBJECT; GcHeader.kind picks which).
 // A Buffer is a STABLE handle onto a separate OBJ_BYTES body: growth reallocates
@@ -62,19 +55,6 @@ typedef enum {
 typedef struct { void *bytes; size_t len; size_t cap; } Buffer;
 typedef struct { uint8_t *region; size_t len; bool closed; } Mmap;
 typedef struct { void *owner; size_t offset; size_t len; } Slice;
-
-// Prepended to every heap object; the Value's `tup`/`clo` points at the body
-// just past it, so HEADER/BODY convert between the two.
-typedef struct GcHeader {
-    struct GcHeader *next; // intrusive list within a generation
-    size_t body;           // body size in bytes
-    uint8_t mark;
-    uint8_t kind; // ObjKind
-    uint8_t old;  // 0 = young (nursery), 1 = tenured
-} GcHeader;
-
-#define BODY(h) ((void *)((h) + 1))
-#define HEADER(p) (((GcHeader *)(p)) - 1)
 
 // ------------------------------------------------------------------ pointer set
 // Open-addressing set of pointer-sized keys. 0 = empty, 1 = tombstone (no real
@@ -268,6 +248,11 @@ static void work_push(GcHeader *h) {
 
 static void mark_obj(void *body) {
     GcHeader *h = HEADER(body);
+    // A static text descriptor (borrowed literal, Stage 1b): it lives `const` in
+    // .rodata, so it must never be marked (the write would fault) or freed. It can
+    // only be reached here, as a child Value of a heap object; the conservative
+    // scan and sweep never see it (`is_object` is false, it's on no gen list).
+    if (h->old == MARM_ETERNAL) return;
     if (!gc_major && h->old) return; // a minor collection leaves the old gen alone
     if (!h->mark) {
         h->mark = 1;
@@ -276,8 +261,8 @@ static void mark_obj(void *body) {
 }
 
 // The logical kind of a value, for the runtime's own dispatch. Immediates decode
-// from the low bits; a pointer's kind comes from its heap header. Defined here
-// (not in runtime.h) because only gc.c sees `GcHeader`/`ObjKind`.
+// from the low bits; a pointer's kind comes from its heap header (which is also
+// how a borrowed literal's static descriptor reports OBJ_TEXT -> TAG_TEXT).
 Tag value_tag(Value v) {
     if (v.w & 1) {
         switch (v.w & TAGMASK) {
@@ -368,6 +353,19 @@ static void scan_words(void *lo, void *hi) {
 
 // Reclaim a dead object: clear its membership record and recycle its storage.
 static void free_object(GcHeader *h) {
+    // An OBJ_MMAP handle owns an OS mapping. Reclaim it here, when the collector
+    // frees the (now unreachable) handle -- a borrowed Bytes/Text view keeps the
+    // handle alive through its traced `owner`, so the mapping stays valid exactly
+    // as long as something references it, and is unmapped once nothing does. This
+    // is the mapping's destructor, not a general finalizer: no user code, no
+    // resurrection, just the `munmap` that pairs with the handle's `free` (the
+    // same shape as the `free()` a large object gets below). `mmap_close` is the
+    // rare explicit opt-in that unmaps eagerly; its `closed` flag guards a double
+    // unmap here.
+    if (h->kind == OBJ_MMAP) {
+        Mmap *m = BODY(h);
+        if (!m->closed) munmap(m->region, m->len);
+    }
     size_t total = sizeof(GcHeader) + h->body;
     if (total <= SMALL_MAX) {
         size_t c = (total + 15) / 16;
@@ -855,6 +853,84 @@ SLICE_GET_BE(slice_get_i16_be, int16_t, 2)
 SLICE_GET_BE(slice_get_i32_be, int32_t, 4)
 SLICE_GET_BE(slice_get_i64_be, int64_t, 8)
 
+// ------------------------------------------------------------- UTF-8 validation
+// Validate a byte range as well-formed UTF-8 (RFC 3629). Two paths, chosen per
+// character boundary:
+//   * ASCII fast path -- word-at-a-time: while the next 8 bytes all have the high
+//     bit clear, skip them. Real-world text is overwhelmingly ASCII, and this runs
+//     at memory speed (~35 GB/s measured).
+//   * multibyte -- a direct lead-byte dispatch (2/3/4-byte), range-checking the
+//     continuation bytes inline. This replaced a Hoehrmann branchless DFA: the DFA
+//     costs two DEPENDENT table loads per byte (a serial latency chain that capped
+//     multibyte input at ~0.74 GB/s), whereas these checks are independent and the
+//     branches predict perfectly on valid text. `(x & 0xC0) == 0x80` is the "is a
+//     continuation byte" test; the E0/ED and F0/F4 special cases bar overlong
+//     encodings, UTF-16 surrogates, and code points past U+10FFFF.
+#define UTF8_CONT(x) (((x) & 0xC0) == 0x80)
+static bool utf8_is_valid(const uint8_t *b, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        if (b[i] < 0x80) { // ASCII (single or a run)
+            while (i + 8 <= len) {
+                uint64_t w;
+                memcpy(&w, b + i, 8);
+                if (w & 0x8080808080808080ULL) break;
+                i += 8;
+            }
+            while (i < len && b[i] < 0x80) i++;
+            continue;
+        }
+        uint8_t c = b[i];
+        if (c < 0xC2) {
+            return false; // 0x80-0xBF stray continuation, or 0xC0/0xC1 overlong lead
+        } else if (c < 0xE0) { // 2-byte: C2..DF 80..BF
+            if (i + 2 > len || !UTF8_CONT(b[i + 1])) return false;
+            i += 2;
+        } else if (c < 0xF0) { // 3-byte: E0..EF
+            if (i + 3 > len || !UTF8_CONT(b[i + 2])) return false;
+            uint8_t b1 = b[i + 1];
+            if (c == 0xE0 ? b1 < 0xA0            // overlong
+                : c == 0xED ? b1 > 0x9F          // surrogate D800..DFFF
+                : !UTF8_CONT(b1))
+                return false;
+            i += 3;
+        } else if (c <= 0xF4) { // 4-byte: F0..F4
+            if (i + 4 > len || !UTF8_CONT(b[i + 2]) || !UTF8_CONT(b[i + 3])) return false;
+            uint8_t b1 = b[i + 1];
+            if (c == 0xF0 ? b1 < 0x90            // overlong
+                : c == 0xF4 ? b1 > 0x8F          // > U+10FFFF
+                : !UTF8_CONT(b1))
+                return false;
+            i += 4;
+        } else {
+            return false; // 0xF5-0xFF
+        }
+    }
+    return true;
+}
+
+// raw_text_from_bytes: validate a byte view as UTF-8 and, on success, copy it
+// into an owned heap Text -- Text is not yet a zero-copy view over Bytes, so a
+// valid run materialises. Returns `This text` or `Nope`, built to match codegen's
+// constructor layout exactly: `Nope` is nullary (`mk_data0`, no fields), not the
+// unit-field shape the older `perhaps_nope()` helper produces.
+Value utf8_from_slice(Value sv) {
+    Slice *s = as_ptr(sv);
+    const uint8_t *p = slice_base(s);
+    size_t n = s->len;
+    if (!utf8_is_valid(p, n)) return mk_data0(0);
+    // The collector is non-moving and `sv` is a live local on the C stack, so its
+    // owner stays reachable and `p` stays valid across the alloc in mk_textn.
+    return mk_data1(1, mk_textn((const char *)p, n));
+}
+
+// Validate only -- no allocation, no materialised Text. Used to profile/benchmark
+// the validator itself (and as a fast `Text.is_valid` that never copies).
+bool utf8_slice_is_valid(Value sv) {
+    Slice *s = as_ptr(sv);
+    return utf8_is_valid(slice_base(s), s->len);
+}
+
 // ----------------------------------------------------------------- memory maps
 // Result ordinals follow `Result ::= Fault e | Return a` -> Fault = 0, Return = 1.
 // (Verify against codegen's constructor numbering before wiring the stdlib.)
@@ -862,7 +938,12 @@ Value result_return(Value x) { return mk_data(1, 1, x); }
 Value result_fault(Value e) { return mk_data(0, 1, e); }
 
 Value perhaps_this(Value x) { return mk_data(1, 1, x); }
-Value perhaps_nope() { return mk_data(0, 1, VUnit()); }
+// `Nope` is nullary: codegen emits it as `mk_data0(0)` (tag, no fields) -- the
+// same shape it gives the shared `Root_Stdlib_Data_Perhaps_Nope` global. We build
+// a fresh one rather than referencing that global, which would chain the runtime
+// to a stdlib symbol absent from any program that never imports Data.Perhaps.
+// Matching is by tag, not identity, so a fresh value is indistinguishable.
+Value perhaps_nope() { return mk_data0(0); }
 
 // Ranged Buffer -> Bytes producers. Like buffer_move/buffer_copy but for a
 // sub-range [off, off+n); Fault(-1) if that range runs past the buffer's length.

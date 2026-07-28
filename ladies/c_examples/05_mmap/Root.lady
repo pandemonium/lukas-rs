@@ -19,18 +19,16 @@ build_payload :: IO Bytes :=
 read_first :: Get Read_Error Int := u8
 
 (* Inside the mapping: view the first two bytes, then read byte 0 through it. *)
-use_map :: Mmap -> IO (Result Mmap_Error (Result Read_Error Int)) := λm.
-  deconstruct view m 0 2 into
-    Fault e    -> pure (Fault e)
-  | Return bs  -> pure (Return (run_get read_first bs))
-
 program :: IO Unit :=
   let* payload = build_payload in
   let* _       = write_file payload path in
-  let* result  = with_mmap path use_map in
+  let* result  = mmap path in         (* map the whole file to Bytes *)
   deconstruct result into
-    Fault _  -> IO.output "mmap-failed"
-  | Return r -> IO.output (display r)
+    Fault _   -> IO.output "mmap-failed"
+  | Return bs ->
+      deconstruct slice bs 0 2 into    (* Bytes sliced and diced -- no handle needed *)
+        Fault _    -> IO.output "slice-failed"
+      | Return sub -> IO.output (display (run_get read_first sub))
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"

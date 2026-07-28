@@ -87,7 +87,7 @@ signature Traversable ::= ∀t : *->*. Functor t + Foldable t |-
   { traverse :: ∀f : *->* α β. Applicative f |- (α -> f β) -> t α -> f (t β)
   }
 
-sequence :: ∀t : *->* f : *->* α.  Traversable t + Applicative f |- t (f α) -> f (t α) :=
+sequence :: ∀t : *->* f : *->* α. Traversable t + Applicative f |- t (f α) -> f (t α) :=
   λtfa.
     traverse id tfa
 

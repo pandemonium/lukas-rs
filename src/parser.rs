@@ -463,6 +463,12 @@ impl<'a> Parser<'a> {
                             | Keyword::Signature
                             | Keyword::Witness
                             | Keyword::Foreign
+                            // `opaque <id> ::=` -- without this, an opaque declaration
+                            // after a binding whose body is on its own indented line
+                            // (which ends in a Dedent, not a Newline separator) is not
+                            // recognised as the next declaration, so the list stops
+                            // early and the enclosing block reports "expected <Ded>".
+                            | Keyword::Opaque
                     ),
                     ..
                 },
@@ -1644,7 +1650,16 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Into),
             TokenKind::Keyword(Keyword::Then),
             TokenKind::Keyword(Keyword::Else),
+            // A following declaration terminates the expression -- none of these
+            // keywords can appear inside one. `Signature` was already here; the
+            // rest were missing, so an expression directly before e.g. an `opaque`
+            // declaration ran past it into the prefix parser's `otherwise` panic.
             TokenKind::Keyword(Keyword::Signature),
+            TokenKind::Keyword(Keyword::Opaque),
+            TokenKind::Keyword(Keyword::Module),
+            TokenKind::Keyword(Keyword::Witness),
+            TokenKind::Keyword(Keyword::Foreign),
+            TokenKind::Keyword(Keyword::Use),
             TokenKind::End,
         ];
 

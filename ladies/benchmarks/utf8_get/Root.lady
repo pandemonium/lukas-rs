@@ -1,0 +1,51 @@
+use Stdlib.
+use Stdlib.Binary.
+use Stdlib.Text.Utf8.
+
+(* UTF-8 validation benchmark -- GET-MONAD validator: `Utf8.is_valid`, the pure       *)
+(* Marmelade reference that reads byte-by-byte through Binary's Get monad (ExceptT     *)
+(* over State over a Bytes reader). Same corpus as `utf8_native`; the ratio between    *)
+(* the two, and where THIS one spends its time, is a test of the backend's ability to  *)
+(* make the monadic abstraction cheap. `reps` is smaller because it is much slower.    *)
+
+reps   :: Int := 10
+copies :: Int := 120000   (* 49-byte chunk -> ~5.9 MB corpus *)
+
+ascii_run :: Int -> Put Unit := λn.
+  if n <= 0 then pure ()
+  else let* _ = put_u8 0x61 in ascii_run (n - 1)
+
+chunk_puts :: Put Unit :=
+  let* _ = ascii_run 40 in
+  let* _ = put_u8 0xC3 in let* _ = put_u8 0xA9 in
+  let* _ = put_u8 0xE2 in let* _ = put_u8 0x82 in let* _ = put_u8 0xAC in
+  let* _ = put_u8 0xF0 in let* _ = put_u8 0x9F in let* _ = put_u8 0x98 in put_u8 0x80
+
+chunk :: IO Bytes :=
+  let* b = new_buffer 64 in
+  let* _ = run_put chunk_puts b in
+  move b
+
+replicate :: Bytes -> Int -> Put Unit := λc n.
+  if n <= 0 then pure ()
+  else let* _ = put_slice c in replicate c (n - 1)
+
+corpus :: IO Bytes :=
+  let* c = chunk in
+  let* b = new_buffer 6000000 in
+  let* _ = run_put (replicate c copies) b in
+  move b
+
+(* Validate `reps` times, counting successes so the calls can't be dead-coded. *)
+loop :: Int -> Bytes -> Int -> Int := λn bytes acc.
+  if n < 1 then acc
+  else loop (n - 1) bytes (acc + (if is_valid bytes then 1 else 0))
+
+program :: IO Unit :=
+  let* bytes = corpus in
+  let* _ = IO.output (display (len bytes)) in
+  IO.output (display (loop reps bytes 0))
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  IO.unsafeRunIO program

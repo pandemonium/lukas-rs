@@ -1,9 +1,13 @@
-foreign len :: forall a. Array a -> Int
-foreign get_element :: forall a. Array a -> Int -> Perhaps a
+foreign raw_len :: forall a. Array a -> Int
+foreign raw_get_element :: forall a. Array a -> Int -> Perhaps a
 
-witness From Int Text :=
-  { from := λthis. "`this`"
-  }
+(* Silently omit the bounds check. Necessary? *)
+(* foreign unsafe_get_element :: forall a. Array a -> Int -> Perhaps a *)
+
+(* foreign generate :: forall a. (Int -> a) -> Int -> Array a *)
+
+length :: ∀α. Array α -> Int := raw_len
+get_element :: ∀α. Array α -> Int -> Perhaps α := raw_get_element
 
 witness Foldable Array :=
   { fold_right := λstep initial as.
@@ -11,29 +15,21 @@ witness Foldable Array :=
         if i < 0 then
           acc
         else
-          deconstruct get_element as i into
+          deconstruct raw_get_element as i into
             This x -> loop (i - 1) (step x acc)
           | Nope   -> loop (i - 1) acc
       in
-        loop (len as - 1) initial
+        loop (raw_len as - 1) initial
 
     fold_left := λstep initial as.
-      let length = len as in
+      let length = raw_len as in
       let loop = λi acc.
         if i >= length then
           acc
         else
-          deconstruct get_element as i into
+          deconstruct raw_get_element as i into
             This x -> loop (i + 1) (step acc x)
           | Nope   -> loop (i + 1) acc
       in
         loop 0 initial
   }
-
-witness ∀a. From (Array a) (List a) :=
-  { from := fold_right Cons Nil
-  }
-
-xs :: List Int := from [ 1; 2; 3 ]
-
-hello :: Text := from 10

@@ -4,6 +4,7 @@ module IO.
 module Data.
 module Binary.
 module Array.
+module Text.
 (* module Files. *)
 
 use Stdlib.Prelude.
@@ -59,18 +60,3 @@ witness Display Char :=
 witness Display Int :=
   { display := λt. prim_show t
   }
-
-module Text:
-  foldr :: ∀α z. (α -> z -> z) -> z -> Text -> z :=
-    λf z fa. text_fold_right f z fa
-
-  foldl :: ∀α z. (z -> α -> z) -> z -> Text -> z :=
-    λf z fa. text_fold_right (λc g z. g (f z c)) id fa z
-
-  to_list :: Text -> List Char :=
-    foldr Cons Nil
-
-  from_list :: List Char -> Text := λcs.
-    deconstruct cs into
-      Cons c tail -> "`c``from_list tail`"
-    | Nil -> ""

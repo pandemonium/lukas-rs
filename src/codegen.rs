@@ -242,10 +242,20 @@ impl lambda_lift::Program {
             writeln!(out, ";\n}}\n")?;
         }
 
-        // Globals may hold closures that name each other's code, but building a
-        // closure only takes the address of a function, so initialisation order
-        // is immaterial here.
         writeln!(out, "void startup(void) {{")?;
+        // Foreign closures init first: their `__init` builders are self-contained
+        // (they build a closure or compute a C-side constant and never read a user
+        // global), and an *eager* user global may APPLY a foreign at its own init
+        // (e.g. `char_width := Array.get_element Char_Width`), which dereferences
+        // the foreign's Value -- so it must already hold its closure, not null.
+        // Runs after `gc_init`/`runtime_init` (see `main`), so `mk_closure` is safe.
+        for name in &self.foreign {
+            writeln!(out, "  {0} = {0}__init();", c_name(name))?;
+        }
+        // User globals then init in dependency order (`in_resolvable_order`): a
+        // binding that merely names another global's closure is order-immaterial,
+        // but one that eagerly applies another user global depends on that global
+        // already being built, which the ordering guarantees.
         for TopLevelBinding { name, value, .. } in &self.globals {
             if is_builtin(name) {
                 continue;
@@ -253,11 +263,6 @@ impl lambda_lift::Program {
             write!(out, "  {} = ", c_name(name))?;
             self.compile_expr(value, out)?;
             writeln!(out, ";")?;
-        }
-        // Build each foreign closure from its companion-provided builder. Runs
-        // after `gc_init`/`runtime_init` (see `main`), so `mk_closure` is safe.
-        for name in &self.foreign {
-            writeln!(out, "  {0} = {0}__init();", c_name(name))?;
         }
         writeln!(out, "}}\n")?;
 
@@ -697,7 +702,20 @@ impl lambda_lift::Program {
     fn compile_constant(&self, the: &Literal) -> String {
         match the {
             Literal::Int(x) => format!("VInt({x})"),
-            Literal::Text(x) => format!("VText(\"{x}\")"),
+            // Borrowed string literal (tagged-value.md Stage 1b): a `const`
+            // text descriptor emitted into .rodata -- a `GcHeader` (kind OBJ_TEXT,
+            // `old = MARM_ETERNAL` so the GC never touches it) immediately
+            // followed by the bytes -- referenced as a Value. Zero copy, zero
+            // per-use allocation (the old `VText`/`mk_text` heap-copied every
+            // literal every time it was evaluated). `sizeof("...")` lets the C
+            // compiler size the body, so any escaping the string already carries
+            // is handled exactly as before. The `static` local in a statement
+            // expression has static storage duration -> it lands in .rodata.
+            Literal::Text(x) => format!(
+                "({{ static const struct {{ GcHeader gch; char b[sizeof(\"{x}\")]; }} \
+                 __marm_txt = {{{{0, sizeof(\"{x}\"), 0, OBJ_TEXT, MARM_ETERNAL}}, \"{x}\"}}; \
+                 VObject((void *)__marm_txt.b); }})"
+            ),
             Literal::Bool(x) => format!("VBool({x})"),
             Literal::Unit => "VUnit()".to_owned(),
             Literal::Char(x) => format!("VChar('{x}')"),
