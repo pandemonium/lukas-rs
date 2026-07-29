@@ -142,6 +142,20 @@ static void *free_list[NCLASS]; // per-class free slots (intrusive: slot holds n
 static PtrSet slab_set;         // bases of live small slabs (insert-only)
 static PtrSet large_set;        // body pointers of live large objects
 
+// Immix mark-region heap (the default; opt back to the slab collector with
+// MARM_GC=slab): a bump-allocated, non-moving, block/line collector that reclaims
+// by whole free lines/blocks -- never touching a dead object. Selected at startup.
+// Defined further down (needs the generation globals); forward-declared here for
+// the dispatch in `is_object` / `gc_new`.
+static bool gc_immix = true;
+static void *ix_alloc(size_t total, ObjKind kind);
+static bool is_object_immix(uintptr_t w);
+static void ix_mark_lines(void *body); // mark the lines a live object spans
+static void ix_reset_lines(void);      // clear data-line marks before a collection
+static void ix_reclaim(void);          // free empty lines, keep occupied ones
+static size_t ix_bytes;                // bytes allocated since the last immix collection
+static size_t ix_threshold;            // collect once ix_bytes crosses this (Appel: 2x live)
+
 static Slab *slab_of(uintptr_t slot) { return (Slab *)(slot & SLAB_MASK); }
 
 static void bit_set(uintptr_t slot) {
@@ -181,6 +195,7 @@ static __attribute__((noinline, cold)) void grow_class(size_t c) {
 // Small objects are validated via their slab's allocation bitmap, large objects
 // via the large-object set. O(1), no per-collection scan.
 static bool is_object(uintptr_t w) {
+    if (gc_immix) return is_object_immix(w);
     uintptr_t slot = w - sizeof(GcHeader);
     uintptr_t base = slot & SLAB_MASK;
     if (ps_has(&slab_set, base)) {
@@ -196,9 +211,37 @@ static bool is_object(uintptr_t w) {
 }
 
 // ------------------------------------------------------------------ generations
-static GcHeader *gc_young = NULL, *gc_old = NULL;
+// Small (slab-allocated) objects carry NO generation-list link: the sweep
+// enumerates them by walking each slab's allocation bitmap in address order --
+// sequential and cache-friendly, versus chasing a per-object list scattered across
+// the whole nursery (a cache miss per object, the dominant minor-GC cost). The
+// `old` header flag distinguishes young from tenured in place. Only large objects
+// (not slab-backed, and rare) keep an explicit list.
+static GcHeader *gc_large = NULL;      // large (malloc'd) objects, both generations
 static size_t gc_young_bytes = 0;      // young allocation since the last minor GC
 static size_t gc_old_bytes = 0;        // live bytes tenured in the old generation
+
+// Generational write barrier for the one mutable object, `Buffer`. `Buffer` is the
+// only value whose heap pointer field mutates (`b->bytes = nbody` on growth / range
+// reset). Once the handle has tenured (old), that store is an old->young edge, and a
+// minor collection skips the old gen (no remembered set) -- so it would free the live
+// young `bytes` body. We remember every old buffer whose `bytes` is re-pointed and
+// re-trace it as an extra root on each minor, keeping the young body live until it
+// tenures. Dead buffers are pruned at the next major. (Buffer is the only mutable
+// object, so this tiny set is the whole barrier -- see notes/gc-design.md §6.2.)
+static uintptr_t *gc_rem = NULL; // body pointers of old buffers with a mutated `bytes`
+static size_t gc_rem_len = 0, gc_rem_cap = 0;
+
+static void gc_remember_buffer(void *buffer_body) {
+    if (!HEADER(buffer_body)->old) return; // young handle: a minor traces it anyway
+    for (size_t i = 0; i < gc_rem_len; i++)
+        if (gc_rem[i] == (uintptr_t)buffer_body) return; // already remembered
+    if (gc_rem_len == gc_rem_cap) {
+        gc_rem_cap = gc_rem_cap ? gc_rem_cap * 2 : 16;
+        gc_rem = realloc(gc_rem, gc_rem_cap * sizeof *gc_rem);
+    }
+    gc_rem[gc_rem_len++] = (uintptr_t)buffer_body;
+}
 static size_t gc_nursery = 256u << 20; // trigger a minor GC once the nursery fills.
 // 256 MiB (was 16 MiB): high-churn workloads (e.g. the binary_codec benchmark)
 // pay a per-collection fixed cost (a full conservative stack scan) plus
@@ -257,6 +300,7 @@ static void mark_obj(void *body) {
     if (!h->mark) {
         h->mark = 1;
         work_push(h);
+        if (gc_immix) ix_mark_lines(body); // keep the lines this object spans
     }
 }
 
@@ -378,6 +422,64 @@ static void free_object(GcHeader *h) {
     }
 }
 
+// Sweep the slab-allocated (small) objects by walking every slab's allocation
+// bitmap in address order. Live young objects tenure in place (set `old`); dead
+// ones are freed; a minor skips the old gen. Sequential over dense bitmaps and
+// contiguous slots -- so an object is already in cache for both its mark read and
+// its free-list write, which is the whole point versus the scattered list walk.
+// Adds surviving bytes to `*young_live` / `*old_live` by generation.
+static void sweep_small(bool major, size_t *young_live, size_t *old_live) {
+    for (size_t si = 0; si < slab_set.cap; si++) {
+        uintptr_t base = slab_set.keys ? slab_set.keys[si] : 0;
+        if (!base || base == PS_TOMB) continue;
+        Slab *s = (Slab *)base;
+        // Walk the bitmap a byte (8 slots) at a time: one load per 8 slots, and a
+        // whole empty byte skips 8 free slots with a single branch -- most of the
+        // per-slot overhead the scattered list walk did not have. `bits` is a copy,
+        // so `free_object` clearing the live bitmap underneath does not disturb it.
+        uint32_t nbytes = (s->slot_count + 7) / 8;
+        for (uint32_t byte = 0; byte < nbytes; byte++) {
+            uint8_t bits = s->bitmap[byte];
+            if (!bits) continue; // 8 free slots
+            for (uint32_t k = 0; k < 8; k++) {
+                if (!((bits >> k) & 1)) continue;
+                uint32_t i = byte * 8 + k;
+                if (i >= s->slot_count) break;
+                GcHeader *h = (GcHeader *)(s->slots + (uintptr_t)i * s->slot_size);
+                if (!major && h->old) continue; // minor: leave the old gen alone
+                size_t sz = sizeof(GcHeader) + h->body;
+                if (h->mark) {
+                    h->mark = 0;
+                    if (!major) { h->old = 1; *old_live += sz; } // tenure young survivors
+                    else if (h->old) *old_live += sz;
+                    else *young_live += sz;
+                } else {
+                    free_object(h); // clears this slot's bitmap bit + recycles it
+                }
+            }
+        }
+    }
+}
+
+// The large-object companion to sweep_small: a short intrusive list (large objects
+// are rare, so a list is fine and there is no slab to bitmap-scan).
+static void sweep_large(bool major, size_t *young_live, size_t *old_live) {
+    for (GcHeader **link = &gc_large, *h = *link; h; h = *link) {
+        if (!major && h->old) { link = &h->next; continue; }
+        size_t sz = sizeof(GcHeader) + h->body;
+        if (h->mark) {
+            h->mark = 0;
+            if (!major) { h->old = 1; *old_live += sz; }
+            else if (h->old) *old_live += sz;
+            else *young_live += sz;
+            link = &h->next;
+        } else {
+            *link = h->next;
+            free_object(h);
+        }
+    }
+}
+
 // One collection. `major` selects a full sweep of both generations; otherwise a
 // minor collection sweeps only the nursery, tenuring its survivors.
 static void gc_run(bool major) {
@@ -385,6 +487,7 @@ static void gc_run(bool major) {
     if (major) gc_major_count++;
     else gc_minor_count++;
     gc_major = major;
+    if (gc_immix) ix_reset_lines(); // clear line marks so the trace rebuilds liveness
     jmp_buf regs;
     setjmp(regs); // spill callee-saved registers onto the stack
     void *stack_top = (void *)&regs;
@@ -399,42 +502,39 @@ static void gc_run(bool major) {
     scan_words(&regs, (char *)&regs + sizeof regs);
     scan_words(stack_top, gc_stack_bottom);
 
+    // Write-barrier roots: old buffers whose `bytes` was re-pointed at a young body.
+    // A minor skips the old gen, so trace their (possibly young) bytes explicitly to
+    // keep it live. A major traces the old gen anyway, so this is minor-only.
+    if (!major)
+        for (size_t i = 0; i < gc_rem_len; i++)
+            mark_obj(((Buffer *)gc_rem[i])->bytes);
+
     gc_trace();
 
-    if (major) {
-        // Survivors keep their generation. Free the unmarked from both lists,
-        // unmark and re-thread the survivors, recompute sizes and the threshold.
+    if (gc_immix) {
+        ix_reclaim(); // mark-region: free empty lines/keep occupied ones, no per-object free
+    } else if (major) {
+        // Full sweep of both generations. Survivors keep their generation; the dead
+        // are freed. Bitmap-walk the small objects, list-walk the large ones.
         size_t young_live = 0, old_live = 0;
-        for (GcHeader **link = &gc_young, *h = *link; h; h = *link) {
-            if (h->mark) { h->mark = 0; young_live += sizeof(GcHeader) + h->body; link = &h->next; }
-            else { *link = h->next; free_object(h); }
-        }
-        for (GcHeader **link = &gc_old, *h = *link; h; h = *link) {
-            if (h->mark) { h->mark = 0; old_live += sizeof(GcHeader) + h->body; link = &h->next; }
-            else { *link = h->next; free_object(h); }
-        }
+        sweep_small(true, &young_live, &old_live);
+        sweep_large(true, &young_live, &old_live);
+        // Prune buffers this major freed from the remembered set: their old->young
+        // edge is gone. `is_object` is false once free_object cleared the slot's bit.
+        size_t kept = 0;
+        for (size_t i = 0; i < gc_rem_len; i++)
+            if (is_object(gc_rem[i])) gc_rem[kept++] = gc_rem[i];
+        gc_rem_len = kept;
         gc_young_bytes = young_live;
         gc_old_bytes = old_live;
         size_t twice = gc_old_bytes * 2;
         gc_major_at = twice < gc_major_floor ? gc_major_floor : twice;
     } else {
-        // Tenure the survivors: move them from the nursery into the old list.
-        GcHeader *h = gc_young;
-        gc_young = NULL;
-        size_t promoted = 0;
-        while (h) {
-            GcHeader *next = h->next;
-            if (h->mark) {
-                h->mark = 0;
-                h->old = 1;
-                h->next = gc_old;
-                gc_old = h;
-                promoted += sizeof(GcHeader) + h->body;
-            } else {
-                free_object(h);
-            }
-            h = next;
-        }
+        // Minor: young survivors tenure in place (the sweep sets `old`); the dead
+        // are freed. `promoted` is the tenured bytes; nothing stays young.
+        size_t young_live = 0, promoted = 0;
+        sweep_small(false, &young_live, &promoted);
+        sweep_large(false, &young_live, &promoted);
         gc_young_bytes = 0;
         gc_old_bytes += promoted;
     }
@@ -451,6 +551,14 @@ void gc_collect(void) { gc_run(true); }
 // collection that leaves the old generation too large escalates to a major.
 static void gc_reserve(size_t need) {
     if (!gc_on || gc_disabled) return;
+    if (gc_immix) {
+        // Collect once allocation since the last collection crosses the adaptive
+        // threshold (Appel: ~2x the live set, floored at one nursery). This keeps a
+        // whole-heap trace cheap-per-garbage on a large stable live set (the codec)
+        // while staying frequent when little survives (utf8_get).
+        if (ix_bytes + need > ix_threshold) gc_run(false);
+        return;
+    }
     if (gc_young_bytes + need > gc_nursery) {
         if (!gc_generational) {
             gc_run(true); // emulate a single-generation collector for comparison
@@ -461,10 +569,195 @@ static void gc_reserve(size_t need) {
     }
 }
 
+// ============================ Immix mark-region heap ========================
+// 32 KiB blocks divided into 128 B lines. Small/medium objects bump-allocate
+// through a block's free lines; larger objects share the malloc'd large-object
+// path. Non-moving, so conservative roots just work (an ambiguous pointer keeps
+// its object's line live -- nothing to rewrite). See notes/gc-design.md Option 1.
+#define IX_BLOCK (32u * 1024)
+#define IX_LINE  128u
+#define IX_LINES (IX_BLOCK / IX_LINE)      // 256 lines / block
+#define IX_MASK  (~((uintptr_t)IX_BLOCK - 1))
+#define IX_MAX_ALLOC (IX_LINE * 4u)        // bigger than this -> large-object space
+
+typedef struct IxBlock {
+    struct IxBlock *next;            // link over every block, for reclaim iteration
+    struct IxBlock *rnext;           // recyclable list: blocks with free lines to bump into
+    uint8_t line[IX_LINES];          // per line: occupied? (rebuilt each collection)
+    uint8_t start[IX_BLOCK / 8 / 8]; // object-start bitmap, 1 bit per 8 B (conservative)
+    uint32_t data_line;              // first data line (past this header)
+} IxBlock;
+
+#define IX_GBYTES (IX_LINE / 8u / 8u)      // object-start bytes per line (16 granules = 2)
+
+static IxBlock *ix_blocks = NULL, *ix_tail = NULL; // all blocks, in allocation order
+static IxBlock *ix_recycle = NULL;         // blocks with free lines (rebuilt each collection)
+static PtrSet ix_set;                      // block bases, O(1) conservative membership
+static IxBlock *ix_cur = NULL;             // block currently being bump-filled
+static uintptr_t ix_ptr = 0, ix_limit = 0; // bump cursor + end of the current free run
+static uintptr_t ix_run = 0;               // start of the current run (for bulk line marking)
+static size_t ix_bytes = 0;                // bytes allocated since the last collection
+
+static inline void ix_set_start(IxBlock *b, uintptr_t body) {
+    size_t g = (body - (uintptr_t)b) / 8;
+    b->start[g >> 3] |= (uint8_t)(1u << (g & 7));
+}
+static inline bool ix_is_start(IxBlock *b, uintptr_t body) {
+    size_t g = (body - (uintptr_t)b) / 8;
+    return (b->start[g >> 3] >> (g & 7)) & 1;
+}
+
+static IxBlock *ix_new_block(void) {
+    IxBlock *b = aligned_alloc(IX_BLOCK, IX_BLOCK);
+    memset(b->line, 0, sizeof b->line);
+    memset(b->start, 0, sizeof b->start);
+    b->data_line = (uint32_t)((sizeof(IxBlock) + IX_LINE - 1) / IX_LINE);
+    for (uint32_t i = 0; i < b->data_line; i++) b->line[i] = 1; // header lines: always occupied
+    b->next = NULL;
+    if (ix_tail) ix_tail->next = b; else ix_blocks = b; // append, so the alloc walk is linear
+    ix_tail = b;
+    ps_insert(&ix_set, (uintptr_t)b);
+    return b;
+}
+
+// Find the first run of free lines in `b` at/after line `from`; return its byte
+// range via out-params. Pure (no globals), so the allocator can probe blocks.
+static bool ix_find_run(IxBlock *b, uint32_t from, uintptr_t *s, uintptr_t *e) {
+    uint32_t i = from;
+    while (i < IX_LINES && b->line[i]) i++;         // skip occupied lines
+    if (i >= IX_LINES) return false;
+    uint32_t j = i;
+    while (j < IX_LINES && !b->line[j]) j++;         // extent of the free run
+    *s = (uintptr_t)b + (uintptr_t)i * IX_LINE;
+    *e = (uintptr_t)b + (uintptr_t)j * IX_LINE;
+    return true;
+}
+
+// Bump-allocate header+body of `total` bytes for a `kind` object; returns the BODY.
+// Filled lines are marked occupied so the monotonic block walk never re-fills them
+// within an epoch; `gc_reserve` triggers a collection before the heap grows without
+// bound. Objects over IX_MAX_ALLOC use the malloc'd large path.
+static void *ix_alloc(size_t total, ObjKind kind) {
+    total = (total + 7u) & ~(size_t)7u; // keep every body pointer 8-aligned (bump)
+    GcHeader *h;
+    if (total > IX_MAX_ALLOC) {                     // large: malloc, shared large path
+        h = malloc(total);
+        ps_insert(&large_set, (uintptr_t)BODY(h));
+        h->next = gc_large;
+        gc_large = h;
+    } else {
+        while (ix_ptr + total > ix_limit) {
+            // Leaving the current run: bulk-mark the lines we filled as occupied, in
+            // one memset, so `ix_find_run` never re-fills them. Doing this per run
+            // (not per object) is the Phase-3 win -- the per-object work is now just
+            // the bump + one start bit, matching the slab's single bitmap write.
+            if (ix_cur && ix_ptr > ix_run) {
+                uint32_t a = (uint32_t)((ix_run - (uintptr_t)ix_cur) / IX_LINE);
+                uint32_t z = (uint32_t)((ix_ptr - 1 - (uintptr_t)ix_cur) / IX_LINE);
+                memset(ix_cur->line + a, 1, z - a + 1);
+            }
+            uintptr_t s, e;
+            if (ix_cur) {                            // more free lines forward in this block?
+                uint32_t from = (uint32_t)((ix_limit - (uintptr_t)ix_cur) / IX_LINE);
+                if (from < IX_LINES && ix_find_run(ix_cur, from, &s, &e)) {
+                    ix_ptr = s; ix_limit = e; ix_run = s; continue;
+                }
+            }
+            // Next block with free lines: pop the recyclable list (never walks full
+            // blocks -- that was O(blocks) per fill), else grow a fresh block.
+            if (ix_recycle) { ix_cur = ix_recycle; ix_recycle = ix_recycle->rnext; }
+            else ix_cur = ix_new_block();
+            (void)ix_find_run(ix_cur, ix_cur->data_line, &s, &e); // recyclable/fresh => has a run
+            ix_ptr = s; ix_limit = e; ix_run = s;
+        }
+        h = (GcHeader *)ix_ptr;
+        ix_ptr += total;
+        ix_set_start(ix_cur, (uintptr_t)BODY(h));
+    }
+    h->body = total - sizeof(GcHeader);
+    h->mark = 0;
+    h->kind = kind;
+    h->old = 0;
+    ix_bytes += total;
+    gc_total_bytes += total;
+    return BODY(h);
+}
+
+// Mark every line a live object spans (called from `mark_obj` when it first marks
+// the object). Large objects aren't block-backed -- skip them.
+static void ix_mark_lines(void *body) {
+    GcHeader *h = HEADER(body);
+    if (sizeof(GcHeader) + h->body > IX_MAX_ALLOC) return; // large object: not block-backed
+    IxBlock *b = (IxBlock *)((uintptr_t)h & IX_MASK);
+    uint32_t l0 = (uint32_t)(((uintptr_t)h - (uintptr_t)b) / IX_LINE);
+    uint32_t l1 = (uint32_t)(((uintptr_t)body + h->body - 1 - (uintptr_t)b) / IX_LINE);
+    for (uint32_t i = l0; i <= l1; i++) b->line[i] = 1;
+}
+
+// Clear every block's data-line marks so the mark phase rebuilds liveness from
+// scratch (header lines stay occupied). Object marks are already 0 at this point
+// (cleared for survivors by the previous reclaim; 0 at birth for the rest).
+static void ix_reset_lines(void) {
+    for (IxBlock *b = ix_blocks; b; b = b->next)
+        memset(b->line + b->data_line, 0, IX_LINES - b->data_line);
+}
+
+// Reclaim after marking: an unmarked (line==0) line is free -- drop its dead
+// objects' start bits so the space can be re-bumped; an occupied line is kept, and
+// the marks of the objects starting in it are cleared for the next cycle. Never
+// touches a dead object's body -- that is the whole win. Large objects sweep via
+// the shared list.
+static void ix_reclaim(void) {
+    size_t live = 0; // occupied line bytes -- the live set, for the Appel threshold
+    ix_recycle = NULL;
+    for (IxBlock *b = ix_blocks; b; b = b->next) {
+        bool has_free = false;
+        for (uint32_t i = b->data_line; i < IX_LINES; i++) {
+            if (b->line[i]) {
+                live += IX_LINE;
+                // A kept line retains any dead objects sharing it (line-granularity
+                // floating garbage). Clear a live object's mark for the next cycle,
+                // but DROP a dead object's start bit: otherwise a conservative stack
+                // word pointing at that retained corpse would pass `is_object` and get
+                // traced, following its now-dangling fields into reclaimed memory.
+                for (uint32_t g = i * 16u; g < i * 16u + 16u; g++)
+                    if ((b->start[g >> 3] >> (g & 7)) & 1) {
+                        GcHeader *h = HEADER((void *)((uintptr_t)b + (uintptr_t)g * 8));
+                        if (h->mark) h->mark = 0;
+                        else b->start[g >> 3] &= (uint8_t) ~(1u << (g & 7));
+                    }
+            } else {
+                has_free = true;
+                memset(b->start + i * IX_GBYTES, 0, IX_GBYTES);
+            }
+        }
+        if (has_free) { b->rnext = ix_recycle; ix_recycle = b; } // reusable next epoch
+    }
+    for (GcHeader **link = &gc_large, *h = *link; h; h = *link) {
+        if (h->mark) { h->mark = 0; live += sizeof(GcHeader) + h->body; link = &h->next; }
+        else { *link = h->next; free_object(h); }
+    }
+    ix_bytes = 0;
+    ix_threshold = 2 * live > gc_nursery ? 2 * live : gc_nursery; // grow with the live set
+    ix_cur = NULL; ix_ptr = 0; ix_limit = 0; // restart bump allocation from the first block
+}
+
+// Conservative membership for the Immix heap: is `w` the body of a live object?
+// `w` must be 8-aligned (bodies are), sit in a known block, and carry an
+// object-start bit. No slot grid -- the start bitmap is what a variable-size,
+// bump-allocated heap uses in place of the slab bitmap.
+static bool is_object_immix(uintptr_t w) {
+    if (w & 7u) return false;
+    IxBlock *b = (IxBlock *)((w - sizeof(GcHeader)) & IX_MASK);
+    if (!ps_has(&ix_set, (uintptr_t)b)) return ps_has(&large_set, w);
+    return ix_is_start(b, w);
+}
+
 // Allocate a header + body, born young: a slab slot for small objects, malloc
 // for large ones. Records the object in the membership machinery.
 static void *gc_new(size_t body, ObjKind kind) {
     size_t total = sizeof(GcHeader) + body;
+    if (gc_immix) return ix_alloc(total, kind);
     GcHeader *h;
     if (total <= SMALL_MAX) {
         size_t c = (total + 15) / 16;
@@ -473,16 +766,17 @@ static void *gc_new(size_t body, ObjKind kind) {
         free_list[c] = *(void **)slot;
         bit_set((uintptr_t)slot);
         h = slot;
+        // No list link: enumerated by slab bitmap at sweep time.
     } else {
         h = malloc(total);
         ps_insert(&large_set, (uintptr_t)BODY(h));
+        h->next = gc_large; // large objects are enumerated via this list
+        gc_large = h;
     }
-    h->next = gc_young;
     h->body = body;
     h->mark = 0;
     h->kind = kind;
     h->old = 0;
-    gc_young = h;
     gc_young_bytes += total;
     gc_total_bytes += total;
     return BODY(h);
@@ -523,6 +817,10 @@ void gc_init(void *stack_bottom) {
     gc_major_at = gc_major_floor;
     if (getenv("MARM_NOGEN")) gc_generational = false;
     if (getenv("MARM_NOGC")) gc_disabled = true;
+    const char *which = getenv("MARM_GC");
+    if (which && strcmp(which, "slab") == 0) gc_immix = false;
+    if (which && strcmp(which, "immix") == 0) gc_immix = true;
+    ix_threshold = gc_nursery; // first immix collection after one nursery of allocation
     if (getenv("MARM_GC_STATS")) atexit(gc_report);
     gc_on = true;
 }
@@ -740,6 +1038,7 @@ void buffer_put_u8(Value bv, uint8_t byte) {
         memcpy(nbody, b->bytes, b->len);
         b->bytes = nbody;
         b->cap = ncap;
+        gc_remember_buffer(b); // old handle -> young body: record for the minor barrier
     }
     ((uint8_t *)b->bytes)[b->len++] = byte;
 }
@@ -799,6 +1098,7 @@ Value buffer_move(Value bv) {
     b->bytes = fresh;
     b->len = 0;
     b->cap = 16;
+    gc_remember_buffer(b); // old handle -> young body: record for the minor barrier
     return mk_slice(body, 0, len);
 }
 
@@ -957,6 +1257,7 @@ Value buffer_move_range(Value bv, size_t off, size_t n) {
     b->bytes = fresh;
     b->len = 0;
     b->cap = 16;
+    gc_remember_buffer(b); // old handle -> young body: record for the minor barrier
     return result_return(mk_slice(body, off, n));
 }
 
