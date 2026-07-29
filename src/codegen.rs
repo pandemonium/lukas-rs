@@ -217,9 +217,21 @@ impl lambda_lift::Program {
             for i in 0..*params {
                 write!(out, "  (void)l{i};")?;
             }
-            write!(out, "\n  return ")?;
-            self.compile_expr(body, out)?;
-            writeln!(out, ";\n}}\n")?;
+            // A worker that tail-calls itself is emitted as a loop (each self
+            // tail-call becomes reassign-params + `continue`), so the recursion
+            // runs in constant stack instead of relying on clang's unreliable
+            // tail-call elimination. Workers with no self-tail-call keep the
+            // plain `return <expr>;` form (output-identical to before).
+            let loopify = std::env::var_os("MARM_NO_LOOPIFY").is_none();
+            if loopify && self.has_tail_self_call(name, *params, body) {
+                write!(out, "\n  for (;;) {{ ")?;
+                self.compile_tail(name, *params, body, out)?;
+                writeln!(out, " }}\n}}\n")?;
+            } else {
+                write!(out, "\n  return ")?;
+                self.compile_expr(body, out)?;
+                writeln!(out, ";\n}}\n")?;
+            }
         }
 
         // Chain workers: the uncurried entry a chain-head closure carries, run by
@@ -742,5 +754,147 @@ impl lambda_lift::Program {
         write!(code, "; ")?;
         self.compile_expr(body, code)?;
         write!(code, "; }})")
+    }
+
+    // -------------------------------------------------------- self-tail loops
+    // clang's tail-call optimisation is best-effort and does NOT fire reliably
+    // for a self-call nested in a branch/ternary -- it stays a real `bl`, so a
+    // deeply self-recursive worker overflows the stack. When a worker tail-calls
+    // itself we instead emit its body as `for (;;) { ... }` and rewrite each
+    // self-tail-call to "reassign the parameters, then `continue`" -- constant
+    // stack, guaranteed, no reliance on the C compiler.
+
+    // Whether `expr`, in tail position, is a saturated self-call to `worker`
+    // (which has `arity` parameters) -- the shape that becomes a loop back-edge.
+    fn is_self_call(&self, worker: &QualifiedName, arity: usize, expr: &Expr) -> bool {
+        let mut count = 0usize;
+        let mut head: &Expr = expr;
+        while let Expr::Apply(_, inner) = head {
+            count += 1;
+            head = &inner.function;
+        }
+        count == arity
+            && matches!(head, Expr::Variable(_, Identifier::Global(qn)) if qn.as_ref() == worker)
+    }
+
+    // Whether any tail position of `expr` is a self-call -- i.e. whether this
+    // worker needs the loop wrapper. Mirrors the tail structure `compile_tail`
+    // walks, so the two agree on exactly which positions are tail positions.
+    fn has_tail_self_call(&self, worker: &QualifiedName, arity: usize, expr: &Expr) -> bool {
+        match expr {
+            Expr::Ascription(_, the) => self.has_tail_self_call(worker, arity, &the.ascribed_tree),
+            Expr::If(_, the) => {
+                self.has_tail_self_call(worker, arity, &the.consequent)
+                    || self.has_tail_self_call(worker, arity, &the.alternate)
+            }
+            Expr::Let(_, the) => self.has_tail_self_call(worker, arity, &the.body),
+            Expr::Sequence(_, the) => self.has_tail_self_call(worker, arity, &the.and_then),
+            Expr::Deconstruct(_, the) => the
+                .match_clauses
+                .iter()
+                .any(|clause| self.has_tail_self_call(worker, arity, &clause.consequent)),
+            _ => self.is_self_call(worker, arity, expr),
+        }
+    }
+
+    // Emit `expr` in tail position as C statements. A saturated self-call becomes
+    // the loop back-edge (evaluate the new arguments into temporaries -- they
+    // read the *current* frame -- then overwrite the parameters `l0..l{arity-1}`
+    // and `continue`); every other tail value becomes `return <expr>;`.
+    fn compile_tail(
+        &self,
+        worker: &QualifiedName,
+        arity: usize,
+        expr: &Expr,
+        code: &mut CodeBuffer,
+    ) -> fmt::Result {
+        match expr {
+            Expr::Ascription(_, the) => {
+                self.compile_tail(worker, arity, &the.ascribed_tree, code)
+            }
+
+            Expr::If(_, the) => {
+                write!(code, "if (as_bool(")?;
+                self.compile_expr(&the.predicate, code)?;
+                write!(code, ")) {{ ")?;
+                self.compile_tail(worker, arity, &the.consequent, code)?;
+                write!(code, " }} else {{ ")?;
+                self.compile_tail(worker, arity, &the.alternate, code)?;
+                write!(code, " }}")
+            }
+
+            Expr::Let(_, the) => {
+                let Identifier::Local(LexicalLevel(level)) = &the.binder else {
+                    panic!("let binder is always a local: {:?}", the.binder);
+                };
+                write!(code, "Value l{level} = ")?;
+                self.compile_expr(&the.bound, code)?;
+                write!(code, "; ")?;
+                self.compile_tail(worker, arity, &the.body, code)
+            }
+
+            Expr::Sequence(_, the) => {
+                write!(code, "(void)(")?;
+                self.compile_expr(&the.this, code)?;
+                write!(code, "); ")?;
+                self.compile_tail(worker, arity, &the.and_then, code)
+            }
+
+            Expr::Deconstruct(_, the) => {
+                let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+                let scrutinee = format!("_scrut{id}");
+                write!(code, "{{ Value {scrutinee} = ")?;
+                self.compile_expr(&the.scrutinee, code)?;
+                write!(code, "; ")?;
+                let mut first = true;
+                for clause in &the.match_clauses {
+                    let mut tests = Vec::new();
+                    let mut binds = Vec::new();
+                    self.collect_pattern(&clause.pattern, &scrutinee, &mut tests, &mut binds);
+                    if !first {
+                        write!(code, " else ")?;
+                    }
+                    first = false;
+                    if tests.is_empty() {
+                        write!(code, "{{ ")?;
+                    } else {
+                        write!(code, "if ({}) {{ ", tests.join(" && "))?;
+                    }
+                    for (level, path) in &binds {
+                        write!(code, "Value l{level} = {path}; ")?;
+                    }
+                    self.compile_tail(worker, arity, &clause.consequent, code)?;
+                    write!(code, " }}")?;
+                }
+                write!(code, " else {{ match_fail(); }} }}")
+            }
+
+            _ if self.is_self_call(worker, arity, expr) => {
+                let mut args: Vec<&Expr> = Vec::new();
+                let mut head: &Expr = expr;
+                while let Expr::Apply(_, inner) = head {
+                    args.push(&inner.argument);
+                    head = &inner.function;
+                }
+                args.reverse();
+                let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+                write!(code, "{{ ")?;
+                for (i, arg) in args.iter().enumerate() {
+                    write!(code, "Value _a{id}_{i} = ")?;
+                    self.compile_expr(arg, code)?;
+                    write!(code, "; ")?;
+                }
+                for i in 0..arity {
+                    write!(code, "l{i} = _a{id}_{i}; ")?;
+                }
+                write!(code, "continue; }}")
+            }
+
+            _ => {
+                write!(code, "return ")?;
+                self.compile_expr(expr, code)?;
+                write!(code, ";")
+            }
+        }
     }
 }

@@ -266,7 +266,7 @@ fn within_budget<A>(expr: &Expr<A, Identifier>, budget: usize) -> bool {
 
 /// The immediate sub-trees of a node, in evaluation order. Used by size measurement
 /// (and any other structural fold that does not care which slot a child sits in).
-fn children<A>(expr: &Expr<A, Identifier>) -> Vec<&Tree<A, Identifier>> {
+pub(crate) fn children<A>(expr: &Expr<A, Identifier>) -> Vec<&Tree<A, Identifier>> {
     match expr {
         Expr::Variable(..)
         | Expr::InvokeBridge(..)

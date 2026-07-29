@@ -231,6 +231,61 @@ impl phase::ConstraintExpression<Named> {
     }
 }
 
+/// How a term's body refers to its own (global) name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelfReference {
+    /// The body never names itself.
+    None,
+    /// Every self-reference sits under a lambda, so the value's own global slot
+    /// is only read once that lambda is later invoked -- by which time `startup`
+    /// has filled it. Sound value recursion with no backend support required.
+    Guarded,
+    /// At least one self-reference is evaluated while the binding's own value is
+    /// still being computed (e.g. `x := x`, `ones := Cons 1 ones`). A strict
+    /// backend would read the still-empty slot, so this must be rejected.
+    Unguarded,
+}
+
+impl SelfReference {
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unguarded, _) | (_, Self::Unguarded) => Self::Unguarded,
+            (Self::Guarded, _) | (_, Self::Guarded) => Self::Guarded,
+            _ => Self::None,
+        }
+    }
+}
+
+/// Classify how `body` refers to its own name `own`. A self-reference under a
+/// lambda is *guarded* (its evaluation is deferred to call time, when the global
+/// slot is populated); one evaluated eagerly during the binding's own init is
+/// *unguarded*. Self-references carried as a bound De Bruijn (the `RecursiveLambda`
+/// path for lambda-valued bindings) are handled elsewhere and never appear as a
+/// `Free(own)` here.
+fn classify_self_reference(body: &UntypedExpr, own: &QualifiedName) -> SelfReference {
+    fn walk(expr: &UntypedExpr, own: &QualifiedName, under_lambda: bool) -> SelfReference {
+        match expr {
+            UntypedExpr::Variable(_, Identifier::Free(name)) if name.as_ref() == own => {
+                if under_lambda {
+                    SelfReference::Guarded
+                } else {
+                    SelfReference::Unguarded
+                }
+            }
+            UntypedExpr::Lambda(_, Lambda { body, .. }) => walk(body, own, true),
+            UntypedExpr::RecursiveLambda(_, SelfReferential { lambda, .. }) => {
+                walk(&lambda.body, own, true)
+            }
+            other => crate::simplify::children(other)
+                .into_iter()
+                .fold(SelfReference::None, |acc, child| {
+                    acc.join(walk(&**child, own, under_lambda))
+                }),
+        }
+    }
+    walk(body, own, false)
+}
+
 impl phase::SymbolTable<Named> {
     pub fn elaborate_compilation_unit(mut self) -> Typing<phase::SymbolTable<Types>> {
         self.check_supersignature_acyclicity()?;
@@ -853,8 +908,53 @@ impl phase::SymbolTable<Named> {
     ) -> Typing<Typed> {
         tracing::debug!("{}, {}", symbol.name, symbol.body);
 
-        let expr = ctx.infer_expr(&symbol.body)?;
         let qualified_name = symbol.name.clone();
+
+        // Guarded value recursion: a non-lambda binding may name itself as long as
+        // the self-reference is deferred behind a lambda. Bind the name *before*
+        // inferring the body so the self-reference resolves. Witnesses keep their
+        // existing (lazy-dictionary) path untouched. A `RecursiveLambda`-valued
+        // binding carries its own name as a bound De Bruijn, so it classifies as
+        // `None` here and stays on the plain path below.
+        let expr = match (
+            self.witnesses.contains(&qualified_name),
+            classify_self_reference(&symbol.body, &qualified_name),
+        ) {
+            (false, SelfReference::Unguarded) => {
+                let pi = *symbol.body.annotation();
+                return Err(TypeError::UnguardedValueRecursion {
+                    name: qualified_name,
+                }
+                .at(pi));
+            }
+
+            (false, SelfReference::Guarded) if symbol.type_signature.is_some() => {
+                // With a signature, self-calls may use the declared scheme
+                // (polymorphic recursion is sound because the user annotated it).
+                let signature = symbol.type_signature.as_ref().unwrap();
+                let scheme = signature.type_scheme(&HashMap::default(), ctx)?;
+                ctx.bind_free_term(qualified_name.clone(), scheme);
+                ctx.infer_expr(&symbol.body)?
+            }
+
+            (false, SelfReference::Guarded) => {
+                // No signature: monomorphic recursion. Bind a fresh metavariable
+                // for the self-reference, then reconcile it with the inferred type.
+                let pi = *symbol.body.annotation();
+                let own = Type::fresh();
+                ctx.bind_free_term(qualified_name.clone(), TypeScheme::from_constant(own.clone()));
+                let expr = ctx.infer_expr(&symbol.body)?;
+                let unification = expr
+                    .tree
+                    .type_info()
+                    .inferred_type
+                    .unified_with(&own.apply(&expr.substitutions), &ctx.types)
+                    .map_err(|e| e.at(pi))?;
+                expr.apply(&unification)
+            }
+
+            _ => ctx.infer_expr(&symbol.body)?,
+        };
 
         let scheme = if let Some(signature) = &symbol.type_signature {
             signature.type_scheme(&HashMap::default(), ctx)?
@@ -1707,6 +1807,13 @@ pub enum TypeError {
         parse_info: ParseInfo,
         name: Identifier,
     },
+
+    #[error(
+        "unguarded recursive binding: `{name}` refers to itself while computing its own \
+         value.\nGuard the self-reference behind a lambda (or give it a parameter), so it \
+         is only read once the binding is initialised."
+    )]
+    UnguardedValueRecursion { name: namer::QualifiedName },
 
     #[error("undefined type {0}")]
     UndefinedType(namer::QualifiedName),

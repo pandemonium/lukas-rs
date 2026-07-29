@@ -94,32 +94,33 @@ module Utf8:
 
   (* Validate from the cursor to EOF. `position >= length` is the clean-boundary *)
   (* termination (all input consumed => valid); a continuation read that runs off *)
-  (* the end faults Out_of_bounds (a truncated tail => invalid). The `Unit ->` is *)
-  (* the value-recursion workaround -- a nullary Get can't yet name itself. *)
-  walk :: Unit -> Get Fault Unit := λ_.
+  (* the end faults Out_of_bounds (a truncated tail => invalid). A nullary, *)
+  (* self-referential Get -- guarded value recursion: each `walk` sits under a *)
+  (* `let*` lambda, so the global slot is read only when the Get is run. *)
+  walk :: Get Fault Unit :=
     let* pos = Binary.position in
     let* len = Binary.length in
     if pos >= len then pure ()
     else
       let* b0 = byte in
-      if b0 < 0x80 then walk ()
+      if b0 < 0x80 then walk
       else deconstruct char_width b0 into
         This 2 ->
           let* b1 = byte in
-          if is_cont b1 then walk ()
+          if is_cont b1 then walk
           else fail (Invalid_char_sequence [b0; b1])
 
       | This 3 ->
           let* b1 = byte in
           let* b2 = byte in
-          if valid3 b0 b1 b2 then walk ()
+          if valid3 b0 b1 b2 then walk
           else fail (Invalid_char_sequence [b0; b1; b2])
 
       | This 4 ->
           let* b1 = byte in
           let* b2 = byte in
           let* b3 = byte in
-          if valid4 b0 b1 b2 b3 then walk ()
+          if valid4 b0 b1 b2 b3 then walk
           else fail (Invalid_char_sequence [b0; b1; b2; b3])
 
       | otherwise ->
@@ -128,7 +129,7 @@ module Utf8:
   (* Is the whole Bytes well-formed UTF-8? The pure-Marmelade reference validator, *)
   (* run through the Get monad; the C `from_bytes` fast path agrees with it. *)
   is_valid :: Bytes -> Bool := λbytes.
-    deconstruct run_get (walk ()) bytes into
+    deconstruct run_get walk bytes into
       Return _ -> true
     | Fault _  -> false
 
