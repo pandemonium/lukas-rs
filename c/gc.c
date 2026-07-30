@@ -1,6 +1,8 @@
 #include "gc.h"
 
+#include <assert.h>
 #include <setjmp.h>
+#include <stddef.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -148,7 +150,7 @@ static PtrSet large_set;        // body pointers of live large objects
 // Defined further down (needs the generation globals); forward-declared here for
 // the dispatch in `is_object` / `gc_new`.
 static bool gc_immix = true;
-static void *ix_alloc(size_t total, ObjKind kind);
+static void *gc_alloc_slow(size_t total, ObjKind kind);
 static bool is_object_immix(uintptr_t w);
 static void ix_mark_lines(void *body); // mark the lines a live object spans
 static void ix_reset_lines(void);      // clear data-line marks before a collection
@@ -217,7 +219,18 @@ static bool is_object(uintptr_t w) {
 // the whole nursery (a cache miss per object, the dominant minor-GC cost). The
 // `old` header flag distinguishes young from tenured in place. Only large objects
 // (not slab-backed, and rare) keep an explicit list.
-static GcHeader *gc_large = NULL;      // large (malloc'd) objects, both generations
+// Large (malloc'd) objects, both generations. A side array rather than an intrusive
+// header link, so the common small object no longer pays for a `next` field. Large
+// objects are rare, so a growable array (compacted at each sweep) is ample.
+static GcHeader **gc_large = NULL;
+static size_t gc_large_len = 0, gc_large_cap = 0;
+static void large_push(GcHeader *h) {
+    if (gc_large_len == gc_large_cap) {
+        gc_large_cap = gc_large_cap ? gc_large_cap * 2 : 16;
+        gc_large = realloc(gc_large, gc_large_cap * sizeof *gc_large);
+    }
+    gc_large[gc_large_len++] = h;
+}
 static size_t gc_young_bytes = 0;      // young allocation since the last minor GC
 static size_t gc_old_bytes = 0;        // live bytes tenured in the old generation
 
@@ -464,20 +477,22 @@ static void sweep_small(bool major, size_t *young_live, size_t *old_live) {
 // The large-object companion to sweep_small: a short intrusive list (large objects
 // are rare, so a list is fine and there is no slab to bitmap-scan).
 static void sweep_large(bool major, size_t *young_live, size_t *old_live) {
-    for (GcHeader **link = &gc_large, *h = *link; h; h = *link) {
-        if (!major && h->old) { link = &h->next; continue; }
+    size_t w = 0; // compact survivors to the front of the array in place
+    for (size_t i = 0; i < gc_large_len; i++) {
+        GcHeader *h = gc_large[i];
+        if (!major && h->old) { gc_large[w++] = h; continue; }
         size_t sz = sizeof(GcHeader) + h->body;
         if (h->mark) {
             h->mark = 0;
             if (!major) { h->old = 1; *old_live += sz; }
             else if (h->old) *old_live += sz;
             else *young_live += sz;
-            link = &h->next;
+            gc_large[w++] = h;
         } else {
-            *link = h->next;
             free_object(h);
         }
     }
+    gc_large_len = w;
 }
 
 // One collection. `major` selects a full sweep of both generations; otherwise a
@@ -633,53 +648,71 @@ static bool ix_find_run(IxBlock *b, uint32_t from, uintptr_t *s, uintptr_t *e) {
     return true;
 }
 
-// Bump-allocate header+body of `total` bytes for a `kind` object; returns the BODY.
-// Filled lines are marked occupied so the monotonic block walk never re-fills them
-// within an epoch; `gc_reserve` triggers a collection before the heap grows without
-// bound. Objects over IX_MAX_ALLOC use the malloc'd large path.
-static void *ix_alloc(size_t total, ObjKind kind) {
-    total = (total + 7u) & ~(size_t)7u; // keep every body pointer 8-aligned (bump)
+// Cold allocation path: the fast bump in `gc_new` fell through because the current
+// run is exhausted, the object is large, or the slab collector is selected. Do the
+// collection trigger (`gc_reserve`), then allocate + initialise the header. Kept out
+// of line (and never inlined) so `gc_new`'s fast path folds into the fixed-arity
+// constructors as a tight bump with no call. `total` arrives already 8-rounded.
+static __attribute__((noinline)) void *gc_alloc_slow(size_t total, ObjKind kind) {
+    gc_reserve(total); // Appel (immix) / nursery (slab) threshold: collect if due
     GcHeader *h;
-    if (total > IX_MAX_ALLOC) {                     // large: malloc, shared large path
-        h = malloc(total);
-        ps_insert(&large_set, (uintptr_t)BODY(h));
-        h->next = gc_large;
-        gc_large = h;
-    } else {
-        while (ix_ptr + total > ix_limit) {
-            // Leaving the current run: bulk-mark the lines we filled as occupied, in
-            // one memset, so `ix_find_run` never re-fills them. Doing this per run
-            // (not per object) is the Phase-3 win -- the per-object work is now just
-            // the bump + one start bit, matching the slab's single bitmap write.
-            if (ix_cur && ix_ptr > ix_run) {
-                uint32_t a = (uint32_t)((ix_run - (uintptr_t)ix_cur) / IX_LINE);
-                uint32_t z = (uint32_t)((ix_ptr - 1 - (uintptr_t)ix_cur) / IX_LINE);
-                memset(ix_cur->line + a, 1, z - a + 1);
-            }
-            uintptr_t s, e;
-            if (ix_cur) {                            // more free lines forward in this block?
-                uint32_t from = (uint32_t)((ix_limit - (uintptr_t)ix_cur) / IX_LINE);
-                if (from < IX_LINES && ix_find_run(ix_cur, from, &s, &e)) {
-                    ix_ptr = s; ix_limit = e; ix_run = s; continue;
+    if (gc_immix) {
+        if (total > IX_MAX_ALLOC) {                 // large: malloc, shared large path
+            assert(total - sizeof(GcHeader) <= UINT32_MAX); // body is uint32 (see GcHeader)
+            h = malloc(total);
+            ps_insert(&large_set, (uintptr_t)BODY(h));
+            large_push(h);
+        } else {
+            while (ix_ptr + total > ix_limit) {
+                // Leaving the current run: bulk-mark the lines we filled as occupied, in
+                // one memset, so `ix_find_run` never re-fills them. Doing this per run
+                // (not per object) is the Phase-3 win.
+                if (ix_cur && ix_ptr > ix_run) {
+                    uint32_t a = (uint32_t)((ix_run - (uintptr_t)ix_cur) / IX_LINE);
+                    uint32_t z = (uint32_t)((ix_ptr - 1 - (uintptr_t)ix_cur) / IX_LINE);
+                    memset(ix_cur->line + a, 1, z - a + 1);
                 }
+                uintptr_t s, e;
+                if (ix_cur) {                        // more free lines forward in this block?
+                    uint32_t from = (uint32_t)((ix_limit - (uintptr_t)ix_cur) / IX_LINE);
+                    if (from < IX_LINES && ix_find_run(ix_cur, from, &s, &e)) {
+                        ix_ptr = s; ix_limit = e; ix_run = s; continue;
+                    }
+                }
+                // Next block with free lines: pop the recyclable list (never walks full
+                // blocks -- that was O(blocks) per fill), else grow a fresh block.
+                if (ix_recycle) { ix_cur = ix_recycle; ix_recycle = ix_recycle->rnext; }
+                else ix_cur = ix_new_block();
+                (void)ix_find_run(ix_cur, ix_cur->data_line, &s, &e); // recyclable/fresh => a run
+                ix_ptr = s; ix_limit = e; ix_run = s;
             }
-            // Next block with free lines: pop the recyclable list (never walks full
-            // blocks -- that was O(blocks) per fill), else grow a fresh block.
-            if (ix_recycle) { ix_cur = ix_recycle; ix_recycle = ix_recycle->rnext; }
-            else ix_cur = ix_new_block();
-            (void)ix_find_run(ix_cur, ix_cur->data_line, &s, &e); // recyclable/fresh => has a run
-            ix_ptr = s; ix_limit = e; ix_run = s;
+            h = (GcHeader *)ix_ptr;
+            ix_ptr += total;
+            ix_set_start(ix_cur, (uintptr_t)BODY(h));
         }
-        h = (GcHeader *)ix_ptr;
-        ix_ptr += total;
-        ix_set_start(ix_cur, (uintptr_t)BODY(h));
+        ix_bytes += total; // accumulated into gc_total_bytes at each reclaim (stats)
+    } else {
+        // Slab collector (non-default): every allocation lands here.
+        if (total <= SMALL_MAX) {
+            size_t c = (total + 15) / 16;
+            if (!free_list[c]) grow_class(c);
+            void *slot = free_list[c];
+            free_list[c] = *(void **)slot;
+            bit_set((uintptr_t)slot);
+            h = slot;
+        } else {
+            assert(total - sizeof(GcHeader) <= UINT32_MAX);
+            h = malloc(total);
+            ps_insert(&large_set, (uintptr_t)BODY(h));
+            large_push(h);
+        }
+        gc_young_bytes += total;
+        gc_total_bytes += total;
     }
-    h->body = total - sizeof(GcHeader);
+    h->body = (uint32_t)(total - sizeof(GcHeader));
     h->mark = 0;
-    h->kind = kind;
+    h->kind = (uint8_t)kind;
     h->old = 0;
-    ix_bytes += total;
-    gc_total_bytes += total;
     return BODY(h);
 }
 
@@ -733,11 +766,15 @@ static void ix_reclaim(void) {
         }
         if (has_free) { b->rnext = ix_recycle; ix_recycle = b; } // reusable next epoch
     }
-    for (GcHeader **link = &gc_large, *h = *link; h; h = *link) {
-        if (h->mark) { h->mark = 0; live += sizeof(GcHeader) + h->body; link = &h->next; }
-        else { *link = h->next; free_object(h); }
+    size_t w = 0; // compact live large objects to the front of the array in place
+    for (size_t i = 0; i < gc_large_len; i++) {
+        GcHeader *h = gc_large[i];
+        if (h->mark) { h->mark = 0; live += sizeof(GcHeader) + h->body; gc_large[w++] = h; }
+        else free_object(h);
     }
-    ix_bytes = 0;
+    gc_large_len = w;
+    gc_total_bytes += ix_bytes; // fold this epoch's allocation into the lifetime total
+    ix_bytes = 0;               // (the fast path no longer updates gc_total_bytes per object)
     ix_threshold = 2 * live > gc_nursery ? 2 * live : gc_nursery; // grow with the live set
     ix_cur = NULL; ix_ptr = 0; ix_limit = 0; // restart bump allocation from the first block
 }
@@ -753,33 +790,30 @@ static bool is_object_immix(uintptr_t w) {
     return ix_is_start(b, w);
 }
 
-// Allocate a header + body, born young: a slab slot for small objects, malloc
-// for large ones. Records the object in the membership machinery.
-static void *gc_new(size_t body, ObjKind kind) {
-    size_t total = sizeof(GcHeader) + body;
-    if (gc_immix) return ix_alloc(total, kind);
-    GcHeader *h;
-    if (total <= SMALL_MAX) {
-        size_t c = (total + 15) / 16;
-        if (!free_list[c]) grow_class(c);
-        void *slot = free_list[c];
-        free_list[c] = *(void **)slot;
-        bit_set((uintptr_t)slot);
-        h = slot;
-        // No list link: enumerated by slab bitmap at sweep time.
-    } else {
-        h = malloc(total);
-        ps_insert(&large_set, (uintptr_t)BODY(h));
-        h->next = gc_large; // large objects are enumerated via this list
-        gc_large = h;
+// Allocate a header + body, born young. The fast path is the Immix bump: if the
+// object fits the current run, claim it with a pointer bump, one object-start bit,
+// and a single 8-byte header store -- no call, no collection check (the Appel
+// threshold is honoured in `gc_alloc_slow` when a run exhausts, every <=32 KiB).
+// Everything else (run refill, large objects, the slab collector, the collection
+// trigger) is in the out-of-line `gc_alloc_slow`. Inlined into every fixed-arity
+// `mk_*` constructor via `alloc_body`.
+static_assert(sizeof(GcHeader) == 8 && offsetof(GcHeader, body) == 0 &&
+                  offsetof(GcHeader, kind) == 5,
+              "gc_new fast path packs the header into one little-endian 8-byte store");
+static inline void *gc_new(size_t body, ObjKind kind) {
+    size_t total = (sizeof(GcHeader) + body + 7u) & ~(size_t)7u; // 8-align the bump
+    uintptr_t p = ix_ptr;
+    if (__builtin_expect(gc_immix && total <= IX_MAX_ALLOC && p + total <= ix_limit, 1)) {
+        ix_ptr = p + total;
+        GcHeader *h = (GcHeader *)p;
+        ix_set_start(ix_cur, (uintptr_t)BODY(h));
+        // One store initialises the whole 8-byte header (little-endian): body in
+        // bytes 0-3, kind in byte 5, mark/old/pad zero. See the static_assert above.
+        *(uint64_t *)h = (uint64_t)(total - sizeof(GcHeader)) | ((uint64_t)(uint8_t)kind << 40);
+        ix_bytes += total;
+        return BODY(h);
     }
-    h->body = body;
-    h->mark = 0;
-    h->kind = kind;
-    h->old = 0;
-    gc_young_bytes += total;
-    gc_total_bytes += total;
-    return BODY(h);
+    return gc_alloc_slow(total, kind);
 }
 
 static void gc_report(void) {
@@ -788,7 +822,7 @@ static void gc_report(void) {
             "[gc] %lu minor, %lu major; %.1f MB allocated; live old %.1f MB; "
             "nursery %zu KiB\n"
             "[gc] gc %.3fs / total %.3fs -> mutator throughput %.1f%%\n",
-            gc_minor_count, gc_major_count, gc_total_bytes / 1048576.0,
+            gc_minor_count, gc_major_count, (gc_total_bytes + ix_bytes) / 1048576.0,
             gc_old_bytes / 1048576.0, gc_nursery >> 10, gc_time, total,
             total > 0 ? 100.0 * (total - gc_time) / total : 100.0);
 }
@@ -909,13 +943,13 @@ Value mk_data(uint64_t tag, size_t nfields, ...) {
 // Codegen knows a constructor/tuple/closure's field count statically, so for the
 // common small arities it emits these instead of the variadic `mk_*` above. That
 // drops the whole `va_list` setup + field-copy loop (measured ~14% of allocation
-// cost on a cons-heavy loop), and -- since `alloc_body` and the now-slim `gc_new`
-// are `static inline`d in -- folds the reserve+bump path into one flat body with
-// no second call. GC safety is identical to the variadic path: the field/capture
-// arguments live in this frame across the collection `gc_reserve` may trigger, and
-// the collector scans the stack (and setjmp-spilled registers) conservatively.
+// cost on a cons-heavy loop), and -- since `alloc_body` and the inline-fast `gc_new`
+// fold in -- turns a fixed-arity `mk_*` into a straight-line bump. No `gc_reserve`
+// call: the collection trigger now lives in `gc_new`'s cold `gc_alloc_slow`, which
+// runs whenever a bump run exhausts. GC safety is unchanged: the field/capture
+// arguments live in this frame across any collection, and the collector scans the
+// stack (and setjmp-spilled registers) conservatively.
 static inline void *alloc_body(size_t body, ObjKind kind) {
-    gc_reserve(sizeof(GcHeader) + body);
     return gc_new(body, kind);
 }
 

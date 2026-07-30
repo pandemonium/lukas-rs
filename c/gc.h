@@ -23,8 +23,15 @@ typedef enum {
 // Prepended to every heap object; a Value pointer names the body just past the
 // header, so HEADER/BODY convert between the two.
 typedef struct GcHeader {
-    struct GcHeader *next; // intrusive list within a generation
-    size_t body;           // body size in bytes
+    // 8-byte header (was 24). Small objects -- the overwhelming majority -- carry no
+    // generation-list link: slab objects are bitmap-swept and Immix objects are
+    // line-reclaimed, so only large (malloc'd) objects need enumeration, and they
+    // live in a side array (`gc_large`) rather than an intrusive `next`. `body` is a
+    // uint32 because no single object approaches 4 GiB (small objects are <= 512 B;
+    // large ones are realistic buffers/strings). Shrinking the header from 24 to 8
+    // bytes cuts allocation *volume* -- the dominant cost on these alloc-bound
+    // workloads -- by 16 B/object (e.g. a `mk_data1` 40 B -> 24 B).
+    uint32_t body;         // body size in bytes (excludes this header)
     uint8_t mark;
     uint8_t kind; // ObjKind
     uint8_t old;  // 0 = young (nursery), 1 = tenured, MARM_ETERNAL = static

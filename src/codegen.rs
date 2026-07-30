@@ -725,7 +725,7 @@ impl lambda_lift::Program {
             // expression has static storage duration -> it lands in .rodata.
             Literal::Text(x) => format!(
                 "({{ static const struct {{ GcHeader gch; char b[sizeof(\"{x}\")]; }} \
-                 __marm_txt = {{{{0, sizeof(\"{x}\"), 0, OBJ_TEXT, MARM_ETERNAL}}, \"{x}\"}}; \
+                 __marm_txt = {{{{sizeof(\"{x}\"), 0, OBJ_TEXT, MARM_ETERNAL}}, \"{x}\"}}; \
                  VObject((void *)__marm_txt.b); }})"
             ),
             Literal::Bool(x) => format!("VBool({x})"),
