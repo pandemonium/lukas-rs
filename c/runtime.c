@@ -52,7 +52,7 @@ static char *show_alloc(Value x);
 // flat `1, 2, 3`. NB: constructor values share the TAG_TUPLE layout (name in
 // slot 0), so they too print in this shape -- see the note in prim_show.
 static char *show_tuple(Tuple *t) {
-    size_t n = t->len;
+    size_t n = HEADER(t)->body / sizeof(Value); // count recovered from body size
     char **parts = malloc(n * sizeof *parts);
     size_t total = 3; // '(' + ')' + '\0'
     for (size_t i = 0; i < n; i++) {

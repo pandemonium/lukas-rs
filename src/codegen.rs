@@ -636,6 +636,16 @@ impl lambda_lift::Program {
         };
         let name = c_name(&the.lifted_name);
         let n = env.elements.len();
+        // A capture-free closure is identical and immutable, so emit a single static
+        // instance (no per-use heap allocation) -- arity-0 closures were ~8-14% of all
+        // allocation on the monad benchmarks. Mirrors the borrowed-string descriptors.
+        if n == 0 {
+            return if let Some(&arity) = self.chain_heads.get(&the.lifted_name) {
+                write!(code, "STATIC_CLOSURE0({name}, {name}_uworker, {arity})")
+            } else {
+                write!(code, "STATIC_CLOSURE0({name}, NULL, 1)")
+            };
+        }
         // Fixed-arity closure builders for small capture counts; the leading
         // code/worker/arity always precede, so captures keep their leading comma.
         if let Some(&arity) = self.chain_heads.get(&the.lifted_name) {

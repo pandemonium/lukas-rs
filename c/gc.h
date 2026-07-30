@@ -49,6 +49,23 @@ typedef struct GcHeader {
 // `const`, so its `mark` bit must never be written).
 #define MARM_ETERNAL 2
 
+// A capture-free (arity-0) closure is identical and immutable for a given
+// code/worker/arity, so codegen emits ONE static instance instead of allocating one
+// per use (arity-0 closures were ~8-14% of all allocation on the monad benchmarks).
+// Like a borrowed-string descriptor it is `MARM_ETERNAL`, so the collector never marks
+// or frees it (its `const` storage is thus never written). The body mirrors a
+// `Closure`'s fixed prefix with an empty capture array; `nfree == 0`, so the tracer
+// visits no fields. `VObject(&__sc.code)` is the body pointer (past the 8-byte header).
+#define STATIC_CLOSURE0(code_fn, worker_fn, arity_n)                                    \
+    ({ static const struct {                                                           \
+           GcHeader gch;                                                               \
+           Value (*code)(Value, Value);                                                \
+           Value (*worker)(Value, Value *);                                            \
+           size_t arity, nfree;                                                        \
+       } __sc = {{sizeof(Closure), 0, OBJ_CLOSURE, MARM_ETERNAL},                       \
+                 (code_fn), (worker_fn), (arity_n), 0};                                 \
+       VObject((void *)&__sc.code); })
+
 Value result_return(Value x);
 Value result_fault(Value e);
 
@@ -72,6 +89,8 @@ Value mk_tuple(size_t len, ...);
 // which are the only places the count isn't already known statically.
 Value mk_data(uint64_t tag, size_t nfields, ...);
 size_t data_len(Value v);
+// Element count of a tuple / Array, recovered the same way (tuples store no length).
+size_t tuple_len(Value v);
 
 // Fixed-arity constructors for the common small field counts. Codegen knows the
 // count statically and emits these to skip the variadic `va_list`/copy-loop tax

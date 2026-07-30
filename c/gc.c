@@ -283,6 +283,28 @@ static unsigned long long gc_total_bytes = 0;
 static double gc_time = 0.0;   // seconds spent inside gc_run
 static double gc_started = 0.0; // wall clock at gc_init
 
+// Allocation histogram (MARM_ALLOC_STATS): count + bytes by kind and arity. This is
+// the B5 opportunity measurement -- how much allocation is 2-tuples (State pairs),
+// closures (bind continuations), and small data (Results), i.e. what struct-return
+// State + stack closures would remove. Gated: a single predictable branch off the hot
+// path, no effect unless MARM_ALLOC_STATS is set.
+static bool gc_alloc_stats = false;
+#define ALLOC_MAX_ARITY 16
+static unsigned long long alloc_hist_n[8][ALLOC_MAX_ARITY + 1];
+static unsigned long long alloc_hist_b[8][ALLOC_MAX_ARITY + 1];
+static void alloc_record(ObjKind kind, size_t total) {
+    size_t body = total - sizeof(GcHeader), arity = 0;
+    switch (kind) {
+    case OBJ_TUPLE:   arity = body / sizeof(Value); break;
+    case OBJ_DATA:    arity = (body - sizeof(Data)) / sizeof(Value); break;    // fields (no tag)
+    case OBJ_CLOSURE: arity = (body - sizeof(Closure)) / sizeof(Value); break; // captures
+    default: break;
+    }
+    if (arity > ALLOC_MAX_ARITY) arity = ALLOC_MAX_ARITY;
+    alloc_hist_n[kind][arity]++;
+    alloc_hist_b[kind][arity] += total;
+}
+
 static double now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -362,7 +384,8 @@ static void gc_trace(void) {
         switch (h->kind) {
         case OBJ_TUPLE: {
             Tuple *t = BODY(h);
-            for (size_t i = 0; i < t->len; i++) mark_value(t->elems[i]);
+            size_t len = h->body / sizeof(Value); // count recovered from body size
+            for (size_t i = 0; i < len; i++) mark_value(t->elems[i]);
             break;
         }
         case OBJ_CLOSURE: {
@@ -403,6 +426,12 @@ static Value *const gc_builtin_roots[] = {
     &builtin_text_fold_right,
 };
 
+// Conservatively scan a word range for roots. This deliberately reads EVERY word in
+// [lo, hi) -- for a stack scan that includes the compiler's inter-variable padding and,
+// under AddressSanitizer, its poisoned stack redzones. Reading those is intentional and
+// safe (they are real, mapped stack memory), so this function is exempted from ASan's
+// checks; the heap accesses it drives (via `mark_candidate` -> `is_object`) stay checked.
+__attribute__((no_sanitize("address")))
 static void scan_words(void *lo, void *hi) {
     uintptr_t *p = (uintptr_t *)((uintptr_t)lo & ~(uintptr_t)(sizeof(void *) - 1));
     for (; p < (uintptr_t *)hi; p++) mark_candidate(*p);
@@ -504,7 +533,11 @@ static void gc_run(bool major) {
     gc_major = major;
     if (gc_immix) ix_reset_lines(); // clear line marks so the trace rebuilds liveness
     jmp_buf regs;
-    setjmp(regs); // spill callee-saved registers onto the stack
+    // `setjmp` is used ONLY for its side effect: it spills the callee-saved registers
+    // into `regs`, which we then scan conservatively (a live pointer may sit only in a
+    // register). There is no matching `longjmp`, so the return value is intentionally
+    // discarded -- the `(void)` cast documents that and quiets unused-return linters.
+    (void)setjmp(regs); // NOLINT(bugprone-unused-return-value): spill-only, no longjmp
     void *stack_top = (void *)&regs;
 
     // Precise roots: runtime builtins and the emitted global table.
@@ -713,6 +746,7 @@ static __attribute__((noinline)) void *gc_alloc_slow(size_t total, ObjKind kind)
     h->mark = 0;
     h->kind = (uint8_t)kind;
     h->old = 0;
+    if (gc_alloc_stats) alloc_record(kind, total);
     return BODY(h);
 }
 
@@ -787,6 +821,12 @@ static bool is_object_immix(uintptr_t w) {
     if (w & 7u) return false;
     IxBlock *b = (IxBlock *)((w - sizeof(GcHeader)) & IX_MASK);
     if (!ps_has(&ix_set, (uintptr_t)b)) return ps_has(&large_set, w);
+    // `w` must land in `b`'s data region -- past the header lines and strictly before
+    // the block end. A conservative word pointing just past a block otherwise indexes
+    // `start[]` out of bounds (its granule `>> 3` reaches 512, one past the array) and
+    // could conjure a phantom object at the boundary that the tracer then reads past.
+    uintptr_t off = w - (uintptr_t)b;
+    if (off < (uintptr_t)b->data_line * IX_LINE || off >= IX_BLOCK) return false;
     return ix_is_start(b, w);
 }
 
@@ -811,6 +851,7 @@ static inline void *gc_new(size_t body, ObjKind kind) {
         // bytes 0-3, kind in byte 5, mark/old/pad zero. See the static_assert above.
         *(uint64_t *)h = (uint64_t)(total - sizeof(GcHeader)) | ((uint64_t)(uint8_t)kind << 40);
         ix_bytes += total;
+        if (gc_alloc_stats) alloc_record(kind, total);
         return BODY(h);
     }
     return gc_alloc_slow(total, kind);
@@ -825,6 +866,39 @@ static void gc_report(void) {
             gc_minor_count, gc_major_count, (gc_total_bytes + ix_bytes) / 1048576.0,
             gc_old_bytes / 1048576.0, gc_nursery >> 10, gc_time, total,
             total > 0 ? 100.0 * (total - gc_time) / total : 100.0);
+}
+
+// B5 opportunity report (MARM_ALLOC_STATS): allocation count + volume by kind/arity,
+// with the struct-return-State / stack-closure targets (2-tuples, closures, small
+// data) called out. The "% bytes" column is share of total allocated volume.
+static void alloc_report(void) {
+    static const char *names[8] = {"tuple", "closure", "text", "data",
+                                   "buffer", "bytes", "mmap", "slice"};
+    unsigned long long grand = 0;
+    for (int k = 0; k < 8; k++)
+        for (int a = 0; a <= ALLOC_MAX_ARITY; a++) grand += alloc_hist_b[k][a];
+    if (!grand) return;
+    fprintf(stderr, "[alloc] by kind/arity (share of %.1f GB total):\n", grand / 1073741824.0);
+    unsigned long long tup2 = 0;
+    for (int k = 0; k < 8; k++) {
+        unsigned long long kn = 0, kb = 0;
+        for (int a = 0; a <= ALLOC_MAX_ARITY; a++) kn += alloc_hist_n[k][a], kb += alloc_hist_b[k][a];
+        if (!kb) continue;
+        fprintf(stderr, "[alloc]   %-8s %6.2f%%  (%llu objs)\n", names[k],
+                100.0 * (double)kb / (double)grand, kn);
+        for (int a = 0; a <= ALLOC_MAX_ARITY; a++)
+            if (alloc_hist_n[k][a])
+                fprintf(stderr, "[alloc]     arity %2d: %6.2f%%  (%llu)\n", a,
+                        100.0 * (double)alloc_hist_b[k][a] / (double)grand, alloc_hist_n[k][a]);
+    }
+    tup2 = alloc_hist_b[OBJ_TUPLE][2];
+    unsigned long long clos = 0, dat = 0;
+    for (int a = 0; a <= ALLOC_MAX_ARITY; a++) clos += alloc_hist_b[OBJ_CLOSURE][a], dat += alloc_hist_b[OBJ_DATA][a];
+    fprintf(stderr,
+            "[alloc] B5 targets: 2-tuples(State pairs)=%.1f%%  closures=%.1f%%  data=%.1f%%  (sum=%.1f%%)\n",
+            100.0 * (double)tup2 / (double)grand, 100.0 * (double)clos / (double)grand,
+            100.0 * (double)dat / (double)grand,
+            100.0 * (double)(tup2 + clos + dat) / (double)grand);
 }
 
 void gc_init(void *stack_bottom) {
@@ -856,6 +930,7 @@ void gc_init(void *stack_bottom) {
     if (which && strcmp(which, "immix") == 0) gc_immix = true;
     ix_threshold = gc_nursery; // first immix collection after one nursery of allocation
     if (getenv("MARM_GC_STATS")) atexit(gc_report);
+    if (getenv("MARM_ALLOC_STATS")) { gc_alloc_stats = true; atexit(alloc_report); }
     gc_on = true;
 }
 
@@ -915,7 +990,6 @@ Value mk_tuple(size_t len, ...) {
     size_t body = sizeof(Tuple) + len * sizeof(Value);
     gc_reserve(sizeof(GcHeader) + body);
     Tuple *t = gc_new(body, OBJ_TUPLE);
-    t->len = len;
     va_list ap;
     va_start(ap, len);
     for (size_t i = 0; i < len; i++) {
@@ -981,27 +1055,26 @@ Value mk_data4(uint64_t tag, Value f0, Value f1, Value f2, Value f3) {
 
 Value mk_tuple0(void) {
     Tuple *t = alloc_body(sizeof(Tuple), OBJ_TUPLE);
-    t->len = 0;
     return VObject(t);
 }
 Value mk_tuple1(Value e0) {
     Tuple *t = alloc_body(sizeof(Tuple) + 1 * sizeof(Value), OBJ_TUPLE);
-    t->len = 1, t->elems[0] = e0;
+    t->elems[0] = e0;
     return VObject(t);
 }
 Value mk_tuple2(Value e0, Value e1) {
     Tuple *t = alloc_body(sizeof(Tuple) + 2 * sizeof(Value), OBJ_TUPLE);
-    t->len = 2, t->elems[0] = e0, t->elems[1] = e1;
+    t->elems[0] = e0, t->elems[1] = e1;
     return VObject(t);
 }
 Value mk_tuple3(Value e0, Value e1, Value e2) {
     Tuple *t = alloc_body(sizeof(Tuple) + 3 * sizeof(Value), OBJ_TUPLE);
-    t->len = 3, t->elems[0] = e0, t->elems[1] = e1, t->elems[2] = e2;
+    t->elems[0] = e0, t->elems[1] = e1, t->elems[2] = e2;
     return VObject(t);
 }
 Value mk_tuple4(Value e0, Value e1, Value e2, Value e3) {
     Tuple *t = alloc_body(sizeof(Tuple) + 4 * sizeof(Value), OBJ_TUPLE);
-    t->len = 4, t->elems[0] = e0, t->elems[1] = e1, t->elems[2] = e2, t->elems[3] = e3;
+    t->elems[0] = e0, t->elems[1] = e1, t->elems[2] = e2, t->elems[3] = e3;
     return VObject(t);
 }
 
@@ -1043,6 +1116,12 @@ Value mk_closure4(Value (*code)(Value, Value), Value c0, Value c1, Value c2, Val
 // size (the count is not stored in the object itself).
 size_t data_len(Value v) {
     return (HEADER(as_ptr(v))->body - sizeof(Data)) / sizeof(Value);
+}
+
+// Element count of a tuple (also the backing of Array), recovered from the header
+// body size: a tuple body is exactly `n * sizeof(Value)` (no stored length).
+size_t tuple_len(Value v) {
+    return HEADER(as_ptr(v))->body / sizeof(Value);
 }
 
 // ----------------------------------------------------------------- byte buffers

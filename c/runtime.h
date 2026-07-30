@@ -86,7 +86,9 @@ struct Closure {
 };
 
 struct Tuple {
-    size_t len;
+    // No `len` field: like `Data`, the element count is recovered from the GC
+    // header's body size (`body / sizeof(Value)`), saving 8 bytes per tuple. A
+    // tuple body is exactly `n * sizeof(Value)`, so the division is exact.
     Value elems[]; // flexible array member
 };
 
