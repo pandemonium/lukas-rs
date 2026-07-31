@@ -636,34 +636,34 @@ impl lambda_lift::Program {
         };
         let name = c_name(&the.lifted_name);
         let n = env.elements.len();
-        // A capture-free closure is identical and immutable, so emit a single static
-        // instance (no per-use heap allocation) -- arity-0 closures were ~8-14% of all
-        // allocation on the monad benchmarks. Mirrors the borrowed-string descriptors.
+        // The per-function `code`/`worker`/`arity` are identical for every closure of
+        // this lifted function, so emit ONE shared static `ClosureDesc`; the heap
+        // closure stores just a pointer to it plus the captures (24 B smaller). A
+        // curried-chain head carries an uncurried worker + its arity; a plain
+        // single-stage closure has `worker = NULL`, `arity = 1`.
+        let (worker, arity) = match self.chain_heads.get(&the.lifted_name) {
+            Some(&arity) => (format!("{name}_uworker"), arity),
+            None => ("NULL".to_owned(), 1),
+        };
+        // Capture-free: identical + immutable, so a single static instance, no heap
+        // allocation at all (mirrors the borrowed-string descriptors).
         if n == 0 {
-            return if let Some(&arity) = self.chain_heads.get(&the.lifted_name) {
-                write!(code, "STATIC_CLOSURE0({name}, {name}_uworker, {arity})")
-            } else {
-                write!(code, "STATIC_CLOSURE0({name}, NULL, 1)")
-            };
+            return write!(code, "STATIC_CLOSURE0({name}, {worker}, {arity})");
         }
-        // Fixed-arity closure builders for small capture counts; the leading
-        // code/worker/arity always precede, so captures keep their leading comma.
-        if let Some(&arity) = self.chain_heads.get(&the.lifted_name) {
-            if n <= 4 {
-                write!(code, "mk_closure_n{n}({name}, {name}_uworker, {arity}")?;
-            } else {
-                write!(code, "mk_closure_n({name}, {name}_uworker, {arity}, {n}")?;
-            }
-        } else if n <= 4 {
-            write!(code, "mk_closure{n}({name}")?;
+        // Per-site static descriptor, then a heap {desc, captures}. Statement-expression
+        // scoping keeps each site's `__d` local, so `&__d` binds to this site's descriptor
+        // even when a captured expression is itself a closure with its own `__d`.
+        write!(code, "({{ static const ClosureDesc __d = {{{name}, {worker}, {arity}}}; ")?;
+        if n <= 4 {
+            write!(code, "mk_closure_d{n}(&__d")?;
         } else {
-            write!(code, "mk_closure({name}, {n}")?;
+            write!(code, "mk_closure_dn(&__d, {n}")?;
         }
         for element in &env.elements {
             write!(code, ", ")?;
             self.compile_expr(element, code)?;
         }
-        write!(code, ")")
+        write!(code, "); }})")
     }
 
     // String interpolation concatenates its segments: literal text verbatim,

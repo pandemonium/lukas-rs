@@ -53,18 +53,14 @@ typedef struct GcHeader {
 // code/worker/arity, so codegen emits ONE static instance instead of allocating one
 // per use (arity-0 closures were ~8-14% of all allocation on the monad benchmarks).
 // Like a borrowed-string descriptor it is `MARM_ETERNAL`, so the collector never marks
-// or frees it (its `const` storage is thus never written). The body mirrors a
-// `Closure`'s fixed prefix with an empty capture array; `nfree == 0`, so the tracer
-// visits no fields. `VObject(&__sc.code)` is the body pointer (past the 8-byte header).
+// or frees it (its `const` storage is thus never written). The body is a single `desc`
+// pointer (no captures), so the tracer visits no fields. `VObject(&__sc.desc)` is the
+// body pointer (past the 8-byte header).
 #define STATIC_CLOSURE0(code_fn, worker_fn, arity_n)                                    \
-    ({ static const struct {                                                           \
-           GcHeader gch;                                                               \
-           Value (*code)(Value, Value);                                                \
-           Value (*worker)(Value, Value *);                                            \
-           size_t arity, nfree;                                                        \
-       } __sc = {{sizeof(Closure), 0, OBJ_CLOSURE, MARM_ETERNAL},                       \
-                 (code_fn), (worker_fn), (arity_n), 0};                                 \
-       VObject((void *)&__sc.code); })
+    ({ static const ClosureDesc __d = {(code_fn), (worker_fn), (arity_n)};              \
+       static const struct { GcHeader gch; const ClosureDesc *desc; } __sc =            \
+           {{sizeof(Closure), 0, OBJ_CLOSURE, MARM_ETERNAL}, &__d};                     \
+       VObject((void *)&__sc.desc); })
 
 Value result_return(Value x);
 Value result_fault(Value e);
@@ -73,12 +69,13 @@ Value perhaps_this(Value x);
 Value perhaps_nope();
 
 // Heap constructors (GC-managed). A lifted function is `Value code(Value self,
-// Value arg)`; a closure stores its `nfree` captured values inline (passed
-// variadically, like `mk_tuple`).
+// Value arg)`; a closure stores a pointer to its shared static `ClosureDesc`
+// (`code`/`worker`/`arity`, see runtime.h) plus its `nfree` captured values inline
+// (passed variadically, like `mk_tuple`).
+Value mk_closure_dn(const ClosureDesc *desc, size_t nfree, ...);
+// Compatibility builders (code/worker/arity instead of a static descriptor) for the
+// runtime builtins and `FOREIGN_DECL` companions; they intern a shared descriptor.
 Value mk_closure(Value (*code)(Value, Value), size_t nfree, ...);
-// A closure that additionally carries an uncurried worker for its curried chain
-// (see `Closure` in runtime.h). `mk_closure(code, nfree, ...)` is
-// `mk_closure_n(code, NULL, 1, nfree, ...)`: a single-stage closure, no fast path.
 Value mk_closure_n(Value (*code)(Value, Value), Value (*worker)(Value, Value *),
                    size_t arity, size_t nfree, ...);
 Value mk_tuple(size_t len, ...);
@@ -106,16 +103,11 @@ Value mk_tuple1(Value e0);
 Value mk_tuple2(Value e0, Value e1);
 Value mk_tuple3(Value e0, Value e1, Value e2);
 Value mk_tuple4(Value e0, Value e1, Value e2, Value e3);
-Value mk_closure0(Value (*code)(Value, Value));
-Value mk_closure1(Value (*code)(Value, Value), Value c0);
-Value mk_closure2(Value (*code)(Value, Value), Value c0, Value c1);
-Value mk_closure3(Value (*code)(Value, Value), Value c0, Value c1, Value c2);
-Value mk_closure4(Value (*code)(Value, Value), Value c0, Value c1, Value c2, Value c3);
-Value mk_closure_n0(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity);
-Value mk_closure_n1(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity, Value c0);
-Value mk_closure_n2(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity, Value c0, Value c1);
-Value mk_closure_n3(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity, Value c0, Value c1, Value c2);
-Value mk_closure_n4(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity, Value c0, Value c1, Value c2, Value c3);
+Value mk_closure_d0(const ClosureDesc *desc);
+Value mk_closure_d1(const ClosureDesc *desc, Value c0);
+Value mk_closure_d2(const ClosureDesc *desc, Value c0, Value c1);
+Value mk_closure_d3(const ClosureDesc *desc, Value c0, Value c1, Value c2);
+Value mk_closure_d4(const ClosureDesc *desc, Value c0, Value c1, Value c2, Value c3);
 
 // Owned (collectable) strings. Borrowed literals stay as `VText("...")` -- a bare
 // pointer into read-only data, never a GC object. `mk_text*` copy into the heap,

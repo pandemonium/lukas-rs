@@ -67,21 +67,25 @@ typedef enum {
 } Tag;
 Tag value_tag(Value v);
 
-struct Closure {
+// The per-FUNCTION part of a closure: `code`, `worker`, and `arity` are identical
+// for every closure of a given lifted function, so codegen emits ONE static
+// descriptor (in .rodata) that all its closures point at, instead of re-storing all
+// three (24 B) in each heap closure. `code` is the single-stage entry; `worker` is
+// the uncurried fast-path entry for a curried chain of `arity` stages (NULL, arity 1,
+// for an ordinary single-stage closure), letting a saturated `apply_n` skip the
+// intermediate currying-stage closures.
+typedef struct ClosureDesc {
     Value (*code)(Value self, Value arg);
-    // Uncurried fast-path entry for a multi-stage curried chain. When `worker`
-    // is non-NULL, this closure is the head of a chain of `arity` stages and
-    // `worker(self, args)` runs all of them at once, given exactly `arity`
-    // arguments -- skipping the intermediate currying-stage closures that
-    // `code` would allocate one per stage. NULL (with arity 1) for an ordinary
-    // single-stage closure, which is applied through `code` alone.
     Value (*worker)(Value self, Value *args);
     size_t arity;
-    // The captured values are stored *inline* here (a "flat" closure) rather
-    // than in a separate environment tuple: one heap object per closure instead
-    // of two, and `env_get` is a single load. `nfree` is how many follow, so the
-    // collector knows how much of `caps` to trace.
-    size_t nfree;
+} ClosureDesc;
+
+struct Closure {
+    const ClosureDesc *desc; // shared static {code, worker, arity}; per-function, not per-closure
+    // The captured values are stored *inline* here (a "flat" closure) rather than in
+    // a separate environment tuple: one heap object per closure, and `env_get` is a
+    // single load. The capture count is recovered from the GC header's body size
+    // (`(body - sizeof(Closure)) / sizeof(Value)`), so it is not stored.
     Value caps[]; // flexible array member
 };
 
@@ -160,7 +164,7 @@ Value prim_str_concat(size_t n, ...);
 // gc.h, since they are what the garbage collector manages.
 
 // Apply a closure value to an argument.
-static inline Value apply(Value f, Value x) { return as_closure(f)->code(f, x); }
+static inline Value apply(Value f, Value x) { return as_closure(f)->desc->code(f, x); }
 
 // Apply a closure value to `n` arguments at once (the flattened spine of a
 // nested application). When `f` is the head of a curried chain whose remaining
@@ -170,9 +174,9 @@ static inline Value apply(Value f, Value x) { return as_closure(f)->code(f, x); 
 // `n > arity`, or a plain single-stage closure) falls back to applying one
 // argument at a time through `code`, exactly reproducing the curried semantics.
 static inline Value apply_n(Value f, size_t n, Value *args) {
-    Closure *c = as_closure(f);
-    if (c->worker && c->arity == n) {
-        return c->worker(f, args);
+    const ClosureDesc *d = as_closure(f)->desc;
+    if (d->worker && d->arity == n) {
+        return d->worker(f, args);
     }
     Value r = f;
     for (size_t i = 0; i < n; i++) {

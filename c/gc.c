@@ -390,7 +390,8 @@ static void gc_trace(void) {
         }
         case OBJ_CLOSURE: {
             Closure *c = BODY(h);
-            for (size_t i = 0; i < c->nfree; i++) mark_value(c->caps[i]);
+            size_t nfree = (h->body - sizeof(Closure)) / sizeof(Value); // count from body
+            for (size_t i = 0; i < nfree; i++) mark_value(c->caps[i]); // desc is static, not traced
             break;
         }
         case OBJ_DATA: {
@@ -935,30 +936,51 @@ void gc_init(void *stack_bottom) {
 }
 
 // Shared builder: allocate a closure with `nfree` inline captures read from the
-// (already-started) `va_list`. `gc_reserve` runs before any capture is read, so
-// the captures are still live in the caller's argument area (conservatively
-// scanned) across the possible collection -- the same discipline as `mk_tuple`.
-static Value mk_closure_va(Value (*code)(Value, Value),
-                           Value (*worker)(Value, Value *), size_t arity,
-                           size_t nfree, va_list ap) {
+// (already-started) `va_list`. The per-function `code`/`worker`/`arity` live in the
+// shared static `desc`; only the captures are stored here. The captures are read only
+// AFTER `gc_new` returns, so across the collection `gc_new` may trigger they are still
+// live in the caller's argument area (conservatively scanned) -- as with `mk_tuple`.
+static Value mk_closure_dva(const ClosureDesc *desc, size_t nfree, va_list ap) {
     size_t body = sizeof(Closure) + nfree * sizeof(Value);
-    gc_reserve(sizeof(GcHeader) + body);
     Closure *c = gc_new(body, OBJ_CLOSURE);
-    c->code = code;
-    c->worker = worker;
-    c->arity = arity;
-    c->nfree = nfree;
+    c->desc = desc;
     for (size_t i = 0; i < nfree; i++) {
         c->caps[i] = va_arg(ap, Value);
     }
     return VObject(c);
 }
 
+Value mk_closure_dn(const ClosureDesc *desc, size_t nfree, ...) {
+    va_list ap;
+    va_start(ap, nfree);
+    Value v = mk_closure_dva(desc, nfree, ap);
+    va_end(ap);
+    return v;
+}
+
+// Compatibility path for callers that pass code/worker/arity directly rather than a
+// static descriptor: the runtime builtins and the `FOREIGN_DECL` companions. These
+// are few and mostly built once, so a tiny intern cache hands out ONE shared descriptor
+// per distinct (code, worker, arity) -- no per-call allocation, no leak. The
+// codegen-emitted hot path uses `mk_closure_d*` with its own static descriptors.
+static ClosureDesc *intern_desc(Value (*code)(Value, Value),
+                                Value (*worker)(Value, Value *), size_t arity) {
+    static ClosureDesc *cache[256];
+    static size_t ncache = 0;
+    for (size_t i = 0; i < ncache; i++)
+        if (cache[i]->code == code && cache[i]->worker == worker && cache[i]->arity == arity)
+            return cache[i];
+    ClosureDesc *d = malloc(sizeof *d); // one per distinct function; never freed
+    d->code = code, d->worker = worker, d->arity = arity;
+    if (ncache < sizeof cache / sizeof *cache) cache[ncache++] = d;
+    return d;
+}
+
 Value mk_closure_n(Value (*code)(Value, Value), Value (*worker)(Value, Value *),
                    size_t arity, size_t nfree, ...) {
     va_list ap;
     va_start(ap, nfree);
-    Value v = mk_closure_va(code, worker, arity, nfree, ap);
+    Value v = mk_closure_dva(intern_desc(code, worker, arity), nfree, ap);
     va_end(ap);
     return v;
 }
@@ -966,17 +988,16 @@ Value mk_closure_n(Value (*code)(Value, Value), Value (*worker)(Value, Value *),
 Value mk_closure(Value (*code)(Value, Value), size_t nfree, ...) {
     va_list ap;
     va_start(ap, nfree);
-    Value v = mk_closure_va(code, NULL, 1, nfree, ap);
+    Value v = mk_closure_dva(intern_desc(code, NULL, 1), nfree, ap);
     va_end(ap);
     return v;
 }
 
 // Copy `len` bytes into a fresh, collectable string body (NUL-terminated, so it
 // remains a valid C string for `strcmp`/`fputs`). `src` stays live across the
-// possible collection in `gc_reserve` because it is on the C stack, which the
-// collector scans conservatively.
+// collection `gc_new` may trigger because it is on the C stack, which the collector
+// scans conservatively.
 Value mk_textn(const char *src, size_t len) {
-    gc_reserve(sizeof(GcHeader) + len + 1);
     char *body = gc_new(len + 1, OBJ_TEXT);
     memcpy(body, src, len);
     body[len] = '\0';
@@ -988,7 +1009,6 @@ Value mk_text(const char *src) { return mk_textn(src, strlen(src)); }
 
 Value mk_tuple(size_t len, ...) {
     size_t body = sizeof(Tuple) + len * sizeof(Value);
-    gc_reserve(sizeof(GcHeader) + body);
     Tuple *t = gc_new(body, OBJ_TUPLE);
     va_list ap;
     va_start(ap, len);
@@ -1001,7 +1021,6 @@ Value mk_tuple(size_t len, ...) {
 
 Value mk_data(uint64_t tag, size_t nfields, ...) {
     size_t body = sizeof(Data) + nfields * sizeof(Value);
-    gc_reserve(sizeof(GcHeader) + body);
     Data *d = gc_new(body, OBJ_DATA);
     d->tag = tag;
     va_list ap;
@@ -1078,39 +1097,34 @@ Value mk_tuple4(Value e0, Value e1, Value e2, Value e3) {
     return VObject(t);
 }
 
-// Closure builders. `_nK` carries an uncurried worker (arity from the chain); the
-// plain `K` form is the single-stage closure (`worker = NULL`, `arity = 1`).
-Value mk_closure_n0(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity) {
+// Closure builders. The per-function `code`/`worker`/`arity` come from the shared
+// static `desc` (codegen emits one per closure site); only the captures are stored
+// in the heap object, so a closure body is `sizeof(Closure)` (one pointer) + captures.
+Value mk_closure_d0(const ClosureDesc *desc) {
     Closure *c = alloc_body(sizeof(Closure), OBJ_CLOSURE);
-    c->code = code, c->worker = worker, c->arity = arity, c->nfree = 0;
+    c->desc = desc;
     return VObject(c);
 }
-Value mk_closure_n1(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity, Value c0) {
+Value mk_closure_d1(const ClosureDesc *desc, Value c0) {
     Closure *c = alloc_body(sizeof(Closure) + 1 * sizeof(Value), OBJ_CLOSURE);
-    c->code = code, c->worker = worker, c->arity = arity, c->nfree = 1, c->caps[0] = c0;
+    c->desc = desc, c->caps[0] = c0;
     return VObject(c);
 }
-Value mk_closure_n2(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity, Value c0, Value c1) {
+Value mk_closure_d2(const ClosureDesc *desc, Value c0, Value c1) {
     Closure *c = alloc_body(sizeof(Closure) + 2 * sizeof(Value), OBJ_CLOSURE);
-    c->code = code, c->worker = worker, c->arity = arity, c->nfree = 2, c->caps[0] = c0, c->caps[1] = c1;
+    c->desc = desc, c->caps[0] = c0, c->caps[1] = c1;
     return VObject(c);
 }
-Value mk_closure_n3(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity, Value c0, Value c1, Value c2) {
+Value mk_closure_d3(const ClosureDesc *desc, Value c0, Value c1, Value c2) {
     Closure *c = alloc_body(sizeof(Closure) + 3 * sizeof(Value), OBJ_CLOSURE);
-    c->code = code, c->worker = worker, c->arity = arity, c->nfree = 3, c->caps[0] = c0, c->caps[1] = c1, c->caps[2] = c2;
+    c->desc = desc, c->caps[0] = c0, c->caps[1] = c1, c->caps[2] = c2;
     return VObject(c);
 }
-Value mk_closure_n4(Value (*code)(Value, Value), Value (*worker)(Value, Value *), size_t arity, Value c0, Value c1, Value c2, Value c3) {
+Value mk_closure_d4(const ClosureDesc *desc, Value c0, Value c1, Value c2, Value c3) {
     Closure *c = alloc_body(sizeof(Closure) + 4 * sizeof(Value), OBJ_CLOSURE);
-    c->code = code, c->worker = worker, c->arity = arity, c->nfree = 4,
-    c->caps[0] = c0, c->caps[1] = c1, c->caps[2] = c2, c->caps[3] = c3;
+    c->desc = desc, c->caps[0] = c0, c->caps[1] = c1, c->caps[2] = c2, c->caps[3] = c3;
     return VObject(c);
 }
-Value mk_closure0(Value (*code)(Value, Value)) { return mk_closure_n0(code, NULL, 1); }
-Value mk_closure1(Value (*code)(Value, Value), Value c0) { return mk_closure_n1(code, NULL, 1, c0); }
-Value mk_closure2(Value (*code)(Value, Value), Value c0, Value c1) { return mk_closure_n2(code, NULL, 1, c0, c1); }
-Value mk_closure3(Value (*code)(Value, Value), Value c0, Value c1, Value c2) { return mk_closure_n3(code, NULL, 1, c0, c1, c2); }
-Value mk_closure4(Value (*code)(Value, Value), Value c0, Value c1, Value c2, Value c3) { return mk_closure_n4(code, NULL, 1, c0, c1, c2, c3); }
 
 // Field count of a live constructor value, recovered from its heap header's body
 // size (the count is not stored in the object itself).
@@ -1127,9 +1141,7 @@ size_t tuple_len(Value v) {
 // ----------------------------------------------------------------- byte buffers
 Value mk_buffer(size_t cap) {
     if (cap == 0) cap = 16;
-    gc_reserve(sizeof(GcHeader) + cap);
-    void *body = gc_new(cap, OBJ_BYTES); // stays live on the stack across the next reserve
-    gc_reserve(sizeof(GcHeader) + sizeof(Buffer));
+    void *body = gc_new(cap, OBJ_BYTES); // stays live on the stack across the next gc_new
     Buffer *b = gc_new(sizeof(Buffer), OBJ_BUFFER);
     b->bytes = body;
     b->len = 0;
@@ -1145,7 +1157,6 @@ void buffer_put_u8(Value bv, uint8_t byte) {
     Buffer *b = as_ptr(bv);
     if (b->len == b->cap) {
         size_t ncap = b->cap * 2;
-        gc_reserve(sizeof(GcHeader) + ncap);
         void *nbody = gc_new(ncap, OBJ_BYTES);
         b = as_ptr(bv);
         memcpy(nbody, b->bytes, b->len);
@@ -1190,8 +1201,7 @@ void buffer_put_slice(Value bv, Value sv) {
 
 Value mk_slice(void *owner, size_t offset, size_t len) {
     // `owner` is a body pointer; it sits on the stack (conservatively scanned), so
-    // it survives the collection `gc_reserve` may trigger.
-    gc_reserve(sizeof(GcHeader) + sizeof(Slice));
+    // it survives the collection `gc_new` may trigger.
     Slice *s = gc_new(sizeof(Slice), OBJ_SLICE);
     s->owner = owner;
     s->offset = offset;
@@ -1205,7 +1215,6 @@ Value buffer_move(Value bv) {
     Buffer *b = as_ptr(bv);
     size_t len = b->len;
     void *body = b->bytes; // handed off below; stays live on the stack meanwhile
-    gc_reserve(sizeof(GcHeader) + 16);
     void *fresh = gc_new(16, OBJ_BYTES);
     b = as_ptr(bv);
     b->bytes = fresh;
@@ -1217,7 +1226,6 @@ Value buffer_move(Value bv) {
 
 Value buffer_copy(Value bv) {
     size_t n = ((Buffer *)as_ptr(bv))->len;
-    gc_reserve(sizeof(GcHeader) + (n ? n : 1));
     void *body = gc_new(n ? n : 1, OBJ_BYTES);
     Buffer *b = as_ptr(bv); // re-fetch after the possible collection
     memcpy(body, b->bytes, n);
@@ -1364,7 +1372,6 @@ Value buffer_move_range(Value bv, size_t off, size_t n) {
     Buffer *b = as_ptr(bv);
     if (off + n > b->len) return result_fault(VInt(-1));
     void *body = b->bytes; // handed off below; stays live on the stack meanwhile
-    gc_reserve(sizeof(GcHeader) + 16);
     void *fresh = gc_new(16, OBJ_BYTES);
     b = as_ptr(bv);
     b->bytes = fresh;
@@ -1377,7 +1384,6 @@ Value buffer_move_range(Value bv, size_t off, size_t n) {
 Value buffer_copy_range(Value bv, size_t off, size_t n) {
     Buffer *b = as_ptr(bv);
     if (off + n > b->len) return result_fault(VInt(-1));
-    gc_reserve(sizeof(GcHeader) + (n ? n : 1));
     void *body = gc_new(n ? n : 1, OBJ_BYTES);
     b = as_ptr(bv); // re-fetch after the possible collection
     memcpy(body, (const uint8_t *)b->bytes + off, n);
@@ -1385,7 +1391,6 @@ Value buffer_copy_range(Value bv, size_t off, size_t n) {
 }
 
 static Value mk_mmap(uint8_t *region, size_t len) {
-    gc_reserve(sizeof(GcHeader) + sizeof(Mmap));
     Mmap *m = gc_new(sizeof(Mmap), OBJ_MMAP);
     m->region = region;
     m->len = len;
