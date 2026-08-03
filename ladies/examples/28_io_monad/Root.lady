@@ -8,4 +8,4 @@ main :: IO Unit :=
 
 start := λ_.
   print_endline "##TC"
-  IO.unsafeRunIO main
+  IO.unsafe_run_IO main

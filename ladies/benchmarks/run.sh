@@ -14,7 +14,7 @@ NAME="${1:-binary_codec}"
 SRC="$ROOT/ladies/benchmarks/$NAME"
 W="$(mktemp -d)"
 
-cargo run -q --manifest-path "$ROOT/Cargo.toml" --bin mc -- \
+cargo run --release -q --manifest-path "$ROOT/Cargo.toml" --bin mc -- \
     --library "$LIB" --source "$SRC" --backend native -o "$W/prog.c" || exit 1
 
 # link the program + runtime + every stdlib companion (foreign bindings)

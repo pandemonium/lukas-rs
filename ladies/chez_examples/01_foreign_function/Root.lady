@@ -45,5 +45,5 @@ file_io :: IO Text := λ_.
 start :: Int -> Unit := λ_.
   print_endline "##TC"
   print_endline (prim_show (sqrt_int 144))
-  let contents = IO.unsafeRunIO file_io in
+  let contents = IO.unsafe_run_IO file_io in
   print_endline "File contents: `contents`"

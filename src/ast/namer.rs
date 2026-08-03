@@ -2022,7 +2022,7 @@ impl phase::Pattern<Desugared> {
                     constructor: Identifier::Free(
                         symbols
                             .resolve_free_term_name(&pattern.constructor, semantic_scope)
-                            .expect("msg")
+                            .expect(&format!("resolve: {}", &pattern.constructor))
                             .into_qualified_name()
                             .into(),
                     ),

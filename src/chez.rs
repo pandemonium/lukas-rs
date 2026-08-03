@@ -113,6 +113,7 @@ impl ast::Literal {
     fn emit(&self, code: &mut CodeBuffer) -> Result<()> {
         match self {
             ast::Literal::Int(x) => write!(code, "{x}")?,
+            ast::Literal::Float(x) => write!(code, "{x}")?,
             ast::Literal::Text(x) => write!(code, "\"{x}\"")?,
             ast::Literal::Bool(true) => write!(code, "#t")?,
             ast::Literal::Bool(false) => write!(code, "#f")?,

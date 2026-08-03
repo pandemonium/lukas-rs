@@ -38,7 +38,23 @@ use crate::{
 
 /// Largest term body (in AST nodes) the inliner will unfold. Combinators, method
 /// selectors, constructor wrappers and dictionaries are all well under this.
+///
+/// Swept 2026-08-03 (`MARM_INLINE_BUDGET`, all benchmarks): 100 sits just above a SHARP
+/// deforestation cliff and is load-bearing. binary_codec drops from 9115 to 7765 lines of
+/// emitted C between budget 70 and 60 -- a single ~61-70-node monad-plumbing helper stops
+/// being inlined, so the transformer construct/deconstruct pairs no longer cancel: 6.8s ->
+/// 7.15s at 60, and 16.7s (2.5x!) at 50; utf8_get is 2.3x slower at 50. Above 70 the codec C
+/// is byte-identical; raising the budget to 4000 changes NOTHING on any benchmark (the only
+/// remaining un-inlined bodies are recursive, gated by the recursion guard, not by size). So
+/// 100 = the knee + ~30 nodes of margin; there is no perf to win by tuning it either way.
 const INLINE_BUDGET: usize = 100;
+/// Effective inline budget, overridable via `MARM_INLINE_BUDGET` for tuning sweeps.
+fn inline_budget() -> usize {
+    std::env::var("MARM_INLINE_BUDGET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(INLINE_BUDGET)
+}
 /// Ceiling on inlines per term body, so an accidental miss in the acyclicity check
 /// can only under-optimise, never loop.
 const INLINE_FUEL: usize = 200_000;
@@ -95,23 +111,34 @@ impl phase::SymbolTable<Types> {
             .map(|(name, symbol)| {
                 let symbol = match symbol {
                     Symbol::Term(term) => {
-                        // Do not inline into a recursive body (a loop) -- that is where
-                        // inlining an effectful `bind` leaks by capturing the action.
-                        let inls = if guard_loops && recursive.contains(&term.name) {
-                            &no_inline
+                        let TermSymbol {
+                            name,
+                            type_signature,
+                            body,
+                        } = term;
+                        // A recursive body (a loop) is normally simplified WITHOUT inlining:
+                        // fusing an effectful `bind` in welds the sequenced action into the
+                        // recursion, which leaks (see `build_inlinables`). But the leak is
+                        // exactly non-tail-recursion -- so we may keep the fused body whenever
+                        // fusion left every self-call in tail position (`fusion_safe`). Try the
+                        // fused body, keep it only if tail-safe, else fall back to the guarded
+                        // (un-inlined) body -- the always-safe status quo.
+                        let body = if !guard_loops || !recursive.contains(&name) {
+                            simplify_term(body, &inlinables)
                         } else {
-                            &inlinables
+                            let fused = simplify_term(body.clone(), &inlinables);
+                            if fusion_safe(&fused) {
+                                fused
+                            } else {
+                                simplify_term(body, &no_inline)
+                            }
                         };
-                        let body = simplify_term(term.body, inls);
-                        if dump
-                            .as_deref()
-                            .is_some_and(|f| term.name.to_string().contains(f))
-                        {
-                            eprintln!("==== {} ====\n{}\n", term.name, body);
+                        if dump.as_deref().is_some_and(|f| name.to_string().contains(f)) {
+                            eprintln!("==== {} ====\n{}\n", name, body);
                         }
                         Symbol::Term(TermSymbol {
-                            name: term.name,
-                            type_signature: term.type_signature,
+                            name,
+                            type_signature,
                             body,
                         })
                     }
@@ -205,9 +232,10 @@ fn build_inlinables(
         .map(|(name, _)| (*name).clone())
         .collect();
 
+    let budget = inline_budget();
     let inlinables = terms
         .iter()
-        .filter(|(name, body)| within_budget(body, INLINE_BUDGET) && !recursive.contains(*name))
+        .filter(|(name, body)| within_budget(body, budget) && !recursive.contains(*name))
         .map(|(name, body)| ((*name).clone(), Rc::new((*body).clone())))
         .collect();
 
@@ -226,6 +254,135 @@ fn contains_recursion<A>(expr: &Expr<A, Identifier>) -> bool {
             },
         ) if mentions_level(&lambda.body, *level) => true,
         _ => children(expr).into_iter().any(|c| contains_recursion(c)),
+    }
+}
+
+/// Whether the *fused* body of a recursive term is safe to keep -- i.e. inlining did not
+/// move the recursion out of tail position. The space leak that `build_inlinables`'s guard
+/// exists to prevent is *exactly* non-tail recursion: fusing an effectful `bind` in turns
+/// the self-call into the scrutinee of a `deconstruct` (forcing the sequenced action), which
+/// clang can no longer sibling-call, so the piled-up frames each root one iteration's data.
+/// A self-call that stays a tail call compiles to a clean constant-stack loop and cannot leak.
+/// (Diagnosed on `binary_codec` (leaks) vs `utf8_get` (safe); see notes/loop-fusion-safety.md.)
+///
+/// Only direct (`RecursiveLambda`) recursion is judged safe; mutual recursion and any other
+/// shape stay guarded. That is sound because `inlinables` never holds a recursive term, so
+/// fusion can only splice *non-recursive* helpers into the body -- it relocates the term's own
+/// `Bound` self-call but never introduces a fused call to another recursive term.
+fn fusion_safe<A>(body: &Expr<A, Identifier>) -> bool {
+    match body {
+        Expr::RecursiveLambda(
+            _,
+            SelfReferential {
+                own_name: Identifier::Bound(level),
+                lambda,
+            },
+        ) => self_calls_all_tail(&lambda.body, *level, true, true),
+        _ => false,
+    }
+}
+
+/// Check that every self-reference (`Bound(level)` -- the absolute De Bruijn level of the
+/// recursive term's own binder) occurs only as the head of an application in *tail position*.
+/// `tail` tracks whether the current node is a tail context; `leading` tracks whether we are
+/// still peeling the term's own parameter lambdas (its arity), the only lambdas whose body
+/// stays a tail context. Tail-ness threads through leading lambdas, `if` branches, `deconstruct`
+/// arms and `let` bodies only; every other position (scrutinees, let-RHS, arguments, inner
+/// lambdas, tuples, ...) is conservatively non-tail, so a self-reference there fails the check.
+fn self_calls_all_tail<A>(
+    expr: &Expr<A, Identifier>,
+    level: usize,
+    tail: bool,
+    leading: bool,
+) -> bool {
+    match expr {
+        // A self-reference reached directly is NOT the head of a tail application (those are
+        // consumed in the `Apply` arm below) -- so it is a leak-shaped occurrence.
+        Expr::Variable(_, Identifier::Bound(k)) if *k == level => false,
+        Expr::Variable(..)
+        | Expr::Constant(..)
+        | Expr::InvokeBridge(..)
+        | Expr::MakeClosure(..) => true,
+
+        Expr::RecursiveLambda(_, SelfReferential { lambda, .. }) => {
+            self_calls_all_tail(&lambda.body, level, tail, leading)
+        }
+        Expr::Lambda(_, Lambda { body, .. }) => {
+            // Leading lambdas are the term's arity, so their body inherits `tail`. An inner
+            // lambda is a returned closure / deferred action, never a tail context here.
+            if leading {
+                self_calls_all_tail(body, level, tail, true)
+            } else {
+                self_calls_all_tail(body, level, false, false)
+            }
+        }
+
+        Expr::Apply(_, Apply { function, argument }) => {
+            if tail && spine_head_is_self(expr, level) {
+                // A tail self-call: the head is the legitimate recursion; the arguments are
+                // evaluated first, so they must be self-free (checked in non-tail position).
+                spine_args_self_free(expr, level)
+            } else {
+                self_calls_all_tail(function, level, false, false)
+                    && self_calls_all_tail(argument, level, false, false)
+            }
+        }
+
+        Expr::If(
+            _,
+            IfThenElse {
+                predicate,
+                consequent,
+                alternate,
+            },
+        ) => {
+            self_calls_all_tail(predicate, level, false, false)
+                && self_calls_all_tail(consequent, level, tail, false)
+                && self_calls_all_tail(alternate, level, tail, false)
+        }
+        Expr::Deconstruct(
+            _,
+            Deconstruct {
+                scrutinee,
+                match_clauses,
+            },
+        ) => {
+            self_calls_all_tail(scrutinee, level, false, false)
+                && match_clauses
+                    .iter()
+                    .all(|c| self_calls_all_tail(&c.consequent, level, tail, false))
+        }
+        Expr::Let(_, Binding { bound, body, .. }) => {
+            self_calls_all_tail(bound, level, false, false)
+                && self_calls_all_tail(body, level, tail, false)
+        }
+
+        // Every other node has no tail sub-position, so any self-reference inside is
+        // (conservatively) leak-shaped -- walk the children in non-tail position.
+        _ => children(expr)
+            .into_iter()
+            .all(|c| self_calls_all_tail(c, level, false, false)),
+    }
+}
+
+/// Whether the head of an application spine `((f a) b) c` is the self-reference `Bound(level)`.
+fn spine_head_is_self<A>(expr: &Expr<A, Identifier>, level: usize) -> bool {
+    match expr {
+        Expr::Apply(_, Apply { function, .. }) => spine_head_is_self(function, level),
+        Expr::Variable(_, Identifier::Bound(k)) => *k == level,
+        _ => false,
+    }
+}
+
+/// Whether the *arguments* of a self-call spine `((self a) b) c` are free of self-references
+/// (the head itself is the recursion and is ignored). Each argument is checked non-tail.
+fn spine_args_self_free<A>(expr: &Expr<A, Identifier>, level: usize) -> bool {
+    match expr {
+        Expr::Apply(_, Apply { function, argument }) => {
+            self_calls_all_tail(argument, level, false, false)
+                && spine_args_self_free(function, level)
+        }
+        _ => true,
     }
 }
 

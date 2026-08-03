@@ -724,6 +724,7 @@ impl lambda_lift::Program {
     fn compile_constant(&self, the: &Literal) -> String {
         match the {
             Literal::Int(x) => format!("VInt({x})"),
+            Literal::Float(x) => format!("VInt({x})"),
             // Borrowed string literal (tagged-value.md Stage 1b): a `const`
             // text descriptor emitted into .rodata -- a `GcHeader` (kind OBJ_TEXT,
             // `old = MARM_ETERNAL` so the GC never touches it) immediately

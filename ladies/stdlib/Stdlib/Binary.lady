@@ -13,6 +13,7 @@ foreign Raw_Buffer
 foreign Raw_Bytes
 foreign Raw_Mmap
 
+(* These put functions are actually push:es *)
 foreign raw_new_buffer :: Int -> Raw_Buffer
 foreign raw_put_u8     :: Raw_Buffer -> Int -> Unit
 foreign raw_put_16_le  :: Raw_Buffer -> Int -> Unit
@@ -55,6 +56,26 @@ opaque Bytes  ::= Bytes Raw_Bytes
 Read_Error   ::= Out_of_bounds
 Mmap_Error   ::= Mmap_io Int
 Buffer_Error ::= Out_of_range
+
+(* It is not obvious that this is the correct solution. Is there really *)
+(* just the one way to read an Int from a byte slice? *)
+witness From Bytes (Perhaps Int) :=
+  { from := λ(Bytes bytes).
+      let length = raw_slice_len bytes in
+      print_endline "from: length `length`"
+      let zero = Int.of_char '0' in
+      let nine = Int.of_char '9' in
+      let compute = λacc i.
+        if i < length then
+          let digit = raw_get_u8 bytes i in
+          if digit >= zero and digit <= nine then
+            compute (10 * acc + digit - zero) (i + 1)
+          else
+            Nope
+        else
+          This acc
+      in compute 0 0
+  }
 
 witness Display Read_Error :=
   { display := λ_. "out of bounds"
@@ -103,6 +124,10 @@ move :: Buffer -> IO Bytes := λ(Buffer b). IO.suspend (λ_. Bytes (raw_move b))
 
 copy :: Buffer -> IO Bytes := λ(Buffer b). IO.suspend (λ_. Bytes (raw_copy b))
 
+module Buffer:
+  put_u8 :: Buffer -> Int -> IO Unit := λ(Buffer buffer) byte.
+    IO.suspend (λ_. raw_put_u8 buffer byte)
+
 module Bytes:
   length :: Bytes -> Int := len
 
@@ -112,6 +137,21 @@ module Bytes:
   (* Unchecked split at `n` -> (prefix, suffix); caller ensures 0 <= n <= length. *)
   split_at :: Bytes -> Int -> (Bytes, Bytes) := λ(Bytes bytes) n.
     (Bytes (raw_sub bytes 0 n), Bytes (raw_sub bytes n (raw_slice_len bytes - n)))
+
+  position :: Bytes -> (Int -> Bool) -> Perhaps Int := λ(Bytes bytes) p.
+    let length = raw_slice_len bytes in
+    let scan = λi.
+      if p (raw_get_u8 bytes i)
+        then This i
+        else
+          let next_i = 1 + 1 in
+          if next_i < length
+            then scan next_i
+            else Nope
+    in
+      if length > 0
+          then scan 0
+          else Nope
 
   get_u8 :: Bytes -> Int -> Int := λ(Bytes bytes).
     raw_get_u8 bytes

@@ -28,5 +28,5 @@ output :: Text -> IO Unit := λtext.
 
 suspend :: ∀α. (Unit -> α) -> IO α := Suspend
 
-unsafeRunIO :: ∀α. IO α -> Unit := λ(Suspend thunk).
+unsafe_run_IO :: ∀α. IO α -> α := λ(Suspend thunk).
   thunk ()

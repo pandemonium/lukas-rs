@@ -282,19 +282,23 @@ pub type Interpretation<A = Val> = Result<A, RuntimeError>;
 
 pub type Environment = cek::Env;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Int(i64),
+    Float(f64),
     Text(String),
     Bool(bool),
     Unit,
     Char(char),
 }
 
+impl Eq for Literal {}
+
 impl From<ast::Literal> for Literal {
     fn from(value: ast::Literal) -> Self {
         match value {
             ast::Literal::Int(x) => Self::Int(x),
+            ast::Literal::Float(x) => Self::Float(x),
             ast::Literal::Text(x) => Self::Text(x),
             ast::Literal::Bool(x) => Self::Bool(x),
             ast::Literal::Unit => Self::Unit,
@@ -307,6 +311,7 @@ impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Int(x) => write!(f, "{x}"),
+            Self::Float(x) => write!(f, "{x}"),
             Self::Text(x) => write!(f, "{x}"),
             Self::Bool(x) => write!(f, "{x}"),
             Self::Unit => write!(f, "()"),

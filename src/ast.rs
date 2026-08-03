@@ -1,4 +1,4 @@
-use std::{fmt, marker::PhantomData, rc::Rc};
+use std::{cmp::Ordering, fmt, marker::PhantomData, rc::Rc};
 
 use crate::{
     ast::{
@@ -622,13 +622,63 @@ pub struct Tuple<A, Id> {
     pub elements: Vec<Tree<A, Id>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Debug, Clone)]
 pub enum Literal {
     Int(i64),
+    Float(f64),
     Text(String),
     Bool(bool),
     Unit,
     Char(char),
+}
+
+impl Literal {
+    fn variant_rank(&self) -> u8 {
+        match self {
+            Self::Int(..) => 0,
+            Self::Float(..) => 1,
+            Self::Text(..) => 2,
+            Self::Bool(..) => 3,
+            Self::Unit => 4,
+            Self::Char(..) => 5,
+        }
+    }
+}
+
+impl PartialEq for Literal {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Literal {}
+
+impl PartialOrd for Literal {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Literal {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::Int(lhs), Self::Int(rhs)) => lhs.cmp(rhs),
+
+            (Self::Float(lhs), Self::Float(rhs)) => {
+                lhs.total_cmp(rhs)
+            }
+
+            (Self::Text(lhs), Self::Text(rhs)) => lhs.cmp(rhs),
+
+            (Self::Bool(lhs), Self::Bool(rhs)) => lhs.cmp(rhs),
+
+            (Self::Unit, Self::Unit) => Ordering::Equal,
+
+            (Self::Char(lhs), Self::Char(rhs)) => lhs.cmp(rhs),
+
+            _ => self.variant_rank().cmp(&other.variant_rank()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -885,6 +935,7 @@ impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Int(x) => write!(f, "{x}"),
+            Self::Float(x) => write!(f, "{x}"),
             Self::Text(x) => write!(f, "{x}"),
             Self::Bool(x) => write!(f, "{x}"),
             Self::Unit => write!(f, "()"),

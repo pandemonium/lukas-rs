@@ -3,6 +3,19 @@ use Stdlib.Data.List.
 use Stdlib.Data.Perhaps.
 use Stdlib.Binary.
 
+module String.
+
+signature From_Text ::= ∀α.
+  { parse :: Text -> Perhaps α
+  }
+
+(* C fast path for integer parsing. *)
+foreign raw_parse_int :: Text -> Perhaps Int
+
+witness From Text (Perhaps Int) :=
+  { from := raw_parse_int
+  }
+
 (* The C fast path (Text.c -> gc.c utf8_from_slice): a branchless RFC-3629 DFA that *)
 (* validates and, on success, materialises an owned Text. `Bytes` erases to its raw *)
 (* slice, so the value crosses to C as the slice directly -- no unwrap needed. *)
@@ -17,6 +30,7 @@ from_bytes :: Bytes -> Perhaps Text :=
   raw_text_from_bytes
 
 (* Native validity check (does not copy). Utf8.is_valid is the Get-monad twin. *)
+(* This means that Text could just be a plan struct that owns a Bytes. It could be opaque. *)
 is_valid :: Bytes -> Bool :=
   raw_is_valid
 

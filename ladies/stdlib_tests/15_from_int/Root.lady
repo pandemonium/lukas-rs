@@ -1,0 +1,35 @@
+use Stdlib.
+use Stdlib.Binary.
+
+main :: IO (Perhaps Int) :=
+  let* buffer = new_buffer 4 in
+  let* _ = Buffer.put_u8 buffer (Int.of_char '1') in
+  let* _ = Buffer.put_u8 buffer (Int.of_char '2') in
+  let* _ = Buffer.put_u8 buffer (Int.of_char '3') in
+  let* _ = Buffer.put_u8 buffer (Int.of_char '4') in
+  let* bytes = move buffer in
+  let int = from bytes :: Perhaps Int in
+  pure int
+
+run_int_parser_through_io := λ_.
+  let program = main in
+  deconstruct IO.unsafe_run_IO program into
+    This x -> print_endline "1234 is `x`"
+  | Nope   -> print_endline "Did not parse"
+
+round_trip :: Text -> Int -> Bool := λsource expected.
+  let parsed = from source :: Perhaps Int in
+    let matches = λx. x = expected in
+  perhaps false id (fmap matches parsed)
+
+start := λ_.
+  let loop = λi.
+    if i >= 0
+      then
+        let matches = round_trip "`i`" i in
+        if matches
+          then loop (i - 1)
+          else print_endline "`i` did not parse correctly"
+      else
+        ()
+  in loop 10000000

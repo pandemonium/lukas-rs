@@ -2552,6 +2552,7 @@ impl From<Literal> for ast::Literal {
     fn from(value: Literal) -> Self {
         match value {
             Literal::Integer(x) => ast::Literal::Int(x),
+            Literal::Float(x) => todo!(),
             Literal::Text(x) => ast::Literal::Text(x),
             Literal::Bool(x) => ast::Literal::Bool(x),
             Literal::Unit => ast::Literal::Unit,

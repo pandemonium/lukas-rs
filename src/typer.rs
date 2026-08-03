@@ -1917,7 +1917,7 @@ pub enum TypeError {
 
     // This could be improved!
     #[error(
-        "record shape missmatch, missing: {} (and superfluous: {}).",
+        "record shape mismatch, missing: {} (and superfluous: {}).",
         display_list(", ", missing),
         display_list(", ", superfluous)
     )]
@@ -2549,6 +2549,7 @@ impl Type {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BaseType {
     Int,
+    Float,
     Text,
     Bool,
     Unit,
@@ -2560,6 +2561,7 @@ impl BaseType {
     const fn local_name(&self) -> &str {
         match self {
             Self::Int => "Int",
+            Self::Float => "Float",
             Self::Text => "Text",
             Self::Bool => "Bool",
             Self::Unit => "Unit",
@@ -5203,6 +5205,7 @@ impl Literal {
     fn synthesize_type(&self) -> Type {
         Type::Base(match self {
             Self::Int(..) => BaseType::Int,
+            Self::Float(..) => BaseType::Int,
             Self::Text(..) => BaseType::Text,
             Self::Bool(..) => BaseType::Bool,
             Self::Unit => BaseType::Unit,
@@ -5526,6 +5529,7 @@ impl fmt::Display for BaseType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Int => write!(f, "Int"),
+            Self::Float => write!(f, "Float"),
             Self::Text => write!(f, "Text"),
             Self::Bool => write!(f, "Bool"),
             Self::Unit => write!(f, "Unit"),

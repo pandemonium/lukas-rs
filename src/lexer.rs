@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, mem::discriminant};
 
 #[derive(Debug)]
 pub struct LexicalAnalyzer {
@@ -289,8 +289,13 @@ impl LexicalAnalyzer {
     }
 
     fn scan_hex_number<'a>(&mut self, prefix: &'a [char]) -> &'a [char] {
-        let (prefix, remains) =
-            prefix.split_at(2 + prefix.iter().skip(2/* 0x */).take_while(|c| c.is_ascii_hexdigit()).count());
+        let (prefix, remains) = prefix.split_at(
+            2 + prefix
+                .iter()
+                .skip(2 /* 0x */)
+                .take_while(|c| c.is_ascii_hexdigit())
+                .count(),
+        );
 
         // This has to be able to fail the tokenization here
         let prefix = prefix.iter().skip(2).collect::<String>();
@@ -306,25 +311,29 @@ impl LexicalAnalyzer {
     }
 
     fn scan_number<'a>(&mut self, prefix: &'a [char]) -> &'a [char] {
-        let (prefix, remains) =
+        let mut buf = String::with_capacity(20);
+
+        let (prefix, mut remains) =
             prefix.split_at(prefix.iter().take_while(|c| c.is_ascii_digit()).count());
 
-        // This has to be able to fail the tokenization here
-        let num = prefix.iter().collect::<String>().parse().unwrap();
+        buf.extend(prefix.iter());
 
-        self.emit(
-            prefix.len() as u32,
-            TokenKind::Literal(Literal::Integer(num)),
-            remains,
-        );
+        let literal = if matches!(&remains, ['.', ..]) {
+            buf.push('.');
+            let prefix = &remains[1..];
+            let (prefix, rem) =
+                prefix.split_at(prefix.iter().take_while(|c| c.is_ascii_digit()).count());
+            buf.extend(prefix.iter());
+            remains = rem;
+            Literal::Float(buf.parse().unwrap())
+        } else {
+            Literal::Integer(buf.parse().unwrap())
+        };
+
+        self.emit(buf.len() as u32, TokenKind::Literal(literal), remains);
 
         remains
     }
-}
-
-#[test]
-fn foo() {
-    assert_eq!(0xabcd, "0xabcd".parse::<i64>().unwrap());
 }
 
 const fn is_special_symbol(c: char) -> bool {
@@ -673,16 +682,19 @@ impl Keyword {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Integer(i64),
+    Float(f64),
     Text(String),
     Bool(bool),
     Unit,
     Char(char),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+impl Eq for Literal {}
+
+#[derive(Debug, Clone)]
 pub struct Token {
     pub kind: TokenKind,
     pub position: SourceLocation,
@@ -802,6 +814,7 @@ impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Integer(x) => write!(f, "{x}"),
+            Self::Float(x) => write!(f, "{x}"),
             Self::Text(x) => write!(f, "{x}"),
             Self::Bool(x) => write!(f, "{x}"),
             Self::Unit => write!(f, "()"),

@@ -1,0 +1,10 @@
+opaque String ::= Data Bytes
+
+witness From String (Perhaps Int) :=
+  { from := λ(Data bytes). from bytes
+  }
+
+from_bytes :: Bytes -> Perhaps String := λbytes.
+  if Text.is_valid bytes
+  then This (Data bytes)
+  else Nope

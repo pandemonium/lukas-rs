@@ -43,7 +43,10 @@ witness ∀α. Monoid α |- Monoid (Perhaps α) :=
   }
 
 witness ∀α. Display α |- Display (Perhaps α) :=
-  { display := λt. prim_show t
+  { display := λt.
+      deconstruct t into
+        This x -> "`x`"
+      | Nope   -> ""
   }
 
 witness Traversable Perhaps :=

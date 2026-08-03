@@ -135,4 +135,4 @@ program :: IO Unit :=
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  IO.unsafeRunIO program
+  IO.unsafe_run_IO program

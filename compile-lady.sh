@@ -103,12 +103,14 @@ mkdir -p "$BUILD_DIR"
 cd "$ROOT_DIR"
 
 run_mc() {
-  cargo run -q --bin mc -- "$@"
+  cargo run --release -q --bin mc -- "$@"
 }
 
 case "$BACKEND" in
   native)
-    ROOT_C="$BUILD_DIR/root.c"
+    # Keep generated C beside Root.lady. The leading dot prevents the ordinary
+    # "$SOURCE_PATH"/*.c glob below from treating it as a foreign implementation.
+    ROOT_C="$SOURCE_PATH/.${NAME}.generated.c"
     BIN="$SOURCE_PATH/$NAME"
     C_SOURCE_LIST="$BUILD_DIR/native-c-sources.txt"
     CC=${CC:-clang}
@@ -130,8 +132,8 @@ case "$BACKEND" in
     [ -s "$ROOT_C" ] || die "the host compiler did not produce C: $ROOT_C"
 
     # Collect companion C implementations from both the source module and the
-    # complete standard-library tree. This matches c/run.sh and prevents
-    # unresolved foreign declarations at link time.
+    # complete standard-library tree. Hidden generated files are not matched
+    # by this glob.
     : > "$C_SOURCE_LIST"
 
     for foreign_c in "$SOURCE_PATH"/*.c; do
@@ -153,6 +155,8 @@ case "$BACKEND" in
       die "native C compilation failed"
     fi
 
+    echo "generated C:"
+    echo "  $ROOT_C"
     echo "built native executable:"
     echo "  $BIN"
     ;;
@@ -174,6 +178,7 @@ case "$BACKEND" in
     if [ -z "$SCHEME_BIN" ]; then
       SCHEME_BIN=$(command -v scheme 2>/dev/null || true)
     fi
+
     if [ -z "$PETITE_BIN" ]; then
       PETITE_BIN=$(command -v petite 2>/dev/null || true)
     fi
@@ -185,8 +190,10 @@ case "$BACKEND" in
 
     if [ -z "$PETITE_BOOT" ]; then
       petite_parent=$(CDPATH= cd -- "$(dirname -- "$PETITE_BIN")/.." && pwd)
-      PETITE_BOOT=$(find "$petite_parent" -type f -name petite.boot -print 2>/dev/null \
-        | head -n 1 || true)
+      PETITE_BOOT=$(
+        find "$petite_parent" -type f -name petite.boot -print 2>/dev/null \
+          | head -n 1 || true
+      )
     fi
 
     [ -n "$PETITE_BOOT" ] && [ -f "$PETITE_BOOT" ] \
