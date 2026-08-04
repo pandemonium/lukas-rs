@@ -25,4 +25,4 @@ depth :: NatF Int -> Int := λn. deconstruct n into ZeroF -> 0 | SuccF r -> r + 
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (cata depth (MkFix (SuccF (MkFix (SuccF (MkFix ZeroF)))))))
+  print_endline "`cata depth (MkFix (SuccF (MkFix (SuccF (MkFix ZeroF)))))`"

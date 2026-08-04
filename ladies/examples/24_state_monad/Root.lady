@@ -10,5 +10,5 @@ tick :: State Int Int :=
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (eval tick 41))   (* value read: 41 *)
-  print_endline (prim_show (exec tick 41))   (* final state: 42 *)
+  print_endline "`eval tick 41`"   (* value read: 41 *)
+  print_endline "`exec tick 41`"   (* final state: 42 *)

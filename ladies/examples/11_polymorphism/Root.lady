@@ -5,5 +5,5 @@ use Stdlib.
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (List.length (Cons 1 (Cons 2 (Cons 3 Nil)))))  (* 3 *)
-  print_endline (prim_show (List.length (Cons "a" (Cons "b" Nil))))        (* same fn, list of Text: 2 *)
+  print_endline "`List.length (Cons 1 (Cons 2 (Cons 3 Nil)))`"  (* 3 *)
+  print_endline "`List.length (Cons "a" (Cons "b" Nil))`"        (* same fn, list of Text: 2 *)

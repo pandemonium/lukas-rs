@@ -8,6 +8,6 @@ const :: ∀α β. α -> β -> α := λa _. a
 start :: Int -> Unit := λ_.
   print_endline "##TC"
   let inc = λx. x + 1 in
-  print_endline (prim_show (compose inc inc 40))  (* inc (inc 40) = 42 *)
-  print_endline (prim_show (flip const 1 2))      (* const 2 1 = 2 *)
-  print_endline (prim_show (id 5))
+  print_endline "`compose inc inc 40`"  (* inc (inc 40) = 42 *)
+  print_endline "`flip const 1 2`"      (* const 2 1 = 2 *)
+  print_endline "`id 5`"

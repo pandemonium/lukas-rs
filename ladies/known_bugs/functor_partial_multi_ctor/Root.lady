@@ -40,5 +40,5 @@ get := λq. deconstruct q into MkQ1 a x -> x | MkQ2 a y -> y
 
 start := λ_.
   print_endline "##TC"
-  print_endline (prim_show (get (fmap (λn. n + 1) (MkQ1 "k" 41))))
-  print_endline (prim_show (get (fmap (λn. n + 1) (MkQ2 "k" 9))))
+  print_endline "`get (fmap (λn. n + 1) (MkQ1 "k" 41))`"
+  print_endline "`get (fmap (λn. n + 1) (MkQ2 "k" 9))`"

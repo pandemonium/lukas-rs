@@ -43,7 +43,7 @@ message :: Bx.Slice :=
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (Bx.length message))
-  print_endline (prim_show (Bx.get_u8 message 0))
-  print_endline (prim_show (Bx.get_u8 message 1))
-  print_endline (prim_show (Bx.get_i32_le message 2))
+  print_endline "`Bx.length message`"
+  print_endline "`Bx.get_u8 message 0`"
+  print_endline "`Bx.get_u8 message 1`"
+  print_endline "`Bx.get_i32_le message 2`"

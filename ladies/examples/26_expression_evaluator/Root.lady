@@ -13,4 +13,4 @@ start :: Int -> Unit := λ_.
   print_endline "##TC"
   (* (2 + 3) * (10 + (-4))  =  5 * 6  =  30 *)
   let e = Mul (Add (Lit 2) (Lit 3)) (Add (Lit 10) (Neg (Lit 4))) in
-  print_endline (prim_show (eval e))   (* 30 *)
+  print_endline "`eval e`"   (* 30 *)

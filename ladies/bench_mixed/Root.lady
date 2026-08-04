@@ -82,4 +82,4 @@ loop :: Int -> Int -> Int := λn acc.
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (loop 2000000 1))
+  print_endline "`loop 2000000 1`"

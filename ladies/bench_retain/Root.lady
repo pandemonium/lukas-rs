@@ -30,4 +30,4 @@ start :: Int -> Unit := λ_.
   let keep = build 400000 Nil in     (* ~400k live nodes -> tenured old gen *)
   let base = sum keep 0 in           (* touch it, keep it live *)
   let c = churn keep 1000000 base in (* churn 1e6 rounds while keep stays live *)
-  print_endline (prim_show c)
+  print_endline "`c`"

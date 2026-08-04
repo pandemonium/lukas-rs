@@ -41,4 +41,4 @@ sample :: Expr Text Int := MkExpr (Apply 9 (MkExpr (Var 9 "x")) (MkExpr (Lit 9 (
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (countNodes sample))
+  print_endline "`countNodes sample`"

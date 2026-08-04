@@ -20,4 +20,4 @@ both :: Perhaps Int -> Perhaps Int -> Int := λp q.
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (both (This 3) (This 4)))
+  print_endline "`both (This 3) (This 4)`"

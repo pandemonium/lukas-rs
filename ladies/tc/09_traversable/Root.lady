@@ -49,5 +49,5 @@ start :: Int -> Unit := λ_.
   let r  = traverse (λx. if x > 0 then This x else Nope) xs in
   print_endline "##TC"
   deconstruct r into
-    This ys -> print_endline (prim_show (fold_right (λa z. a + z) 0 ys))
+    This ys -> print_endline "`fold_right (λa z. a + z) 0 ys`"
   | Nope    -> print_endline "nope"

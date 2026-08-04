@@ -26,4 +26,4 @@ mconcat :: ∀α. Monoid α |- List α -> α :=
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (mconcat (Cons 1 (Cons 2 (Cons 3 Nil)))))
+  print_endline "`mconcat (Cons 1 (Cons 2 (Cons 3 Nil)))`"

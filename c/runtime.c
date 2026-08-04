@@ -29,144 +29,47 @@
     Value NAME
 
 bool val_eq(Value a, Value b) {
-    Tag ta = value_tag(a);
-    if (ta != value_tag(b)) {
+    // Immediates (Int/Bool/Char/Unit) compare by word identity: two immediate values
+    // are equal exactly when their words match, so no per-kind tag is needed. A
+    // well-typed `=` only ever compares two values of the same type, so if one side
+    // is an immediate the other is too (and a stray immediate-vs-pointer mix still
+    // compares unequal, since their words differ). Compound values (tuples, sum types)
+    // are never compared here -- their equality is structural and lives in `Eq`
+    // witnesses that recurse through the leaves -- so only Text needs the pointer path.
+    if (a.w & IMM_TAG) {
+        return a.w == b.w;
+    }
+    // Text/Bytes are OBJ_SLICE (OBJ_TEXT is legacy): compare by length then bytes.
+    uint8_t ka = HEADER(as_ptr(a))->kind;
+    if (ka != HEADER(as_ptr(b))->kind) {
         return false;
     }
-    switch (ta) {
-    case TAG_INT:  return as_int(a) == as_int(b);
-    case TAG_BOOL: return as_bool(a) == as_bool(b);
-    case TAG_CHAR: return as_char(a) == as_char(b);
-    case TAG_TEXT: {
-        // Text/Bytes are OBJ_SLICE: compare by length then bytes (no NUL, no strcmp).
+    if (ka == OBJ_SLICE || ka == OBJ_TEXT) {
         size_t na = slice_len(a), nb = slice_len(b);
         return na == nb && memcmp(slice_ptr(a), slice_ptr(b), na) == 0;
     }
-    case TAG_UNIT: return true;
-    default:       return false;
-    }
+    return false;
 }
 
-// Render a value to a freshly malloc'd C string, mirroring the interpreter's
-// `Val` Display (the reference the `expected` files are generated from).
-static char *show_alloc(Value x);
-
-// A product (tuple or record) prints as `(e0, e1, …)`: elements comma-separated
-// and parenthesised, so nesting stays visible -- `((1, 2), 3)` rather than the
-// flat `1, 2, 3`. NB: constructor values share the TAG_TUPLE layout (name in
-// slot 0), so they too print in this shape -- see the note in prim_show.
-static char *show_tuple(Tuple *t) {
-    size_t n = HEADER(t)->body / sizeof(Value); // count recovered from body size
-    char **parts = malloc(n * sizeof *parts);
-    size_t total = 3; // '(' + ')' + '\0'
-    for (size_t i = 0; i < n; i++) {
-        parts[i] = show_alloc(t->elems[i]);
-        total += strlen(parts[i]) + (i ? 2 : 0); // ", " between elements
-    }
-
-    char *out = malloc(total);
-    char *p = out;
-    *p++ = '(';
-    for (size_t i = 0; i < n; i++) {
-        if (i) {
-            *p++ = ',';
-            *p++ = ' ';
-        }
-        size_t len = strlen(parts[i]);
-        memcpy(p, parts[i], len);
-        p += len;
-        free(parts[i]);
-    }
-    *p++ = ')';
-    *p = '\0';
-    free(parts);
-    return out;
-}
-
-// A constructor value prints as `#<tag>(fields…)` (or just `#<tag>` for a
-// nullary constructor). The runtime carries no constructor *names*, only the
-// integer tag, so `show` of a data value is a debugging aid rather than
-// source-faithful -- the previous string-tag layout printed the mangled name,
-// but nothing depends on that.
-static char *show_data(Value x) {
-    size_t n = data_len(x);
-    char tagbuf[24];
-    snprintf(tagbuf, sizeof tagbuf, "#%llu", (unsigned long long)data_tag(x));
-    if (n == 0) {
-        return strdup(tagbuf);
-    }
-    char **parts = malloc(n * sizeof *parts);
-    size_t total = strlen(tagbuf) + 3; // "(" + ")" + '\0'
-    for (size_t i = 0; i < n; i++) {
-        parts[i] = show_alloc(data_field(x, i));
-        total += strlen(parts[i]) + (i ? 2 : 0); // ", " between fields
-    }
-    char *out = malloc(total);
-    char *p = out;
-    size_t tlen = strlen(tagbuf);
-    memcpy(p, tagbuf, tlen);
-    p += tlen;
-    *p++ = '(';
-    for (size_t i = 0; i < n; i++) {
-        if (i) {
-            *p++ = ',';
-            *p++ = ' ';
-        }
-        size_t len = strlen(parts[i]);
-        memcpy(p, parts[i], len);
-        p += len;
-        free(parts[i]);
-    }
-    *p++ = ')';
-    *p = '\0';
-    free(parts);
-    return out;
-}
-
-static char *show_alloc(Value x) {
+// `prim_show` is monomorphised: codegen selects one of these leaves from the
+// argument's static type. Each renders a single primitive value to an owned Text;
+// compound values never reach here -- their `Display` witnesses recurse through the
+// leaves. (This mirrors the interpreter's `Val` Display, the reference the `expected`
+// files are generated from.)
+Value prim_show_int(Value x) {
     char buf[32];
-    switch (value_tag(x)) {
-    case TAG_INT:
-        snprintf(buf, sizeof buf, "%lld", (long long)as_int(x));
-        return strdup(buf);
-    case TAG_BOOL:
-        return strdup(as_bool(x) ? "true" : "false");
-    case TAG_CHAR:
-        buf[0] = as_char(x);
-        buf[1] = '\0';
-        return strdup(buf);
-    case TAG_TEXT: {
-        // A Text is an OBJ_SLICE (not NUL-terminated): copy its bytes into a fresh
-        // NUL-terminated C string for the show machinery.
-        size_t n = slice_len(x);
-        char *s = malloc(n + 1);
-        memcpy(s, slice_ptr(x), n);
-        s[n] = '\0';
-        return s;
-    }
-    case TAG_UNIT:
-        return strdup("()");
-    case TAG_TUPLE:
-        return show_tuple(as_tuple(x));
-    case TAG_DATA:
-        return show_data(x);
-    default:
-        return strdup("<value>");
-    }
+    int n = snprintf(buf, sizeof buf, "%lld", (long long)as_int(x));
+    return mk_textn(buf, (size_t)n);
 }
 
-// NB: sum-type constructors are TAG_TUPLE with the constructor name in slot 0,
-// indistinguishable at runtime from a plain tuple, so `Some 5` currently renders
-// as `(Some, 5)` rather than the interpreter's `(Some 5)`. Disambiguating needs
-// a representation change (a distinct tag/marker); tuples and records are exact.
-Value prim_show(Value x) {
-    // `show_alloc` returns a temporary malloc; hand its contents to the collector
-    // as an owned text and release the temporary.
-    char *s = show_alloc(x);
-    Value v = mk_text(s);
-    free(s);
-    return v;
+Value prim_show_char(Value x) {
+    char c = as_char(x);
+    return mk_textn(&c, 1);
 }
+
+// Display of a Text is the Text itself -- immutable OBJ_SLICE, so returning it is a
+// zero-copy identity.
+Value prim_show_text(Value x) { return x; }
 
 Value prim_print_endline(Value x) {
     // Text is an OBJ_SLICE with an explicit length (no NUL); write exactly its bytes.
@@ -226,7 +129,6 @@ BINOP(builtin_and, prim_and);
 BINOP(builtin_or, prim_or);
 BINOP(builtin_xor, prim_xor);
 
-UNOP(builtin_show, prim_show);
 UNOP(builtin_print_endline, prim_print_endline);
 
 // text_fold_right : (Char -> a -> a) -> a -> Text -> a
@@ -266,7 +168,6 @@ void runtime_init(void) {
     builtin_and = mk_closure(builtin_and_1, 0);
     builtin_or = mk_closure(builtin_or_1, 0);
     builtin_xor = mk_closure(builtin_xor_1, 0);
-    builtin_show = mk_closure(builtin_show_1, 0);
     builtin_print_endline = mk_closure(builtin_print_endline_1, 0);
     builtin_text_fold_right = mk_closure(tfr_1, 0);
 }

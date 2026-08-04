@@ -5,4 +5,4 @@ start :: Int -> Unit := λ_.
   let x = 10 in
   let y = x + 5 in       (* refers to the earlier binding *)
   let x = y * 2 in       (* shadows the outer x *)
-  print_endline (prim_show x)   (* 30 *)
+  print_endline "`x`"   (* 30 *)

@@ -3,5 +3,5 @@ use Stdlib.
 start :: Int -> Unit := λ_.
   print_endline "##TC"
   deconstruct traverse (λx. This x) (Cons 1 (Cons 2 (Cons 3 Nil))) into
-    This ys -> print_endline (prim_show (List.fold_left (λz a. z * 10 + a) 0 ys))
+    This ys -> print_endline "`List.fold_left (λz a. z * 10 + a) 0 ys`"
   | Nope    -> print_endline "no"

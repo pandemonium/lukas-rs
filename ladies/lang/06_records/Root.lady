@@ -15,7 +15,7 @@ start :: Int -> Unit := λ_.
   let p = mk 3 4 in
 
   (* field projection ; expect 25 *)
-  print_endline (prim_show (mag2 p))
+  print_endline "`mag2 p`"
 
   (* record pattern ; expect 7 *)
-  deconstruct p into { X: a; Y: b } -> print_endline (prim_show (a + b))
+  deconstruct p into { X: a; Y: b } -> print_endline "`a + b`"

@@ -39,7 +39,7 @@ withDefault :: ∀m : * -> *. Applicative m + MonadError Text m |- Int -> m Int 
   catchError mx (λ_. pure dflt)
 
 forceIO :: ∀a. IO a -> a := λ(Suspend f). f ()
-showR :: Result Int Text -> Text := λr. Result.result (λe. e) (λn. prim_show n) r
+showR :: Result Int Text -> Text := λr. Result.result (λe. e) (λn. "`n`") r
 run :: ExceptT IO Text Int -> Text := λp. showR (forceIO (runExceptT p))
 
 start :: Int -> Unit := λ_.

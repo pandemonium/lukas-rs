@@ -29,4 +29,4 @@ fold_map :: ∀t : *->* α m. Monoid m + Foldable t |- (α -> m) -> t α -> m :=
 start :: Int -> Unit := λ_.
   print_endline "##TC"
   (* sum the list by folding into the Int monoid *)
-  print_endline (prim_show (fold_map (λx. x) (Cons 1 (Cons 2 (Cons 3 Nil)))))   (* 6 *)
+  print_endline "`fold_map (λx. x) (Cons 1 (Cons 2 (Cons 3 Nil)))`"   (* 6 *)

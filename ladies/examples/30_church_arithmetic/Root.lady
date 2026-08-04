@@ -90,11 +90,11 @@ church :: ∀a. (a -> a) -> a -> Fix NatF -> a := λf x n.
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (toInt (add three (fromInt 4))))          (* 7   *)
-  print_endline (prim_show (toInt (mul three (fromInt 4))))          (* 12  *)
-  print_endline (prim_show (toInt (pow two (fromInt 5))))            (* 32  *)
-  print_endline (prim_show (toInt (monus (fromInt 7) (fromInt 4))))  (* 3   *)
-  print_endline (prim_show (toInt (factorial (fromInt 5))))          (* 120 *)
-  print_endline (prim_show (eqNat (mul three two) (fromInt 6)))      (* true *)
-  print_endline (prim_show (toInt (church (λk. mul two k) one (fromInt 8))))  (* 256 = 2^8 *)
-  print_endline (prim_show (toInt (church succ zero three)))         (* 3, since f^n x with f=succ,x=zero *)
+  print_endline "`toInt (add three (fromInt 4))`"          (* 7   *)
+  print_endline "`toInt (mul three (fromInt 4))`"          (* 12  *)
+  print_endline "`toInt (pow two (fromInt 5))`"            (* 32  *)
+  print_endline "`toInt (monus (fromInt 7) (fromInt 4))`"  (* 3   *)
+  print_endline "`toInt (factorial (fromInt 5))`"          (* 120 *)
+  print_endline "`eqNat (mul three two) (fromInt 6)`"      (* true *)
+  print_endline "`toInt (church (λk. mul two k) one (fromInt 8))`"  (* 256 = 2^8 *)
+  print_endline "`toInt (church succ zero three)`"         (* 3, since f^n x with f=succ,x=zero *)

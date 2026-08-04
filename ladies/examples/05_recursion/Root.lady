@@ -9,5 +9,5 @@ fibonacci :: Int -> Int := λn.
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (factorial 5))    (* 120 *)
-  print_endline (prim_show (fibonacci 10))   (* 89 *)
+  print_endline "`factorial 5`"    (* 120 *)
+  print_endline "`fibonacci 10`"   (* 89 *)

@@ -15,4 +15,4 @@ witness Monoid Int :=
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (mappend 3 (mappend 4 mempty)))
+  print_endline "`mappend 3 (mappend 4 mempty)`"

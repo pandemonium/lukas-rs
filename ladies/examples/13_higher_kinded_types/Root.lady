@@ -12,7 +12,7 @@ bump := λx. fmap (λn. n + 1) x
 
 start := λ_.
   print_endline "##TC"
-  print_endline (prim_show (sum_list (bump (Cons 1 (Cons 2 Nil)))))   (* 5, at f = List *)
+  print_endline "`sum_list (bump (Cons 1 (Cons 2 Nil)))`"   (* 5, at f = List *)
   deconstruct bump (This 40) into                                     (* 41, at f = Perhaps *)
-    This n -> print_endline (prim_show n)
+    This n -> print_endline "`n`"
   | Nope   -> print_endline "-"

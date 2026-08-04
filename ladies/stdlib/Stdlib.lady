@@ -46,3 +46,18 @@ witness Ord Int :=
   { lte := λp q. p <= q
   }
 
+(* --------------------------------------------------------------- Eq for tuples *)
+(* Derived product equality: tuples are equal element-wise, each element compared by *)
+(* its own `Eq` witness. Provided for a useful range of arities. *)
+witness ∀α β. Eq α + Eq β |- Eq (α, β) :=
+  { eq := λ(a, b) (c, d). eq a c and eq b d
+  }
+
+witness ∀α β γ. Eq α + Eq β + Eq γ |- Eq (α, β, γ) :=
+  { eq := λ(a, b, c) (d, e, f). eq a d and eq b e and eq c f
+  }
+
+witness ∀α β δ ε. Eq α + Eq β + Eq δ + Eq ε |- Eq (α, β, δ, ε) :=
+  { eq := λ(a, b, c, d) (e, f, g, h). eq a e and eq b f and eq c g and eq d h
+  }
+

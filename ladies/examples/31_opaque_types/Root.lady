@@ -28,5 +28,5 @@ start :: Int -> Unit := λ_.
   print_endline "##TC"
   let room = Celsius.of_degrees 20 in
   let hot  = Celsius.warmer room 5 in
-  print_endline (prim_show (Celsius.degrees hot))                              (* 25 *)
-  print_endline (prim_show (Celsius.degrees (Celsius.of_degrees (0 - 300))))   (* -273, clamped *)
+  print_endline "`Celsius.degrees hot`"                              (* 25 *)
+  print_endline "`Celsius.degrees (Celsius.of_degrees (0 - 300))`"   (* -273, clamped *)

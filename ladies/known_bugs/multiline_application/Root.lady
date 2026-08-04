@@ -28,4 +28,4 @@ r := f 1
 
 start := λ_.
   print_endline "##TC"
-  print_endline (prim_show r)
+  print_endline "`r`"

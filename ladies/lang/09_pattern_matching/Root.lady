@@ -98,7 +98,7 @@ merge :: Perhaps Int -> Perhaps Int -> Perhaps Int := λa b.
   | Nope,   Nope   -> b
 
 show_perhaps :: Perhaps Int -> Text := λp.
-  deconstruct p into This n -> prim_show n | Nope -> "nope"
+  deconstruct p into This n -> "`n`" | Nope -> "nope"
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
@@ -106,10 +106,10 @@ start :: Int -> Unit := λ_.
   let three = Cons 10 (Cons 20 (Cons 30 Nil)) in
   print_endline (describe Nil)                             (* empty *)
   print_endline (describe three)                           (* three or more *)
-  print_endline (prim_show (sum_first_three three))        (* 60 *)
-  print_endline (prim_show (sum_first_three one))          (* 10 *)
+  print_endline "`sum_first_three three`"        (* 60 *)
+  print_endline "`sum_first_three one`"          (* 10 *)
   let tree = Branch (Branch (Leaf 1) (Leaf 2)) (Leaf 3) in
-  print_endline (prim_show (sum_tree tree))                (* 6 *)
+  print_endline "`sum_tree tree`"                (* 6 *)
   print_endline (if is_pair (Branch (Leaf 1) (Leaf 2)) then "pair" else "no")   (* pair *)
   print_endline (if is_pair tree then "pair" else "no")    (* no *)
   print_endline (paint { colour := Red; alpha := 255 })    (* solid red *)
@@ -123,8 +123,8 @@ start :: Int -> Unit := λ_.
   print_endline (theme_name { primary := Green; accent := Blue; level := 2 })    (* sky *)
   print_endline (theme_name { primary := Green; accent := Green; level := 1 })   (* custom *)
   let pixels = Cons { colour := Green; alpha := 77 } Nil in
-  print_endline (prim_show (first_alpha pixels))           (* 77 *)
+  print_endline "`first_alpha pixels`"           (* 77 *)
   let pixels2 = Cons { colour := Blue; alpha := 10 } (Cons { colour := Red; alpha := 88 } Nil) in
-  print_endline (prim_show (first_red_alpha pixels2))      (* 88 *)
+  print_endline "`first_red_alpha pixels2`"      (* 88 *)
   print_endline (show_perhaps (merge (This 40) (This 2)))  (* 42 *)
   print_endline (show_perhaps (merge Nope (This 9)))       (* 9 *)

@@ -14,6 +14,8 @@ signature Ord ::= ∀α. Eq α |-
   { lte :: α -> α -> Bool
   }
 
+Ordering ::= Less | Equal | Greater
+
 signature Functor ::= ∀f : * -> *.
   { fmap :: ∀α β. (α -> β) -> f α -> f β
   }

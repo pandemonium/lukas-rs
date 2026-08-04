@@ -12,7 +12,7 @@ halve :: Int -> Perhaps Int := λn.
   if (n % 2) = 0 then This (n / 2) else Nope
 
 show_maybe :: Perhaps Int -> Text := λp.
-  deconstruct p into This n -> prim_show n | Nope -> "stopped"
+  deconstruct p into This n -> "`n`" | Nope -> "stopped"
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"

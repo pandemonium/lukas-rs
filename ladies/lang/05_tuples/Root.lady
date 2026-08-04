@@ -27,43 +27,43 @@ start :: Int -> Unit := λ_.
 
   (* bare tuples -- no enclosing parens -- plus ordinal projection *)
   let t = 1, 2, 3 in
-  print_endline (prim_show (t.0 + t.1 + t.2))              (* 6 *)
+  print_endline "`t.0 + t.1 + t.2`"              (* 6 *)
 
   let p = 10, 20 in
-  print_endline (prim_show (p.0 + p.1))                    (* 30 *)
+  print_endline "`p.0 + p.1`"                    (* 30 *)
 
   (* elements may be arbitrary expressions; `,` binds looser than + and * *)
   let e = 1 + 1, 2 * 3 in
-  print_endline (prim_show (e.0 + e.1))                    (* 8 *)
+  print_endline "`e.0 + e.1`"                    (* 8 *)
 
   let q = 1, 2, 3, 4 in
-  print_endline (prim_show q.3)                            (* 4 *)
+  print_endline "`q.3`"                            (* 4 *)
 
   (* tuple pattern in a let binding; the value is a bare tuple *)
   let (a, b) = 5, 6 in
-  print_endline (prim_show (a + b))                        (* 11 *)
+  print_endline "`a + b`"                        (* 11 *)
 
   (* here the parens GROUP the tuple as one argument to swap *)
-  print_endline (prim_show (swap (7, 100)).0)             (* 100 *)
+  print_endline "`(swap (7, 100)).0`"             (* 100 *)
 
   (* bare tuple as a deconstruct scrutinee *)
-  deconstruct 3, 4 into (a, b) -> print_endline (prim_show (a * b))   (* 12 *)
+  deconstruct 3, 4 into (a, b) -> print_endline "`a * b`"   (* 12 *)
 
   (* nested tuple pattern (parens group the inner tuple) *)
   deconstruct (1, 2), 3 into
-    ((a, b), c) -> print_endline (prim_show (a + b + c))   (* 6 *)
+    ((a, b), c) -> print_endline "`a + b + c`"   (* 6 *)
 
-  print_endline (prim_show (mkPair 8 9).1)                 (* 9 *)
-  print_endline (prim_show (sum3 (1, 2, 3)))               (* 6 *)
-  print_endline (prim_show (sumNested ((1, 2), 3)))        (* 6 *)
-  print_endline (prim_show (dup 5).0)                      (* 5 *)
+  print_endline "`(mkPair 8 9).1`"                 (* 9 *)
+  print_endline "`sum3 (1, 2, 3)`"               (* 6 *)
+  print_endline "`sumNested ((1, 2), 3)`"        (* 6 *)
+  print_endline "`(dup 5).0`"                      (* 5 *)
 
   (* Nested tuples keep their shape: `(1, 2), 3` is a PAIR whose first element is *)
   (* itself a pair, distinct from the flat triple `1, 2, 3`. Projection reaches *)
-  (* into the nesting, and prim_show parenthesises so the shape is visible. *)
+  (* into the nesting, and display parenthesises so the shape is visible. *)
   let n = (1, 2), 3 in
-  print_endline (prim_show n.0)                            (* (1, 2) *)
-  print_endline (prim_show n.0.1)                          (* 2 *)
-  print_endline (prim_show n)                              (* ((1, 2), 3) *)
-  print_endline (prim_show (1, (2, 3)))                    (* (1, (2, 3)) *)
-  print_endline (prim_show (1, 2, 3))                      (* (1, 2, 3) *)
+  print_endline "`n.0`"                            (* (1, 2) *)
+  print_endline "`n.0.1`"                          (* 2 *)
+  print_endline "`n`"                              (* ((1, 2), 3) *)
+  print_endline "`1, (2, 3)`"                    (* (1, (2, 3)) *)
+  print_endline "`1, 2, 3`"                      (* (1, 2, 3) *)

@@ -28,4 +28,4 @@ start :: Int -> Unit := λ_.
   let xs = Cons 1 (Cons 2 (Cons 3 Nil)) in
   let ys = fmap (λx. x * 10) xs in
   print_endline "##TC"
-  print_endline (prim_show (fold_right (λa z. a + z) 0 ys))
+  print_endline "`fold_right (λa z. a + z) 0 ys`"

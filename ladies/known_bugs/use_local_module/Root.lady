@@ -17,4 +17,4 @@ use M.
 
 start := λ_.
   print_endline "##TC"
-  print_endline (prim_show (helper 21))
+  print_endline "`helper 21`"

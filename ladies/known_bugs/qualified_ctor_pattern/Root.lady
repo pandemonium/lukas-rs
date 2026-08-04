@@ -17,4 +17,4 @@ len := λxs. deconstruct xs into
 
 start := λ_.
   print_endline "##TC"
-  print_endline (prim_show (len (Cons 1 Nil)))
+  print_endline "`len (Cons 1 Nil)`"

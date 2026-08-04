@@ -9,5 +9,5 @@ module Stats:
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (Math.cube 3))         (* 27 *)
-  print_endline (prim_show (Stats.mean3 3 6 9))   (* 6 *)
+  print_endline "`Math.cube 3`"         (* 27 *)
+  print_endline "`Stats.mean3 3 6 9`"   (* 6 *)

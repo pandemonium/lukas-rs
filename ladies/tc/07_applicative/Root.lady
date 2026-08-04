@@ -28,5 +28,5 @@ start :: Int -> Unit := λ_.
   let r = liftA2 (λa b. a + b) (This 3) (This 4) in
   print_endline "##TC"
   deconstruct r into
-    This x -> print_endline (prim_show x)
+    This x -> print_endline "`x`"
   | Nope   -> print_endline "nope"

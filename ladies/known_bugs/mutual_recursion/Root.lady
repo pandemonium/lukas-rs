@@ -12,4 +12,4 @@ pong := λn. if n <= 0 then 1 else ping (n - 1)
 
 start := λ_.
   print_endline "##TC"
-  print_endline (prim_show (ping 4))
+  print_endline "`ping 4`"

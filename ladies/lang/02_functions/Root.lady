@@ -15,14 +15,14 @@ start :: Int -> Unit := λ_.
 
   (* partial application ; expect 42 *)
   let inc = add 1 in
-  print_endline (prim_show (inc 41))
+  print_endline "`inc 41`"
 
   (* composition ; expect 42 *)
   let twice = compose inc inc in
-  print_endline (prim_show (twice 40))
+  print_endline "`twice 40`"
 
   (* flip + const ; flip const 99 7 = const 7 99 = 7 *)
-  print_endline (prim_show (flip const 99 7))
+  print_endline "`flip const 99 7`"
 
   (* identity ; expect 5 *)
-  print_endline (prim_show (id 5))
+  print_endline "`id 5`"

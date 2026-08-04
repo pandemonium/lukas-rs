@@ -11,4 +11,4 @@ combine :: ∀α. Monoid α |- List α -> α := λxs.
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (combine (Cons 1 (Cons 2 (Cons 3 Nil)))))   (* 6 *)
+  print_endline "`combine (Cons 1 (Cons 2 (Cons 3 Nil)))`"   (* 6 *)

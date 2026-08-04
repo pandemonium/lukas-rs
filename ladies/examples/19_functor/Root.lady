@@ -4,7 +4,7 @@
 use Stdlib.
 
 show_maybe :: Perhaps Int -> Text := λp.
-  deconstruct p into This n -> prim_show n | Nope -> "-"
+  deconstruct p into This n -> "`n`" | Nope -> "-"
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"

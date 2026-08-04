@@ -4,7 +4,7 @@ start :: Int -> Unit := λ_.
   print_endline "##TC"
 
   (* arithmetic -- * / % bind tighter than + - ; 2 + 12 - 5 + 1 = 10 *)
-  print_endline (prim_show (2 + 3 * 4 - 10 / 2 + 7 % 3))
+  print_endline "`2 + 3 * 4 - 10 / 2 + 7 % 3`"
 
   (* comparison (= < > <= >=) and boolean and/or, if as an expression *)
   print_endline (if (3 < 4) and (5 >= 5) then "yes" else "no")
@@ -12,4 +12,4 @@ start :: Int -> Unit := λ_.
 
   (* text and char literals *)
   print_endline "a text literal"
-  print_endline (prim_show 'x')
+  print_endline "`'x'`"

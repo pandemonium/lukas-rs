@@ -16,4 +16,4 @@ witness Squash Box :=
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (squash (MkBox 5)))   (* mappend 5 0 = 5 *)
+  print_endline "`squash (MkBox 5)`"   (* mappend 5 0 = 5 *)

@@ -9,7 +9,7 @@ add_maybe :: Perhaps Int -> Perhaps Int -> Perhaps Int := λa b.
   | otherwise      -> Nope
 
 show_maybe :: Perhaps Int -> Text := λp.
-  deconstruct p into This n -> prim_show n | Nope -> "nope"
+  deconstruct p into This n -> "`n`" | Nope -> "nope"
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"

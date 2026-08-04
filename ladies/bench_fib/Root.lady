@@ -7,4 +7,4 @@ fib :: Int -> Int := λn.
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (fib 42))
+  print_endline "`fib 42`"

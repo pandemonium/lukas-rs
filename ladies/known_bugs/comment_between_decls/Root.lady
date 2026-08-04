@@ -17,4 +17,4 @@ g := λx. x + 2
 
 start := λ_.
   print_endline "##TC"
-  print_endline (prim_show (f (g 0)))
+  print_endline "`f (g 0)`"

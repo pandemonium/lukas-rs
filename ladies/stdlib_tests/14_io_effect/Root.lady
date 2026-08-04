@@ -1,9 +1,9 @@
 use Stdlib.
 (* IO as the traverse/sequence effect: actions run left-to-right, values collected. loud x prints x and returns x squared. *)
 shL   :: List Int    -> Text := λxs. deconstruct xs into Nil -> "nil" | Cons a t -> "`a`,`shL t`"
-shPI  :: Perhaps Int -> Text := λp. deconstruct p into This n -> prim_show n | Nope -> "nope"
+shPI  :: Perhaps Int -> Text := λp. deconstruct p into This n -> "`n`" | Nope -> "nope"
 runIO :: ∀α. IO α -> α := λ(Suspend th). th ()
-loud  :: Int -> IO Int := λx. Suspend (λ_. let _ = print_endline (prim_show x) in x * x)
+loud  :: Int -> IO Int := λx. Suspend (λ_. let _ = print_endline "`n`" in x * x)
 start :: Int -> Unit := λ_.
   print_endline "##TC"
   print_endline (shL  (runIO (traverse loud (Cons 1 (Cons 2 (Cons 3 Nil))))))

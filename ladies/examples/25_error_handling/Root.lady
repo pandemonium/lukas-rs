@@ -16,7 +16,7 @@ chain :: ∀α β e. (α -> Result e β) -> Result e α -> Result e β := λf r.
 
 show :: Result Error Int -> Text := λr.
   deconstruct r into
-    Return a          -> prim_show a
+    Return a          -> "`a`"
   | Fault DivByZero   -> "error: divide by zero"
   | Fault Negative    -> "error: negative"
 

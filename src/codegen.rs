@@ -12,6 +12,7 @@ use crate::{
     closed::{self, CaptureInfo, Closed, Identifier, LexicalLevel},
     lambda_lift::{self, ChainWorker, ClosureInfo, LiftedFunction, TopLevelBinding, Worker},
     phase,
+    typer::{BaseType, Type},
 };
 
 pub struct Codegen;
@@ -57,7 +58,6 @@ fn surface_name(q: &QualifiedName) -> String {
 fn map_builtin_name(q: &QualifiedName) -> &'static str {
     match q.member.as_str() {
         "print_endline" => "builtin_print_endline",
-        "prim_show" => "builtin_show",
         "=" => "builtin_eq",
         "-" => "builtin_sub",
         "+" => "builtin_add",
@@ -141,6 +141,24 @@ fn builtin_prim(head: &Expr) -> Option<(&'static str, usize)> {
         "print_endline" => ("prim_print_endline", 1),
         _otherwise => return None,
     })
+}
+
+// The monomorphic `prim_show` leaf for `arg`'s static type. `prim_show` is only ever
+// applied at a primitive (leaf) type -- the `Display` witnesses for compound types
+// recurse through `display`, never calling `prim_show` on a tuple/constructor -- so a
+// non-leaf here is a compiler invariant break.
+fn show_prim(arg: &Expr) -> &'static str {
+    match &arg.annotation().type_info.inferred_type {
+        Type::Base(BaseType::Int) => "prim_show_int",
+        Type::Base(BaseType::Char) => "prim_show_char",
+        Type::Base(BaseType::Text) => "prim_show_text",
+        // `Text` is the stdlib DU `Text ::= Text Bytes`, so it appears as a constructor.
+        Type::Constructor(name) if name.member.as_str() == "Text" => "prim_show_text",
+        other => panic!(
+            "prim_show applied to non-primitive type {other:?}; render compound values \
+             through `display` / string interpolation, not raw `prim_show`"
+        ),
+    }
 }
 
 // Fresh scrutinee temporaries for `deconstruct`. A monotonic counter keeps each
@@ -565,6 +583,15 @@ impl lambda_lift::Program {
 
         if let Some((prim, arity)) = builtin_prim(head) {
             if arity == args.len() {
+                // `prim_show` is monomorphised: the runtime carries no immediate tag, so
+                // codegen picks the leaf (`prim_show_int`/`_char`/`_text`) from the
+                // argument's static type. Only primitive types reach here -- compound
+                // values are rendered by their `Display` witnesses.
+                let prim = if prim == "prim_show" {
+                    show_prim(args[0])
+                } else {
+                    prim
+                };
                 write!(code, "{prim}(")?;
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {

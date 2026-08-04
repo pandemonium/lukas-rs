@@ -87,7 +87,7 @@ sample :: Expr Text Int := MkExpr appNode
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (countNodes sample))                      (* 4 *)
-  print_endline (prim_show (sumAnnotations sample))                  (* 24 *)
-  print_endline (prim_show (countNodes (stripAnnotations sample)))   (* 4 *)
-  print_endline (prim_show (sumAnnotations (mapAnnotation (λn. n + 1) sample)))  (* 28 *)
+  print_endline "`countNodes sample`"                      (* 4 *)
+  print_endline "`sumAnnotations sample`"                  (* 24 *)
+  print_endline "`countNodes (stripAnnotations sample)`"   (* 4 *)
+  print_endline "`sumAnnotations (mapAnnotation (λn. n + 1) sample)`"  (* 28 *)

@@ -340,31 +340,11 @@ static void mark_obj(void *body) {
     }
 }
 
-// The logical kind of a value, for the runtime's own dispatch. Immediates decode
-// from the low bits; a pointer's kind comes from its heap header (which is also
-// how a borrowed literal's static descriptor reports OBJ_TEXT -> TAG_TEXT).
-Tag value_tag(Value v) {
-    if (v.w & 1) {
-        switch (v.w & TAGMASK) {
-        case IMM_INT:  return TAG_INT;
-        case IMM_BOOL: return TAG_BOOL;
-        case IMM_CHAR: return TAG_CHAR;
-        default:       return TAG_UNIT; // IMM_UNIT
-        }
-    }
-    switch (HEADER(as_ptr(v))->kind) {
-    case OBJ_TEXT:    return TAG_TEXT;
-    // Text is the stdlib DU `Text ::= Text Bytes`, which newtype-erases to its Bytes
-    // (an OBJ_SLICE). A user-facing Bytes erases to the same OBJ_SLICE, so both report
-    // TAG_TEXT and share the runtime's byte-oriented eq/show. (OBJ_TEXT is legacy: no
-    // path produces it now -- literals and `mk_textn` build slices.)
-    case OBJ_SLICE:   return TAG_TEXT;
-    case OBJ_TUPLE:   return TAG_TUPLE;
-    case OBJ_CLOSURE: return TAG_CLOSURE;
-    case OBJ_DATA:    return TAG_DATA;
-    default:          return TAG_OBJECT; // buffer / bytes / mmap
-    }
-}
+// `value_tag` is gone: the word no longer tags *which* immediate a value is, and the
+// runtime's two former consumers are now representation-driven instead -- `val_eq`
+// compares immediates by word identity and pointers by `GcHeader.kind`, and `prim_show`
+// is monomorphised per-type at codegen. `GcHeader.kind` (the OBJ_* kinds) is untouched;
+// the GC still dispatches its field tracing on it.
 
 static void mark_value(Value v) {
     // A precise Value: immediates (Int/Bool/Char/Unit) are odd; every even word
@@ -431,7 +411,7 @@ static Value *const gc_builtin_roots[] = {
     &builtin_add, &builtin_sub, &builtin_mul, &builtin_div,
     &builtin_mod, &builtin_eq,  &builtin_lt,  &builtin_gt,
     &builtin_le,  &builtin_ge,  &builtin_and, &builtin_or,
-    &builtin_xor, &builtin_show, &builtin_print_endline,
+    &builtin_xor, &builtin_print_endline,
     &builtin_text_fold_right,
 };
 

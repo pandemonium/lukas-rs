@@ -24,48 +24,29 @@ typedef struct Closure Closure;
 typedef struct Tuple Tuple;
 typedef struct Data Data;
 
-// A Marmelade value is a single tagged 64-bit word. The low 3 bits discriminate:
+// A Marmelade value is a single tagged 64-bit word. ONE bit discriminates:
 //
 //   xxx0   pointer to a heap body -- its kind (closure/tuple/data/text/object)
 //          is recovered from the body's `GcHeader.kind`. Bodies are >= 8-byte
-//          aligned, so a real pointer always has its low 3 bits clear.
-//   x001   Int   -- 61-bit signed, stored as `(n << 3) | 1`
-//   x011   Bool  -- `(b << 3) | 3`
-//   x101   Char  -- `(c << 3) | 5`
-//   x111   Unit  -- the constant 7
+//          aligned, so a real pointer always has its low bit clear.
+//   xxx1   immediate -- Int/Bool/Char/Unit, payload in the high 63 bits
+//          (`(payload << 1) | 1`). The word carries NO tag saying *which*
+//          immediate it is: access is type-driven (codegen picks `as_int`
+//          vs `as_char` from the static type), equality of immediates is word
+//          identity (`a.w == b.w`), and `show` is lowered per-type at codegen.
+//          Int is therefore 63-bit signed. See notes/tagged-value.md.
 //
 // Every immediate is odd; every pointer is even, so `w & 1` alone tells them
-// apart. Keeping `Value` register-sized (one word, returned in one register) is
-// what lets clang sibling-call-optimise the recursive `apply` that loop fusion
-// buries -- a 16-byte struct return blocks that TCO and overflows the stack.
-// See notes/tagged-value.md.
+// apart -- which is all the GC needs to trace heap fields precisely. Keeping
+// `Value` register-sized (one word, returned in one register) is what lets clang
+// sibling-call-optimise the recursive `apply` that loop fusion buries -- a
+// 16-byte struct return blocks that TCO and overflows the stack.
 struct Value {
     uint64_t w;
 };
 
-// Low-3-bit immediate tags (`w & TAGMASK` for an odd word).
-#define TAGMASK  7u
-#define IMM_INT  1u
-#define IMM_BOOL 3u
-#define IMM_CHAR 5u
-#define IMM_UNIT 7u
-
-// The logical kind of a value, for the runtime's own dispatch (`val_eq`,
-// `prim_show`). Immediates decode from the low bits; for a pointer the kind
-// comes from the heap header, so `value_tag` lives in gc.c where that header is
-// visible. Codegen never sees this enum -- it calls typed accessors directly.
-typedef enum {
-    TAG_INT,
-    TAG_TEXT,
-    TAG_BOOL,
-    TAG_UNIT,
-    TAG_CHAR,
-    TAG_CLOSURE,
-    TAG_TUPLE,
-    TAG_DATA,
-    TAG_OBJECT, // a GC object (Buffer/Mmap/Slice); GcHeader.kind selects its layout + tracing
-} Tag;
-Tag value_tag(Value v);
+// The single immediate tag bit: an odd word is an immediate, an even word a pointer.
+#define IMM_TAG 1u
 
 // The per-FUNCTION part of a closure: `code`, `worker`, and `arity` are identical
 // for every closure of a given lifted function, so codegen emits ONE static
@@ -115,18 +96,20 @@ Value mk_text(const char *src);
 
 // Value constructors. Immediates pack into the word; a text literal becomes an
 // owned heap string; `VObject` just carries the (already 8-aligned) body pointer.
-static inline Value VInt(int64_t x)     { return (Value){((uint64_t)x << 3) | IMM_INT}; }
+static inline Value VInt(int64_t x)     { return (Value){((uint64_t)x << 1) | IMM_TAG}; }
 static inline Value VText(const char *s){ return mk_text(s); }
-static inline Value VBool(bool x)       { return (Value){((uint64_t)(x ? 1u : 0u) << 3) | IMM_BOOL}; }
-static inline Value VChar(char x)       { return (Value){((uint64_t)(uint8_t)x << 3) | IMM_CHAR}; }
-static inline Value VUnit_(void)        { return (Value){IMM_UNIT}; }
+static inline Value VBool(bool x)       { return (Value){((uint64_t)(x ? 1u : 0u) << 1) | IMM_TAG}; }
+static inline Value VChar(char x)       { return (Value){((uint64_t)(uint8_t)x << 1) | IMM_TAG}; }
+static inline Value VUnit_(void)        { return (Value){IMM_TAG}; }
 #define VUnit() (VUnit_())
 static inline Value VObject(void *p)    { return (Value){(uint64_t)(uintptr_t)p}; }
 
-// Immediate decoders. `as_int` sign-extends via an arithmetic right shift.
-static inline int64_t as_int(Value v)  { return (int64_t)v.w >> 3; }
-static inline bool    as_bool(Value v) { return (v.w >> 3) & 1u; } // truthiness, for `if`
-static inline char    as_char(Value v) { return (char)((v.w >> 3) & 0xFFu); }
+// Immediate decoders. `as_int` sign-extends via an arithmetic right shift. Each is
+// type-driven: codegen calls the right one from the static type -- the word itself
+// carries no tag distinguishing Int/Bool/Char/Unit.
+static inline int64_t as_int(Value v)  { return (int64_t)v.w >> 1; }
+static inline bool    as_bool(Value v) { return (v.w >> 1) & 1u; } // truthiness, for `if`
+static inline char    as_char(Value v) { return (char)((v.w >> 1) & 0xFFu); }
 
 // Pointer decoders. A pointer value's word *is* the body pointer.
 static inline void     *as_ptr(Value v)     { return (void *)(uintptr_t)v.w; }
@@ -140,7 +123,7 @@ static inline const char *as_text(Value v)  { return (const char *)(uintptr_t)v.
 // allocation) entirely. The `builtin_*` closure values below remain for partial
 // application and higher-order use (e.g. passing `+` to a fold).
 bool val_eq(Value a, Value b);
-// Arithmetic is untag -> compute -> retag. Int is 61-bit, so overflow wraps
+// Arithmetic is untag -> compute -> retag. Int is 63-bit, so overflow wraps
 // (OCaml-style, no check); the codec's fields fit, full-width lands in Stage 2.
 static inline Value prim_add(Value a, Value b) { return VInt(as_int(a) + as_int(b)); }
 static inline Value prim_sub(Value a, Value b) { return VInt(as_int(a) - as_int(b)); }
@@ -155,7 +138,12 @@ static inline Value prim_eq(Value a, Value b) { return VBool(val_eq(a, b)); }
 static inline Value prim_and(Value a, Value b) { return VBool(as_bool(a) && as_bool(b)); }
 static inline Value prim_or(Value a, Value b) { return VBool(as_bool(a) || as_bool(b)); }
 static inline Value prim_xor(Value a, Value b) { return VBool(as_bool(a) != as_bool(b)); }
-Value prim_show(Value x);
+// `prim_show` is monomorphised: codegen picks the right leaf from the argument's
+// static type. Only the primitive (leaf) types reach these -- compound values are
+// rendered by their `Display` witnesses, which recurse through the leaves.
+Value prim_show_int(Value x);
+Value prim_show_char(Value x);
+Value prim_show_text(Value x);
 Value prim_print_endline(Value x);
 // Concatenate `n` text values (used by string interpolation).
 Value prim_str_concat(size_t n, ...);
@@ -217,7 +205,6 @@ extern Value builtin_ge;
 extern Value builtin_and;
 extern Value builtin_or;
 extern Value builtin_xor;
-extern Value builtin_show;
 extern Value builtin_print_endline;
 extern Value builtin_text_fold_right;
 

@@ -10,6 +10,6 @@ area :: Shape -> Int := λs.
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (area (Circle 10)))      (* 300 *)
-  print_endline (prim_show (area (Rectangle 3 4)))  (* 12 *)
-  print_endline (prim_show (area Dot))              (* 0 *)
+  print_endline "`area (Circle 10)`"      (* 300 *)
+  print_endline "`area (Rectangle 3 4)`"  (* 12 *)
+  print_endline "`area Dot`"              (* 0 *)

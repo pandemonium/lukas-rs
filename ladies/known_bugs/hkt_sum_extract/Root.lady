@@ -25,4 +25,4 @@ unbox  := λb. deconstruct b into MkBox a -> a
 
 start := λ_.
   print_endline "##TC"
-  print_endline (prim_show (unbox (unwrap (MkWrap (MkBox 41)))))
+  print_endline "`unbox (unwrap (MkWrap (MkBox 41)))`"

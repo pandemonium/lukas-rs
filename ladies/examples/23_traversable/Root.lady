@@ -8,5 +8,5 @@ start :: Int -> Unit := λ_.
   print_endline "##TC"
   let r = traverse (λx. if x > 0 then This x else Nope) (Cons 1 (Cons 2 (Cons 3 Nil))) in
   deconstruct r into
-    This ys -> print_endline (prim_show (List.length ys))   (* 3 *)
+    This ys -> print_endline "`List.length ys`"   (* 3 *)
   | Nope    -> print_endline "a value was rejected"

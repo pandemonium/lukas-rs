@@ -3,5 +3,5 @@ use Stdlib.
 start :: Int -> Unit := λ_.
   print_endline "##TC"
   deconstruct bind (λx. This (x + 1)) (This 41) into
-    This n -> print_endline (prim_show n)
+    This n -> print_endline "`n`"
   | Nope   -> print_endline "no"

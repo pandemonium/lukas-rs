@@ -72,7 +72,7 @@ module Buffer:
   (* Effectful, hence IO -- but built directly with `Suspend` (no witness needed to     *)
   (* construct). The buffer HANDLE is stable (growth reallocates the body in place), so  *)
   (* a write returns Unit and `put_u8`'s buffer stays valid.                             *)
-  new_buffer :: Int -> IO Buffer := λcap. Suspend (λ_. Buffer (raw_new_buffer cap))
+  new_buffer :: Int -> IO Buffer := λcapacity. Suspend (λ_. Buffer (raw_new_buffer capacity))
 
   put_u8    :: Buffer -> Int -> IO Unit := λ(Buffer b) v. Suspend (λ_. raw_put_u8 b v)
   put_16_le :: Buffer -> Int -> IO Unit := λ(Buffer b) v. Suspend (λ_. raw_put_16_le b v)
@@ -169,7 +169,7 @@ module Text:
 (* to `display x`, so `Display` -- the signature plus witnesses for the builtin types -- *)
 (* must be primordial for interpolation to work with no imports. `Display` for user types *)
 (* is added in Stdlib / user code. (All other classes -- Functor/Monad/Foldable/... -- are *)
-(* Stdlib.) The builtin witnesses defer to the runtime `prim_show`.                        *)
+(* Stdlib.) The builtin witnesses defer to the runtime `display`.                        *)
 signature Display ::= ∀α.
   { display :: α -> Text
   }
@@ -184,4 +184,42 @@ witness Display Char :=
 
 witness Display Int :=
   { display := λt. prim_show t
+  }
+
+witness Display Bool :=
+  { display := λb. if b then "true" else "false"
+  }
+
+witness Display Unit :=
+  { display := λ_. "()"
+  }
+
+(* ------------------------------------------------------- Display for tuples *)
+(* The "derived" product instances: a tuple displays as `(e0, e1, …)` -- each element *)
+(* rendered by its own `Display` witness, comma-separated and parenthesised, so nesting *)
+(* stays visible (`((1, 2), 3)`). Provided for a useful range of arities; beyond that a *)
+(* program declares its own. These live in the primordial Prelude so string             *)
+(* interpolation of a tuple works with no imports.                                      *)
+witness ∀α β. Display α + Display β |- Display (α, β) :=
+  { display := λ(a, b). "(`a`, `b`)"
+  }
+
+witness ∀α β γ. Display α + Display β + Display γ |- Display (α, β, γ) :=
+  { display := λ(a, b, c). "(`a`, `b`, `c`)"
+  }
+
+witness ∀α β γ δ. Display α + Display β + Display γ + Display δ |- Display (α, β, γ, δ) :=
+  { display := λ(a, b, c, d). "(`a`, `b`, `c`, `d`)"
+  }
+
+witness ∀α β γ δ ε. Display α + Display β + Display γ + Display δ + Display ε |- Display (α, β, γ, δ, ε) :=
+  { display := λ(a, b, c, d, e). "(`a`, `b`, `c`, `d`, `e`)"
+  }
+
+witness ∀α β γ δ ε ζ. Display α + Display β + Display γ + Display δ + Display ε + Display ζ |- Display (α, β, γ, δ, ε, ζ) :=
+  { display := λ(a, b, c, d, e, f). "(`a`, `b`, `c`, `d`, `e`, `f`)"
+  }
+
+witness ∀α β γ δ ε ζ η. Display α + Display β + Display γ + Display δ + Display ε + Display ζ + Display η |- Display (α, β, γ, δ, ε, ζ, η) :=
+  { display := λ(a, b, c, d, e, f, g). "(`a`, `b`, `c`, `d`, `e`, `f`, `g`)"
   }

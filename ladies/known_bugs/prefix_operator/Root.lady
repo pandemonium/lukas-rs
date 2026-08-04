@@ -12,4 +12,4 @@
 start := λ_.
   print_endline "##TC"
   let x = (-5) in
-  print_endline (prim_show x)
+  print_endline "`x`"

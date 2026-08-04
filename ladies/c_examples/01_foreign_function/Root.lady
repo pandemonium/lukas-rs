@@ -16,7 +16,7 @@ foreign pow :: Int -> Int -> Int
 
 start :: Int -> Unit := λ_.
   print_endline "##TC"
-  print_endline (prim_show (isqrt 144))       (* 12 *)
-  print_endline (prim_show (pow 2 10))        (* 1024 *)
+  print_endline "`isqrt 144`"       (* 12 *)
+  print_endline "`pow 2 10`"        (* 1024 *)
   let powers_of_three = pow 3 in              (* partial application of a foreign *)
-  print_endline (prim_show (powers_of_three 4))   (* 81 *)
+  print_endline "`powers_of_three 4`"   (* 81 *)

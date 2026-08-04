@@ -8,4 +8,4 @@
 
 start := λ_.
   print_endline "##TC"
-  print_endline (prim_show (10 / 0))
+  print_endline "`10 / 0`"
