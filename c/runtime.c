@@ -37,7 +37,11 @@ bool val_eq(Value a, Value b) {
     case TAG_INT:  return as_int(a) == as_int(b);
     case TAG_BOOL: return as_bool(a) == as_bool(b);
     case TAG_CHAR: return as_char(a) == as_char(b);
-    case TAG_TEXT: return strcmp(as_text(a), as_text(b)) == 0;
+    case TAG_TEXT: {
+        // Text/Bytes are OBJ_SLICE: compare by length then bytes (no NUL, no strcmp).
+        size_t na = slice_len(a), nb = slice_len(b);
+        return na == nb && memcmp(slice_ptr(a), slice_ptr(b), na) == 0;
+    }
     case TAG_UNIT: return true;
     default:       return false;
     }
@@ -131,8 +135,15 @@ static char *show_alloc(Value x) {
         buf[0] = as_char(x);
         buf[1] = '\0';
         return strdup(buf);
-    case TAG_TEXT:
-        return strdup(as_text(x));
+    case TAG_TEXT: {
+        // A Text is an OBJ_SLICE (not NUL-terminated): copy its bytes into a fresh
+        // NUL-terminated C string for the show machinery.
+        size_t n = slice_len(x);
+        char *s = malloc(n + 1);
+        memcpy(s, slice_ptr(x), n);
+        s[n] = '\0';
+        return s;
+    }
     case TAG_UNIT:
         return strdup("()");
     case TAG_TUPLE:
@@ -158,32 +169,37 @@ Value prim_show(Value x) {
 }
 
 Value prim_print_endline(Value x) {
-    fputs(as_text(x), stdout);
+    // Text is an OBJ_SLICE with an explicit length (no NUL); write exactly its bytes.
+    fwrite(slice_ptr(x), 1, slice_len(x), stdout);
     fputc('\n', stdout);
     return VUnit();
 }
 
 Value prim_str_concat(size_t n, ...) {
-    const char **parts = malloc(n * sizeof *parts);
+    // Each part is a Text (OBJ_SLICE). Gather (base, len) pairs, assemble the bytes into
+    // a plain malloc buffer, then hand it to `mk_textn` (which builds a fresh Text-slice).
+    // Doing all the reads before any allocation keeps the source slice pointers valid.
+    const uint8_t **parts = malloc(n * sizeof *parts);
+    size_t *lens = malloc(n * sizeof *lens);
     size_t total = 0;
     va_list ap;
     va_start(ap, n);
     for (size_t i = 0; i < n; i++) {
         Value v = va_arg(ap, Value);
-        parts[i] = as_text(v);
-        total += strlen(parts[i]);
+        parts[i] = slice_ptr(v);
+        lens[i] = slice_len(v);
+        total += lens[i];
     }
     va_end(ap);
 
-    char *buf = malloc(total + 1);
+    char *buf = malloc(total ? total : 1);
     size_t offset = 0;
     for (size_t i = 0; i < n; i++) {
-        size_t len = strlen(parts[i]);
-        memcpy(buf + offset, parts[i], len);
-        offset += len;
+        memcpy(buf + offset, parts[i], lens[i]);
+        offset += lens[i];
     }
-    buf[offset] = '\0';
     free(parts);
+    free(lens);
     // `buf` is fully assembled before this point, so the collection that
     // `mk_textn` may trigger cannot disturb it (it is a malloc, not a GC object).
     Value result = mk_textn(buf, total);
@@ -217,9 +233,12 @@ UNOP(builtin_print_endline, prim_print_endline);
 static Value tfr_3(Value self, Value s) {
     Value f = env_get(self, 0);
     Value acc = env_get(self, 1);
-    const char *str = as_text(s);
-    for (size_t k = strlen(str); k-- > 0;) {
-        acc = apply(apply(f, VChar(str[k])), acc);
+    // Text is an OBJ_SLICE; fold right over its bytes. `s` is a live stack Value, so its
+    // owner survives the `apply` collections -- re-read each byte via `slice_get_u8`.
+    // (Byte-granular for now, matching the previous behaviour; a UTF-8-decoding fold is
+    // the later native fast-path.)
+    for (size_t k = slice_len(s); k-- > 0;) {
+        acc = apply(apply(f, VChar(slice_get_u8(s, k))), acc);
     }
     return acc;
 }

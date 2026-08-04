@@ -14,15 +14,15 @@ put_all :: Array Int -> Put Unit := λxs.
 
 (* Materialise an array of byte values into a Bytes view (buffer -> move). *)
 bytes_of :: Array Int -> IO Bytes := λxs.
-  let* b = new_buffer 16 in
+  let* b = Buffer.new_buffer 16 in
   let* _ = run_put (put_all xs) b in
-  move b
+  Buffer.move b
 
 (* Validate one case two ways -- the C fast path (Text.from_bytes) and the pure *)
 (* Get-monad reference validator (Utf8.is_valid) -- and show they agree. *)
 check :: Array Int -> IO Unit := λxs.
   let* bs = bytes_of xs in
-  let get = if is_valid bs then "valid" else "invalid" in
+  let get = if Bytes.is_valid bs then "valid" else "invalid" in
   deconstruct Text.from_bytes bs into
     This t -> IO.output "ok `t` (get=`get`)"
   | Nope   -> IO.output "invalid (get=`get`)"

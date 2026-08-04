@@ -5,6 +5,6 @@ witness From String (Perhaps Int) :=
   }
 
 from_bytes :: Bytes -> Perhaps String := λbytes.
-  if Text.is_valid bytes
+  if Bytes.is_valid bytes
   then This (Data bytes)
   else Nope

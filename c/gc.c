@@ -56,7 +56,8 @@
 // plus an offset/length. An Mmap wraps a region that is NOT GC memory.
 typedef struct { void *bytes; size_t len; size_t cap; } Buffer;
 typedef struct { uint8_t *region; size_t len; bool closed; } Mmap;
-typedef struct { void *owner; size_t offset; size_t len; } Slice;
+// `Slice` moved to gc.h so emitted code can build a static .rodata Text (a Slice over a
+// static OBJ_BYTES body) the same way it builds other immortal descriptors.
 
 // ------------------------------------------------------------------ pointer set
 // Open-addressing set of pointer-sized keys. 0 = empty, 1 = tombstone (no real
@@ -353,10 +354,15 @@ Tag value_tag(Value v) {
     }
     switch (HEADER(as_ptr(v))->kind) {
     case OBJ_TEXT:    return TAG_TEXT;
+    // Text is the stdlib DU `Text ::= Text Bytes`, which newtype-erases to its Bytes
+    // (an OBJ_SLICE). A user-facing Bytes erases to the same OBJ_SLICE, so both report
+    // TAG_TEXT and share the runtime's byte-oriented eq/show. (OBJ_TEXT is legacy: no
+    // path produces it now -- literals and `mk_textn` build slices.)
+    case OBJ_SLICE:   return TAG_TEXT;
     case OBJ_TUPLE:   return TAG_TUPLE;
     case OBJ_CLOSURE: return TAG_CLOSURE;
     case OBJ_DATA:    return TAG_DATA;
-    default:          return TAG_OBJECT; // buffer / bytes / mmap / slice
+    default:          return TAG_OBJECT; // buffer / bytes / mmap
     }
 }
 
@@ -411,7 +417,9 @@ static void gc_trace(void) {
         }
         case OBJ_SLICE: {
             Slice *s = BODY(h);
-            mark_obj(s->owner); // owner is a live OBJ_BYTES body or OBJ_MMAP handle
+            // owner is a live OBJ_BYTES body / OBJ_MMAP handle / another OBJ_SLICE, or
+            // NULL for an inline-owned slice (its bytes live in this object -- no child).
+            if (s->owner) mark_obj(s->owner);
             break;
         }
         }
@@ -993,15 +1001,21 @@ Value mk_closure(Value (*code)(Value, Value), size_t nfree, ...) {
     return v;
 }
 
-// Copy `len` bytes into a fresh, collectable string body (NUL-terminated, so it
-// remains a valid C string for `strcmp`/`fputs`). `src` stays live across the
-// collection `gc_new` may trigger because it is on the C stack, which the collector
-// scans conservatively.
+// Copy `len` bytes into a fresh, collectable Text -- i.e. an OBJ_SLICE over a fresh
+// OBJ_BYTES body (Text erases to Bytes erases to a slice). NOT NUL-terminated: Text
+// carries an explicit length, and consumers use `slice_len`/`slice_ptr`, never `strlen`.
+// `src` stays live across the collection `gc_new` may trigger because it is on the C
+// stack (conservatively scanned).
 Value mk_textn(const char *src, size_t len) {
-    char *body = gc_new(len + 1, OBJ_TEXT);
-    memcpy(body, src, len);
-    body[len] = '\0';
-    return VObject(body);
+    // ONE allocation: an inline-owned OBJ_SLICE -- the Slice header followed by the bytes,
+    // with owner == NULL marking "bytes are inline". (The previous form allocated an
+    // OBJ_BYTES body plus a separate OBJ_SLICE header -- two objects per computed string.)
+    Slice *s = gc_new(sizeof(Slice) + len, OBJ_SLICE);
+    s->owner = NULL;
+    s->offset = 0;
+    s->len = len;
+    memcpy((char *)(s + 1), src, len); // `src` is a malloc/rodata pointer, not GC memory
+    return VObject(s);
 }
 
 // Copy a NUL-terminated C string into a collectable string body.
@@ -1233,12 +1247,33 @@ Value buffer_copy(Value bv) {
 }
 
 static const uint8_t *slice_base(Slice *s) {
+    // An inline-owned slice (owner == NULL) stores its bytes immediately after the Slice
+    // header -- a single allocation for owned strings (mk_textn), no separate OBJ_BYTES.
+    if (s->owner == NULL) return (const uint8_t *)(s + 1) + s->offset;
     GcHeader *h = HEADER(s->owner);
     if (h->kind == OBJ_BYTES) return (const uint8_t *)s->owner + s->offset;
+    // A sub-view of an inline-owned slice borrows that slice as its owner.
+    if (h->kind == OBJ_SLICE) return slice_base((Slice *)s->owner) + s->offset;
     return ((Mmap *)s->owner)->region + s->offset; // OBJ_MMAP
 }
 
 size_t slice_len(Value sv) { return ((Slice *)as_ptr(sv))->len; }
+
+// Direct read pointer to a slice's first byte (valid until the next allocation may
+// move nothing -- the GC is non-moving -- but the owner must stay reachable). Used by
+// the Text primitives (print/eq/show/concat) to avoid a per-byte `slice_get_u8`.
+const uint8_t *slice_ptr(Value sv) { return slice_base(as_ptr(sv)); }
+
+// Copy a Text/Bytes slice into a caller buffer as a NUL-terminated C string, for the C
+// APIs that need one (file paths, strtol). Text is length-prefixed, not NUL-terminated,
+// so this is the explicit bridge. Returns false (writing nothing) if it does not fit.
+bool text_to_cstr(Value sv, char *buf, size_t cap) {
+    size_t n = slice_len(sv);
+    if (n + 1 > cap) return false;
+    memcpy(buf, slice_ptr(sv), n);
+    buf[n] = '\0';
+    return true;
+}
 
 uint8_t slice_get_u8(Value sv, size_t i) { return slice_base(as_ptr(sv))[i]; }
 

@@ -1,4 +1,7 @@
-IO ::= ∀α. Suspend (Unit -> α)
+(* The `IO` datatype + `Suspend` constructor live in the primordial Prelude (always *)
+(* imported). This module supplies its Functor/Applicative/Monad witnesses and the  *)
+(* run/output helpers -- so a program can BUILD IO in the Prelude but only SEQUENCE  *)
+(* and RUN it with `use Stdlib`.                                                     *)
 
 witness Functor IO :=
   { fmap := λf (Suspend thunk).

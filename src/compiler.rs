@@ -11,8 +11,8 @@ use crate::{
     chez,
     codegen::CodeBuffer,
     interpreter::{
-        self, Environment, RuntimeError,
-        cek::{Env, Globals},
+        self, Environment, Literal, RuntimeError,
+        cek::{Env, Globals, Val},
     },
     lexer::LexicalAnalyzer,
     parser::{self, ParseError, ParseInfo, Parsed},
@@ -140,7 +140,22 @@ pub struct Compiler {
 impl Compiler {
     pub fn parse_compilation_unit(&self) -> Compilation {
         let module_name = parser::Identifier::from_str(ROOT_MODULE_NAME);
-        let root_module = self.load_module(&module_name)?;
+        let mut root_module = self.load_module(&module_name)?;
+
+        // Always import the primordial `Prelude` (Text/Bytes/Buffer/IO + core ADTs). A
+        // single-segment `use` both LOADS and OPENS it, so string literals resolve and the
+        // byte/text primitives are in scope with zero imports. The primordial carries no
+        // typeclass witnesses, so -- unlike opening all of Stdlib -- it never pollutes a
+        // program's scope. Programs never write `use Prelude` themselves.
+        if let ast::ModuleDeclarator::Inline(declarations) = &mut root_module.declarator {
+            declarations.insert(
+                0,
+                ast::Declaration::Use(
+                    ParseInfo::default(),
+                    ast::UseDeclaration::new(None, parser::IdentifierPath::new("Prelude")),
+                ),
+            );
+        }
 
         // Every Root.lady must define `start`, the program entry point. Check it
         // here so a missing (or, thanks to a parse desync, dropped) `start` is a
@@ -184,6 +199,16 @@ impl Compiler {
             let globals = Globals::default();
 
             let compilation_unit = resolved_symbols.elaborate_compilation_unit()?;
+
+            // The interpreter has no foreign/byte backend (foreigns are provided by the C /
+            // Scheme companions). Bind each `foreign` term to a placeholder so a program that
+            // merely LOADS the always-imported primordial Prelude -- string literals, module
+            // mounting, pure computation -- initialises and runs. A program that actually
+            // APPLIES a foreign (real byte work) is a C-backend concern and would error here.
+            for foreign in &compilation_unit.foreign_terms {
+                globals.define(foreign.name.clone(), Val::Constant(Literal::Unit));
+            }
+
             let deps = compilation_unit.dependency_matrix();
             let evaluation_order = deps.in_resolvable_order();
 

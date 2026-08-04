@@ -10,9 +10,9 @@ payload :: Put Unit :=
   put_u8 1
 
 built :: IO Bytes :=
-  let* b = new_buffer 8 in
+  let* b = Buffer.new_buffer 8 in
   let* _ = run_put payload b in
-  move b
+  Buffer.move b
 
 (* A reader: two bytes then their sum. The cursor advances automatically. *)
 pair :: Get Read_Error Int :=
@@ -35,7 +35,7 @@ sh :: Result Read_Error Int -> Text := λr.
 
 program :: IO Unit :=
   let* s = built in
-  let* _ = IO.output (display (len s)) in
+  let* _ = IO.output (display (Bytes.length s)) in
   let* _ = IO.output (sh (run_get pair s)) in
   let* _ = IO.output (sh (run_get wide s)) in
   IO.output (sh (run_get over s))

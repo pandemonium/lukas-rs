@@ -10,14 +10,19 @@
 #include <errno.h>
 
 // prim_open : Text -> Text -> FILE   (path, mode)
-FOREIGN_DECL(int64_t, Root_Files_prim_open, Text, path, Text, mode, {
-    return (int64_t)(intptr_t)fopen(path, mode);
+// Text is an OBJ_SLICE (length-prefixed, no NUL) -> copy each into a NUL-terminated buffer.
+FOREIGN_DECL(int64_t, Root_Files_prim_open, Value, path, Value, mode, {
+    char p[4096];
+    char m[16];
+    if (!text_to_cstr(path, p, sizeof p) || !text_to_cstr(mode, m, sizeof m))
+        return (int64_t)(intptr_t)NULL;
+    return (int64_t)(intptr_t)fopen(p, m);
 })
 
-// prim_write_line : FILE -> Text -> Unit
-FOREIGN_DECL(Value, Root_Files_prim_write_line, int64_t, h, Text, line, {
+// prim_write_line : FILE -> Text -> Unit  (write the slice's bytes; no NUL needed)
+FOREIGN_DECL(Value, Root_Files_prim_write_line, int64_t, h, Value, line, {
     FILE *f = (FILE *)(intptr_t)h;
-    fputs(line, f);
+    fwrite(slice_ptr(line), 1, slice_len(line), f);
     fputc('\n', f);
     return VUnit();
 })

@@ -1,9 +1,5 @@
-// Companion implementation of Stdlib.Text's `foreign` primitives.
-//
-// The real work (UTF-8 validation + materialising an owned Text) lives in the
-// runtime (gc.c :: utf8_from_slice); this is the thin marshalling wrapper. A
-// `Bytes` is a newtype over its raw slice and erases to it, so the argument
-// arrives as the OBJ_SLICE Value directly -- no unwrapping needed here.
+// Companion for Stdlib.Text's `raw_parse_int` (the int-parsing experiment). The UTF-8
+// validator (`raw_is_valid`) and the byte primitives live in the primordial Prelude.c.
 #include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -13,22 +9,14 @@
 
 static bool parse_int(const char *s, int64_t *out);
 
-// raw_text_from_bytes : Bytes -> Perhaps Text  (UTF-8 validate; This on success, else Nope)
-FOREIGN_DECL(Value, Root_Stdlib_Text_raw_text_from_bytes, Value, s, {
-    return utf8_from_slice(s);
-})
-
-// raw_is_valid : Bytes -> Bool  (validate only; no allocation, no materialised Text)
-FOREIGN_DECL(Bool, Root_Stdlib_Text_raw_is_valid, Value, s, {
-    return utf8_slice_is_valid(s);
-})
-
 // raw_parse_int : Text -> Perhaps Int
+// Text is an OBJ_SLICE (length-prefixed, no NUL); copy it into a small NUL-terminated
+// buffer for strtol. Anything that can't be a decimal int in 63 chars can't parse anyway.
 FOREIGN_DECL(Value, Root_Stdlib_Text_raw_parse_int, Value, s, {
-    const char* text = as_text(s);
+    char text[64];
     int64_t number;
 
-    if (parse_int(text, &number)) {
+    if (text_to_cstr(s, text, sizeof text) && parse_int(text, &number)) {
         return perhaps_this(VInt(number));
     } else {
         return perhaps_nope();

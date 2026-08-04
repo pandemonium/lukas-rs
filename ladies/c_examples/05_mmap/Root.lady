@@ -12,9 +12,9 @@ payload :: Put Unit :=
   put_u8 173
 
 build_payload :: IO Bytes :=
-  let* b = new_buffer 4 in
+  let* b = Buffer.new_buffer 4 in
   let* _ = run_put payload b in
-  move b
+  Buffer.move b
 
 read_first :: Get Read_Error Int := u8
 

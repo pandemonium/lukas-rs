@@ -1,4 +1,5 @@
-Result ::= ∀e α. Fault e | Return α
+(* `Result` (the type + the `result` eliminator) lives in the primordial Prelude, always *)
+(* imported. This module adds its typeclass witnesses.                                    *)
 
 witness ∀α e. Display α + Display e |- Display (Result e α) :=
   { display := λt.
@@ -40,8 +41,3 @@ witness ∀e. Traversable (Result e) :=
   { traverse := λf. result (compose pure Fault) (compose (fmap Return) f)
   }
 
-result :: ∀α e z. (e -> z) -> (α -> z) -> Result e α -> z :=
-  λfault return ra.
-    deconstruct ra into
-      Fault e  -> fault e
-    | Return a -> return a

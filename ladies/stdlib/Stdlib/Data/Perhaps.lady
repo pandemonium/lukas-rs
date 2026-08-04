@@ -1,5 +1,5 @@
-Perhaps ::= ∀α. Nope | This α
-
+(* `Perhaps` (the type + the `perhaps` eliminator) lives in the primordial Prelude, always *)
+(* imported. This module adds its typeclass witnesses and combinators.                     *)
 
 witness Functor Perhaps :=
   { fmap := λf fa.
@@ -57,9 +57,6 @@ witness ∀α. Eq α |- Eq (Perhaps α) :=
   { eq := λp q. p = q
   }
 
-
-perhaps :: ∀α z. z -> (α -> z) -> Perhaps α -> z :=
-  λz f xa. deconstruct xa into This x -> f x | otherwise -> z
 
 map :: ∀α β. (α -> β) -> Perhaps α -> Perhaps β :=
   λf. perhaps Nope (compose This f)

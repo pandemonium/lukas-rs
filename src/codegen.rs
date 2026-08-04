@@ -680,10 +680,10 @@ impl lambda_lift::Program {
             match segment {
                 Segment::Literal(_, literal) => write!(code, "{}", self.compile_constant(literal))?,
                 Segment::Expression(expr) => {
-                    // todo: this is wrong -- it must call display. Is that already in expr?
-                    write!(code, "prim_show(")?;
+                    // The parser already wraps each interpolated expression in `display`, so the
+                    // segment is a `Text`-typed term -- emit it directly (a redundant `prim_show`
+                    // here would just re-copy the slice).
                     self.compile_expr(expr, code)?;
-                    write!(code, ")")?;
                 }
             }
         }
@@ -725,19 +725,22 @@ impl lambda_lift::Program {
         match the {
             Literal::Int(x) => format!("VInt({x})"),
             Literal::Float(x) => format!("VInt({x})"),
-            // Borrowed string literal (tagged-value.md Stage 1b): a `const`
-            // text descriptor emitted into .rodata -- a `GcHeader` (kind OBJ_TEXT,
-            // `old = MARM_ETERNAL` so the GC never touches it) immediately
-            // followed by the bytes -- referenced as a Value. Zero copy, zero
-            // per-use allocation (the old `VText`/`mk_text` heap-copied every
-            // literal every time it was evaluated). `sizeof("...")` lets the C
-            // compiler size the body, so any escaping the string already carries
-            // is handled exactly as before. The `static` local in a statement
-            // expression has static storage duration -> it lands in .rodata.
+            // A string literal is a `Text` -- the stdlib DU `Text ::= Text Bytes`, which
+            // newtype-erases to a `Bytes`, which erases to an OBJ_SLICE. So emit an
+            // immortal .rodata Text: a `static const` OBJ_BYTES body holding the bytes,
+            // plus a `static const` OBJ_SLICE over it, both `MARM_ETERNAL` so the GC
+            // never touches them. Zero copy, zero per-use allocation, valid-by-
+            // construction (no runtime UTF-8 check -- the source is known-good).
+            // `sizeof("...")` sizes the body (escapes handled by the C compiler); the
+            // slice length excludes the trailing NUL. `static` locals in a statement
+            // expression have static storage duration -> they land in .rodata.
             Literal::Text(x) => format!(
                 "({{ static const struct {{ GcHeader gch; char b[sizeof(\"{x}\")]; }} \
-                 __marm_txt = {{{{sizeof(\"{x}\"), 0, OBJ_TEXT, MARM_ETERNAL}}, \"{x}\"}}; \
-                 VObject((void *)__marm_txt.b); }})"
+                 __marm_b = {{{{sizeof(\"{x}\"), 0, OBJ_BYTES, MARM_ETERNAL}}, \"{x}\"}}; \
+                 static const struct {{ GcHeader gch; Slice s; }} \
+                 __marm_s = {{{{sizeof(Slice), 0, OBJ_SLICE, MARM_ETERNAL}}, \
+                 {{(void *)__marm_b.b, 0, sizeof(\"{x}\") - 1}}}}; \
+                 VObject((void *)&__marm_s.s); }})"
             ),
             Literal::Bool(x) => format!("VBool({x})"),
             Literal::Unit => "VUnit()".to_owned(),

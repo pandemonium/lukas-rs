@@ -2,12 +2,12 @@ use Stdlib.
 use Stdlib.Binary.
 
 main :: IO (Perhaps Int) :=
-  let* buffer = new_buffer 4 in
+  let* buffer = Buffer.new_buffer 4 in
   let* _ = Buffer.put_u8 buffer (Int.of_char '1') in
   let* _ = Buffer.put_u8 buffer (Int.of_char '2') in
   let* _ = Buffer.put_u8 buffer (Int.of_char '3') in
   let* _ = Buffer.put_u8 buffer (Int.of_char '4') in
-  let* bytes = move buffer in
+  let* bytes = Buffer.move buffer in
   let int = from bytes :: Perhaps Int in
   pure int
 
@@ -19,7 +19,7 @@ run_int_parser_through_io := λ_.
 
 round_trip :: Text -> Int -> Bool := λsource expected.
   let parsed = from source :: Perhaps Int in
-    let matches = λx. x = expected in
+  let matches = λx. x = expected in
   perhaps false id (fmap matches parsed)
 
 start := λ_.

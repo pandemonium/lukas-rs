@@ -1,4 +1,3 @@
-module Prelude.
 module Control.
 module IO.
 module Data.
@@ -7,7 +6,6 @@ module Array.
 module Text.
 (* module Files. *)
 
-use Stdlib.Prelude.
 use Stdlib.Data.
 use Stdlib.Data.List.
 use Stdlib.Data.Perhaps.
@@ -21,9 +19,8 @@ signature From ::= ∀α β.
   { from :: α -> β
   }
 
-signature Display ::= ∀α.
-  { display :: α -> Text
-  }
+(* `Display` (signature + Int/Char/Text witnesses) is in the primordial Prelude, because *)
+(* string interpolation desugars to `display`. This module adds Display for its own types. *)
 
 witness Semigroup Text :=
   { mappend := λp q. "`p``q`"
@@ -49,14 +46,3 @@ witness Ord Int :=
   { lte := λp q. p <= q
   }
 
-witness Display Text :=
-  { display := λt. prim_show t
-  }
-
-witness Display Char :=
-  { display := λt. prim_show t
-  }
-
-witness Display Int :=
-  { display := λt. prim_show t
-  }

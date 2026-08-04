@@ -291,16 +291,45 @@ impl phase::Expr<Parsed> {
     ) -> Lambda<ParseInfo, IdentifierPath> {
         tracing::trace!("lower_inline_patterns: lowering!");
         let binder = fresh_identifier_path();
+        let pattern = the.parameter.into_pattern();
+        let body = Self::recurse(the.body);
+        // Push the deconstruct PAST any trailing lambdas, down to the innermost body, so a
+        // multi-parameter lambda whose first parameter is a pattern (`λ(Bytes s) i. e`) keeps
+        // its parameters ADJACENT: `λfresh i. deconstruct fresh into Bytes s -> e`. If instead
+        // the deconstruct sat directly under `fresh` (wrapping the `λi`), it would split the
+        // lambda into an arity-1 worker that RETURNS a closure for the remaining parameters --
+        // a partial-application allocation at every call site (measured: ~6% on the byte/Get/Put
+        // benchmarks). Threading it inward keeps the run of lambdas together so lambda-lifting
+        // emits a saturated arity-N worker. Deconstruct-of-a-newtype is a runtime no-op, and for
+        // any irrefutable parameter pattern this is order-preserving.
         Lambda {
             parameter: binder.clone(),
-            // Only do this stuff when there is an actual pattern match
-            body: Expr::Deconstruct(
+            body: Self::deconstruct_at_innermost(a, binder, pattern, body),
+        }
+    }
+
+    fn deconstruct_at_innermost(
+        a: ParseInfo,
+        binder: IdentifierPath,
+        pattern: crate::ast::pattern::Pattern<ParseInfo, IdentifierPath>,
+        body: Tree<ParseInfo, <Desugared as Phase>::TermId>,
+    ) -> Tree<ParseInfo, <Desugared as Phase>::TermId> {
+        match Rc::unwrap_or_clone(body) {
+            Expr::Lambda(la, inner) => Expr::Lambda(
+                la,
+                Lambda {
+                    parameter: inner.parameter,
+                    body: Self::deconstruct_at_innermost(a, binder, pattern, inner.body),
+                },
+            )
+            .into(),
+            innermost => Expr::Deconstruct(
                 a,
                 Deconstruct {
                     scrutinee: Expr::Variable(a, binder).into(),
                     match_clauses: vec![MatchClause {
-                        pattern: the.parameter.into_pattern(),
-                        consequent: Self::recurse(the.body),
+                        pattern,
+                        consequent: Rc::new(innermost),
                     }],
                 },
             )

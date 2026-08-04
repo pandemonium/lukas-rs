@@ -1,0 +1,187 @@
+(* The primordial Prelude: always imported, no `use Stdlib` required. It holds the      *)
+(* language's runtime-facing primitives -- the opaque byte/text types and the COMPLETE  *)
+(* public API over them, plus the `IO` datatype and the dependency-free core ADTs.       *)
+(*                                                                                        *)
+(* It carries NO typeclass signatures and NO witnesses -- those are all in Stdlib. So    *)
+(* the datatypes here are "dumb": you can PRODUCE an `IO Buffer` (buffer ops build it     *)
+(* with the `Suspend` constructor directly), a `Perhaps`, a `Result`, but to COMPOSE     *)
+(* them -- `bind`/`fmap`/do-notation, folding -- you need `use Stdlib` (the Monad/Functor *)
+(* witnesses live there). Opacity is preserved: the `raw_*` foreigns and `Raw_*` handle   *)
+(* types are private to this module, the byte/text constructors are `opaque`, and no      *)
+(* `Raw_*` ever appears in a public signature.                                            *)
+
+(* ------------------------------------------------------------------ combinators *)
+id :: ∀α. α -> α := λx. x
+
+flip :: ∀α β r. (α -> β -> r) -> β -> α -> r := λf b a. f a b
+
+compose :: ∀α β γ. (β -> γ) -> (α -> β) -> α -> γ := λg f a. g (f a)
+
+const :: ∀α β. α -> β -> α := λa _. a
+
+module Int:
+  foreign raw_int_of_char :: Char -> Int
+  of_char :: Char -> Int := raw_int_of_char
+
+(* ---------------------------------------------------------------- core ADTs *)
+(* Types + eliminators only. Every typeclass WITNESS (Functor/Monad/Foldable/...) and    *)
+(* SIGNATURE lives in Stdlib -- these are dumb until you `use Stdlib`.                    *)
+Perhaps ::= ∀α. Nope | This α
+
+perhaps :: ∀α z. z -> (α -> z) -> Perhaps α -> z :=
+  λz f xa. deconstruct xa into This x -> f x | otherwise -> z
+
+Result ::= ∀e α. Fault e | Return α
+
+result :: ∀α e z. (e -> z) -> (α -> z) -> Result e α -> z :=
+  λfault return ra.
+    deconstruct ra into
+      Fault e  -> fault e
+    | Return a -> return a
+
+Read_Error ::= Out_of_bounds
+
+(* The IO datatype -- just the type + `Suspend`. Its Functor/Applicative/Monad witnesses *)
+(* are in Stdlib, so a deferred effect can be built here but only sequenced with batteries. *)
+IO ::= ∀α. Suspend (Unit -> α)
+
+(* ------------------------------------------------------ byte / text primitives *)
+(* The `Raw_*` handle types and the opaque wrappers sit at this (parent) level so both  *)
+(* the `Bytes` and `Buffer` submodules can name/construct them. The unsafe `raw_*`       *)
+(* foreigns are grouped under their submodule below and stay private to it.             *)
+foreign Raw_Buffer
+foreign Raw_Bytes
+
+opaque Buffer ::= Buffer Raw_Buffer         (* mutable, growable: the write side *)
+opaque Bytes  ::= Bytes Raw_Bytes           (* immutable view:  the read side *)
+opaque Text   ::= MkText Bytes              (* validated UTF-8 view over Bytes *)
+
+module Buffer:
+  foreign raw_new_buffer :: Int -> Raw_Buffer
+  foreign raw_put_u8     :: Raw_Buffer -> Int -> Unit
+  foreign raw_put_16_le  :: Raw_Buffer -> Int -> Unit
+  foreign raw_put_32_le  :: Raw_Buffer -> Int -> Unit
+  foreign raw_put_64_le  :: Raw_Buffer -> Int -> Unit
+  foreign raw_put_16_be  :: Raw_Buffer -> Int -> Unit
+  foreign raw_put_32_be  :: Raw_Buffer -> Int -> Unit
+  foreign raw_put_64_be  :: Raw_Buffer -> Int -> Unit
+  foreign raw_put_slice  :: Raw_Buffer -> Raw_Bytes -> Unit
+  foreign raw_move       :: Raw_Buffer -> Raw_Bytes
+  foreign raw_copy       :: Raw_Buffer -> Raw_Bytes
+
+  (* Effectful, hence IO -- but built directly with `Suspend` (no witness needed to     *)
+  (* construct). The buffer HANDLE is stable (growth reallocates the body in place), so  *)
+  (* a write returns Unit and `put_u8`'s buffer stays valid.                             *)
+  new_buffer :: Int -> IO Buffer := λcap. Suspend (λ_. Buffer (raw_new_buffer cap))
+
+  put_u8    :: Buffer -> Int -> IO Unit := λ(Buffer b) v. Suspend (λ_. raw_put_u8 b v)
+  put_16_le :: Buffer -> Int -> IO Unit := λ(Buffer b) v. Suspend (λ_. raw_put_16_le b v)
+  put_32_le :: Buffer -> Int -> IO Unit := λ(Buffer b) v. Suspend (λ_. raw_put_32_le b v)
+  put_64_le :: Buffer -> Int -> IO Unit := λ(Buffer b) v. Suspend (λ_. raw_put_64_le b v)
+  put_16_be :: Buffer -> Int -> IO Unit := λ(Buffer b) v. Suspend (λ_. raw_put_16_be b v)
+  put_32_be :: Buffer -> Int -> IO Unit := λ(Buffer b) v. Suspend (λ_. raw_put_32_be b v)
+  put_64_be :: Buffer -> Int -> IO Unit := λ(Buffer b) v. Suspend (λ_. raw_put_64_be b v)
+
+  put_slice :: Buffer -> Bytes -> IO Unit := λ(Buffer b) (Bytes s). Suspend (λ_. raw_put_slice b s)
+
+  (* Hand the buffer's bytes to an immutable Bytes, zero-copy (resets the buffer). *)
+  move :: Buffer -> IO Bytes := λ(Buffer b). Suspend (λ_. Bytes (raw_move b))
+
+  (* Independent copy of the buffer's bytes. *)
+  copy :: Buffer -> IO Bytes := λ(Buffer b). Suspend (λ_. Bytes (raw_copy b))
+
+module Bytes:
+  foreign raw_slice_len  :: Raw_Bytes -> Int
+  foreign raw_sub        :: Raw_Bytes -> Int -> Int -> Raw_Bytes
+  foreign raw_get_u8     :: Raw_Bytes -> Int -> Int
+  foreign raw_get_u16_le :: Raw_Bytes -> Int -> Int
+  foreign raw_get_u32_le :: Raw_Bytes -> Int -> Int
+  foreign raw_get_u64_le :: Raw_Bytes -> Int -> Int
+  foreign raw_get_i16_le :: Raw_Bytes -> Int -> Int
+  foreign raw_get_i32_le :: Raw_Bytes -> Int -> Int
+  foreign raw_get_i64_le :: Raw_Bytes -> Int -> Int
+  foreign raw_get_u16_be :: Raw_Bytes -> Int -> Int
+  foreign raw_get_u32_be :: Raw_Bytes -> Int -> Int
+  foreign raw_get_u64_be :: Raw_Bytes -> Int -> Int
+  foreign raw_get_i16_be :: Raw_Bytes -> Int -> Int
+  foreign raw_get_i32_be :: Raw_Bytes -> Int -> Int
+  foreign raw_get_i64_be :: Raw_Bytes -> Int -> Int
+  foreign raw_is_valid   :: Bytes -> Bool     (* Bytes erases to its slice, passed to C *)
+
+  (* Reads are genuinely pure -- no IO. *)
+  length :: Bytes -> Int := λ(Bytes s). raw_slice_len s
+
+  (* Unchecked zero-copy sub-view; caller ensures 0 <= from <= to <= length. *)
+  slice :: Bytes -> Int -> Int -> Bytes := λ(Bytes s) from to. Bytes (raw_sub s from to)
+
+  (* Unchecked split at `n` -> (prefix [0,n), suffix [n,length)). *)
+  split_at :: Bytes -> Int -> (Bytes, Bytes) := λ(Bytes s) n. (Bytes (raw_sub s 0 n), Bytes (raw_sub s n (raw_slice_len s - n)))
+
+  (* First index whose byte satisfies `p`, else Nope. *)
+  position :: Bytes -> (Int -> Bool) -> Perhaps Int := λ(Bytes s) p.
+    let length = raw_slice_len s in
+    let scan = λi.
+      if p (raw_get_u8 s i) then This i
+      else if i + 1 < length then scan (i + 1)
+      else Nope
+    in if length > 0 then scan 0 else Nope
+
+  get_u8     :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_u8 s i
+  get_u16_le :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_u16_le s i
+  get_u32_le :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_u32_le s i
+  get_u64_le :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_u64_le s i
+  get_i16_le :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_i16_le s i
+  get_i32_le :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_i32_le s i
+  get_i64_le :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_i64_le s i
+  get_u16_be :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_u16_be s i
+  get_u32_be :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_u32_be s i
+  get_u64_be :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_u64_be s i
+  get_i16_be :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_i16_be s i
+  get_i32_be :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_i32_be s i
+  get_i64_be :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_i64_be s i
+
+  (* Is the whole view well-formed UTF-8? (C fast path; no allocation.) *)
+  is_valid :: Bytes -> Bool := raw_is_valid
+
+(* --------------------------------------------------------------------- Text *)
+(* `opaque`, so `MkText` -- and thus the UTF-8 invariant -- is sealed in this module.    *)
+(* `from_bytes` is the only validating way in; `to_bytes` the only way out. Char/byte ops *)
+(* delegate to the public `Bytes.*` surface -- Text never reaches past `Bytes`. All pure. *)
+(* Grouped under `module Text:` so the API is `Text.from_bytes`/`Text.length`/... (the     *)
+(* type `Text` and module `Text` coexist, exactly like `Bytes`).                           *)
+module Text:
+  from_bytes :: Bytes -> Perhaps Text := λbytes.
+    if Bytes.is_valid bytes
+      then This (MkText bytes)
+      else Nope
+
+  (* Share the underlying bytes back out (free -- the wrapper erases). *)
+  to_bytes :: Text -> Bytes := λ(MkText b). b
+
+  (* Length in BYTES (Rust `str::len`), not chars. *)
+  length :: Text -> Int := λ(MkText b). Bytes.length b
+
+  (* Byte at index `i`, as Int (Rust `str::as_bytes()[i]`). No char indexing. *)
+  get :: Text -> Int -> Int := λ(MkText b). Bytes.get_u8 b
+
+(* ------------------------------------------------------------------- Display *)
+(* The ONE typeclass in the core: string interpolation (`"…`x`…"`) desugars in the parser *)
+(* to `display x`, so `Display` -- the signature plus witnesses for the builtin types -- *)
+(* must be primordial for interpolation to work with no imports. `Display` for user types *)
+(* is added in Stdlib / user code. (All other classes -- Functor/Monad/Foldable/... -- are *)
+(* Stdlib.) The builtin witnesses defer to the runtime `prim_show`.                        *)
+signature Display ::= ∀α.
+  { display :: α -> Text
+  }
+
+witness Display Text :=
+  { display := λt. prim_show t
+  }
+
+witness Display Char :=
+  { display := λt. prim_show t
+  }
+
+witness Display Int :=
+  { display := λt. prim_show t
+  }

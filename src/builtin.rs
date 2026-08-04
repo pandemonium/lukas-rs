@@ -13,7 +13,7 @@ use crate::{
     parser::{self, ParseInfo, Parsed},
     phase::Phase,
     rawlambda1,
-    typer::{BaseType, ConstraintSet, MetaVariable, Type, TypeScheme},
+    typer::{BaseType, ConstraintSet, MetaVariable, Type, TypeScheme, stdlib_text_type},
 };
 
 fn comparison_signature() -> TypeScheme {
@@ -153,7 +153,7 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
                     codomain: Type::Arrow {
                         domain: Type::Variable(z.clone()).into(),
                         codomain: Type::Arrow {
-                            domain: Type::Base(BaseType::Text).into(),
+                            domain: stdlib_text_type().into(),
                             codomain: Type::Variable(z).into(),
                         }
                         .into(),
@@ -192,13 +192,9 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
             arity: 0,
             kind: Kind::Star,
         },
-        TypeSymbol {
-            definition: TypeDefinition::BaseType(BaseType::Text),
-            origin: TypeOrigin::Builtin,
-            opacity: Access::Anywhere,
-            arity: 0,
-            kind: Kind::Star,
-        },
+        // `Text` is no longer a builtin type: it is the stdlib DU
+        // `opaque Text ::= Text Bytes` (Stdlib/Text.lady). String literals and
+        // interpolation elaborate to it via `stdlib_text_type()`.
         TypeSymbol {
             definition: TypeDefinition::BaseType(BaseType::Bool),
             origin: TypeOrigin::Builtin,

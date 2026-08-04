@@ -40,6 +40,12 @@ typedef struct GcHeader {
 #define BODY(h) ((void *)((h) + 1))
 #define HEADER(p) (((GcHeader *)(p)) - 1)
 
+// An immutable byte view: `owner` is a real GC-body pointer (an OBJ_BYTES body or an
+// OBJ_MMAP handle -- so the tracer keeps the backing live) plus an offset/length.
+// Both `Bytes` and the validated `Text` erase to an OBJ_SLICE over this. Exposed here
+// (not gc.c-private) so codegen can emit a string literal as a static .rodata Slice.
+typedef struct { void *owner; size_t offset; size_t len; } Slice;
+
 // A `GcHeader.old` sentinel marking a static, never-collected object: a borrowed
 // string literal's descriptor, emitted `const` into .rodata by codegen. It is
 // not in any slab or the large-object set (so `is_object` is false for it and
@@ -148,6 +154,8 @@ Value  buffer_copy_range(Value buf, size_t off, size_t n); // -> Result; indepen
 
 Value   mk_slice(void *owner, size_t offset, size_t len);
 size_t  slice_len(Value slice);
+const uint8_t *slice_ptr(Value slice); // direct read pointer to byte 0 (owner must stay live)
+bool text_to_cstr(Value slice, char *buf, size_t cap); // NUL-terminate into buf; false if too big
 uint8_t slice_get_u8(Value slice, size_t i);
 Value   slice_sub(Value slice, size_t offset, size_t len);
 

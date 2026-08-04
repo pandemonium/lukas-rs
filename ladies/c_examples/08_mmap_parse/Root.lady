@@ -31,9 +31,9 @@ payload :: Put Unit :=
   put_u32_be 1000                 (* record 1: val *)
 
 build :: IO Bytes :=
-  let* b = new_buffer 32 in
+  let* b = Buffer.new_buffer 32 in
   let* _ = run_put payload b in
-  move b
+  Buffer.move b
 
 (* ---- reading: the parser, in the Get monad. No source argument anywhere. ---- *)
 records :: Int -> Get Read_Error (List Record) := λn.

@@ -22,9 +22,9 @@ chunk_puts :: Put Unit :=
   let* _ = put_u8 0xF0 in let* _ = put_u8 0x9F in let* _ = put_u8 0x98 in put_u8 0x80
 
 chunk :: IO Bytes :=
-  let* b = new_buffer 64 in
+  let* b = Buffer.new_buffer 64 in
   let* _ = run_put chunk_puts b in
-  move b
+  Buffer.move b
 
 replicate :: Bytes -> Int -> Put Unit := λc n.
   if n <= 0 then pure ()
@@ -32,9 +32,9 @@ replicate :: Bytes -> Int -> Put Unit := λc n.
 
 corpus :: IO Bytes :=
   let* c = chunk in
-  let* b = new_buffer 6000000 in
+  let* b = Buffer.new_buffer 6000000 in
   let* _ = run_put (replicate c copies) b in
-  move b
+  Buffer.move b
 
 (* Validate `reps` times, counting successes so the calls can't be dead-coded. *)
 loop :: Int -> Bytes -> Int -> Int := λn bytes acc.
@@ -43,7 +43,7 @@ loop :: Int -> Bytes -> Int -> Int := λn bytes acc.
 
 program :: IO Unit :=
   let* bytes = corpus in
-  let* _ = IO.output (display (len bytes)) in
+  let* _ = IO.output (display (Bytes.length bytes)) in
   IO.output (display (loop reps bytes 0))
 
 start :: Int -> Unit := λ_.

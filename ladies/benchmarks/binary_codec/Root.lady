@@ -106,9 +106,9 @@ checksum    :: File -> Int := λ(MkFile _ bs). sum_blocks bs
 
 (* ---- build the initial buffer once ---- *)
 initial :: IO Bytes :=
-  let* b = new_buffer 12000000 in
+  let* b = Buffer.new_buffer 12000000 in
   let* _ = run_put (put_file gen_file) b in
-  move b
+  Buffer.move b
 
 (* ---- one round-trip: parse the bytes, checksum, re-serialize ---- *)
 one_iter :: Bytes -> IO Int := λbytes.
@@ -116,10 +116,10 @@ one_iter :: Bytes -> IO Int := λbytes.
     Fault _  -> pure 0
   | Return f ->
       let chk = checksum f in
-      let* b2 = new_buffer 12000000 in
+      let* b2 = Buffer.new_buffer 12000000 in
       let* _  = run_put (put_file f) b2 in
-      let* _  = move b2 in
-      pure (chk + len bytes)
+      let* _  = Buffer.move b2 in
+      pure (chk + Bytes.length bytes)
 
 loop :: Int -> Bytes -> Int -> IO Int := λn bytes acc.
   if n < 1 then pure acc
@@ -129,7 +129,7 @@ loop :: Int -> Bytes -> Int -> IO Int := λn bytes acc.
 
 program :: IO Unit :=
   let* bytes = initial in
-  let* _     = IO.output (display (len bytes)) in
+  let* _     = IO.output (display (Bytes.length bytes)) in
   let* result = loop reps bytes 1 in
   IO.output (display result)
 

@@ -2575,6 +2575,19 @@ impl BaseType {
     }
 }
 
+// The stdlib `Text` type (`opaque Text ::= Text Bytes`, in `Stdlib/Text.lady`). `Text`
+// is no longer a builtin base type: string literals and interpolation elaborate to this
+// stdlib DU, whose sole newtype-erased field is a `Bytes` (a raw slice). This is the one
+// deliberate compiler->stdlib reference (languages special-case `String` the same way);
+// it resolves from the global type table, so any program that reaches the elaborator has
+// `Stdlib.Text` on its library path.
+pub fn stdlib_text_type() -> Type {
+    // `Text` lives in the always-imported primordial `Prelude` (Root.Prelude.Text) -- the
+    // single deliberate compiler->stdlib reference for the string-literal type.
+    let module = parser::IdentifierPath::new("Root").with_suffix("Prelude");
+    Type::Constructor(namer::QualifiedName::new(module, "Text"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TupleType(pub Vec<Type>);
 
@@ -4012,7 +4025,7 @@ impl TypingContext {
             substitutions,
             constraints,
             Expr::Interpolate(
-                pi.with_inferred_type(Type::Base(BaseType::Text)),
+                pi.with_inferred_type(stdlib_text_type()),
                 ast::Interpolate(segs),
             ),
         ))
@@ -5203,10 +5216,16 @@ impl TypingContext {
 
 impl Literal {
     fn synthesize_type(&self) -> Type {
+        // A string literal is a `Text` -- the stdlib DU (`opaque Text ::= Text Bytes`),
+        // not a builtin base type -- so it flows through the same elaboration as any
+        // other constructor value. Every other literal is still a base type.
+        if let Self::Text(..) = self {
+            return stdlib_text_type();
+        }
         Type::Base(match self {
             Self::Int(..) => BaseType::Int,
             Self::Float(..) => BaseType::Int,
-            Self::Text(..) => BaseType::Text,
+            Self::Text(..) => unreachable!("handled above"),
             Self::Bool(..) => BaseType::Bool,
             Self::Unit => BaseType::Unit,
             Self::Char(..) => BaseType::Char,

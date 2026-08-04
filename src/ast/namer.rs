@@ -1111,6 +1111,11 @@ impl phase::SymbolTable<Parsed> {
         }
 
         let mut loaded = HashSet::from([IdentifierPath::new(program.root_module.name.as_str())]);
+
+        // The always-imported primordial `Prelude` is loaded+opened via a `use Prelude.`
+        // injected into the root module (see `Compiler::parse_compilation_unit`); no
+        // special pre-load is needed here.
+
         let root_dir = program.compiler.source_path.clone();
         symtab.add_module_contents(
             &program.compiler,

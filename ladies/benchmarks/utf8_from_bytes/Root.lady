@@ -1,13 +1,11 @@
 use Stdlib.
 use Stdlib.Binary.
 
-(* UTF-8 validation benchmark -- NATIVE (C) validator: `Bytes.is_valid`, a branchless *)
-(* Höhrmann DFA behind a word-at-a-time ASCII fast path, validate-only (no copy).    *)
-(* The sibling `utf8_get` benchmark runs the SAME corpus through the pure Get-monad   *)
-(* validator (`Utf8.is_valid`) so the two can be compared -- a backend stress test.   *)
-(*                                                                                     *)
-(* Corpus: `copies` repetitions of a 49-byte chunk that is ~92% ASCII (40 'a' then    *)
-(* é/€/😀 = a 2/3/4-byte sequence each) -- the realistic mix for real-world text.      *)
+(* from_bytes benchmark: validates AND MATERIALISES a `Text` over the corpus `reps`  *)
+(* times. This is the path the zero-copy change touches -- `from_bytes` now validates *)
+(* in place and wraps the SAME Bytes (one small `This` alloc, no byte copy), where the *)
+(* old path validated and COPIED the whole run into a fresh owned Text. The sibling    *)
+(* utf8_native/utf8_get benchmarks only return Bool (is_valid) and never build a Text. *)
 
 reps   :: Int := 2000
 copies :: Int := 120000   (* 49-byte chunk -> ~5.9 MB corpus *)
@@ -37,10 +35,10 @@ corpus :: IO Bytes :=
   let* _ = run_put (replicate c copies) b in
   Buffer.move b
 
-(* Validate `reps` times, counting successes so the calls can't be dead-coded. *)
+(* from_bytes `reps` times, counting materialised Texts so the calls can't be dead-coded. *)
 loop :: Int -> Bytes -> Int -> Int := λn bytes acc.
   if n < 1 then acc
-  else loop (n - 1) bytes (acc + (if Bytes.is_valid bytes then 1 else 0))
+  else loop (n - 1) bytes (acc + perhaps 0 (const 1) (Text.from_bytes bytes))
 
 program :: IO Unit :=
   let* bytes = corpus in

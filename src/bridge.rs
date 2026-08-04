@@ -8,7 +8,7 @@ use crate::{
     interpreter::{Interpretation, Literal, RuntimeError, cek::Val},
     parser::{self, ParseInfo, Parsed},
     phase::Phase,
-    typer::{BaseType, ConstraintSet, MetaVariable, Type, TypeScheme, display_list},
+    typer::{BaseType, ConstraintSet, MetaVariable, Type, TypeScheme, display_list, stdlib_text_type},
 };
 
 #[derive(Clone)]
@@ -102,31 +102,44 @@ pub trait Intrinsic {
 }
 
 trait TypeBridge {
-    const TYPE: Type;
+    // A method, not a `const`: `String` maps to the stdlib `Text` DU
+    // (`stdlib_text_type()`), whose value is heap-allocated (a `QualifiedName`) and so
+    // cannot be a `const`.
+    fn ty() -> Type;
 }
 
 impl TypeBridge for String {
-    const TYPE: Type = Type::Base(BaseType::Text);
+    fn ty() -> Type {
+        stdlib_text_type()
+    }
 }
 
 impl TypeBridge for () {
-    const TYPE: Type = Type::Base(BaseType::Unit);
+    fn ty() -> Type {
+        Type::Base(BaseType::Unit)
+    }
 }
 
 impl TypeBridge for i64 {
-    const TYPE: Type = Type::Base(BaseType::Int);
+    fn ty() -> Type {
+        Type::Base(BaseType::Int)
+    }
 }
 
 //impl TypeBridge for f64 {
-//    const TYPE: Type = Type::Base(BaseType::Float);
+//    fn ty() -> Type { Type::Base(BaseType::Float) }
 //}
 
 impl TypeBridge for bool {
-    const TYPE: Type = Type::Base(BaseType::Bool);
+    fn ty() -> Type {
+        Type::Base(BaseType::Bool)
+    }
 }
 
 impl TypeBridge for char {
-    const TYPE: Type = Type::Base(BaseType::Char);
+    fn ty() -> Type {
+        Type::Base(BaseType::Char)
+    }
 }
 
 #[macro_export]
@@ -199,8 +212,8 @@ where
 
     fn type_scheme(&self) -> TypeScheme {
         TypeScheme::from_constant(Type::Arrow {
-            domain: A::TYPE.into(),
-            codomain: R::TYPE.into(),
+            domain: A::ty().into(),
+            codomain: R::ty().into(),
         })
     }
 }
@@ -230,10 +243,10 @@ where
 
     fn type_scheme(&self) -> TypeScheme {
         TypeScheme::from_constant(Type::Arrow {
-            domain: A::TYPE.into(),
+            domain: A::ty().into(),
             codomain: Type::Arrow {
-                domain: B::TYPE.into(),
-                codomain: R::TYPE.into(),
+                domain: B::ty().into(),
+                codomain: R::ty().into(),
             }
             .into(),
         })
@@ -267,12 +280,12 @@ where
 
     fn type_scheme(&self) -> TypeScheme {
         TypeScheme::from_constant(Type::Arrow {
-            domain: A::TYPE.into(),
+            domain: A::ty().into(),
             codomain: Type::Arrow {
-                domain: B::TYPE.into(),
+                domain: B::ty().into(),
                 codomain: Type::Arrow {
-                    domain: C::TYPE.into(),
-                    codomain: R::TYPE.into(),
+                    domain: C::ty().into(),
+                    codomain: R::ty().into(),
                 }
                 .into(),
             }
@@ -304,7 +317,7 @@ where
             quantifiers: vec![tp.clone()],
             underlying: Type::Arrow {
                 domain: Type::Variable(tp).into(),
-                codomain: R::TYPE.into(),
+                codomain: R::ty().into(),
             },
             constraints: ConstraintSet::default(),
         }
@@ -389,7 +402,7 @@ impl TryFrom<Val> for String {
         if let Val::Constant(Literal::Text(s)) = value {
             Ok(s)
         } else {
-            Err(RuntimeError::ExpectedType(Type::Base(BaseType::Text)))
+            Err(RuntimeError::ExpectedType(stdlib_text_type()))
         }
     }
 }
@@ -407,7 +420,7 @@ impl TryFrom<Val> for i64 {
         if let Val::Constant(Literal::Int(s)) = value {
             Ok(s)
         } else {
-            Err(RuntimeError::ExpectedType(Type::Base(BaseType::Text)))
+            Err(RuntimeError::ExpectedType(stdlib_text_type()))
         }
     }
 }
@@ -425,7 +438,7 @@ impl TryFrom<Val> for bool {
         if let Val::Constant(Literal::Bool(s)) = value {
             Ok(s)
         } else {
-            Err(RuntimeError::ExpectedType(Type::Base(BaseType::Text)))
+            Err(RuntimeError::ExpectedType(stdlib_text_type()))
         }
     }
 }

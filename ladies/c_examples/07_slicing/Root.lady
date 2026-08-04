@@ -12,7 +12,7 @@ payload :: Put Unit :=
   put_u8 40
 
 fill :: IO Buffer :=
-  let* b = new_buffer 8 in
+  let* b = Buffer.new_buffer 8 in
   let* _ = run_put payload b in
   pure b
 
