@@ -17,3 +17,16 @@ start :: Int -> Unit := λ_.
   let y = x + 5 in
   let x = y * 2 in
   print_endline "`x`"
+
+  (* Hex literals *)
+  let p = 0x1 in
+  let q = 0x1A in
+  let r = 0x1A3 in
+  let s = 0x1A3F in
+  let t = 0x1A3F0 in
+  let u = 0x1A3F09 in
+  print_endline "`p + q + r + s + t + u`"
+
+  (* "Escaped integers for tuple projections. *)
+  let z = #12345678 in
+  print_endline "`12345678`"

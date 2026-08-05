@@ -27,7 +27,7 @@ start :: Int -> Unit := λ_.
 
   (* bare tuples -- no enclosing parens -- plus ordinal projection *)
   let t = 1, 2, 3 in
-  print_endline "`t.0 + t.1 + t.2`"              (* 6 *)
+  print_endline "`t.#0 + t.#1 + t.#2`"              (* 6 *)
 
   let p = 10, 20 in
   print_endline "`p.0 + p.1`"                    (* 30 *)
@@ -63,7 +63,7 @@ start :: Int -> Unit := λ_.
   (* into the nesting, and display parenthesises so the shape is visible. *)
   let n = (1, 2), 3 in
   print_endline "`n.0`"                            (* (1, 2) *)
-  print_endline "`n.0.1`"                          (* 2 *)
+  print_endline "`n.#0.#1`"                          (* 2 *)
   print_endline "`n`"                              (* ((1, 2), 3) *)
   print_endline "`1, (2, 3)`"                    (* (1, (2, 3)) *)
   print_endline "`1, 2, 3`"                      (* (1, 2, 3) *)
