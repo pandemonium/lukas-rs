@@ -26,8 +26,8 @@ use std::{
 use crate::{
     ast::{
         Apply, Array, Binding, Deconstruct, Expr, IfThenElse, Injection, Interpolate, Lambda,
-        ProductElement, Projection, Record, Segment, SelfReferential, Sequence, Tree, Tuple,
-        TypeAscription,
+        Literal, ProductElement, Projection, Record, Segment, SelfReferential, Sequence, Tree,
+        Tuple, TypeAscription,
         namer::{Identifier, QualifiedName, Symbol, TermSymbol},
         pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern},
     },
@@ -91,12 +91,12 @@ impl phase::SymbolTable<Types> {
         // strict win on the codec benchmark: allocation −66%, wall ~1.5x, peak RSS below
         // baseline, output unchanged, whole C panel green. `MARM_NO_INLINE=1` keeps just
         // the local rules; `MARM_NO_SIMPLIFY=1` bypasses the pass entirely.
-        let (inlinables, recursive) = if std::env::var_os("MARM_NO_INLINE").is_some() {
-            (Inlinables::default(), HashSet::default())
-        } else {
-            build_inlinables(&symbols)
-        };
-        let no_inline = Inlinables::default();
+        let (inlinables, leaf_inlinables, recursive) =
+            if std::env::var_os("MARM_NO_INLINE").is_some() {
+                (Inlinables::default(), Inlinables::default(), HashSet::default())
+            } else {
+                build_inlinables(&symbols)
+            };
         let dump = std::env::var("DUMP_SIMPLIFY").ok();
 
         // The recursion guard (don't inline into loops) is what keeps memory flat; the
@@ -122,7 +122,9 @@ impl phase::SymbolTable<Types> {
                         // exactly non-tail-recursion -- so we may keep the fused body whenever
                         // fusion left every self-call in tail position (`fusion_safe`). Try the
                         // fused body, keep it only if tail-safe, else fall back to the guarded
-                        // (un-inlined) body -- the always-safe status quo.
+                        // body -- which still inlines the pure, leaf-only helpers (a monomorphic
+                        // `<` -> `prim_lt` and friends) that can never weld an action into the
+                        // recursion, just not the effectful combinators that cause the leak.
                         let body = if !guard_loops || !recursive.contains(&name) {
                             simplify_term(body, &inlinables)
                         } else {
@@ -130,7 +132,7 @@ impl phase::SymbolTable<Types> {
                             if fusion_safe(&fused) {
                                 fused
                             } else {
-                                simplify_term(body, &no_inline)
+                                simplify_term(body, &leaf_inlinables)
                             }
                         };
                         if dump.as_deref().is_some_and(|f| name.to_string().contains(f)) {
@@ -190,15 +192,22 @@ where
 type Inlinables<A> = HashMap<QualifiedName, Tree<A, Identifier>>;
 
 /// Collect the term bodies eligible to inline (small, within [`INLINE_BUDGET`], and
-/// non-recursive so unfolding terminates), plus the set of *recursive* terms. Both come
-/// from the same term-dependency graph. The recursive set is the set of function bodies
-/// we must NOT inline *into*: a recursive body is a loop, and inlining an effectful `bind`
-/// into a loop welds the sequenced action into the recursion's closure -- the space leak.
-/// Keeping loops calling `bind` as an ordinary worker leaves the action an argument that
-/// dies each turn, while the straight-line callers still collapse fully.
+/// non-recursive so unfolding terminates), the *leaf-safe* subset of those (pure,
+/// closure-free helpers safe to inline even into a non-tail loop), and the set of
+/// *recursive* terms. All come from the same term-dependency graph. The recursive set is
+/// the set of function bodies we must NOT freely inline *into*: a recursive body is a
+/// loop, and inlining an effectful `bind` into a loop welds the sequenced action into the
+/// recursion's closure -- the space leak. Keeping loops calling `bind` as an ordinary
+/// worker leaves the action an argument that dies each turn, while the straight-line
+/// callers still collapse fully. The leaf-safe subset is what a guarded loop *may* still
+/// inline: those helpers contain no closure, so they cannot pin per-iteration data.
 fn build_inlinables(
     symbols: &HashMap<crate::ast::namer::SymbolName, phase::Symbol<Types>>,
-) -> (Inlinables<crate::typer::TypeInfo>, HashSet<QualifiedName>) {
+) -> (
+    Inlinables<crate::typer::TypeInfo>,
+    Inlinables<crate::typer::TypeInfo>,
+    HashSet<QualifiedName>,
+) {
     let terms: Vec<(&QualifiedName, &phase::Expr<Types>)> = symbols
         .values()
         .filter_map(|s| match s {
@@ -233,13 +242,167 @@ fn build_inlinables(
         .collect();
 
     let budget = inline_budget();
-    let inlinables = terms
+    let inlinable = |name: &QualifiedName, body: &phase::Expr<Types>| {
+        // A nullary constructor's term is `Inject(C, [])` -- a shared, immutable value.
+        // `free_variables` counts the constructor name (its tag), so the term looks
+        // self-referential and lands in `recursive`; but unfolding it yields another
+        // `Inject(C, [])` that references nothing, so it can never loop the inliner.
+        // Inlining it is what lets a `deconstruct` whose scrutinee is such a singleton
+        // (e.g. an `Ordering` flowing out of `compare` after case-of-`if` commuting)
+        // see a known constructor and collapse. So keep it regardless of `recursive`.
+        is_nullary_injection(body) || (within_budget(body, budget) && !recursive.contains(name))
+    };
+    let inlinables: Inlinables<_> = terms
         .iter()
-        .filter(|(name, body)| within_budget(body, budget) && !recursive.contains(*name))
+        .filter(|(name, body)| inlinable(name, body))
         .map(|(name, body)| ((*name).clone(), Rc::new((*body).clone())))
         .collect();
 
-    (inlinables, recursive)
+    // The leaf-safe subset: inlinable helpers that are pure and closure-free (transitively),
+    // so splicing one into a non-tail loop can never weld a per-iteration action into the
+    // recursion (the leak). This is what the guarded-loop path is still allowed to inline.
+    let leaf = leaf_safe_terms(&terms, &names);
+    let leaf_inlinables = terms
+        .iter()
+        .filter(|(name, body)| leaf.contains(*name) && inlinable(name, body))
+        .map(|(name, body)| ((*name).clone(), Rc::new((*body).clone())))
+        .collect();
+
+    (inlinables, leaf_inlinables, recursive)
+}
+
+/// The set of terms that are *leaf-safe*: their body, once its leading parameter lambdas
+/// are peeled, contains no closure (`Lambda`/`RecursiveLambda`/`MakeClosure`), and every
+/// term it references is itself leaf-safe. References to non-terms (builtin prims,
+/// constructors that are not standalone terms) are leaves by construction. Such a helper
+/// reduces to first-order code -- prims, constructors, `if`/`deconstruct` -- so inlining
+/// it can never introduce a closure that pins per-iteration data across a non-tail
+/// recursion. The monad combinators (`bind`/`fmap`/`pure`/`apply`/...) all carry a
+/// continuation lambda and so are excluded -- exactly the ones whose fusion leaks.
+fn leaf_safe_terms(
+    terms: &[(&QualifiedName, &phase::Expr<Types>)],
+    names: &HashSet<&QualifiedName>,
+) -> HashSet<QualifiedName> {
+    let bodies: HashMap<&QualifiedName, &phase::Expr<Types>> = terms.iter().copied().collect();
+    // Start optimistic with every closure-free term, then drop any that reaches a
+    // non-leaf term through its free variables until the set stops shrinking (a greatest
+    // fixpoint -- mutual references among leaf helpers stay in).
+    let mut leaf: HashSet<QualifiedName> = terms
+        .iter()
+        .filter(|(_, body)| is_closure_free(body))
+        .map(|(name, _)| (*name).clone())
+        .collect();
+    loop {
+        let doomed: Vec<QualifiedName> = leaf
+            .iter()
+            .filter(|name| {
+                bodies[*name].free_variables().iter().any(|referenced| {
+                    // A reference into `names` (another term) is only safe if that term is
+                    // leaf too; a reference outside `names` is a prim/ctor -- always a leaf.
+                    names.contains(referenced) && !leaf.contains(*referenced)
+                })
+            })
+            .cloned()
+            .collect();
+        if doomed.is_empty() {
+            break;
+        }
+        for name in doomed {
+            leaf.remove(&name);
+        }
+    }
+    leaf
+}
+
+/// Whether `body`, after its leading parameter lambdas (and any ascriptions) are peeled,
+/// computes first-order once applied -- no closure former in the result. A dictionary is a
+/// record, so a record is leaf iff every field is: this admits a witness like `Ord Int`
+/// (`{ compare := λp q. if prim_lt … }`, method bodies closure-free) while excluding a
+/// `Monad` witness (`{ bind := λk m. … k … }`, whose method carries a continuation lambda).
+/// That is exactly the line between the dictionaries safe to fuse into a loop and the ones
+/// whose fusion leaks.
+fn is_closure_free<A>(body: &Expr<A, Identifier>) -> bool {
+    match peel_binders(body) {
+        Expr::Record(_, record) => record.fields.iter().all(|(_, v)| is_closure_free(v)),
+        Expr::Tuple(_, tuple) => tuple.elements.iter().all(|e| is_closure_free(e)),
+        other => has_no_closure(other),
+    }
+}
+
+/// Strip the leading parameter lambdas and type ascriptions off a term body, exposing the
+/// value/computation underneath (a record for a dictionary, an `if`/`deconstruct` for a
+/// plain helper).
+fn peel_binders<A>(body: &Expr<A, Identifier>) -> &Expr<A, Identifier> {
+    let mut node = body;
+    loop {
+        match node {
+            Expr::Lambda(_, lambda) => node = &lambda.body,
+            Expr::RecursiveLambda(_, SelfReferential { lambda, .. }) => node = &lambda.body,
+            Expr::Ascription(_, ascription) => node = &ascription.ascribed_tree,
+            other => return other,
+        }
+    }
+}
+
+/// No `Lambda`/`RecursiveLambda`/`MakeClosure` anywhere in `expr`.
+fn has_no_closure<A>(expr: &Expr<A, Identifier>) -> bool {
+    match expr {
+        Expr::Lambda(..) | Expr::RecursiveLambda(..) | Expr::MakeClosure(..) => false,
+        other => children(other).into_iter().all(|c| has_no_closure(c)),
+    }
+}
+
+/// Conservative structural equality on trees, ignoring annotations: `true` only when the
+/// two are definitely the same value/expression. Unhandled shapes return `false` (a missed
+/// merge, never an unsound one). Enough to spot the equal dead arms case-of-`if` leaves.
+fn trees_equal<A>(a: &Expr<A, Identifier>, b: &Expr<A, Identifier>) -> bool {
+    match (a, b) {
+        (Expr::Constant(_, x), Expr::Constant(_, y)) => literal_eq(x, y),
+        (Expr::Variable(_, x), Expr::Variable(_, y)) => x == y,
+        (Expr::Inject(_, x), Expr::Inject(_, y)) => {
+            x.constructor == y.constructor
+                && x.arguments.len() == y.arguments.len()
+                && x.arguments
+                    .iter()
+                    .zip(&y.arguments)
+                    .all(|(p, q)| trees_equal(p, q))
+        }
+        (Expr::Apply(_, x), Expr::Apply(_, y)) => {
+            trees_equal(&x.function, &y.function) && trees_equal(&x.argument, &y.argument)
+        }
+        (Expr::Tuple(_, x), Expr::Tuple(_, y)) => {
+            x.elements.len() == y.elements.len()
+                && x.elements
+                    .iter()
+                    .zip(&y.elements)
+                    .all(|(p, q)| trees_equal(p, q))
+        }
+        _ => false,
+    }
+}
+
+fn literal_eq(a: &Literal, b: &Literal) -> bool {
+    match (a, b) {
+        (Literal::Int(x), Literal::Int(y)) => x == y,
+        (Literal::Float(x), Literal::Float(y)) => x == y,
+        (Literal::Text(x), Literal::Text(y)) => x == y,
+        (Literal::Bool(x), Literal::Bool(y)) => x == y,
+        (Literal::Char(x), Literal::Char(y)) => x == y,
+        (Literal::Unit, Literal::Unit) => true,
+        _ => false,
+    }
+}
+
+/// A term body that is a bare nullary constructor value, `Inject(C, [])` -- possibly
+/// under type ascriptions, which the elaborator leaves on a constructor term and the
+/// reducer strips on sight. Recognising it lets `build_inlinables` keep the singleton
+/// even though `free_variables` counts its own constructor name as a (spurious) self-dep.
+fn is_nullary_injection<A>(body: &Expr<A, Identifier>) -> bool {
+    match body {
+        Expr::Ascription(_, ascription) => is_nullary_injection(&ascription.ascribed_tree),
+        Expr::Inject(_, Injection { arguments, .. }) => arguments.is_empty(),
+        _ => false,
+    }
 }
 
 /// Whether `expr` contains a self-referential lambda that actually uses its self-binder
@@ -419,6 +582,20 @@ fn within_budget<A>(expr: &Expr<A, Identifier>, budget: usize) -> bool {
     }
     let mut count = 0;
     go(expr, budget, &mut count)
+}
+
+/// Guard for case-of-`if` commuting: the whole match is duplicated into both branches,
+/// so only commute when the clauses are small enough that the copy is cheap. Bounds the
+/// duplicated size to `MAX_CLAUSES * PER_CLAUSE_BUDGET` nodes -- comfortably fits the
+/// `compare`-shaped matches (a couple of clauses returning `true`/`false`) this exists
+/// for, while refusing to fan a large match body out across an `if`.
+fn clauses_are_small<A>(clauses: &[MatchClause<A, Identifier>]) -> bool {
+    const MAX_CLAUSES: usize = 4;
+    const PER_CLAUSE_BUDGET: usize = 8;
+    clauses.len() <= MAX_CLAUSES
+        && clauses
+            .iter()
+            .all(|clause| within_budget(&clause.consequent, PER_CLAUSE_BUDGET))
 }
 
 /// The immediate sub-trees of a node, in evaluation order. Used by size measurement
@@ -912,6 +1089,70 @@ where
             Some(reduced) => (true, reduced),
             None => (false, Expr::Project(a, projection)),
         },
+
+        // `if p then e else e` -> `e`: both arms agree, so the (pure) test is dead. This
+        // fires after case-of-`if` commuting + case-of-known-constructor reduce a `compare`
+        // chain: e.g. `a < b` becomes `if prim_lt a b then true else (if prim_eq a b then
+        // false else false)`, and this collapses the inner `if prim_eq …` to `false`,
+        // dropping the now-useless `prim_eq` (a real `val_eq` call) from the hot path.
+        // Conditions are pure Bool expressions here, so discarding `p` is sound.
+        Expr::If(_, ref ite) if trees_equal(&ite.consequent, &ite.alternate) => {
+            let Expr::If(_, ite) = expr else {
+                unreachable!("guarded by the match arm")
+            };
+            (true, Rc::unwrap_or_clone(ite.consequent))
+        }
+
+        // case-of-`if` commuting: `deconstruct (if p then t else e) into cs` becomes
+        // `if p then (deconstruct t into cs) else (deconstruct e into cs)`. This pushes
+        // the match down onto each branch, where -- once `t`/`e` are known constructors
+        // (the `compare` witnesses expand to `if prim_lt … then Less else …`) -- the
+        // case-of-known-constructor arm below fires and the `Ordering` is never built.
+        // An `if` binds nothing, so both branches sit at the scrutinee's depth: with De
+        // Bruijn levels the clauses move in verbatim, no shifting. Terminating: the rule
+        // only moves the deconstruct strictly toward the leaves of the `if`-tree (a
+        // constructor leaf then reduces, any other leaf leaves an irreducible match).
+        // Guarded to small clauses since they are duplicated into both branches.
+        Expr::Deconstruct(a, deconstruct)
+            if matches!(&*deconstruct.scrutinee, Expr::If(..))
+                && clauses_are_small(&deconstruct.match_clauses) =>
+        {
+            let Deconstruct {
+                scrutinee,
+                match_clauses,
+            } = deconstruct;
+            let Expr::If(
+                _,
+                IfThenElse {
+                    predicate,
+                    consequent,
+                    alternate,
+                },
+            ) = Rc::unwrap_or_clone(scrutinee)
+            else {
+                unreachable!("guarded by the match arm")
+            };
+            let on_branch = |branch: Tree<A, Identifier>, clauses| {
+                Rc::new(Expr::Deconstruct(
+                    a.clone(),
+                    Deconstruct {
+                        scrutinee: branch,
+                        match_clauses: clauses,
+                    },
+                ))
+            };
+            (
+                true,
+                Expr::If(
+                    a.clone(),
+                    IfThenElse {
+                        predicate,
+                        consequent: on_branch(consequent, match_clauses.clone()),
+                        alternate: on_branch(alternate, match_clauses),
+                    },
+                ),
+            )
+        }
 
         Expr::Deconstruct(a, deconstruct) => match deconstruct_literal(&a, &deconstruct) {
             Some(reduced) => (true, reduced),

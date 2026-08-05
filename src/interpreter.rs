@@ -311,7 +311,9 @@ impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Int(x) => write!(f, "{x}"),
-            Self::Float(x) => write!(f, "{x}"),
+            // `{x:?}` keeps the decimal point (`1.0`, not `1`), so a Float always reads
+            // back as a Float rather than degenerating to an Int in the rendered output.
+            Self::Float(x) => write!(f, "{x:?}"),
             Self::Text(x) => write!(f, "{x}"),
             Self::Bool(x) => write!(f, "{x}"),
             Self::Unit => write!(f, "()"),

@@ -603,6 +603,22 @@ impl Operator {
             Self::Ascribe => "::",
         }
     }
+
+    /// The term-level name an infix operator desugars to when it is applied.
+    /// The ordering operators route to the polymorphic, `Ord`-constrained
+    /// `lt/gt/lte/gte` in the Prelude (which delegate to `compare`); `=` routes to
+    /// the `Eq` method `eq` (whose primitive witnesses bottom out in `prim_eq`);
+    /// every other operator still resolves to the like-named builtin.
+    pub const fn term_name(&self) -> &str {
+        match self {
+            Self::Lt => "lt",
+            Self::Gt => "gt",
+            Self::Lte => "lte",
+            Self::Gte => "gte",
+            Self::Equals => "eq",
+            other => other.name(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

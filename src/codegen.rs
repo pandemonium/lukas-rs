@@ -58,19 +58,19 @@ fn surface_name(q: &QualifiedName) -> String {
 fn map_builtin_name(q: &QualifiedName) -> &'static str {
     match q.member.as_str() {
         "print_endline" => "builtin_print_endline",
-        "=" => "builtin_eq",
+        "prim_eq" => "builtin_eq",
         "-" => "builtin_sub",
         "+" => "builtin_add",
         "*" => "builtin_mul",
         "/" => "builtin_div",
         "%" => "builtin_mod",
-        "<" => "builtin_lt",
-        ">" => "builtin_gt",
+        "prim_lt" => "builtin_lt",
+        "prim_gt" => "builtin_gt",
         "and" => "builtin_and",
         "xor" => "builtin_xor",
         "or" => "builtin_or",
-        ">=" => "builtin_ge",
-        "<=" => "builtin_le",
+        "prim_gte" => "builtin_ge",
+        "prim_lte" => "builtin_le",
         "text_fold_right" => "builtin_text_fold_right",
         otherwise => panic!("unmapped builtin {otherwise:?}"),
     }
@@ -129,11 +129,11 @@ fn builtin_prim(head: &Expr) -> Option<(&'static str, usize)> {
         "*" => ("prim_mul", 2),
         "/" => ("prim_div", 2),
         "%" => ("prim_mod", 2),
-        "=" => ("prim_eq", 2),
-        "<" => ("prim_lt", 2),
-        ">" => ("prim_gt", 2),
-        "<=" => ("prim_le", 2),
-        ">=" => ("prim_ge", 2),
+        "prim_eq" => ("prim_eq", 2),
+        "prim_lt" => ("prim_lt", 2),
+        "prim_gt" => ("prim_gt", 2),
+        "prim_lte" => ("prim_le", 2),
+        "prim_gte" => ("prim_ge", 2),
         "and" => ("prim_and", 2),
         "or" => ("prim_or", 2),
         "xor" => ("prim_xor", 2),
@@ -150,6 +150,7 @@ fn builtin_prim(head: &Expr) -> Option<(&'static str, usize)> {
 fn show_prim(arg: &Expr) -> &'static str {
     match &arg.annotation().type_info.inferred_type {
         Type::Base(BaseType::Int) => "prim_show_int",
+        Type::Base(BaseType::Float) => "prim_show_float",
         Type::Base(BaseType::Char) => "prim_show_char",
         Type::Base(BaseType::Text) => "prim_show_text",
         // `Text` is the stdlib DU `Text ::= Text Bytes`, so it appears as a constructor.
@@ -159,6 +160,26 @@ fn show_prim(arg: &Expr) -> &'static str {
              through `display` / string interpolation, not raw `prim_show`"
         ),
     }
+}
+
+// The builtin arithmetic/ordering operators are polymorphic (`∀a. a -> a -> a` and
+// `∀a. a -> a -> Bool`), so their prim is chosen from the operands' static type -- the
+// runtime word carries no Int/Float tag. When that type is `Float`, remap the int prim
+// (`prim_add`, `prim_lt`, ...) to its boxed-double variant (`prim_fadd`, `prim_flt`,
+// ...). `prim_eq` needs no remap: `val_eq` already dispatches on the boxed float's kind.
+fn float_prim(prim: &str) -> Option<&'static str> {
+    Some(match prim {
+        "prim_add" => "prim_fadd",
+        "prim_sub" => "prim_fsub",
+        "prim_mul" => "prim_fmul",
+        "prim_div" => "prim_fdiv",
+        "prim_mod" => "prim_fmod",
+        "prim_lt" => "prim_flt",
+        "prim_gt" => "prim_fgt",
+        "prim_le" => "prim_fle",
+        "prim_ge" => "prim_fge",
+        _otherwise => return None,
+    })
 }
 
 // Fresh scrutinee temporaries for `deconstruct`. A monotonic counter keeps each
@@ -596,6 +617,13 @@ impl lambda_lift::Program {
                 // values are rendered by their `Display` witnesses.
                 let prim = if prim == "prim_show" {
                     show_prim(args[0])
+                } else if matches!(
+                    args[0].annotation().type_info.inferred_type,
+                    Type::Base(BaseType::Float)
+                ) {
+                    // A Float-typed operand routes the arithmetic/ordering op to its
+                    // boxed-double prim; everything else keeps the int/generic prim.
+                    float_prim(prim).unwrap_or(prim)
                 } else {
                     prim
                 };
@@ -758,7 +786,11 @@ impl lambda_lift::Program {
     fn compile_constant(&self, the: &Literal) -> String {
         match the {
             Literal::Int(x) => format!("VInt({x})"),
-            Literal::Float(x) => format!("VInt({x})"),
+            // A Float literal is a fixed, immortal boxed double: emit ONE `.rodata`
+            // STATIC_FLOAT box (like a static Text) rather than heap-allocating on every
+            // mention. `{x:?}` keeps the decimal point, so the C `double` literal is
+            // valid (`1.0`, not `1`).
+            Literal::Float(x) => format!("STATIC_FLOAT({x:?})"),
             // A string literal is a `Text` -- the stdlib DU `Text ::= Text Bytes`, which
             // newtype-erases to a `Bytes`, which erases to an OBJ_SLICE. So emit an
             // immortal .rodata Text: a `static const` OBJ_BYTES body holding the bytes,

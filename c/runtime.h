@@ -15,6 +15,7 @@
 #ifndef MARMELADE_RUNTIME_H
 #define MARMELADE_RUNTIME_H
 
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -94,6 +95,10 @@ struct Data {
 // borrowed-literal optimisation is Stage 1b -- see notes/tagged-value.md).
 Value mk_text(const char *src);
 
+// Box a double on the heap (OBJ_FLOAT leaf). Defined in gc.c; declared here so `VFloat`
+// can build one. A 64-bit float cannot be an immediate, so every computed Float boxes.
+Value mk_float(double x);
+
 // Value constructors. Immediates pack into the word; a text literal becomes an
 // owned heap string; `VObject` just carries the (already 8-aligned) body pointer.
 static inline Value VInt(int64_t x)     { return (Value){((uint64_t)x << 1) | IMM_TAG}; }
@@ -103,6 +108,8 @@ static inline Value VChar(char x)       { return (Value){((uint64_t)(uint8_t)x <
 static inline Value VUnit_(void)        { return (Value){IMM_TAG}; }
 #define VUnit() (VUnit_())
 static inline Value VObject(void *p)    { return (Value){(uint64_t)(uintptr_t)p}; }
+// A Float is a pointer to a heap-boxed double (OBJ_FLOAT); it can never be immediate.
+static inline Value VFloat(double x)    { return mk_float(x); }
 
 // Immediate decoders. `as_int` sign-extends via an arithmetic right shift. Each is
 // type-driven: codegen calls the right one from the static type -- the word itself
@@ -110,6 +117,10 @@ static inline Value VObject(void *p)    { return (Value){(uint64_t)(uintptr_t)p}
 static inline int64_t as_int(Value v)  { return (int64_t)v.w >> 1; }
 static inline bool    as_bool(Value v) { return (v.w >> 1) & 1u; } // truthiness, for `if`
 static inline char    as_char(Value v) { return (char)((v.w >> 1) & 0xFFu); }
+
+// A boxed Float: the word is the OBJ_FLOAT body pointer, which points straight at the
+// stored double (the box body is exactly one double). Read it back by value.
+static inline double   as_float(Value v)    { return *(const double *)(uintptr_t)v.w; }
 
 // Pointer decoders. A pointer value's word *is* the body pointer.
 static inline void     *as_ptr(Value v)     { return (void *)(uintptr_t)v.w; }
@@ -138,10 +149,24 @@ static inline Value prim_eq(Value a, Value b) { return VBool(val_eq(a, b)); }
 static inline Value prim_and(Value a, Value b) { return VBool(as_bool(a) && as_bool(b)); }
 static inline Value prim_or(Value a, Value b) { return VBool(as_bool(a) || as_bool(b)); }
 static inline Value prim_xor(Value a, Value b) { return VBool(as_bool(a) != as_bool(b)); }
+// Float arithmetic: unbox -> compute -> rebox. Codegen picks these (over the `prim_*`
+// int forms) when the operands' static type is Float. Each result is a fresh heap box.
+// `prim_fmod` is C `fmod` (IEEE remainder toward zero), matching the interpreter's `%`.
+static inline Value prim_fadd(Value a, Value b) { return VFloat(as_float(a) + as_float(b)); }
+static inline Value prim_fsub(Value a, Value b) { return VFloat(as_float(a) - as_float(b)); }
+static inline Value prim_fmul(Value a, Value b) { return VFloat(as_float(a) * as_float(b)); }
+static inline Value prim_fdiv(Value a, Value b) { return VFloat(as_float(a) / as_float(b)); }
+static inline Value prim_fmod(Value a, Value b) { return VFloat(fmod(as_float(a), as_float(b))); }
+static inline Value prim_flt(Value a, Value b) { return VBool(as_float(a) < as_float(b)); }
+static inline Value prim_fgt(Value a, Value b) { return VBool(as_float(a) > as_float(b)); }
+static inline Value prim_fle(Value a, Value b) { return VBool(as_float(a) <= as_float(b)); }
+static inline Value prim_fge(Value a, Value b) { return VBool(as_float(a) >= as_float(b)); }
+static inline Value prim_feq(Value a, Value b) { return VBool(as_float(a) == as_float(b)); }
 // `prim_show` is monomorphised: codegen picks the right leaf from the argument's
 // static type. Only the primitive (leaf) types reach these -- compound values are
 // rendered by their `Display` witnesses, which recurse through the leaves.
 Value prim_show_int(Value x);
+Value prim_show_float(Value x);
 Value prim_show_char(Value x);
 Value prim_show_text(Value x);
 Value prim_print_endline(Value x);

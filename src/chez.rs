@@ -113,7 +113,10 @@ impl ast::Literal {
     fn emit(&self, code: &mut CodeBuffer) -> Result<()> {
         match self {
             ast::Literal::Int(x) => write!(code, "{x}")?,
-            ast::Literal::Float(x) => write!(code, "{x}")?,
+            // `{x:?}` forces the decimal point so Chez reads an inexact flonum (`1.0`),
+            // not the exact integer `1` -- the difference decides whether `/` is flonum
+            // division or exact rational division downstream.
+            ast::Literal::Float(x) => write!(code, "{x:?}")?,
             ast::Literal::Text(x) => write!(code, "\"{x}\"")?,
             ast::Literal::Bool(true) => write!(code, "#t")?,
             ast::Literal::Bool(false) => write!(code, "#f")?,
@@ -185,19 +188,19 @@ fn map_builtin_name(name: &QualifiedName) -> &'static str {
     match member.as_str() {
         "print_endline" => "print-endline",
         "prim_show" => "show",
-        "=" => "=",
+        "prim_eq" => "equal?",
         "-" => "-",
         "+" => "+",
         "*" => "*",
         "/" => "/",
         "%" => "mod",
-        "<" => "<",
-        ">" => ">",
+        "prim_lt" => "<",
+        "prim_gt" => ">",
         "and" => "and",
         "xor" => "bool-xor",
         "or" => "or",
-        ">=" => ">=",
-        "<=" => "<=",
+        "prim_gte" => ">=",
+        "prim_lte" => "<=",
         "text_fold_right" => "text-fold-right",
         otherwise => panic!("unmapped builtin {otherwise:?}"),
     }

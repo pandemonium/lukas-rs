@@ -72,32 +72,41 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
     let builtins = parser::IdentifierPath::new(BUILTIN_MODULE_NAME);
     let stdlib = parser::IdentifierPath::new(STDLIB_MODULE_NAME);
 
-    let eq = PartialRawLambda2 {
-        name: Operator::Equals.name(),
+    // Leaf equality primitive: `=` desugars to the `Eq` method `eq`, whose primitive
+    // witnesses (Int/Float/Char/Bool/Text/Unit) bottom out here. `equals` compares the
+    // built-in literals (and, harmlessly, products); compound `Eq` is the tuple/user
+    // witnesses recursing back through `eq`, never this leaf.
+    let prim_eq = PartialRawLambda2 {
+        name: "prim_eq",
         apply: |p, q| equals(p, q).map(|r| Val::Constant(Literal::Bool(r))),
         type_scheme: comparison_signature(),
     };
 
-    let gte = PartialRawLambda2 {
-        name: Operator::Gte.name(),
+    // Leaf comparison primitives, in the spirit of `prim_show`: polymorphic over
+    // the built-in literal types, they bottom out the `Ord` witnesses for Int/Float
+    // (whose `compare` is written in terms of them). The `< > <= >=` operators no
+    // longer bind here -- they desugar to the polymorphic `lt/gt/lte/gte` in the
+    // Prelude, which delegate to `compare`.
+    let prim_gte = PartialRawLambda2 {
+        name: "prim_gte",
         apply: mk_comparison_op(gte),
         type_scheme: comparison_signature(),
     };
 
-    let lte = PartialRawLambda2 {
-        name: Operator::Lte.name(),
+    let prim_lte = PartialRawLambda2 {
+        name: "prim_lte",
         apply: mk_comparison_op(lte),
         type_scheme: comparison_signature(),
     };
 
-    let gt = PartialRawLambda2 {
-        name: Operator::Gt.name(),
+    let prim_gt = PartialRawLambda2 {
+        name: "prim_gt",
         apply: mk_comparison_op(gt),
         type_scheme: comparison_signature(),
     };
 
-    let lt = PartialRawLambda2 {
-        name: Operator::Lt.name(),
+    let prim_lt = PartialRawLambda2 {
+        name: "prim_lt",
         apply: mk_comparison_op(lt),
         type_scheme: comparison_signature(),
     };
@@ -168,11 +177,11 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
     let terms = vec![
         rawlambda1!(prim_show).into_symbol(&stdlib),
         lambda1!(print_endline).into_symbol(&stdlib),
-        eq.into_symbol(&builtins),
-        gte.into_symbol(&builtins),
-        lte.into_symbol(&builtins),
-        gt.into_symbol(&builtins),
-        lt.into_symbol(&builtins),
+        prim_gte.into_symbol(&stdlib),
+        prim_lte.into_symbol(&stdlib),
+        prim_gt.into_symbol(&stdlib),
+        prim_lt.into_symbol(&stdlib),
+        prim_eq.into_symbol(&stdlib),
         lambda2!(and).into_symbol(&builtins),
         lambda2!(or).into_symbol(&builtins),
         lambda2!(xor).into_symbol(&builtins),
@@ -187,6 +196,13 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
     let types = vec![
         TypeSymbol {
             definition: TypeDefinition::BaseType(BaseType::Int),
+            origin: TypeOrigin::Builtin,
+            opacity: Access::Anywhere,
+            arity: 0,
+            kind: Kind::Star,
+        },
+        TypeSymbol {
+            definition: TypeDefinition::BaseType(BaseType::Float),
             origin: TypeOrigin::Builtin,
             opacity: Access::Anywhere,
             arity: 0,
@@ -254,6 +270,7 @@ pub fn print_endline(x: String) {
 pub fn equals(p: Val, q: Val) -> Option<bool> {
     match (p, q) {
         (Val::Constant(Literal::Int(p)), Val::Constant(Literal::Int(q))) => Some(p == q),
+        (Val::Constant(Literal::Float(p)), Val::Constant(Literal::Float(q))) => Some(p == q),
         (Val::Constant(Literal::Bool(p)), Val::Constant(Literal::Bool(q))) => Some(p == q),
         (Val::Constant(Literal::Text(p)), Val::Constant(Literal::Text(q))) => Some(p == q),
         (Val::Constant(Literal::Unit), Val::Constant(Literal::Unit)) => Some(true),
@@ -274,6 +291,7 @@ pub fn equals(p: Val, q: Val) -> Option<bool> {
 pub fn gte(p: Literal, q: Literal) -> Option<bool> {
     match (p, q) {
         (Literal::Int(p), Literal::Int(q)) => Some(p >= q),
+        (Literal::Float(p), Literal::Float(q)) => Some(p >= q),
         (Literal::Text(p), Literal::Text(q)) => Some(p >= q),
         (Literal::Char(p), Literal::Char(q)) => Some(p >= q),
         _otherwise => None,
@@ -283,6 +301,7 @@ pub fn gte(p: Literal, q: Literal) -> Option<bool> {
 pub fn gt(p: Literal, q: Literal) -> Option<bool> {
     match (p, q) {
         (Literal::Int(p), Literal::Int(q)) => Some(p > q),
+        (Literal::Float(p), Literal::Float(q)) => Some(p > q),
         (Literal::Text(p), Literal::Text(q)) => Some(p > q),
         (Literal::Char(p), Literal::Char(q)) => Some(p > q),
         _otherwise => None,
@@ -292,6 +311,7 @@ pub fn gt(p: Literal, q: Literal) -> Option<bool> {
 pub fn lte(p: Literal, q: Literal) -> Option<bool> {
     match (p, q) {
         (Literal::Int(p), Literal::Int(q)) => Some(p <= q),
+        (Literal::Float(p), Literal::Float(q)) => Some(p <= q),
         (Literal::Text(p), Literal::Text(q)) => Some(p <= q),
         (Literal::Char(p), Literal::Char(q)) => Some(p <= q),
         _otherwise => None,
@@ -301,6 +321,7 @@ pub fn lte(p: Literal, q: Literal) -> Option<bool> {
 pub fn lt(p: Literal, q: Literal) -> Option<bool> {
     match (p, q) {
         (Literal::Int(p), Literal::Int(q)) => Some(p < q),
+        (Literal::Float(p), Literal::Float(q)) => Some(p < q),
         (Literal::Text(p), Literal::Text(q)) => Some(p < q),
         (Literal::Char(p), Literal::Char(q)) => Some(p < q),
         _otherwise => None,
@@ -322,6 +343,7 @@ fn xor(p: bool, q: bool) -> bool {
 pub fn plus(p: Literal, q: Literal) -> Option<Literal> {
     match (p, q) {
         (Literal::Int(p), Literal::Int(q)) => Some(Literal::Int(p + q)),
+        (Literal::Float(p), Literal::Float(q)) => Some(Literal::Float(p + q)),
         _otherwise => None,
     }
 }
@@ -329,6 +351,7 @@ pub fn plus(p: Literal, q: Literal) -> Option<Literal> {
 pub fn minus(p: Literal, q: Literal) -> Option<Literal> {
     match (p, q) {
         (Literal::Int(p), Literal::Int(q)) => Some(Literal::Int(p - q)),
+        (Literal::Float(p), Literal::Float(q)) => Some(Literal::Float(p - q)),
         _otherwise => None,
     }
 }
@@ -336,6 +359,7 @@ pub fn minus(p: Literal, q: Literal) -> Option<Literal> {
 pub fn times(p: Literal, q: Literal) -> Option<Literal> {
     match (p, q) {
         (Literal::Int(p), Literal::Int(q)) => Some(Literal::Int(p * q)),
+        (Literal::Float(p), Literal::Float(q)) => Some(Literal::Float(p * q)),
         _otherwise => None,
     }
 }
@@ -343,6 +367,7 @@ pub fn times(p: Literal, q: Literal) -> Option<Literal> {
 pub fn divided(p: Literal, q: Literal) -> Option<Literal> {
     match (p, q) {
         (Literal::Int(p), Literal::Int(q)) => Some(Literal::Int(p / q)),
+        (Literal::Float(p), Literal::Float(q)) => Some(Literal::Float(p / q)),
         _otherwise => None,
     }
 }
@@ -350,6 +375,7 @@ pub fn divided(p: Literal, q: Literal) -> Option<Literal> {
 pub fn modulo(p: Literal, q: Literal) -> Option<Literal> {
     match (p, q) {
         (Literal::Int(p), Literal::Int(q)) => Some(Literal::Int(p % q)),
+        (Literal::Float(p), Literal::Float(q)) => Some(Literal::Float(p % q)),
         _otherwise => None,
     }
 }

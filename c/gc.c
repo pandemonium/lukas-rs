@@ -291,8 +291,8 @@ static double gc_started = 0.0; // wall clock at gc_init
 // path, no effect unless MARM_ALLOC_STATS is set.
 static bool gc_alloc_stats = false;
 #define ALLOC_MAX_ARITY 16
-static unsigned long long alloc_hist_n[8][ALLOC_MAX_ARITY + 1];
-static unsigned long long alloc_hist_b[8][ALLOC_MAX_ARITY + 1];
+static unsigned long long alloc_hist_n[OBJ_KIND_COUNT][ALLOC_MAX_ARITY + 1];
+static unsigned long long alloc_hist_b[OBJ_KIND_COUNT][ALLOC_MAX_ARITY + 1];
 static void alloc_record(ObjKind kind, size_t total) {
     size_t body = total - sizeof(GcHeader), arity = 0;
     switch (kind) {
@@ -389,6 +389,7 @@ static void gc_trace(void) {
         case OBJ_TEXT:
         case OBJ_BYTES: // raw bytes, no child Values
         case OBJ_MMAP:  // region pointer + flags, no child Values
+        case OBJ_FLOAT: // a boxed double, no child Values
             break;
         case OBJ_BUFFER: {
             Buffer *b = BODY(h);
@@ -861,15 +862,15 @@ static void gc_report(void) {
 // with the struct-return-State / stack-closure targets (2-tuples, closures, small
 // data) called out. The "% bytes" column is share of total allocated volume.
 static void alloc_report(void) {
-    static const char *names[8] = {"tuple", "closure", "text", "data",
-                                   "buffer", "bytes", "mmap", "slice"};
+    static const char *names[OBJ_KIND_COUNT] = {"tuple", "closure", "text", "data",
+                                                "buffer", "bytes", "mmap", "slice", "float"};
     unsigned long long grand = 0;
-    for (int k = 0; k < 8; k++)
+    for (int k = 0; k < OBJ_KIND_COUNT; k++)
         for (int a = 0; a <= ALLOC_MAX_ARITY; a++) grand += alloc_hist_b[k][a];
     if (!grand) return;
     fprintf(stderr, "[alloc] by kind/arity (share of %.1f GB total):\n", grand / 1073741824.0);
     unsigned long long tup2 = 0;
-    for (int k = 0; k < 8; k++) {
+    for (int k = 0; k < OBJ_KIND_COUNT; k++) {
         unsigned long long kn = 0, kb = 0;
         for (int a = 0; a <= ALLOC_MAX_ARITY; a++) kn += alloc_hist_n[k][a], kb += alloc_hist_b[k][a];
         if (!kb) continue;
@@ -1024,6 +1025,15 @@ Value mk_data(uint64_t tag, size_t nfields, ...) {
     }
     va_end(ap);
     return VObject(d);
+}
+
+// Box a double: an OBJ_FLOAT leaf whose body is exactly the 8-byte double. Every
+// computed Float allocates one (a 64-bit IEEE-754 value cannot live in the tagged
+// word); `as_float` reads it back. Literals use the immortal STATIC_FLOAT box instead.
+Value mk_float(double x) {
+    double *p = gc_new(sizeof(double), OBJ_FLOAT);
+    *p = x;
+    return VObject(p);
 }
 
 // ---------------------------------------------- fixed-arity constructors

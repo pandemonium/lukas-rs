@@ -2032,7 +2032,7 @@ impl<'a> Parser<'a> {
             Apply {
                 function: Expr::Variable(
                     ParseInfo::from_position(operator_position),
-                    IdentifierPattern::from_atom(parse_info, operator.name()),
+                    IdentifierPattern::from_atom(parse_info, operator.term_name()),
                 )
                 .into(),
                 argument: lhs.into(),
@@ -2552,7 +2552,7 @@ impl From<Literal> for ast::Literal {
     fn from(value: Literal) -> Self {
         match value {
             Literal::Integer(x) => ast::Literal::Int(x),
-            Literal::Float(x) => todo!(),
+            Literal::Float(x) => ast::Literal::Float(x),
             Literal::Text(x) => ast::Literal::Text(x),
             Literal::Bool(x) => ast::Literal::Bool(x),
             Literal::Unit => ast::Literal::Unit,

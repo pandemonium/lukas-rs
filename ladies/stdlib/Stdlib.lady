@@ -38,13 +38,15 @@ witness Monoid Int :=
   { mempty := 0
   }
 
-witness Eq Int :=
-  { eq := λp q. p = q
+witness Semigroup Float :=
+  { mappend := λp q. p + q
   }
 
-witness Ord Int :=
-  { lte := λp q. p <= q
+witness Monoid Float :=
+  { mempty := 0.0
   }
+
+(* Eq/Ord for Int, Float, and Char are primordial (Prelude). *)
 
 (* --------------------------------------------------------------- Eq for tuples *)
 (* Derived product equality: tuples are equal element-wise, each element compared by *)

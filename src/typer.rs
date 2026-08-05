@@ -15,10 +15,9 @@ use tracing::instrument;
 
 use crate::{
     ast::{
-        self, Apply, Array, ArrowTypeExpr, Binding, ConstraintExpression,
-        Deconstruct, IfThenElse, Injection, Kind, Lambda, Literal, ProductElement, Projection,
-        Record, Segment, SelfReferential, Sequence, Tree, Tuple, TupleTypeExpr, TypeAscription,
-        TypeExpression,
+        self, Apply, Array, ArrowTypeExpr, Binding, ConstraintExpression, Deconstruct, IfThenElse,
+        Injection, Kind, Lambda, Literal, ProductElement, Projection, Record, Segment,
+        SelfReferential, Sequence, Tree, Tuple, TupleTypeExpr, TypeAscription, TypeExpression,
         annotation::Annotated,
         constraints::{Witness, WitnessEnvironment},
         namer::{
@@ -942,7 +941,10 @@ impl phase::SymbolTable<Named> {
                 // for the self-reference, then reconcile it with the inferred type.
                 let pi = *symbol.body.annotation();
                 let own = Type::fresh();
-                ctx.bind_free_term(qualified_name.clone(), TypeScheme::from_constant(own.clone()));
+                ctx.bind_free_term(
+                    qualified_name.clone(),
+                    TypeScheme::from_constant(own.clone()),
+                );
                 let expr = ctx.infer_expr(&symbol.body)?;
                 let unification = expr
                     .tree
@@ -1881,7 +1883,7 @@ pub enum TypeError {
     #[error("cyclic supersignatures: {}", display_list(" requires ", cycle))]
     CyclicSupersignature { cycle: Vec<QualifiedName> },
 
-    #[error("no witness found for constraint {0}")]
+    #[error("no witness found for {0}")]
     NoWitness(Constraint),
 
     #[error(
@@ -3710,7 +3712,19 @@ impl TypingContext {
                 },
             )
         } else {
-            panic!("{normalized_type:?}")
+            // In check mode a lambda must be given a function type. If the expected type is
+            // not an arrow -- e.g. a signature ascribes `Text -> Float` to a two-parameter
+            // lambda, so the trailing `λtemp. ...` is checked against the codomain `Float` --
+            // the lambda cannot have that type: always an error. We still INFER the lambda's
+            // own type, but solely to name it in the diagnostic (`Float -> File_Row` reads far
+            // better than `?a -> ?b`); the inferred typing is otherwise discarded -- we never
+            // proceed with it, since that would silently discard the ascription being checked.
+            let (substitutions, _, typing_info, _) = self.infer_lambda(pi, lambda)?;
+            Err(TypeError::UnificationImpossible {
+                lhs: typing_info.inferred_type.apply(&substitutions),
+                rhs: expected_type.apply(&substitutions),
+            }
+            .at(pi))
         }
     }
 
@@ -5224,7 +5238,7 @@ impl Literal {
         }
         Type::Base(match self {
             Self::Int(..) => BaseType::Int,
-            Self::Float(..) => BaseType::Int,
+            Self::Float(..) => BaseType::Float,
             Self::Text(..) => unreachable!("handled above"),
             Self::Bool(..) => BaseType::Bool,
             Self::Unit => BaseType::Unit,

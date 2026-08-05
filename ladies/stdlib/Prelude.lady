@@ -164,12 +164,74 @@ module Text:
   (* Byte at index `i`, as Int (Rust `str::as_bytes()[i]`). No char indexing. *)
   get :: Text -> Int -> Int := λ(MkText b). Bytes.get_u8 b
 
+(* ----------------------------------------------------------------- Eq / Ord *)
+(* Two more primordial classes, for the same reason as `Display` below: the parser *)
+(* desugars the comparison operators to term-level calls, so their classes must be in *)
+(* scope with no imports. `<` `>` `<=` `>=` become `lt` `gt` `lte` `gte` -- polymorphic, *)
+(* `Ord`-constrained, and defined purely in terms of `compare`. (`=` stays the builtin *)
+(* structural `equals`.) `compare` bottoms out in the `prim_*` leaf comparisons, in the *)
+(* spirit of `prim_show`. Witnesses for user types are added in Stdlib / user code. *)
+Ordering ::= Less | Equal | Greater
+
+signature Eq ::= ∀α.
+  { eq :: α -> α -> Bool
+  }
+
+signature Ord ::= ∀α. Eq α |-
+  { compare :: α -> α -> Ordering
+  }
+
+(* `=` desugars to `eq`; these primitive witnesses bottom out in the `prim_eq` leaf *)
+(* (immediates compare by word, Text/Bytes by their bytes, Float by double value). *)
+(* Compound equality is the tuple/user `Eq` witnesses recursing back through `eq`. *)
+witness Eq Int   := { eq := λp q. prim_eq p q }
+witness Eq Float := { eq := λp q. prim_eq p q }
+witness Eq Char  := { eq := λp q. prim_eq p q }
+witness Eq Bool  := { eq := λp q. prim_eq p q }
+witness Eq Text  := { eq := λp q. prim_eq p q }
+witness Eq Unit  := { eq := λp q. prim_eq p q }
+
+(* The equality check goes through `eq` -- the superclass `Eq` witness that `Ord` carries *)
+(* (`Ord α` requires `Eq α`) -- so `compare` and `=` always agree; only the strict-less *)
+(* test bottoms out in the `prim_lt` leaf. *)
+witness Ord Int :=
+  { compare := λp q. if prim_lt p q then Less else if eq p q then Equal else Greater
+  }
+
+witness Ord Float :=
+  { compare := λp q. if prim_lt p q then Less else if eq p q then Equal else Greater
+  }
+
+witness Ord Char :=
+  { compare := λp q. if prim_lt p q then Less else if eq p q then Equal else Greater
+  }
+
+(* The comparison operators desugar to these. Each deconstructs `compare`'s Ordering; *)
+(* nullary constructors are shared statics, so this allocates nothing. *)
+lt :: ∀α. Ord α |- α -> α -> Bool := λp q.
+  deconstruct compare p q into Less -> true | otherwise -> false
+
+gt :: ∀α. Ord α |- α -> α -> Bool := λp q.
+  deconstruct compare p q into Greater -> true | otherwise -> false
+
+lte :: ∀α. Ord α |- α -> α -> Bool := λp q.
+  deconstruct compare p q into Greater -> false | otherwise -> true
+
+gte :: ∀α. Ord α |- α -> α -> Bool := λp q.
+  deconstruct compare p q into Less -> false | otherwise -> true
+
+min :: ∀α. Ord α |- α -> α -> α := λlhs rhs.
+  deconstruct compare lhs rhs into Greater -> rhs | otherwise -> lhs
+
+max :: ∀α. Ord α |- α -> α -> α := λlhs rhs.
+  deconstruct compare lhs rhs into Less -> rhs | otherwise -> lhs
+
 (* ------------------------------------------------------------------- Display *)
-(* The ONE typeclass in the core: string interpolation (`"…`x`…"`) desugars in the parser *)
-(* to `display x`, so `Display` -- the signature plus witnesses for the builtin types -- *)
-(* must be primordial for interpolation to work with no imports. `Display` for user types *)
-(* is added in Stdlib / user code. (All other classes -- Functor/Monad/Foldable/... -- are *)
-(* Stdlib.) The builtin witnesses defer to the runtime `display`.                        *)
+(* Like Eq/Ord above, a primordial typeclass: string interpolation (`"…`x`…"`) desugars *)
+(* in the parser to `display x`, so `Display` -- the signature plus witnesses for the *)
+(* builtin types -- must be primordial for interpolation to work with no imports. *)
+(* `Display` for user types is added in Stdlib / user code. (All other classes -- *)
+(* Functor/Monad/Foldable/... -- are Stdlib.) The builtin witnesses defer to `prim_show`. *)
 signature Display ::= ∀α.
   { display :: α -> Text
   }
@@ -183,6 +245,10 @@ witness Display Char :=
   }
 
 witness Display Int :=
+  { display := λt. prim_show t
+  }
+
+witness Display Float :=
   { display := λt. prim_show t
   }
 

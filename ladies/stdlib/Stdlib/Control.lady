@@ -6,15 +6,9 @@ signature Monoid ::= ∀α. Semigroup α |-
   { mempty :: α
   }
 
-signature Eq ::= ∀α.
-  { eq :: α -> α -> Bool
-  }
-
-signature Ord ::= ∀α. Eq α |-
-  { lte :: α -> α -> Bool
-  }
-
-Ordering ::= Less | Equal | Greater
+(* Eq, Ord, Ordering, and lt/gt/lte/gte/min/max are primordial -- they live in the *)
+(* Prelude, because the comparison operators desugar to them and so must resolve with *)
+(* no imports. *)
 
 signature Functor ::= ∀f : * -> *.
   { fmap :: ∀α β. (α -> β) -> f α -> f β

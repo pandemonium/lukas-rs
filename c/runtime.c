@@ -48,6 +48,11 @@ bool val_eq(Value a, Value b) {
         size_t na = slice_len(a), nb = slice_len(b);
         return na == nb && memcmp(slice_ptr(a), slice_ptr(b), na) == 0;
     }
+    // Boxed floats compare by their double value (so `-0.0 == 0.0`, `NaN != NaN`),
+    // which is what an `Eq Float` witness recursing to `=` on a Float leaf expects.
+    if (ka == OBJ_FLOAT) {
+        return as_float(a) == as_float(b);
+    }
     return false;
 }
 
@@ -59,6 +64,28 @@ bool val_eq(Value a, Value b) {
 Value prim_show_int(Value x) {
     char buf[32];
     int n = snprintf(buf, sizeof buf, "%lld", (long long)as_int(x));
+    return mk_textn(buf, (size_t)n);
+}
+
+// Render a double the way the interpreter's Rust `{:?}` does: the shortest decimal
+// that round-trips, always carrying a decimal point (so `1.0` never prints as `1`).
+// C has no shortest-round-trip primitive, so grow `%g` precision until the string
+// parses back to the same bits, then append `.0` if the result looks integral.
+Value prim_show_float(Value x) {
+    double d = as_float(x);
+    char buf[64];
+    int n = 0;
+    for (int prec = 1; prec <= 17; prec++) {
+        n = snprintf(buf, sizeof buf, "%.*g", prec, d);
+        if (strtod(buf, NULL) == d) break; // shortest precision that round-trips
+    }
+    // `%g` drops the point for integral magnitudes ("1", "100"); restore it so the
+    // value reads back as a Float. `nan`/`inf` already contain a letter, so skip them.
+    if (!strpbrk(buf, ".eEnN") && n >= 0 && n < (int)sizeof buf - 3) {
+        buf[n++] = '.';
+        buf[n++] = '0';
+        buf[n] = '\0';
+    }
     return mk_textn(buf, (size_t)n);
 }
 

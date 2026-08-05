@@ -96,6 +96,7 @@ write_file :: Bytes -> Text -> IO Int := λbs path.
 
 (* Map a whole file to Bytes; the mapping's lifetime is the GC's (the Bytes borrows the *)
 (* region). Faults (Mmap_io) only at the open. *)
+(* Why is this function in Binary? *)
 mmap :: Text -> IO (Result Mmap_Error Bytes) := λpath.
   let* opened = IO.suspend (λ_. raw_mmap_open path) in
   deconstruct opened into

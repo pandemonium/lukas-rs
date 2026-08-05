@@ -18,6 +18,8 @@ typedef enum {
     OBJ_BYTES,  // raw byte body (leaf); a Buffer's bytes, grown by reallocation
     OBJ_MMAP,   // handle to a memory-mapped region (region lives outside the heap)
     OBJ_SLICE,  // immutable view; owner is an OBJ_BYTES body or an OBJ_MMAP handle
+    OBJ_FLOAT,  // boxed IEEE-754 double (leaf); a 64-bit float cannot be an immediate
+    OBJ_KIND_COUNT, // number of object kinds; sizes the per-kind stat tables
 } ObjKind;
 
 // Prepended to every heap object; a Value pointer names the body just past the
@@ -83,6 +85,17 @@ typedef struct { void *owner; size_t offset; size_t len; } Slice;
            {{sizeof(Data), 0, OBJ_DATA, MARM_ETERNAL}, (tagv)};                         \
        VObject((void *)&__sd.tag); })
 
+// A float *literal* is a fixed, immutable double, so -- like STATIC_DATA0 -- codegen
+// emits ONE immortal `.rodata` box per literal instead of heap-allocating on every
+// mention. OBJ_FLOAT is a leaf (no child Values), and MARM_ETERNAL keeps the collector
+// off its `const` storage. The body is exactly `sizeof(double)`, matching `mk_float`,
+// so `as_float` reads the same layout whether the box is static or heap-allocated.
+// `VObject(&__sf.f)` is the body pointer (past the 8-byte header).
+#define STATIC_FLOAT(x)                                                                 \
+    ({ static const struct { GcHeader gch; double f; } __sf =                           \
+           {{sizeof(double), 0, OBJ_FLOAT, MARM_ETERNAL}, (x)};                         \
+       VObject((void *)&__sf.f); })
+
 Value result_return(Value x);
 Value result_fault(Value e);
 
@@ -100,6 +113,11 @@ Value mk_closure(Value (*code)(Value, Value), size_t nfree, ...);
 Value mk_closure_n(Value (*code)(Value, Value), Value (*worker)(Value, Value *),
                    size_t arity, size_t nfree, ...);
 Value mk_tuple(size_t len, ...);
+
+// Box a double on the heap (OBJ_FLOAT leaf). A 64-bit IEEE-754 value cannot share the
+// word with the immediate tag bit, so every computed Float is a heap box; `as_float`
+// reads it back. Float *literals* skip this via the immortal STATIC_FLOAT box above.
+Value mk_float(double x);
 
 // A constructor value (see `Data` in runtime.h): an integer tag plus `nfields`
 // inline field values (passed variadically). `data_len` recovers a live data

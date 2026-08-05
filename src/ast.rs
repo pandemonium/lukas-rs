@@ -935,7 +935,7 @@ impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Int(x) => write!(f, "{x}"),
-            Self::Float(x) => write!(f, "{x}"),
+            Self::Float(x) => write!(f, "{x:?}"),
             Self::Text(x) => write!(f, "{x}"),
             Self::Bool(x) => write!(f, "{x}"),
             Self::Unit => write!(f, "()"),

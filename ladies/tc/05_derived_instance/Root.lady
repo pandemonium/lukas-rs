@@ -9,8 +9,10 @@ signature Eq ::= ∀α.
   { eq :: α -> α -> Bool
   }
 
+(* The base case bottoms out in the `prim_eq` leaf: `=` now desugars to `eq`, so a *)
+(* primitive `Eq` witness written as `p = q` would call itself. *)
 witness Eq Int :=
-  { eq := λp q. p = q
+  { eq := λp q. prim_eq p q
   }
 
 witness ∀α. Eq α |- Eq (List α) :=
