@@ -398,6 +398,13 @@ impl lambda_lift::Program {
         }
         let tag = self.constructor_tag(&the.constructor);
         let n = the.arguments.len();
+        // A nullary constructor has no fields, so its `Data` is identical and immutable
+        // for its tag -- emit one static `MARM_ETERNAL` instance (shared per use site)
+        // instead of allocating a fresh `Data` on every mention. Mirrors the capture-
+        // free `STATIC_CLOSURE0` and the borrowed-string literal.
+        if n == 0 {
+            return write!(code, "STATIC_DATA0({tag})");
+        }
         // The tag always precedes the fields, so fields keep their leading comma
         // in both forms; only the callee name / count prefix differs.
         if n <= 4 {

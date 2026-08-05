@@ -68,6 +68,21 @@ typedef struct { void *owner; size_t offset; size_t len; } Slice;
            {{sizeof(Closure), 0, OBJ_CLOSURE, MARM_ETERNAL}, &__d};                     \
        VObject((void *)&__sc.desc); })
 
+// A nullary constructor (a sum-type tag with no fields) is identical and immutable for
+// a given tag, so -- exactly like STATIC_CLOSURE0 -- codegen emits ONE static instance
+// per use site instead of allocating a fresh Data on every mention (nullary
+// constructors like `Nil`/`None`/`Less`/`Equal`/`Greater` were otherwise a heap alloc
+// each). MARM_ETERNAL keeps the collector off its `const` storage: `is_object` is false
+// for it (on no slab or large-object list, so the conservative scan and sweep never see
+// it) and `mark_obj` early-returns on the sentinel, so the tag word is never written.
+// The body is exactly `sizeof(Data)` -- just the tag, no fields -- matching `mk_data0`,
+// so `data_len` recovers 0 fields and the tracer visits nothing. `VObject(&__sd.tag)`
+// is the body pointer (past the 8-byte header), which is what `data_tag` reads.
+#define STATIC_DATA0(tagv)                                                              \
+    ({ static const struct { GcHeader gch; uint64_t tag; } __sd =                       \
+           {{sizeof(Data), 0, OBJ_DATA, MARM_ETERNAL}, (tagv)};                         \
+       VObject((void *)&__sd.tag); })
+
 Value result_return(Value x);
 Value result_fault(Value e);
 

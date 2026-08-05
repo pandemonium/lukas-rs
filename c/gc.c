@@ -1348,13 +1348,13 @@ static bool utf8_is_valid(const uint8_t *b, size_t len) {
 // raw_text_from_bytes: validate a byte view as UTF-8 and, on success, copy it
 // into an owned heap Text -- Text is not yet a zero-copy view over Bytes, so a
 // valid run materialises. Returns `This text` or `Nope`, built to match codegen's
-// constructor layout exactly: `Nope` is nullary (`mk_data0`, no fields), not the
-// unit-field shape the older `perhaps_nope()` helper produces.
+// constructor layout exactly: `Nope` is nullary (no fields), so it is the shared
+// `STATIC_DATA0` instance -- a `.rodata` value, never a heap allocation.
 Value utf8_from_slice(Value sv) {
     Slice *s = as_ptr(sv);
     const uint8_t *p = slice_base(s);
     size_t n = s->len;
-    if (!utf8_is_valid(p, n)) return mk_data0(0);
+    if (!utf8_is_valid(p, n)) return STATIC_DATA0(0);
     // The collector is non-moving and `sv` is a live local on the C stack, so its
     // owner stays reachable and `p` stays valid across the alloc in mk_textn.
     return mk_data1(1, mk_textn((const char *)p, n));
@@ -1374,12 +1374,13 @@ Value result_return(Value x) { return mk_data(1, 1, x); }
 Value result_fault(Value e) { return mk_data(0, 1, e); }
 
 Value perhaps_this(Value x) { return mk_data(1, 1, x); }
-// `Nope` is nullary: codegen emits it as `mk_data0(0)` (tag, no fields) -- the
-// same shape it gives the shared `Root_Stdlib_Data_Perhaps_Nope` global. We build
-// a fresh one rather than referencing that global, which would chain the runtime
-// to a stdlib symbol absent from any program that never imports Data.Perhaps.
-// Matching is by tag, not identity, so a fresh value is indistinguishable.
-Value perhaps_nope() { return mk_data0(0); }
+// `Nope` is nullary: codegen emits it as a `STATIC_DATA0(0)` -- a shared, immutable
+// `.rodata` instance (tag, no fields), never a heap allocation. We do the same here
+// rather than reference the stdlib `Root_Stdlib_Data_Perhaps_Nope` global, which would
+// chain the runtime to a symbol absent from any program that never imports Data.Perhaps.
+// Matching is by tag, not identity, so this static is indistinguishable from that
+// global -- and, being static, it costs no allocation on the hot Option-returning path.
+Value perhaps_nope() { return STATIC_DATA0(0); }
 
 // Ranged Buffer -> Bytes producers. Like buffer_move/buffer_copy but for a
 // sub-range [off, off+n); Fault(-1) if that range runs past the buffer's length.
