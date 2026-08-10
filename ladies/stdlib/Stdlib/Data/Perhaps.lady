@@ -58,6 +58,9 @@ witness ∀α. Eq α |- Eq (Perhaps α) :=
   }
 
 
+is_this :: ∀α. Perhaps α -> Bool := λpa.
+  deconstruct pa into This _ -> true | _ -> false
+
 map :: ∀α β. (α -> β) -> Perhaps α -> Perhaps β :=
   λf. perhaps Nope (compose This f)
 

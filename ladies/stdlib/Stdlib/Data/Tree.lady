@@ -1,0 +1,101 @@
+Tree_Map ::= ∀α β.
+  Tip
+| Node α β (Tree_Map α β) (Tree_Map α β)
+
+Tree_Set ::= ∀α. Tree_Set (Tree_Map α Unit)
+
+witness ∀α. Foldable (Tree_Map α) :=
+  { fold_right := Tree_Map.foldr
+    fold_left := Tree_Map.foldl
+  }
+
+witness ∀α β. From (Tree_Map α β) (List (α, β)) :=
+  { from := Tree_Map.to_list
+  }
+
+witness ∀α β. Display α + Display β |- Display (Tree_Map α β) :=
+  { display := λmap.
+      "`Tree_Map.to_list map`"
+  }
+
+witness ∀α. Display α |- Display (Tree_Set α) :=
+  { display := λset.
+      "`Tree_Set.to_list set`"
+  }
+
+module Tree_Map:
+  empty :: ∀α β. Tree_Map α β := Tip
+
+  length :: ∀α β. Tree_Map α β -> Int :=
+    foldr (λ_ z. 1 + z) 0
+
+  insert :: ∀α β. Ord α |- α -> β -> Tree_Map α β -> Tree_Map α β := λk v map.
+    deconstruct map into
+      Tip -> Node k v Tip Tip
+    | Node k' v' lhs rhs ->
+      if k < k' then Node k' v' (insert k v lhs) rhs
+      else if k = k' then map
+      else Node k' v' lhs (insert k v rhs)
+
+  lookup :: ∀α β. Ord α |- α -> Tree_Map α β -> Perhaps β := λkey map.
+    deconstruct map into
+      Tip -> Nope
+    | Node key' v lhs rhs ->
+      if key < key' then lookup key lhs
+      else if key = key' then This v
+      else lookup key rhs
+
+  contains :: ∀α β. Ord α |- α -> Tree_Map α β -> Bool := λk map.
+    let x = lookup k map in
+    Perhaps.is_this x
+
+  (* foldl_with_key *)
+
+  foldr_with_key :: ∀α β z. (α -> β -> z -> z) -> z -> Tree_Map α β -> z := λf z ta.
+    deconstruct ta into
+      Tip -> z
+    | Node k v lhs rhs ->
+      let right = foldr_with_key f z rhs in
+      let acc = f k v right in
+      foldr_with_key f acc lhs
+
+  map_with_key :: ∀α β γ. Ord α |- (α -> β -> γ) -> Tree_Map α β -> Tree_Map α γ := λf ta.
+    foldr_with_key (λk v z. insert k (f k v) z) empty ta
+
+  foldr :: ∀α β z. (β -> z -> z) -> z -> Tree_Map α β -> z := λf z ta.
+    deconstruct ta into
+      Tip -> z
+    | Node _ v lhs rhs ->
+      let right = foldr f z rhs in
+      let acc = f v right in
+      foldr f acc lhs
+
+  foldl :: ∀α β z. (z -> β -> z) -> z -> Tree_Map α β -> z := λf z ta.
+    deconstruct ta into
+      Tip -> z
+    | Node _ v lhs rhs ->
+      let left = foldl f z lhs in
+      let acc = f left v in
+      foldl f acc rhs
+
+  to_list :: ∀α β. Tree_Map α β -> List (α, β) :=
+    foldr_with_key (λk v. Cons (k, v)) Nil
+
+
+module Tree_Set:
+  empty :: ∀α. Tree_Set α :=
+    Tree_Set Tree_Map.empty
+
+  length :: ∀α. Tree_Set α -> Int := λ(Tree_Set map).
+    Tree_Map.length map
+
+  insert :: ∀α. Ord α |- α -> Tree_Set α -> Tree_Set α := λa (Tree_Set map).
+    Tree_Set (Tree_Map.insert a () map)
+
+  contains :: ∀α. α -> Tree_Set α -> Bool := λa (Tree_Set map).
+    Tree_Map.contains a map
+
+  to_list :: ∀α. Tree_Set α -> List α := λ(Tree_Set map).
+    Tree_Map.foldr_with_key (λk _. Cons k) Nil map
+
+(* Tree_Map ::= ∀k v. Make_Tree_Map (Tree_Map (k, v)) *)

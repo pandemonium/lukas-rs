@@ -1014,6 +1014,12 @@ Value mk_tuple(size_t len, ...) {
     return VObject(t);
 }
 
+Value mk_tuple_uninit(size_t len) {
+    size_t body = sizeof(Tuple) + len * sizeof(Value);
+    Tuple *t = gc_new(body, OBJ_TUPLE);
+    return VObject(t);
+}
+
 Value mk_data(uint64_t tag, size_t nfields, ...) {
     size_t body = sizeof(Data) + nfields * sizeof(Value);
     Data *d = gc_new(body, OBJ_DATA);

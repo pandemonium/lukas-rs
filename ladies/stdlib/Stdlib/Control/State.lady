@@ -35,6 +35,13 @@ eval :: ∀s α. State s α -> s -> α :=
 exec :: ∀s α. State s α -> s -> s :=
   λst s. (run st s).0
 
+(* Lift a pure state transition into the monad. It takes the value-first `(α, s)` *)
+(* order -- the natural "(result, next state)" a step returns -- and stores it in  *)
+(* the monad's internal `(s, α)` layout, so `state f` turns any `s -> (α, s)` step *)
+(* into an action.                                                                 *)
+state :: ∀s α. (s -> (α, s)) -> State s α := λf.
+  MkState (λs. let a, s2 = f s in s2, a)
+
 get :: ∀s. State s s :=
   MkState (λs. s, s)
 

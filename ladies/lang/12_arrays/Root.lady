@@ -1,4 +1,5 @@
 use Stdlib.
+use Stdlib.Data.
 
 (* How do I mention the Tuple2 type? It does not have a name. *)
 (* witness ∀α β. Display α + Display β |- α, β := *)

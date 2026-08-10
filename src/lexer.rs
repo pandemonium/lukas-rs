@@ -351,7 +351,7 @@ fn is_identifier_prefix(c: char) -> bool {
 }
 
 fn is_identifier_continuation(c: char) -> bool {
-    c.is_alphabetic() || c == '_' || c.is_numeric()
+    c.is_alphabetic() || c == '_' || c.is_numeric() || c == '\''
 }
 
 impl Default for LexicalAnalyzer {

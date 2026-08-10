@@ -288,6 +288,7 @@ impl Compiler {
                     // C has no closures: convert them away and lambda-lift before
                     // emitting. Dependency-resolvable order lives on the pre-closure
                     // table, so eager top-level values initialise after what they read.
+                    let program = program.specialize();
                     let order = program
                         .dependency_matrix()
                         .in_resolvable_order()

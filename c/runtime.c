@@ -6,6 +6,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
+
+int64_t now_millis(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
+}
 
 // A curried binary builtin: stage 1 captures the first argument, stage 2
 // applies the primitive PRIM. These closures exist only for partial/higher-order

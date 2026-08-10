@@ -19,6 +19,10 @@ compose :: ∀α β γ. (β -> γ) -> (α -> β) -> α -> γ := λg f a. g (f a)
 
 const :: ∀α β. α -> β -> α := λa _. a
 
+fst :: ∀α β. (α, β) -> α := λ(a, _). a
+
+snd :: ∀α β. (α, β) -> β := λ(_, b). b
+
 module Int:
   foreign raw_int_of_char :: Char -> Int
   of_char :: Char -> Int := raw_int_of_char
@@ -54,7 +58,7 @@ foreign Raw_Bytes
 
 opaque Buffer ::= Buffer Raw_Buffer         (* mutable, growable: the write side *)
 opaque Bytes  ::= Bytes Raw_Bytes           (* immutable view:  the read side *)
-opaque Text   ::= MkText Bytes              (* validated UTF-8 view over Bytes *)
+opaque Text   ::= MkText Bytes              (* validated UTF-8 view over Bytes. Couldn't this be `Text`? *)
 
 module Buffer:
   foreign raw_new_buffer :: Int -> Raw_Buffer
@@ -108,14 +112,39 @@ module Bytes:
   foreign raw_get_i64_be :: Raw_Bytes -> Int -> Int
   foreign raw_is_valid   :: Bytes -> Bool     (* Bytes erases to its slice, passed to C *)
 
+  (* Compare byte slices. Text needs a Collation. *)
+  compare :: Bytes -> Bytes -> Ordering := λlhs rhs.
+    let lhs_len = length lhs in
+    (* Replace with raw_memchr or something. *)
+    let compare_contents = λi.
+      if i < lhs_len then
+        let l = get_u8 lhs i in
+        let r = get_u8 rhs i in
+
+        if l < r
+        then Less
+        else if l = r then compare_contents (i + 1)
+        else Greater
+      else
+        Equal
+    in
+      if lhs_len < length rhs then Less
+      else if lhs_len = length rhs then compare_contents 0
+      else Greater
+
   (* Reads are genuinely pure -- no IO. *)
   length :: Bytes -> Int := λ(Bytes s). raw_slice_len s
 
   (* Unchecked zero-copy sub-view; caller ensures 0 <= from <= to <= length. *)
-  slice :: Bytes -> Int -> Int -> Bytes := λ(Bytes s) from to. Bytes (raw_sub s from to)
+  slice :: Bytes -> Int -> Int -> Bytes := λ(Bytes s) from to.
+    Bytes (raw_sub s from to)
 
   (* Unchecked split at `n` -> (prefix [0,n), suffix [n,length)). *)
-  split_at :: Bytes -> Int -> (Bytes, Bytes) := λ(Bytes s) n. (Bytes (raw_sub s 0 n), Bytes (raw_sub s n (raw_slice_len s - n)))
+  split_at :: Bytes -> Int -> (Bytes, Bytes) := λ(Bytes s) n.
+    Bytes (raw_sub s 0 n), Bytes (raw_sub s n (raw_slice_len s - n))
+
+  skip :: Bytes -> Int -> Bytes := λ(Bytes s) n.
+    Bytes (raw_sub s n (raw_slice_len s - n))
 
   (* First index whose byte satisfies `p`, else Nope. *)
   position :: Bytes -> (Int -> Bool) -> Perhaps Int := λ(Bytes s) p.
@@ -195,15 +224,29 @@ witness Eq Unit  := { eq := λp q. prim_eq p q }
 (* (`Ord α` requires `Eq α`) -- so `compare` and `=` always agree; only the strict-less *)
 (* test bottoms out in the `prim_lt` leaf. *)
 witness Ord Int :=
-  { compare := λp q. if prim_lt p q then Less else if eq p q then Equal else Greater
+  { compare := λp q.
+      if prim_lt p q then Less
+      else if eq p q then Equal
+      else Greater
   }
 
 witness Ord Float :=
-  { compare := λp q. if prim_lt p q then Less else if eq p q then Equal else Greater
+  { compare := λp q.
+      if prim_lt p q then Less
+      else if eq p q then Equal
+      else Greater
   }
 
 witness Ord Char :=
-  { compare := λp q. if prim_lt p q then Less else if eq p q then Equal else Greater
+  { compare := λp q.
+      if prim_lt p q then Less
+      else if eq p q then Equal
+      else Greater
+  }
+
+witness Ord Text :=
+  { compare := λ(MkText lhs) (MkText rhs).
+      Bytes.compare lhs rhs
   }
 
 (* The comparison operators desugar to these. Each deconstructs `compare`'s Ordering; *)

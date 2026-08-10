@@ -99,6 +99,10 @@ Value mk_text(const char *src);
 // can build one. A 64-bit float cannot be an immediate, so every computed Float boxes.
 Value mk_float(double x);
 
+// Wall-clock time in milliseconds since the Unix epoch. Passed to the program's
+// `start` entry point as its argument.
+int64_t now_millis(void);
+
 // Value constructors. Immediates pack into the word; a text literal becomes an
 // owned heap string; `VObject` just carries the (already 8-aligned) body pointer.
 static inline Value VInt(int64_t x)     { return (Value){((uint64_t)x << 1) | IMM_TAG}; }

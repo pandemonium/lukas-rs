@@ -1,0 +1,71 @@
+module Array:
+  foreign raw_len :: ∀α. Array α -> Int
+  foreign raw_get :: ∀α. Array α -> Int -> Perhaps α
+
+  length :: ∀α. Array α -> Int := raw_len
+  get :: ∀α. Array α -> Int -> Perhaps α := raw_get
+
+
+foreign Raw_Mutable_Array
+
+opaque Mutable_Array ::= ∀α. Mutable Raw_Mutable_Array
+
+module Mutable_Array:
+  foreign raw_allocate_mutable_array_uninit :: Int -> Raw_Mutable_Array
+  foreign raw_len :: ∀α. Raw_Mutable_Array -> Int
+  foreign raw_get :: ∀α. Raw_Mutable_Array -> Int -> Perhaps α
+  foreign raw_get_unchecked :: ∀α. Raw_Mutable_Array -> Int -> α
+  foreign raw_put :: ∀α. Raw_Mutable_Array -> Int -> α -> Perhaps α
+  foreign raw_put_unchecked :: ∀α. Raw_Mutable_Array -> Int -> α -> α
+
+  (* Think about how this function could be shared with the Readonly array. They have the same backing. *)
+  generate :: ∀α. Int -> (Int -> α) -> Mutable_Array α := λlength mk_element.
+    let array = raw_allocate_mutable_array_uninit length in
+    let generate_elements = λi.
+      if i < length then
+        let element = mk_element i in
+        raw_put_unchecked array i element
+        generate_elements (i + 1)
+      else Mutable array
+    in generate_elements 0
+
+  length :: ∀α. Mutable_Array α -> Int := λ(Mutable array). raw_len array
+
+  get :: ∀α. Mutable_Array α -> Int -> IO (Perhaps α) := λ(Mutable array) index.
+    IO.suspend (λ_. raw_get array index)
+
+  put :: ∀α. Mutable_Array α -> Int -> α -> IO (Perhaps α) := λ(Mutable array) index element.
+    IO.suspend (λ_. raw_put array index element)
+
+  get_unchecked :: ∀α. Mutable_Array α -> Int -> IO α := λ(Mutable array) index.
+    IO.suspend (λ_. raw_get_unchecked array index)
+
+  put_unchecked :: ∀α. Mutable_Array α -> Int -> α -> IO α := λ(Mutable array) index element.
+    IO.suspend (λ_. raw_put_unchecked array index element)
+
+
+
+witness Foldable Array :=
+  { fold_right := λstep initial as.
+      let loop = λi acc.
+        if i < 0 then
+          acc
+        else
+          deconstruct Array.get as i into
+            This x -> loop (i - 1) (step x acc)
+          | Nope   -> loop (i - 1) acc
+      in
+        loop (Array.length as - 1) initial
+
+    fold_left := λstep initial as.
+      let length = Array.length as in
+      let loop = λi acc.
+        if i >= length then
+          acc
+        else
+          deconstruct Array.get as i into
+            This x -> loop (i + 1) (step acc x)
+          | Nope   -> loop (i + 1) acc
+      in
+        loop 0 initial
+  }

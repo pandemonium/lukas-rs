@@ -1,3 +1,4 @@
+use Stdlib.Data.Array.
 use Stdlib.Data.List.
 use Stdlib.Data.Perhaps.
 use Stdlib.Binary.
@@ -13,17 +14,28 @@ signature From_Text ::= ∀α.
   { parse :: Text -> Perhaps α
   }
 
-(* C fast path for integer parsing. *)
 foreign raw_parse_int :: Text -> Perhaps Int
+foreign raw_parse_float :: Text -> Perhaps Float
 
 witness From Text (Perhaps Int) :=
   { from := raw_parse_int
   }
 
-foldr :: ∀α z. (α -> z -> z) -> z -> Text -> z :=
+witness From Text (Perhaps Float) :=
+  { from := raw_parse_float
+  }
+
+witness Ord Text :=
+  { compare := λlhs rhs.
+      let lhs_bytes = Text.to_bytes lhs in
+      let rhs_bytes = Text.to_bytes rhs in
+      Equal
+  }
+
+foldr :: ∀z. (Char -> z -> z) -> z -> Text -> z :=
   λf z fa. text_fold_right f z fa
 
-foldl :: ∀α z. (z -> α -> z) -> z -> Text -> z :=
+foldl :: ∀z. (z -> Char -> z) -> z -> Text -> z :=
   λf z fa. text_fold_right (λc g z. g (f z c)) id fa z
 
 to_list :: Text -> List Char :=
@@ -61,7 +73,7 @@ module Utf8:
     ]
 
   char_width :: Int -> Perhaps Int :=
-    Array.get_element Char_Width
+    Array.get Char_Width
 
   opaque Validation_Run ::=
     { Valid   :: Bytes

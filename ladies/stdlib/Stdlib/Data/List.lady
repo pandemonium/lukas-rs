@@ -1,9 +1,8 @@
 List ::= ∀α. Nil | Cons α (List α)
 
-
-witness ∀t : *->* α. Foldable t |- From (t α) (List α) :=
-  { from := fold_right Cons Nil
-  }
+(* The generic `From (Foldable t) (List α)` witness lives in Stdlib (not here): in this *)
+(* module `fold_right` binds to the concrete function below, which would collapse it to  *)
+(* List-only. There, class methods are opened last so it dispatches through the dict.    *)
 
 witness Functor List :=
   { fmap := λf xs.

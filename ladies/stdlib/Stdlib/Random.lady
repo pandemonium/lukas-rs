@@ -1,0 +1,13 @@
+use Stdlib.Control.State.
+
+LCG ::= LCG Int
+
+module LCG:
+  from_seed :: Int -> LCG := LCG
+
+  next :: LCG -> (Int, LCG) := λ(LCG s).
+    let s2 = (1664525 * s + 1013904223) % 4294967296 in
+    s2, LCG s2
+
+module Gen:
+  next :: State LCG Int := state LCG.next

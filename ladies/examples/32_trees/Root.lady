@@ -1,0 +1,17 @@
+use Stdlib.
+use Stdlib.Data.Tree.
+use Stdlib.Random.
+
+
+
+(* Insert `n` random draws into `tree`, threading the generator in the State monad. *)
+fill :: ∀α. Ord α |- Int -> (Int -> α) -> Tree_Set α -> State LCG (Tree_Set α) := λi mk_element tree.
+  if i > 0 then
+    let* random_number = Gen.next in
+    let element = mk_element random_number in
+    fill (i - 1) mk_element (Tree_Set.insert element tree)
+  else pure tree
+
+start := λseed.
+  let tree = eval (fill 1000000 (lambda x. "key-`x`") Tree_Set.empty) (LCG.from_seed seed) in
+  print_endline "size `Tree_Set.length tree`"

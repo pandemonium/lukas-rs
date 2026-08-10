@@ -1,3 +1,5 @@
 module List.
 module Result.
 module Perhaps.
+module Tree.
+module Array.

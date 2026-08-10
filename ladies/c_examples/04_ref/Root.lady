@@ -1,0 +1,50 @@
+use Stdlib.
+use Stdlib.IO.
+
+(* An IORef: a mutable reference cell holding one Value slot you can overwrite in    *)
+(* place. The whole point -- and the reason read/write must be IO -- is that after a *)
+(* `write`, a `read` of the SAME cell yields a DIFFERENT value. That breaks          *)
+(* referential transparency (`read r` is not a constant), so the operations cannot   *)
+(* be pure functions; they have to be sequenced in a monad.                          *)
+
+(* The cell itself is a one-element GC object (a tuple), so the garbage collector    *)
+(* already traces the value it holds -- keeping the referent alive. `raw_write`      *)
+(* overwrites slot 0 destructively; see Root.c.                                      *)
+Cell ::= ∀a. MkCell (Array a)
+
+module Ref:
+  foreign raw_new   :: ∀a. a -> Array a
+  foreign raw_read  :: ∀a. Array a -> a
+  foreign raw_write :: ∀a. Array a -> a -> Unit
+
+  (* new r  : allocate a fresh cell initialised to x.        *)
+  new :: ∀a. a -> IO (Cell a) := λx.
+    IO.suspend (λ_. MkCell (raw_new x))
+
+  (* read r : observe the cell's CURRENT contents.           *)
+  read :: ∀a. Cell a -> IO a := λ(MkCell c).
+    IO.suspend (λ_. raw_read c)
+
+  (* write r x : replace the contents. Subsequent reads see x. *)
+  write :: ∀a. Cell a -> a -> IO Unit := λ(MkCell c) x.
+    IO.suspend (λ_. raw_write c x)
+
+  (* modify r f : read-modify-write, the shape every hashtable insert needs. *)
+  modify :: ∀a. Cell a -> (a -> a) -> IO Unit := λr f.
+    let* x = read r in
+    write r (f x)
+
+(* Build the effect as a value, then run it once. Three reads of the SAME `r`        *)
+(* produce 1, 42, 142 -- proof that `read` is effectful, not a pure projection.      *)
+start := λ_.
+  let program =
+    let* r = Ref.new 1 in
+    let* a = Ref.read r in
+    let* _ = Ref.write r 42 in
+    let* b = Ref.read r in
+    let* _ = Ref.modify r (λn. n + 100) in
+    let* c = Ref.read r in
+    pure (a, b, c)
+  in
+  let a, b, c = unsafe_run_IO program in
+  print_endline "same ref, three reads: `a`, then `b`, then `c`"

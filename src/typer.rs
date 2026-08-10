@@ -959,7 +959,14 @@ impl phase::SymbolTable<Named> {
         };
 
         let scheme = if let Some(signature) = &symbol.type_signature {
-            signature.type_scheme(&HashMap::default(), ctx)?
+            let declared = signature.type_scheme(&HashMap::default(), ctx)?;
+            // Witnesses are verified on the separate dictionary-elaboration path.
+            if !self.witnesses.contains(&qualified_name) {
+                let inferred = expr.tree.type_info().inferred_type.apply(&expr.substitutions);
+                let pi = *symbol.body.annotation();
+                declared.reject_if_more_general_than(&inferred, &qualified_name, pi, ctx)?;
+            }
+            declared
         } else {
             let inferred_type = &expr.as_constrained_type();
             inferred_type.generalize(ctx).underlying
@@ -1866,6 +1873,16 @@ pub enum TypeError {
     #[error("all of {} is not covered", deconstruct.scrutinee)]
     MatchNotExhaustive {
         deconstruct: phase::Deconstruct<Types>,
+    },
+
+    #[error(
+        "the declared signature of `{name}` is more general than its definition\n       \
+         declared: {declared}\n       inferred: {inferred}"
+    )]
+    SignatureTooGeneral {
+        name: QualifiedName,
+        declared: Type,
+        inferred: Type,
     },
 
     #[error("Bad specialization: {0}")]
@@ -3024,6 +3041,39 @@ impl TypeScheme {
             .map(|tp| (tp.clone(), Type::fresh_with_kind(tp.kind().clone())))
             .collect::<Vec<_>>()
             .into()
+    }
+
+    /// Reject a declared signature the body cannot actually deliver: instantiate the
+    /// `∀`-vars, unify with `inferred`, and fail if any collapsed with another or was
+    /// pinned to a concrete type -- i.e. this scheme promises more polymorphism than
+    /// the definition has.
+    fn reject_if_more_general_than(
+        &self,
+        inferred: &Type,
+        name: &QualifiedName,
+        pi: ParseInfo,
+        ctx: &TypingContext,
+    ) -> Typing<()> {
+        let quantifiers = self.instantiation_substitutions();
+        let reconciliation = self
+            .underlying
+            .apply(&quantifiers)
+            .unified_with(inferred, &ctx.types)
+            .map_err(|e| e.at(pi))?;
+
+        let mut witnessed = HashSet::new();
+        for (_, fresh) in quantifiers.iter() {
+            match fresh.apply(&reconciliation) {
+                Type::Variable(v) if witnessed.insert(v.clone()) => {}
+                _ => Err(TypeError::SignatureTooGeneral {
+                    name: name.clone(),
+                    declared: self.underlying.clone(),
+                    inferred: inferred.clone(),
+                }
+                .at(pi))?,
+            }
+        }
+        Ok(())
     }
 
     pub fn instantiate(&self) -> Constrained<Type> {

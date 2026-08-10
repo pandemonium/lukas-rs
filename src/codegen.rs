@@ -348,9 +348,20 @@ impl lambda_lift::Program {
         writeln!(out, "  gc_init(&gc_anchor);")?;
         writeln!(out, "  runtime_init();")?;
         writeln!(out, "  startup();")?;
-        write!(out, "  ")?;
-        self.compile_expr(&self.start, out)?;
-        writeln!(out, ";")?;
+        // `start` receives the process's start time in milliseconds. The entry is
+        // synthesised as `start <arg>`; call the closure with the clock instead.
+        match &self.start {
+            Expr::Apply(_, the) => {
+                write!(out, "  apply(")?;
+                self.compile_expr(&the.function, out)?;
+                writeln!(out, ", VInt(now_millis()));")?;
+            }
+            other => {
+                write!(out, "  ")?;
+                self.compile_expr(other, out)?;
+                writeln!(out, ";")?;
+            }
+        }
         writeln!(out, "  return 0;\n}}")?;
         Ok(())
     }
