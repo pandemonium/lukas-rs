@@ -48,6 +48,13 @@ use crate::{
 /// remaining un-inlined bodies are recursive, gated by the recursion guard, not by size). So
 /// 100 = the knee + ~30 nodes of margin; there is no perf to win by tuning it either way.
 const INLINE_BUDGET: usize = 100;
+/// Whether the IO-deforestation reductions (single-use let-forwarding, case-of-case
+/// commuting, saturated-constructor-application folding) are enabled. Default on; set
+/// `MARM_NO_IODEFOREST` to disable, for A/B and regression bisection.
+fn iodeforest_on() -> bool {
+    std::env::var_os("MARM_NO_IODEFOREST").is_none()
+}
+
 /// Effective inline budget, overridable via `MARM_INLINE_BUDGET` for tuning sweeps.
 fn inline_budget() -> usize {
     std::env::var("MARM_INLINE_BUDGET")
@@ -895,6 +902,47 @@ fn pattern_binder_count<A>(pattern: &Pattern<A, Identifier>) -> usize {
     }
 }
 
+/// The lowest De Bruijn level a pattern binds (`None` if it binds nothing). A pattern's
+/// binders occupy a contiguous `[base, base + pattern_binder_count)` range starting at the
+/// scrutinee's depth, so this `base` is exactly the `shift` threshold when relocating other
+/// clauses underneath these binders (see the case-of-case rule).
+fn pattern_min_level<A>(pattern: &Pattern<A, Identifier>) -> Option<usize> {
+    match pattern {
+        Pattern::Bind(_, Identifier::Bound(level)) => Some(*level),
+        Pattern::Bind(..) | Pattern::Literally(..) => None,
+        Pattern::Coproduct(_, ConstructorPattern { arguments, .. }) => {
+            arguments.iter().filter_map(pattern_min_level).min()
+        }
+        Pattern::Tuple(_, TuplePattern { elements }) => {
+            elements.iter().filter_map(pattern_min_level).min()
+        }
+        Pattern::Struct(_, StructPattern { fields }) => {
+            fields.iter().filter_map(|(_, p)| pattern_min_level(p)).min()
+        }
+    }
+}
+
+/// Relocate a clause list underneath `by` freshly interposed binders starting at `from`:
+/// each clause's own binders (levels `>= from`) and references to them shift up by `by`;
+/// references to enclosing binders (`< from`) are untouched. Used by case-of-case commuting
+/// to move the outer match into an inner arm, under that arm's pattern binders.
+fn shift_clauses<A>(
+    clauses: &[MatchClause<A, Identifier>],
+    from: usize,
+    by: usize,
+) -> Vec<MatchClause<A, Identifier>>
+where
+    A: Clone,
+{
+    clauses
+        .iter()
+        .map(|clause| MatchClause {
+            pattern: walk_pattern(&clause.pattern, &|id| shift_id(id, from, by)),
+            consequent: Rc::new(shift(&clause.consequent, from, by)),
+        })
+        .collect()
+}
+
 /// Rewrite to a fixpoint. Each sweep is `Expr::map` bottom-up (so a node's children
 /// are already reduced when it is visited); we repeat whole sweeps until one changes
 /// nothing, because a rule like let-forwarding can splice fresh redexes *deep* inside
@@ -1070,14 +1118,22 @@ where
         // is an *elimination* (projection base / apply head / deconstruct scrutinee).
         // That is what finally lets a forwarded dictionary meet its projection and a
         // forwarded `MkGet`/`MkState` payload meet its deconstruct, so the box cancels.
-        //   * value-bound only -> duplicating / dropping it is effect- and
-        //     termination-neutral (and it de-sugars to no allocation once it cancels);
-        //   * all-uses-eliminated -> the copy always meets an eliminator, so we never
-        //     turn a shared allocation into a per-use one.
+        //   * value-bound -> duplicating / dropping it is effect- and termination-neutral
+        //     (and it de-sugars to no allocation once it cancels);
+        //   * OR forwardable-effectfully -> the bound expression's single use is the FIRST
+        //     thing the body evaluates (`forwardable_effectfully`), so a possibly-effectful,
+        //     non-value bound may be forwarded without reordering effects. This is what lets
+        //     the `let x = ARG in deconstruct x …` that `unsafe_run_IO`'s beta-to-let leaves
+        //     behind forward `ARG` into the force, exposing the inner (newtype-unwrap)
+        //     deconstruct to case-of-case -- while NOT touching `let x = E in let y = F in … x`
+        //     (which would flip effect order).
+        //   * all-uses-eliminated (the value case) -> every use is a scrutinee / head / base,
+        //     so we never turn a shared allocation into a per-use one.
         // Zero uses is the degenerate case: a dead pure `let`, simply dropped.
         Expr::Let(_a, binding)
             if matches!(&binding.binder, Identifier::Bound(l)
-                if is_value(&binding.bound) && all_uses_eliminated(&binding.body, *l)) =>
+                if (is_value(&binding.bound) && all_uses_eliminated(&binding.body, *l))
+                    || (iodeforest_on() && forwardable_effectfully(&binding.body, *l))) =>
         {
             let Identifier::Bound(level) = binding.binder else {
                 unreachable!("guarded by the match arm")
@@ -1149,6 +1205,75 @@ where
                         predicate,
                         consequent: on_branch(consequent, match_clauses.clone()),
                         alternate: on_branch(alternate, match_clauses),
+                    },
+                ),
+            )
+        }
+
+        // case-of-case commuting: `deconstruct (deconstruct s into [Pᵢ -> bᵢ]) into cs`
+        // becomes `deconstruct s into [Pᵢ -> (deconstruct bᵢ into cs)]`, pushing the outer
+        // match down onto each inner arm. This is the analog of case-of-`if` commuting for a
+        // `deconstruct` scrutinee -- the shape a run marker `deconstruct M into Suspend v ->
+        // v()` hits when `M` is a newtype unwrap `deconstruct set into Mutable arr -> Suspend
+        // (λ_. raw …)`: the outer force cannot meet the `Suspend` until it floats through the
+        // unwrap, after which case-of-known-constructor cancels the box and the `Suspend`
+        // closure vanishes. Pure structural commute of matches already present -- it inlines
+        // no combinator into any loop, so it cannot introduce the non-tail fusion leak.
+        //
+        // Unlike case-of-`if` (an `if` binds nothing), an inner arm `Pᵢ` binds `nᵢ` variables,
+        // so the outer clauses -- duplicated into that arm -- move under those binders and must
+        // shift up by `nᵢ` (from the inner binders' base level). Guarded to small outer clauses
+        // (copied into every arm) and terminating: the outer match only moves strictly toward
+        // the leaves of the inner match tree.
+        Expr::Deconstruct(a, deconstruct)
+            if iodeforest_on()
+                && matches!(&*deconstruct.scrutinee, Expr::Deconstruct(..))
+                && clauses_are_small(&deconstruct.match_clauses) =>
+        {
+            let Deconstruct {
+                scrutinee,
+                match_clauses: outer,
+            } = deconstruct;
+            let Expr::Deconstruct(
+                inner_a,
+                Deconstruct {
+                    scrutinee: inner_scrutinee,
+                    match_clauses: inner,
+                },
+            ) = Rc::unwrap_or_clone(scrutinee)
+            else {
+                unreachable!("guarded by the match arm")
+            };
+            let commuted = inner
+                .into_iter()
+                .map(|clause| {
+                    let n = pattern_binder_count(&clause.pattern);
+                    let outer = if n == 0 {
+                        outer.clone()
+                    } else {
+                        let base = pattern_min_level(&clause.pattern)
+                            .expect("a clause binding n > 0 variables has a bound binder");
+                        shift_clauses(&outer, base, n)
+                    };
+                    MatchClause {
+                        pattern: clause.pattern,
+                        consequent: Rc::new(Expr::Deconstruct(
+                            a.clone(),
+                            Deconstruct {
+                                scrutinee: clause.consequent,
+                                match_clauses: outer,
+                            },
+                        )),
+                    }
+                })
+                .collect();
+            (
+                true,
+                Expr::Deconstruct(
+                    inner_a,
+                    Deconstruct {
+                        scrutinee: inner_scrutinee,
+                        match_clauses: commuted,
                     },
                 ),
             )
@@ -1409,6 +1534,40 @@ where
     }
 }
 
+/// Whether `let level = E in body` may forward a *non-value* (possibly effectful) `E` into
+/// `body` without reordering effects. Sound only when `E`'s single use is the FIRST thing
+/// `body` evaluates -- i.e. `body` is directly a `deconstruct`/`project` whose scrutinee/base
+/// spine-head is `level`, with the binder used exactly once and nowhere else. Then `E` runs
+/// first either way. This is the `let x = ARG in deconstruct x into Suspend v -> v()` shape
+/// that `unsafe_run_IO`'s beta-to-let leaves; it deliberately EXCLUDES `let x = E in let y =
+/// F in … x …`, where forwarding `x` past `F` would flip their effect order (the bug that
+/// reversed `traverse`'s left-to-right prints in stdlib_tests/14_io_effect).
+fn forwardable_effectfully<A>(body: &Expr<A, Identifier>, level: usize) -> bool {
+    match body {
+        Expr::Deconstruct(_, d) => {
+            eliminated_head(&d.scrutinee, level) && count_level_uses(&d.scrutinee, level) == 1
+        }
+        Expr::Project(_, p) => {
+            eliminated_head(&p.base, level) && count_level_uses(&p.base, level) == 1
+        }
+        _ => false,
+    }
+}
+
+/// Count how many times `level` occurs as a `Variable`. Levels are absolute, so this is
+/// correct regardless of nesting depth. Used to spot a *linearly* used `let` binder, which
+/// may be forwarded even when its bound expression is not a syntactic value (one use cannot
+/// duplicate work).
+fn count_level_uses<A>(expr: &Expr<A, Identifier>, level: usize) -> usize {
+    match expr {
+        Expr::Variable(_, Identifier::Bound(k)) => usize::from(*k == level),
+        _ => children(expr)
+            .into_iter()
+            .map(|c| count_level_uses(c, level))
+            .sum(),
+    }
+}
+
 /// Whether `level` is used anywhere in `expr`. Sound for checking an outer binder's
 /// self-reference: the body's own binders all sit strictly deeper, so any `Bound(level)`
 /// there is necessarily a use of that outer binder.
@@ -1571,8 +1730,52 @@ where
             select_constructor_clause(a, scrutinee, injection, match_clauses)
         }
         Expr::Tuple(_, tuple) => select_tuple_clause(a, scrutinee, tuple, match_clauses),
+
+        // A constructor referenced as a *value* and then applied -- `Apply(Variable(C), args)`
+        // -- is never built as an `Inject` (only a syntactic `C args` is), so it never meets
+        // its `deconstruct` and the box never cancels. Fold a *saturated* such application into
+        // an injection view so the ordinary case-of-known-constructor selection fires. Guarded
+        // to a head whose name actually matches one of the clause constructors, so it only ever
+        // touches genuine constructor values, never an ordinary function application; arity is
+        // enforced downstream by `build_let_chain` (a partial application declines). This is
+        // what finally collapses `IO.suspend` / `MkGet` / `MkExceptT` / `MkState` values that a
+        // `let*`-desugared `bind` applies, once they reach a force -- the monad-ceremony boxes.
+        Expr::Apply(..) if iodeforest_on() => {
+            let (head, arguments) = peel_apply_spine(scrutinee);
+            let qn = match head {
+                Expr::Variable(_, id) => id.try_as_free()?,
+                _ => return None,
+            };
+            let names_a_clause = match_clauses.iter().any(|clause| {
+                matches!(&clause.pattern,
+                    Pattern::Coproduct(_, cp) if cp.constructor.try_as_free() == Some(qn))
+            });
+            if !names_a_clause {
+                return None;
+            }
+            let injection = Injection {
+                constructor: qn.clone(),
+                arguments,
+            };
+            select_constructor_clause(a, scrutinee, &injection, match_clauses)
+        }
         _ => None,
     }
+}
+
+/// Peel a left-nested application spine `((h a₁) a₂ …) aₙ` into its head `h` and the argument
+/// list `[a₁, …, aₙ]` in source order. A non-application returns itself and no arguments.
+fn peel_apply_spine<A>(
+    scrutinee: &Tree<A, Identifier>,
+) -> (&Expr<A, Identifier>, Vec<Tree<A, Identifier>>) {
+    let mut node: &Expr<A, Identifier> = &**scrutinee;
+    let mut arguments = Vec::new();
+    while let Expr::Apply(_, apply) = node {
+        arguments.push(apply.argument.clone());
+        node = &apply.function;
+    }
+    arguments.reverse();
+    (node, arguments)
 }
 
 fn select_constructor_clause<A>(
