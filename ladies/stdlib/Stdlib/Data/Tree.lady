@@ -97,5 +97,3 @@ module Tree_Set:
 
   to_list :: ∀α. Tree_Set α -> List α := λ(Tree_Set map).
     Tree_Map.foldr_with_key (λk _. Cons k) Nil map
-
-(* Tree_Map ::= ∀k v. Make_Tree_Map (Tree_Map (k, v)) *)

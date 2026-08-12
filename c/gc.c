@@ -281,7 +281,10 @@ static void *gc_stack_bottom = NULL;
 // Statistics, reported at exit when MARM_GC_STATS is set.
 static unsigned long gc_minor_count = 0, gc_major_count = 0;
 static unsigned long long gc_total_bytes = 0;
-static double gc_time = 0.0;   // seconds spent inside gc_run
+static double gc_time = 0.0;   // seconds spent inside gc_run (collection)
+static double alloc_time = 0.0; // seconds in the allocation slow path, EXCLUDING any
+                                // collection it triggered (run/block refill overhead);
+                                // the fast bump in gc_new is folded into mutator time
 static double gc_started = 0.0; // wall clock at gc_init
 
 // Allocation histogram (MARM_ALLOC_STATS): count + bytes by kind and arity. This is
@@ -677,6 +680,8 @@ static bool ix_find_run(IxBlock *b, uint32_t from, uintptr_t *s, uintptr_t *e) {
 // of line (and never inlined) so `gc_new`'s fast path folds into the fixed-arity
 // constructors as a tight bump with no call. `total` arrives already 8-rounded.
 static __attribute__((noinline)) void *gc_alloc_slow(size_t total, ObjKind kind) {
+    double slow_t0 = now();
+    double gc_before = gc_time; // subtract any collection triggered below
     gc_reserve(total); // Appel (immix) / nursery (slab) threshold: collect if due
     GcHeader *h;
     if (gc_immix) {
@@ -737,6 +742,7 @@ static __attribute__((noinline)) void *gc_alloc_slow(size_t total, ObjKind kind)
     h->kind = (uint8_t)kind;
     h->old = 0;
     if (gc_alloc_stats) alloc_record(kind, total);
+    alloc_time += (now() - slow_t0) - (gc_time - gc_before);
     return BODY(h);
 }
 
@@ -849,13 +855,18 @@ static inline void *gc_new(size_t body, ObjKind kind) {
 
 static void gc_report(void) {
     double total = now() - gc_started;
+    double mutator = total - gc_time - alloc_time;
     fprintf(stderr,
             "[gc] %lu minor, %lu major; %.1f MB allocated; live old %.1f MB; "
             "nursery %zu KiB\n"
-            "[gc] gc %.3fs / total %.3fs -> mutator throughput %.1f%%\n",
+            "[gc] gc %.3fs / total %.3fs -> mutator throughput %.1f%%\n"
+            "[time] mutator %.3fs (%.1f%%)  alloc %.3fs (%.1f%%)  gc %.3fs (%.1f%%)\n",
             gc_minor_count, gc_major_count, (gc_total_bytes + ix_bytes) / 1048576.0,
             gc_old_bytes / 1048576.0, gc_nursery >> 10, gc_time, total,
-            total > 0 ? 100.0 * (total - gc_time) / total : 100.0);
+            total > 0 ? 100.0 * (total - gc_time) / total : 100.0,
+            mutator, total > 0 ? 100.0 * mutator / total : 0.0,
+            alloc_time, total > 0 ? 100.0 * alloc_time / total : 0.0,
+            gc_time, total > 0 ? 100.0 * gc_time / total : 0.0);
 }
 
 // B5 opportunity report (MARM_ALLOC_STATS): allocation count + volume by kind/arity,
@@ -1020,10 +1031,217 @@ Value mk_tuple_uninit(size_t len) {
     return VObject(t);
 }
 
+// ------------------------------------------------------------- flat arrays
+// A `Mutable_Array` whose element is a product (a tuple or record -- both are
+// OBJ_TUPLE -- at any nesting depth) stores its elements' *leaves* inline, so an
+// array of nested products is ONE heap object all the way down instead of the
+// array plus a boxed object per element per nesting level (the flat-layout
+// north-star: "N nested-product elements = one GC object"). The flat<->canonical
+// coercion is localised to get/put, so every caller still only ever sees an
+// ordinary boxed value.
+//
+// Layout: an ordinary OBJ_TUPLE body, so the existing blind even/odd tracer
+// walks it unchanged (each stored leaf is one word -- immediate, skipped; or
+// pointer, traced). Header words (all immediates, tracer-skipped):
+//   [0] count          [1] stride (leaf words per element)   [2] shape_len
+//   [3 .. 3+shape_len) shape          then count*stride leaf words.
+// The `shape` is a pre-order flattening of the element's product structure: a
+// positive entry `k` is a product node of arity `k` (its `k` children follow in
+// pre-order); `0` is a leaf (one stored word). It is discovered once from
+// element 0 (no type information on the C side); every element of a monomorphic
+// array shares it. `flatten`/`unflatten` walk it in lockstep to pack an element
+// in / rebuild the canonical nested value out.
+//
+// Recursion/size guard: a product deeper than FLAT_MAX_DEPTH or wider than
+// FLAT_MAX_SHAPE (e.g. a tuple-built recursive structure) falls back to a single
+// boxed leaf for the whole element -- the pre-flat representation -- so a
+// recursive type is never linearised forever.
+
+#define FLAT_MAX_SHAPE 128
+#define FLAT_MAX_DEPTH 16
+
+// Pre-order shape of a value: append product/leaf entries to `shape`, return the
+// leaf count. `*ok` is cleared (and expansion stops) past the size/depth guard,
+// so the caller falls back to treating the whole element as one boxed leaf.
+// `MARM_NOFLAT` forces the boxed leaf (stride 1) for A/B measurement.
+static size_t build_shape(Value v, int64_t *shape, size_t *slen, int depth, bool *ok) {
+    static int noflat = -1;
+    if (noflat < 0) noflat = getenv("MARM_NOFLAT") != NULL;
+    if (*slen >= FLAT_MAX_SHAPE) { *ok = false; return 1; }
+    if (!noflat && depth <= FLAT_MAX_DEPTH && !(v.w & IMM_TAG) &&
+        HEADER(as_ptr(v))->kind == OBJ_TUPLE) {
+        Tuple *t = as_tuple(v);
+        size_t k = HEADER(t)->body / sizeof(Value);
+        shape[(*slen)++] = (int64_t)k; // product node of arity k
+        size_t leaves = 0;
+        for (size_t i = 0; i < k && *ok; i++) {
+            leaves += build_shape(t->elems[i], shape, slen, depth + 1, ok);
+        }
+        return leaves;
+    }
+    shape[(*slen)++] = 0; // leaf
+    return 1;
+}
+
+// Pack `v`'s leaves into `dest` in shape order (advancing both cursors).
+static void flatten(Value v, const int64_t *shape, size_t *si, Value *dest, size_t *di) {
+    int64_t node = shape[(*si)++];
+    if (node == 0) {
+        dest[(*di)++] = v;
+        return;
+    }
+    Tuple *t = as_tuple(v);
+    for (int64_t i = 0; i < node; i++) {
+        flatten(t->elems[i], shape, si, dest, di);
+    }
+}
+
+// Rebuild the canonical (nested) value from `src`'s leaves in shape order. A
+// product node allocates its tuple zeroed and fills field-by-field: the
+// half-built tuple is a live stack root and its unset fields are 0 (tracer-
+// skipped), so a GC during a later field's rebuild is safe; the GC is non-moving
+// so `src` (into the rooted array) stays valid.
+static Value unflatten(const int64_t *shape, size_t *si, const Value *src, size_t *sri) {
+    int64_t node = shape[(*si)++];
+    if (node == 0) {
+        return src[(*sri)++];
+    }
+    size_t body = sizeof(Tuple) + (size_t)node * sizeof(Value);
+    Tuple *t = gc_new(body, OBJ_TUPLE);
+    memset(t->elems, 0, (size_t)node * sizeof(Value));
+    Value out = VObject(t);
+    for (int64_t i = 0; i < node; i++) {
+        Value child = unflatten(shape, si, src, sri);
+        as_tuple(out)->elems[i] = child; // re-read: `out` may have survived a GC
+    }
+    return out;
+}
+
+// Copy the array's shape into `buf` (small; <= FLAT_MAX_SHAPE); returns its len.
+static size_t read_shape(Value arr, int64_t *buf) {
+    Tuple *t = as_tuple(arr);
+    size_t slen = (size_t)as_int(t->elems[2]);
+    for (size_t i = 0; i < slen; i++) buf[i] = as_int(t->elems[3 + i]);
+    return slen;
+}
+
+static size_t flat_elem_base(Value arr) { return 3 + (size_t)as_int(as_tuple(arr)->elems[2]); }
+
+// Allocate a zeroed flat array with its header + shape filled in. Zeroing is
+// mandatory: gc_new does not zero, the tracer trusts every even word, and
+// generation fills element-by-element with GC-triggering callbacks in between --
+// a garbage word would be chased as a pointer; a zeroed word is 0, which
+// mark_value skips (see notes/flat-layout.md DD3).
+static Value mk_flat_array(size_t count, size_t stride, const int64_t *shape, size_t slen) {
+    if (stride == 0) stride = 1;
+    size_t words = 3 + slen + count * stride;
+    size_t body = sizeof(Tuple) + words * sizeof(Value);
+    Tuple *t = gc_new(body, OBJ_TUPLE);
+    memset(t->elems, 0, words * sizeof(Value));
+    t->elems[0] = VInt((int64_t)count);
+    t->elems[1] = VInt((int64_t)stride);
+    t->elems[2] = VInt((int64_t)slen);
+    for (size_t i = 0; i < slen; i++) t->elems[3 + i] = VInt(shape[i]);
+    return VObject(t);
+}
+
+size_t flat_array_count(Value arr) { return (size_t)as_int(as_tuple(arr)->elems[0]); }
+
+// Store element `i` in place (no boxing, no allocation), packing its leaves.
+void flat_array_set(Value arr, size_t i, Value elt) {
+    int64_t shape[FLAT_MAX_SHAPE];
+    size_t slen = read_shape(arr, shape);
+    Tuple *t = as_tuple(arr);
+    size_t stride = (size_t)as_int(t->elems[1]);
+    Value *slot = &t->elems[flat_elem_base(arr) + i * stride];
+    size_t si = 0, di = 0;
+    flatten(elt, shape, &si, slot, &di);
+}
+
+// Read element `i` back out as a canonical (nested) value. `arr` is a live root
+// on the caller's stack across the rebuild allocation.
+Value flat_array_get(Value arr, size_t i) {
+    int64_t shape[FLAT_MAX_SHAPE];
+    read_shape(arr, shape);
+    size_t stride = (size_t)as_int(as_tuple(arr)->elems[1]);
+    size_t base = flat_elem_base(arr) + i * stride;
+    size_t si = 0, sri = base;
+    return unflatten(shape, &si, as_tuple(arr)->elems, &sri);
+}
+
+// Store element `i`, returning the previous element boxed out. The box-out runs
+// before the overwrite; `elt` is a live root on the stack across it.
+Value flat_array_put(Value arr, size_t i, Value elt) {
+    Value prev = flat_array_get(arr, i);
+    flat_array_set(arr, i, elt);
+    return prev;
+}
+
+// Build a flat array from `n` already-evaluated element values (a readonly
+// `[...]` literal). Shape from element 0; the `elems` block is a live stack root
+// across the alloc. Mirrors `flat_generate` without the per-index callback.
+Value mk_flat_array_from(size_t n, Value *elems) {
+    int64_t shape[FLAT_MAX_SHAPE];
+    if (n == 0) {
+        shape[0] = 0;
+        return mk_flat_array(0, 1, shape, 1);
+    }
+    size_t slen = 0;
+    bool ok = true;
+    size_t stride = build_shape(elems[0], shape, &slen, 0, &ok);
+    if (!ok) {
+        slen = 0;
+        shape[slen++] = 0;
+        stride = 1;
+    }
+    Value arr = mk_flat_array(n, stride, shape, slen); // may GC; elems[] rooted on stack
+    for (size_t i = 0; i < n; i++) flat_array_set(arr, i, elems[i]);
+    return arr;
+}
+
+// Build a flat array of `length` elements, each `apply(mk_element, i)`. The
+// element shape is taken from element 0; an empty array defaults to one leaf.
+Value flat_generate(int64_t length, Value mk_element) {
+    int64_t shape[FLAT_MAX_SHAPE];
+    if (length <= 0) {
+        shape[0] = 0;
+        return mk_flat_array(0, 1, shape, 1);
+    }
+    Value e0 = apply(mk_element, VInt(0)); // may GC; mk_element rooted on stack
+    size_t slen = 0;
+    bool ok = true;
+    size_t stride = build_shape(e0, shape, &slen, 0, &ok);
+    if (!ok) { // too deep/wide: fall back to one boxed leaf per element
+        slen = 0;
+        shape[slen++] = 0;
+        stride = 1;
+    }
+    Value arr = mk_flat_array((size_t)length, stride, shape, slen); // may GC; e0 rooted
+    flat_array_set(arr, 0, e0);
+    for (int64_t i = 1; i < length; i++) {
+        Value ei = apply(mk_element, VInt(i)); // may GC; arr rooted on stack
+        flat_array_set(arr, (size_t)i, ei);
+    }
+    return arr;
+}
+
+// Rebuild a boxed constructor from an INLINED sum's region (copy-out): `tag_imm`
+// is the inline tag (an immediate VInt), `payload_words` the union payload width,
+// `src` the payload words (active variant's fields, then zeroed padding). The
+// result is a max-payload OBJ_DATA -- the padding fields stay 0 (tracer-skipped)
+// and are never read by the active variant's pattern. `src` points into a live,
+// non-moving object, so it survives the alloc.
+Value mk_data_inline(Value tag_imm, size_t payload_words, const Value *src) {
+    Data *d = gc_new(sizeof(Data) + payload_words * sizeof(Value), OBJ_DATA);
+    HEADER(d)->ctag = (uint8_t)as_int(tag_imm);
+    memcpy(d->fields, src, payload_words * sizeof(Value));
+    return VObject(d);
+}
+
 Value mk_data(uint64_t tag, size_t nfields, ...) {
     size_t body = sizeof(Data) + nfields * sizeof(Value);
     Data *d = gc_new(body, OBJ_DATA);
-    d->tag = tag;
+    HEADER(d)->ctag = (uint8_t)tag;
     va_list ap;
     va_start(ap, nfields);
     for (size_t i = 0; i < nfields; i++) {
@@ -1058,27 +1276,27 @@ static inline void *alloc_body(size_t body, ObjKind kind) {
 
 Value mk_data0(uint64_t tag) {
     Data *d = alloc_body(sizeof(Data), OBJ_DATA);
-    d->tag = tag;
+    HEADER(d)->ctag = (uint8_t)tag;
     return VObject(d);
 }
 Value mk_data1(uint64_t tag, Value f0) {
     Data *d = alloc_body(sizeof(Data) + 1 * sizeof(Value), OBJ_DATA);
-    d->tag = tag, d->fields[0] = f0;
+    HEADER(d)->ctag = (uint8_t)tag, d->fields[0] = f0;
     return VObject(d);
 }
 Value mk_data2(uint64_t tag, Value f0, Value f1) {
     Data *d = alloc_body(sizeof(Data) + 2 * sizeof(Value), OBJ_DATA);
-    d->tag = tag, d->fields[0] = f0, d->fields[1] = f1;
+    HEADER(d)->ctag = (uint8_t)tag, d->fields[0] = f0, d->fields[1] = f1;
     return VObject(d);
 }
 Value mk_data3(uint64_t tag, Value f0, Value f1, Value f2) {
     Data *d = alloc_body(sizeof(Data) + 3 * sizeof(Value), OBJ_DATA);
-    d->tag = tag, d->fields[0] = f0, d->fields[1] = f1, d->fields[2] = f2;
+    HEADER(d)->ctag = (uint8_t)tag, d->fields[0] = f0, d->fields[1] = f1, d->fields[2] = f2;
     return VObject(d);
 }
 Value mk_data4(uint64_t tag, Value f0, Value f1, Value f2, Value f3) {
     Data *d = alloc_body(sizeof(Data) + 4 * sizeof(Value), OBJ_DATA);
-    d->tag = tag, d->fields[0] = f0, d->fields[1] = f1, d->fields[2] = f2, d->fields[3] = f3;
+    HEADER(d)->ctag = (uint8_t)tag, d->fields[0] = f0, d->fields[1] = f1, d->fields[2] = f2, d->fields[3] = f3;
     return VObject(d);
 }
 

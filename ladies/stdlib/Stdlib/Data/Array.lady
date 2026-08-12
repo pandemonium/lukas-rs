@@ -11,7 +11,7 @@ foreign Raw_Mutable_Array
 opaque Mutable_Array ::= ∀α. Mutable Raw_Mutable_Array
 
 module Mutable_Array:
-  foreign raw_allocate_mutable_array_uninit :: Int -> Raw_Mutable_Array
+  foreign raw_generate :: ∀α. Int -> (Int -> α) -> Raw_Mutable_Array
   foreign raw_len :: ∀α. Raw_Mutable_Array -> Int
   foreign raw_get :: ∀α. Raw_Mutable_Array -> Int -> Perhaps α
   foreign raw_get_unchecked :: ∀α. Raw_Mutable_Array -> Int -> α
@@ -20,14 +20,7 @@ module Mutable_Array:
 
   (* Think about how this function could be shared with the Readonly array. They have the same backing. *)
   generate :: ∀α. Int -> (Int -> α) -> Mutable_Array α := λlength mk_element.
-    let array = raw_allocate_mutable_array_uninit length in
-    let generate_elements = λi.
-      if i < length then
-        let element = mk_element i in
-        raw_put_unchecked array i element
-        generate_elements (i + 1)
-      else Mutable array
-    in generate_elements 0
+    Mutable (raw_generate length mk_element)
 
   length :: ∀α. Mutable_Array α -> Int := λ(Mutable array). raw_len array
 
@@ -43,6 +36,10 @@ module Mutable_Array:
   put_unchecked :: ∀α. Mutable_Array α -> Int -> α -> IO α := λ(Mutable array) index element.
     IO.suspend (λ_. raw_put_unchecked array index element)
 
+  modify_unchecked :: ∀α. Mutable_Array α -> Int -> (α -> α) -> IO α := λ(Mutable array) index f.
+    let previous = raw_get_unchecked array index in
+    let element = f previous in
+    pure (raw_put_unchecked array index element)
 
 
 witness Foldable Array :=

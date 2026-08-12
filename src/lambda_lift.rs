@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     ast::{
-        Apply, Literal,
+        Apply, ApplyTypeExpr, ArrowTypeExpr, Literal, TupleTypeExpr, TypeExpression,
         namer::{QualifiedName, Symbol, SymbolName, TypeDefinition},
         pattern::MatchClause,
     },
@@ -17,6 +17,219 @@ use crate::{
     phase,
     typer::TypeInfo,
 };
+
+/// Widest flattened field a record may inline before it is kept as a pointer
+/// instead (the reference-large-values policy): a nested ground product wider
+/// than this contributes one pointer word, so a big shared sub-record is not
+/// copied into every parent.
+const FLAT_INLINE_CAP: usize = 8;
+
+/// How a non-recursive coproduct is stored inline in a flat parent: a tag word
+/// followed by a payload region sized to the widest variant. Kept per-type; a
+/// recursive or oversized sum has no `CoproductLayout` and stays a boxed pointer.
+#[derive(Debug, Clone)]
+pub struct CoproductLayout {
+    /// Total inlined width in words: the tag word plus the widest variant's payload.
+    pub union_width: usize,
+    /// Flattened field widths of each constructor, indexed by tag (its ordinal).
+    pub variant_widths: Vec<Vec<usize>>,
+}
+
+impl closed::SymbolTable {
+    /// Per-record-type flattened field widths, in the record's CANONICAL field
+    /// order (sorted by field name) -- the same order the typer assigns projection
+    /// ordinals and `compile_record` emits fields, so codegen's offsets line up. A
+    /// width > 1 means the field is a nested GROUND, non-recursive product small
+    /// enough to store inline; every polymorphic, recursive, applied, arrow, base,
+    /// or oversized field is one word (a scalar or a pointer). Built from the type
+    /// *declarations* -- the ground-field rule makes the layout fixed per nominal
+    /// type, so no instantiation is needed.
+    fn record_layout_table(&self) -> HashMap<QualifiedName, Vec<usize>> {
+        let mut table = HashMap::default();
+        for symbol in self.symbols.values() {
+            if let Symbol::Type(type_symbol) = symbol {
+                if let TypeDefinition::Record(record) = &type_symbol.definition {
+                    let mut fields: Vec<_> = record.fields.iter().collect();
+                    fields.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+                    let widths = fields
+                        .iter()
+                        .map(|field| {
+                            // Seed the on-path set with the record itself, so a
+                            // directly self-recursive field is cut to a pointer.
+                            let mut on_path = vec![record.name.clone()];
+                            self.type_expr_width(&field.type_signature.body, &mut on_path)
+                        })
+                        .collect();
+                    table.insert(record.name.clone(), widths);
+                }
+            }
+        }
+        table
+    }
+
+    /// Total inlined width of a record type, or `None` if `name` is not a record
+    /// (a base/coproduct/signature/unknown type -- one word as a field).
+    fn record_total_width(
+        &self,
+        name: &QualifiedName,
+        on_path: &mut Vec<QualifiedName>,
+    ) -> Option<usize> {
+        let Symbol::Type(type_symbol) = self.symbols.get(&SymbolName::Type(name.clone()))? else {
+            return None;
+        };
+        let TypeDefinition::Record(record) = &type_symbol.definition else {
+            return None;
+        };
+        Some(
+            record
+                .fields
+                .iter()
+                .map(|field| self.type_expr_width(&field.type_signature.body, on_path))
+                .sum(),
+        )
+    }
+
+    /// Flattened width of one field type. A named record recurses (ground-field
+    /// rule); a tuple flattens structurally; everything else is one word. A type
+    /// already on the expansion path is the recursion knot -> one pointer word.
+    fn type_expr_width<A>(
+        &self,
+        type_expr: &TypeExpression<A, QualifiedName>,
+        on_path: &mut Vec<QualifiedName>,
+    ) -> usize {
+        let inlined = |total: usize| if (1..=FLAT_INLINE_CAP).contains(&total) { total } else { 1 };
+        // A coproduct field inlines only under MARM_FLAT_SUMS (codegen must handle
+        // the tag+union). Off by default: sum fields stay one boxed word.
+        let sum_width = |this: &Self, name: &QualifiedName, on_path: &mut Vec<QualifiedName>| {
+            if flat_sums_enabled() {
+                this.coproduct_layout(name, on_path).map_or(1, |l| inlined(l.union_width))
+            } else {
+                1
+            }
+        };
+        match type_expr {
+            TypeExpression::Constructor(_, name) => {
+                if on_path.contains(name) {
+                    return 1;
+                }
+                on_path.push(name.clone());
+                let width = match self.record_total_width(name, on_path) {
+                    Some(total) => inlined(total),
+                    None => sum_width(self, name, on_path),
+                };
+                on_path.pop();
+                width
+            }
+            TypeExpression::Tuple(_, TupleTypeExpr(elements)) => {
+                inlined(elements.iter().map(|e| self.type_expr_width(e, on_path)).sum())
+            }
+            // An applied type constructor -- `Perhaps τ`, `Result e a`, `Pair a b`:
+            // its layout is fixed by the head (parameters are width-1 either way,
+            // ground-field rule), so peel to the head and use its record/sum width.
+            // Gated with the sum flag (new behavior; applied types were boxed before).
+            TypeExpression::Apply(..) if flat_sums_enabled() => match applied_head(type_expr) {
+                Some(name) if !on_path.contains(name) => {
+                    on_path.push(name.clone());
+                    let width = match self.record_total_width(name, on_path) {
+                        Some(total) => inlined(total),
+                        None => sum_width(self, name, on_path),
+                    };
+                    on_path.pop();
+                    width
+                }
+                _ => 1,
+            },
+            // Polymorphic, applied, and function fields are one word.
+            TypeExpression::Parameter(..)
+            | TypeExpression::Apply(..)
+            | TypeExpression::Arrow(..) => 1,
+        }
+    }
+
+    /// The inlined layout of a coproduct: its union width (a tag word plus the
+    /// widest variant's flattened payload) and the per-constructor field widths.
+    /// `None` (kept boxed, one word) when it is RECURSIVE -- any constructor field
+    /// references a type on the current expansion path (the recursion knot, S4:
+    /// `List`/`Tree` stay boxed) -- or the union exceeds `FLAT_INLINE_CAP`. Assumes
+    /// `name` is already on `on_path`. Only NON-recursive sums (`Perhaps`, `Result`,
+    /// `Ordering`, enums, small ADTs) inline; matching is nominal, so the
+    /// ground-field rule keeps it safe just like records.
+    fn coproduct_layout(
+        &self,
+        name: &QualifiedName,
+        on_path: &mut Vec<QualifiedName>,
+    ) -> Option<CoproductLayout> {
+        let Symbol::Type(type_symbol) = self.symbols.get(&SymbolName::Type(name.clone()))? else {
+            return None;
+        };
+        let TypeDefinition::Coproduct(coproduct) = &type_symbol.definition else {
+            return None;
+        };
+        // A newtype (single ctor, single field) is box-erased elsewhere -- it is
+        // its field, not a tagged sum, so it has no inline union layout.
+        if let [only] = coproduct.constructors.as_slice() {
+            if only.signature.len() == 1 {
+                return None;
+            }
+        }
+        let mut variant_widths = Vec::with_capacity(coproduct.constructors.len());
+        for constructor in &coproduct.constructors {
+            let mut widths = Vec::with_capacity(constructor.signature.len());
+            for field in &constructor.signature {
+                if type_expr_references_path(field, on_path) {
+                    return None; // recursion knot -> keep the whole sum boxed
+                }
+                widths.push(self.type_expr_width(field, on_path));
+            }
+            variant_widths.push(widths);
+        }
+        let payload = variant_widths.iter().map(|v| v.iter().sum::<usize>()).max().unwrap_or(0);
+        let union_width = 1 + payload; // tag word + widest variant's payload
+        (1..=FLAT_INLINE_CAP)
+            .contains(&union_width)
+            .then_some(CoproductLayout { union_width, variant_widths })
+    }
+}
+
+/// Whether inlined-sum flattening is enabled (`MARM_FLAT_SUMS`). Off by default:
+/// a coproduct field stays one boxed word, and applied types are not inlined.
+fn flat_sums_enabled() -> bool {
+    std::env::var_os("MARM_FLAT_SUMS").is_some()
+}
+
+/// The head type-constructor name of an applied type: `Perhaps τ` -> `Perhaps`,
+/// `Pair a b` -> `Pair`. `None` if the spine head is not a bare constructor.
+fn applied_head<A>(type_expr: &TypeExpression<A, QualifiedName>) -> Option<&QualifiedName> {
+    match type_expr {
+        TypeExpression::Constructor(_, name) => Some(name),
+        TypeExpression::Apply(_, apply) => applied_head(&apply.function),
+        _ => None,
+    }
+}
+
+/// Whether a field type references any type currently on the expansion path --
+/// the recursion signal for `coproduct_layout` (catches direct and applied
+/// self-reference, e.g. `Cons α (List α)` while `List` is on the path).
+fn type_expr_references_path<A>(
+    type_expr: &TypeExpression<A, QualifiedName>,
+    on_path: &[QualifiedName],
+) -> bool {
+    match type_expr {
+        TypeExpression::Constructor(_, name) => on_path.contains(name),
+        TypeExpression::Parameter(..) => false,
+        TypeExpression::Tuple(_, TupleTypeExpr(elements)) => {
+            elements.iter().any(|e| type_expr_references_path(e, on_path))
+        }
+        TypeExpression::Apply(_, ApplyTypeExpr { function, argument, .. }) => {
+            type_expr_references_path(function, on_path)
+                || type_expr_references_path(argument, on_path)
+        }
+        TypeExpression::Arrow(_, ArrowTypeExpr { domain, codomain }) => {
+            type_expr_references_path(domain, on_path)
+                || type_expr_references_path(codomain, on_path)
+        }
+    }
+}
 
 impl closed::SymbolTable {
     // `order` is the dependency-resolvable order of the symbols (computed on the
@@ -57,6 +270,38 @@ impl closed::SymbolTable {
                         }
                     }
                 }
+            }
+        }
+
+        // Per-record flattened field widths, for the nested-product-literal join
+        // (one heap object instead of a box per nesting level). Built here while
+        // the type symbols are still in the table.
+        let record_layouts = self.record_layout_table();
+        // Per-coproduct inlined layout: (union width = tag + widest variant, per-tag
+        // variant field widths). Only non-recursive sums under the cap appear.
+        let mut coproduct_layouts: HashMap<QualifiedName, CoproductLayout> =
+            HashMap::default();
+        for symbol in self.symbols.values() {
+            if let Symbol::Type(type_symbol) = symbol {
+                if let TypeDefinition::Coproduct(coproduct) = &type_symbol.definition {
+                    let mut on_path = vec![coproduct.name.clone()];
+                    if let Some(layout) = self.coproduct_layout(&coproduct.name, &mut on_path) {
+                        coproduct_layouts.insert(coproduct.name.clone(), layout);
+                    }
+                }
+            }
+        }
+        if std::env::var_os("DUMP_LAYOUTS").is_some() {
+            let mut entries: Vec<_> = record_layouts.iter().collect();
+            entries.sort_by_key(|(name, _)| name.to_string());
+            for (name, widths) in entries {
+                let total: usize = widths.iter().sum();
+                eprintln!("[layout] record {name}: fields={widths:?} total={total}");
+            }
+            let mut sums: Vec<_> = coproduct_layouts.iter().collect();
+            sums.sort_by_key(|(name, _)| name.to_string());
+            for (name, layout) in sums {
+                eprintln!("[layout] sum {name}: union={} variants={:?}", layout.union_width, layout.variant_widths);
             }
         }
 
@@ -128,6 +373,8 @@ impl closed::SymbolTable {
             chain_heads,
             constructor_tags,
             newtype_constructors,
+            record_layouts,
+            coproduct_layouts,
             start: Expr::Apply(
                 CaptureInfo::dummy(),
                 Apply {
@@ -688,6 +935,12 @@ pub struct Program {
     /// erases: an `Inject` becomes the field itself; a constructor pattern binds the
     /// field to the scrutinee directly (no tag test, no `data_field`).
     pub newtype_constructors: HashSet<QualifiedName>,
+    /// Per-record-type flattened field widths (field order). Width > 1 marks a
+    /// nested ground product stored inline; codegen lays such a record's leaves
+    /// in one object and reaches fields by computed offset. See `record_layout_table`.
+    pub record_layouts: HashMap<QualifiedName, Vec<usize>>,
+    /// Per-coproduct inlined layout: (union width, per-tag variant field widths).
+    pub coproduct_layouts: HashMap<QualifiedName, CoproductLayout>,
     pub start: Expr,
 }
 
@@ -783,6 +1036,8 @@ impl fmt::Display for Program {
             chain_heads: _,
             constructor_tags: _,
             newtype_constructors: _,
+            record_layouts: _,
+            coproduct_layouts: _,
             start,
         } = self;
 

@@ -1,0 +1,29 @@
+use Stdlib.
+
+(* Nested-record allocation benchmark. Each iteration builds a Box = two nested   *)
+(* Points (a 2-deep record literal). With MARM_FLAT_RECORDS the whole Box is ONE  *)
+(* 4-word object; without it, a Box plus its two Point boxes = three allocations. *)
+(* So flag-on should allocate ~3x fewer objects. The box escapes into `area`, so  *)
+(* it is really built, and the projections there read its inlined leaves.         *)
+
+Point ::=
+  { x :: Int
+    y :: Int
+  }
+
+Box ::=
+  { lo :: Point
+    hi :: Point
+  }
+
+module Bench:
+  area :: Box -> Int := λb. b.lo.x + b.lo.y + b.hi.x + b.hi.y
+
+  loop :: Int -> Int -> Int := λn acc.
+    if n <= 0 then acc
+    else
+      let b = { lo := { x := n; y := n + 1 }; hi := { x := n + 2; y := n + 3 } } in
+      loop (n - 1) (acc + Bench.area b)
+
+start := λ_.
+  print_endline "sum `Bench.loop 50000000 0`"

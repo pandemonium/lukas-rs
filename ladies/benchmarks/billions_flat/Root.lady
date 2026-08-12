@@ -1,0 +1,43 @@
+use Stdlib.
+use Stdlib.Data.Array.
+
+(* Prove-it-first for the flat-memory-layout plan (notes/flat-layout.md). Same workload  *)
+(* as `billions`: draw 10,000,000 values from a full-period LCG and count the distinct    *)
+(* ones. `billions` uses a persistent boxed Tree_Set (~300M arity-4 node allocs, 92% of   *)
+(* all alloc). This version uses an open-addressing hash SET over ONE mutable array of      *)
+(* immediate Ints, driven entirely through the public IO-based Mutable_Array API. The array *)
+(* is allocated + initialised once by `generate`; every insert is an in-place probe + write. *)
+(* Immediate Ints already store flat in a tuple slot (no per-element box), so this isolates   *)
+(* the data-structure win; the remaining allocation is the IO monad's Suspend closures. The   *)
+(* flat-record case (city -> {min,max,sum,count}) is the next step and is what needs OBJ_SHAPED.*)
+
+module Flat:
+  cap :: Int := 33554432
+  empty :: Int := 4294967296
+  mul :: Int := 189812531
+
+  hash :: Int -> Int := λk. (k * mul) % cap
+
+  insert :: Mutable_Array Int -> Int -> IO Int := λset k.
+    let probe = λi.
+      let* slot = Mutable_Array.get_unchecked set i in
+      if slot = k then pure 0
+      else if slot = empty then
+        let* _ = Mutable_Array.put_unchecked set i k in
+        pure 1
+      else
+        let next = i + 1 in
+        probe (if next < cap then next else 0)
+    in probe (hash k)
+
+  fill :: Mutable_Array Int -> Int -> Int -> Int -> IO Int := λset n seed count.
+    if n > 0 then
+      let seed2 = (1664525 * seed + 1013904223) % 4294967296 in
+      let* added = insert set seed2 in
+      fill set (n - 1) seed2 (count + added)
+    else pure count
+
+start := λseed.
+  let set = Mutable_Array.generate Flat.cap (λ_. Flat.empty) in
+  let count = unsafe_run_IO (Flat.fill set 10000000 seed 0) in
+  print_endline "distinct `count`"

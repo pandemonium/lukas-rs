@@ -39,6 +39,12 @@ typedef struct GcHeader {
   uint8_t mark;
   uint8_t kind; // ObjKind
   uint8_t old;  // 0 = young (nursery), 1 = tenured, MARM_ETERNAL = static
+  // Constructor tag for an OBJ_DATA value: which constructor of its sum type.
+  // Lives in the header's former padding byte (header stays 8 B) instead of a
+  // full body word, shrinking every constructor node by 8 B -- the dominant
+  // object on recursive-structure workloads. Unused (garbage, never read) for
+  // other kinds, since `data_tag` is only emitted for constructor values.
+  uint8_t ctag;
 } GcHeader;
 
 #define BODY(h) ((void *)((h) + 1))
@@ -89,18 +95,21 @@ typedef struct {
 // `Nil`/`None`/`Less`/`Equal`/`Greater` were otherwise a heap alloc each).
 // MARM_ETERNAL keeps the collector off its `const` storage: `is_object` is
 // false for it (on no slab or large-object list, so the conservative scan and
-// sweep never see it) and `mark_obj` early-returns on the sentinel, so the tag
-// word is never written. The body is exactly `sizeof(Data)` -- just the tag, no
-// fields -- matching `mk_data0`, so `data_len` recovers 0 fields and the tracer
-// visits nothing. `VObject(&__sd.tag)` is the body pointer (past the 8-byte
-// header), which is what `data_tag` reads.
+// sweep never see it) and `mark_obj` early-returns on the sentinel. The tag now
+// lives in the header's `ctag` byte (not a body word), so the body is empty (0
+// fields) -- `data_len` recovers 0 and the tracer visits nothing. The body
+// pointer is just past the 8-byte header, which is what `data_tag` reads back
+// (via `HEADER(...)->ctag`).
+// `_Alignas(16)`: this struct is only a GcHeader (4-byte alignment), but every
+// object body must be 8-aligned like the heap allocator's -- the tagged-value
+// representation reserves the low bits of a pointer, so a body must never carry
+// spare low bits. Heap bodies get this from `gc_new`; this static forces it.
 #define STATIC_DATA0(tagv)                                                     \
   ({                                                                           \
-    static const struct {                                                      \
+    _Alignas(16) static const struct {                                         \
       GcHeader gch;                                                            \
-      uint64_t tag;                                                            \
-    } __sd = {{sizeof(Data), 0, OBJ_DATA, MARM_ETERNAL}, (tagv)};              \
-    VObject((void *)&__sd.tag);                                                \
+    } __sd = {{0, 0, OBJ_DATA, MARM_ETERNAL, (tagv)}};                         \
+    VObject((void *)((const char *)&__sd + sizeof(GcHeader)));                 \
   })
 
 // A float *literal* is a fixed, immutable double, so -- like STATIC_DATA0 --
@@ -139,6 +148,18 @@ Value mk_closure_n(Value (*code)(Value, Value), Value (*worker)(Value, Value *),
 Value mk_tuple(size_t len, ...);
 Value mk_tuple_uninit(size_t len);
 
+// Flat mutable arrays: one heap object holding all `count` elements' leaves
+// inline, so an array of nested products is a single GC object (see the
+// flat-array section in gc.c). `flat_generate` builds one by calling
+// `mk_element` per index, discovering the element's product shape from element
+// 0; get/put rebuild / pack the flat<->canonical coercion. Backing the
+// `Mutable_Array` foreigns.
+Value flat_generate(int64_t length, Value mk_element);
+Value mk_flat_array_from(size_t n, Value *elems);
+size_t flat_array_count(Value arr);
+Value flat_array_get(Value arr, size_t i);
+Value flat_array_put(Value arr, size_t i, Value elt);
+
 // Box a double on the heap (OBJ_FLOAT leaf). A 64-bit IEEE-754 value cannot
 // share the word with the immediate tag bit, so every computed Float is a heap
 // box; `as_float` reads it back. Float *literals* skip this via the immortal
@@ -150,7 +171,15 @@ Value mk_float(double x);
 // value's field count from its heap header -- used by the collector and `show`,
 // which are the only places the count isn't already known statically.
 Value mk_data(uint64_t tag, size_t nfields, ...);
+// Copy-out for inlined sums: rebuild a boxed OBJ_DATA from an inline tag +
+// payload region (see gc.c). Backing the flat-layout inlined-sum reads.
+Value mk_data_inline(Value tag_imm, size_t payload_words, const Value *src);
 size_t data_len(Value v);
+
+// A constructor value's tag (which constructor), read from the header's `ctag`
+// byte. Lives here (not runtime.h) because it needs `GcHeader`/`HEADER`. Only
+// emitted for values codegen knows are constructors.
+#define data_tag(v) (HEADER(as_data(v))->ctag)
 // Element count of a tuple / Array, recovered the same way (tuples store no
 // length).
 size_t tuple_len(Value v);

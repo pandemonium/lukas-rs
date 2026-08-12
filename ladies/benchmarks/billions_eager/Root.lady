@@ -1,0 +1,38 @@
+use Stdlib.
+use Stdlib.Data.Array.
+
+(* HAND-WRITTEN "deforested" form of billions_flat: exactly what an IO worker/wrapper *)
+(* pass should emit. Each Mutable_Array op is run eagerly with unsafe_run_IO (which     *)
+(* simplify collapses: unsafe_run_IO (Suspend (λ_. raw)) -> raw, zero closures), and the *)
+(* loops are strict tail recursion returning the value directly (no IO threading). This  *)
+(* measures whether the eager/strict form leaks or allocates -- the empirical question.  *)
+
+module Flat:
+  cap :: Int := 33554432
+  empty :: Int := 4294967296
+  mul :: Int := 189812531
+
+  hash :: Int -> Int := λk. (k * mul) % cap
+
+  insert :: Mutable_Array Int -> Int -> Int := λset k.
+    let probe = λi.
+      let slot = unsafe_run_IO (Mutable_Array.get_unchecked set i) in
+      if slot = k then 0
+      else if slot = empty then
+        let _ = unsafe_run_IO (Mutable_Array.put_unchecked set i k) in 1
+      else
+        let next = i + 1 in
+        probe (if next < cap then next else 0)
+    in probe (hash k)
+
+  fill :: Mutable_Array Int -> Int -> Int -> Int -> Int := λset n seed count.
+    if n > 0 then
+      let seed2 = (1664525 * seed + 1013904223) % 4294967296 in
+      let added = insert set seed2 in
+      fill set (n - 1) seed2 (count + added)
+    else count
+
+start := λseed.
+  let set = Mutable_Array.generate Flat.cap (λ_. Flat.empty) in
+  let count = Flat.fill set 10000000 seed 0 in
+  print_endline "distinct `count`"

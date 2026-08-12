@@ -3,3 +3,4 @@ module Result.
 module Perhaps.
 module Tree.
 module Array.
+module Hash.

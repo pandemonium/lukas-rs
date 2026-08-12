@@ -68,6 +68,8 @@ witness ∀α. Eq α |- Eq (List α) :=
       | otherwise            -> false
   }
 
+empty :: ∀α. List α := Nil
+
 head :: ∀α. List α -> Perhaps α :=
   λxs. deconstruct xs into Cons a tail -> This a | otherwise -> Nope
 

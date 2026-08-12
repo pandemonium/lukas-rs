@@ -417,6 +417,17 @@ impl phase::SymbolTable<Named> {
             // no signature, declared == inferred (current behaviour).
             let given = given_constraints(symbol, &term, ctx)?;
 
+            // Zonk the wanted constraints through the term's own substitution before
+            // discharge. A constraint collected inside a nested recursive lambda can
+            // still carry a metavariable (`Sink $meta`) that later unification bound
+            // to a concrete head (`$meta := Box`); without re-applying the substitution
+            // the stale copy survives *alongside* its ground form and, being
+            // variable-headed, is misclassified as parametric -> a spurious leading
+            // dictionary parameter. For a witness that turns the produced record into a
+            // `λself. record` function that callers project unforced (a null deref). The
+            // set re-collects, so the stale copy collapses onto its ground twin.
+            let wanted = term.constraints.apply(&term.substitutions);
+
             // this has to bind every term in TypingContext so that later elaborations
             // can discover constraints (type and order)
             // So it needs the name!
@@ -424,7 +435,7 @@ impl phase::SymbolTable<Named> {
                 &symbol.name,
                 &witnesses,
                 given,
-                term.constraints,
+                wanted,
                 term.tree,
                 ctx,
             )
@@ -962,9 +973,35 @@ impl phase::SymbolTable<Named> {
             let declared = signature.type_scheme(&HashMap::default(), ctx)?;
             // Witnesses are verified on the separate dictionary-elaboration path.
             if !self.witnesses.contains(&qualified_name) {
-                let inferred = expr.tree.type_info().inferred_type.apply(&expr.substitutions);
+                let inferred = expr
+                    .tree
+                    .type_info()
+                    .inferred_type
+                    .apply(&expr.substitutions);
                 let pi = *symbol.body.annotation();
                 declared.reject_if_more_general_than(&inferred, &qualified_name, pi, ctx)?;
+
+                // Ambiguity: a quantified variable that occurs in the constraint
+                // context but nowhere in the declared type is fixed by nothing at a
+                // call site (there are no functional dependencies), so instance
+                // resolution leaves it -- and the dictionary it selects -- undetermined.
+                // Reject with a clear message rather than leaking a phantom dictionary
+                // parameter or wiring an arbitrary instance. E.g. `hash_with : ∀α
+                // factory h. … Hash_Stream_Factory factory h |- factory -> α -> Int`,
+                // where `h` appears only in the constraint.
+                let type_vars = declared.underlying.variables();
+                for constraint in declared.constraints.iter() {
+                    if constraint.constraint_type.variables().iter().any(|v| {
+                        declared.quantifiers.contains(v) && !type_vars.contains(v)
+                    }) {
+                        return Err(TypeError::AmbiguousConstraint {
+                            name: qualified_name.clone(),
+                            constraint: constraint.clone(),
+                            underlying: declared.underlying.clone(),
+                        }
+                        .at(pi));
+                    }
+                }
             }
             declared
         } else {
@@ -1174,6 +1211,36 @@ fn resolve_constraints(
     ctx: &mut TypingContext,
 ) -> Result<Expr, TypeError> {
     let is_constrained = !given.is_empty() || !constraints.is_empty();
+
+    // A witness body can leave its class parameter as a free metavariable: when a
+    // method threads state through a nested recursive lambda, the recursion's fresh
+    // codomain never ties back to the instance head, so a sibling-method use yields
+    // `Sink $a` with `$a` unbound. The produced dictionary's own type is already the
+    // ground head (`Sink Box`), so pin the parameter by unifying every wanted
+    // constraint of the witness's class against that head; the resulting
+    // substitution then also grounds the transitively-affected constraints
+    // (`Monad (State $a)` -> `Monad (State Box)`). Constraints of other classes fail
+    // to unify with the head and are left untouched. Without this the stale
+    // variable-headed constraint is misread as a leading dictionary parameter,
+    // turning the record into a `λself. record` that callers project unforced (a
+    // null dereference).
+    let (mut tree, constraints) = match witnesses.witness_named(symbol_name) {
+        // Only a fully CONCRETE head (`Sink Box`) may pin metavariables this way. A
+        // polymorphic head (`Display (List a)`) legitimately carries same-class
+        // premises (`Display a`, the recursive element instance) that must stay
+        // parametric; unifying those against the head would collapse the recursion.
+        Some(witness) if witness.head.constraint_type.variables().is_empty() => {
+            let head = witness.head.constraint_type.clone();
+            let mut ground = Substitutions::default();
+            for c in constraints.iter() {
+                if let Ok(s) = c.constraint_type.apply(&ground).unified_with(&head, &ctx.types) {
+                    ground = ground.compose(&s);
+                }
+            }
+            (tree.apply(&ground), constraints.apply(&ground))
+        }
+        _ => (tree, constraints),
+    };
 
     // Supersignatures: if this term builds a signature dictionary (a witness),
     // capture the hidden `$super$` fields it must fill *before* the tree is
@@ -1482,6 +1549,9 @@ fn discharge_constraints(
                     use_site_constraints.iter().fold(
                         Expr::Variable(type_info.clone(), term_id.clone()),
                         |f, c| {
+                            if !evidence.contains_key(c) {
+                                println!("discharge_constrans: {c} not in {evidence:?}");
+                            }
                             let mut w = evidence[c].clone();
 
                             // Do not try to insert dictionaries into variables, these
@@ -1726,6 +1796,34 @@ impl Expr {
                 },
             ),
 
+            // A `RecursiveLambda` binds two levels at this node -- its `own_name`
+            // (the self-reference slot) and the inner lambda's parameter -- neither
+            // of which is an `Expr`, so `map`'s recursion never reaches them; only
+            // this arm can shift them. Without it a nested recursive `let` lambda
+            // keeps stale binder levels after a dictionary-parameter shift while the
+            // variables referencing it move, desyncing the recursive frame's scope
+            // in closure conversion (undeclared `l*` in the emitted C).
+            Self::RecursiveLambda(
+                a,
+                SelfReferential {
+                    own_name: Identifier::Bound(own),
+                    lambda:
+                        Lambda {
+                            parameter: Identifier::Bound(p),
+                            body,
+                        },
+                },
+            ) if own >= threshold => Self::RecursiveLambda(
+                a.clone(),
+                SelfReferential {
+                    own_name: Identifier::Bound(delta + own),
+                    lambda: Lambda {
+                        parameter: Identifier::Bound(delta + p),
+                        body,
+                    },
+                },
+            ),
+
             Self::Let(
                 a,
                 Binding {
@@ -1823,6 +1921,19 @@ pub enum TypeError {
          is only read once the binding is initialised."
     )]
     UnguardedValueRecursion { name: namer::QualifiedName },
+
+    #[error(
+        "ambiguous constraint on `{name}`: the type variable in `{constraint}` is fixed by \
+         no argument or result -- it appears only in the constraint context, never in the \
+         declared type `{underlying}`. Nothing at a call site can determine it (this would \
+         be a functional dependency, which is unsupported). Put the variable in the type: \
+         e.g. take/return a value of that type, so a caller pins it."
+    )]
+    AmbiguousConstraint {
+        name: namer::QualifiedName,
+        constraint: Constraint,
+        underlying: Type,
+    },
 
     #[error("undefined type {0}")]
     UndefinedType(namer::QualifiedName),

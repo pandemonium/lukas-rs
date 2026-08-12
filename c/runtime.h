@@ -86,7 +86,9 @@ struct Tuple {
 // not stored -- it is recovered from the GC header's body size when needed (GC
 // tracing, `show`); see `data_len`.
 struct Data {
-    uint64_t tag;
+    // No `tag` body word: the constructor tag lives in the GC header's `ctag`
+    // byte (see gc.h), so a constructor node is 8 B leaner. Fields are inline,
+    // exactly like a tuple; the count is recovered from the header body size.
     Value fields[]; // flexible array member
 };
 
@@ -205,10 +207,10 @@ static inline Value apply_n(Value f, size_t n, Value *args) {
 // i-th element of a tuple value (also used for record ordinals).
 static inline Value proj(Value t, size_t i) { return as_tuple(t)->elems[i]; }
 
-// A constructor value's tag (which constructor) and i-th field. Codegen knows
-// statically whether a value is a tuple or a constructor -- tuple/record access
-// uses `proj`, constructor access uses these -- so no runtime tag check here.
-#define data_tag(v) (as_data(v)->tag)
+// A constructor value's i-th field. Codegen knows statically whether a value is
+// a tuple or a constructor -- tuple/record access uses `proj`, constructor
+// access uses this -- so no runtime kind check here. `data_tag` (which
+// constructor) reads the header's `ctag` byte and so lives in gc.h.
 #define data_field(v, i) (as_data(v)->fields[(i)])
 
 // i-th captured value, read out of a closure's own (inline) environment.

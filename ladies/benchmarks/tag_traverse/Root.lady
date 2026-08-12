@@ -1,0 +1,35 @@
+use Stdlib.
+
+(* Micro-benchmark isolating Stage 2 (pointer-tag no-deref constructor matching).  *)
+(* A full binary tree whose leaves carry a payload we IGNORE. `count_leaves` tests  *)
+(* each node's constructor: a Node reads its two children (so the node is loaded    *)
+(* regardless), but a Leaf returns without touching any field -- so with pointer    *)
+(* tagging the leaf node is NEVER dereferenced (its tag comes from the pointer       *)
+(* bits), while the header-read path must load every leaf node just to learn it is  *)
+(* a leaf. The tree is far larger than cache, so those avoided leaf loads are real   *)
+(* memory traffic. Half the ~2^(depth+1) nodes are leaves, so Stage 2 should roughly *)
+(* halve the loads of a traversal. Run normally vs MARM_NO_PTAG=1 (built with the    *)
+(* header read) to see the difference.                                              *)
+
+Tree ::= Leaf Int | Node Tree Tree
+
+module Bench:
+  build :: Int -> Tree := λdepth.
+    if depth <= 0 then
+      Leaf depth
+    else
+      Node (build (depth - 1)) (build (depth - 1))
+
+  count_leaves :: Tree -> Int := λtree.
+    deconstruct tree into
+      Leaf _        -> 1
+    | Node left right -> count_leaves left + count_leaves right
+
+  repeat :: Tree -> Int -> Int -> Int := λtree passes acc.
+    if passes <= 0 then acc
+    else repeat tree (passes - 1) (acc + Bench.count_leaves tree)
+
+start := λ_.
+  let tree = Bench.build 22 in
+  let total = Bench.repeat tree 2000 0 in
+  print_endline "leaf-visits `total`"

@@ -10,10 +10,16 @@ use crate::{
         namer::QualifiedName, pattern::Pattern,
     },
     closed::{self, CaptureInfo, Closed, Identifier, LexicalLevel},
-    lambda_lift::{self, ChainWorker, ClosureInfo, LiftedFunction, TopLevelBinding, Worker},
+    lambda_lift::{
+        self, ChainWorker, ClosureInfo, CoproductLayout, LiftedFunction, TopLevelBinding, Worker,
+    },
     phase,
     typer::{BaseType, Type},
 };
+
+// Widest inlined field before it is kept a pointer instead; must match
+// `FLAT_INLINE_CAP` in lambda_lift so codegen and the layout table agree.
+const FLAT_INLINE_CAP: usize = 8;
 
 pub struct Codegen;
 
@@ -180,6 +186,15 @@ fn float_prim(prim: &str) -> Option<&'static str> {
         "prim_ge" => "prim_fge",
         _otherwise => return None,
     })
+}
+
+// Peel type ascriptions off an expression -- they are erased at codegen. Used by
+// the flat-record path to see through to a `Record`/`Project` node.
+fn strip_ascription(mut expr: &Expr) -> &Expr {
+    while let Expr::Ascription(_, ascription) = expr {
+        expr = &ascription.ascribed_tree;
+    }
+    expr
 }
 
 // Fresh scrutinee temporaries for `deconstruct`. A monotonic counter keeps each
@@ -379,10 +394,10 @@ impl lambda_lift::Program {
             Expr::Apply(_, the) => self.compile_apply(the, code),
             Expr::Let(_, the) => self.compile_let(the, code),
             Expr::Tuple(_, the) => self.compile_tuple(&the.elements, code),
-            Expr::Record(_, the) => self.compile_record(the, code),
+            Expr::Record(a, the) => self.compile_record(a, the, code),
             Expr::Inject(_, the) => self.compile_inject(the, code),
             Expr::Array(_, the) => self.compile_array(&the.elements, code),
-            Expr::Project(_, the) => self.compile_projection(the, code),
+            Expr::Project(a, the) => self.compile_projection(a, the, code),
             Expr::Sequence(_, the) => self.compile_sequence(the, code),
             Expr::Deconstruct(_, the) => self.compile_deconstruct(the, code),
             Expr::If(_, the) => self.compile_if(the, code),
@@ -412,8 +427,24 @@ impl lambda_lift::Program {
         write!(code, ")")
     }
 
+    // A readonly `[...]` array literal builds a flat array: one heap object with
+    // its elements' leaves inline (an array of products is one object), exactly
+    // like `Mutable_Array` -- the sole other `Array` source. The elements are
+    // evaluated into a stack `(Value[]){...}` block that `mk_flat_array_from`
+    // reads, discovering the element shape from element 0. Access stays through
+    // `Array.get`/`length` (arrays are never `proj`'d), so the layout is opaque.
     fn compile_array(&self, elements: &[Rc<Expr>], code: &mut CodeBuffer) -> fmt::Result {
-        self.compile_tuple(elements, code)
+        if elements.is_empty() {
+            return write!(code, "mk_flat_array_from(0, 0)");
+        }
+        write!(code, "mk_flat_array_from({}, (Value[]){{", elements.len())?;
+        for (i, element) in elements.iter().enumerate() {
+            if i > 0 {
+                write!(code, ", ")?;
+            }
+            self.compile_expr(element, code)?;
+        }
+        write!(code, "}})")
     }
 
     // A constructor value (sum type) is a `Data` object: an integer tag (the
@@ -451,6 +482,340 @@ impl lambda_lift::Program {
         write!(code, ")")
     }
 
+    // -------------------------------------------------- flat record literals
+    // Behind `MARM_FLAT_RECORDS`: a record whose fields include nested GROUND
+    // records is stored as ONE heap object with those sub-records' leaves inline
+    // (the `record_layouts` table gives each field's flattened width). Fewer
+    // allocations -- the confirmed bottleneck. Non-nested records are unchanged
+    // (all fields width 1 => identical to the tuple lowering), so output stays
+    // byte-identical; only allocation count drops.
+
+    fn flat_records_enabled(&self) -> bool {
+        // Default ON; opt out with MARM_NO_FLAT_RECORDS (measured 3x fewer allocs,
+        // 1.44x wall on flat_boxes, byte-identical elsewhere).
+        std::env::var_os("MARM_NO_FLAT_RECORDS").is_none()
+    }
+
+    // The per-field (or per-element) flattened widths of `ty`, if it is a flat
+    // aggregate: a record (from the layout table) or a tuple (element widths).
+    // A record is ALWAYS flat; a tuple is only flat when it is a field of a flat
+    // record (its words inlined there) -- callers gate the tuple case on that.
+    fn flat_widths(&self, ty: &Type) -> Option<Vec<usize>> {
+        match ty {
+            Type::Constructor(name) => self.record_layouts.get(name).cloned(),
+            Type::Tuple(tuple) => Some(tuple.0.iter().map(|t| self.flat_width(t)).collect()),
+            _ => None,
+        }
+    }
+
+    // The flattened width of `ty` as a single field: its inlined width if that is
+    // in `1..=FLAT_INLINE_CAP`, else one pointer word. Matches `type_expr_width`
+    // in lambda_lift, so codegen and the layout table agree.
+    fn flat_width(&self, ty: &Type) -> usize {
+        match self.flat_widths(ty) {
+            Some(widths) => {
+                let total: usize = widths.iter().sum();
+                if (1..=FLAT_INLINE_CAP).contains(&total) { total } else { 1 }
+            }
+            None => 1,
+        }
+    }
+
+    // The inline layout of a coproduct type (peeling `Perhaps τ` to `Perhaps`),
+    // if it is an inlined (non-recursive, under-cap) sum. `None` for records,
+    // recursive/boxed sums, and everything else.
+    fn sum_layout(&self, ty: &Type) -> Option<&CoproductLayout> {
+        let mut head = ty;
+        while let Type::Apply { constructor, .. } = head {
+            head = constructor;
+        }
+        match head {
+            Type::Constructor(name) => self.coproduct_layouts.get(name),
+            _ => None,
+        }
+    }
+
+    // Compile a sub-expression to a standalone C string (for splicing into an
+    // argument list where a `CodeBuffer` write cannot reach).
+    fn compile_to_string(&self, expr: &Expr) -> String {
+        let mut buf = CodeBuffer::default();
+        let _ = self.compile_expr(expr, &mut buf);
+        buf.to_string()
+    }
+
+    // The flat leaf C-expressions of a field `value` occupying `width` inline
+    // words. A width-1 field is its own single value. A wider field is a nested
+    // record: a record *literal* fuses (its leaves splice in directly, so the
+    // sub-object is never built), anything else is splatted from a hoisted temp
+    // (its `width` words copied out -- the value-semantics copy of a small
+    // existing record). Temp bindings accumulate in `prelude`.
+    fn flat_leaves(&self, value: &Expr, width: usize, prelude: &mut Vec<String>) -> Vec<String> {
+        if width == 1 {
+            return vec![self.compile_to_string(value)];
+        }
+        // A literal inlined aggregate fuses: splice its own leaves in directly, so
+        // the sub-object is never built. A record fuses through its layout; a tuple
+        // (only reached here as a flat record's field) through its element widths.
+        match strip_ascription(value) {
+            Expr::Record(annotation, sub) => {
+                if let Some(sub_widths) = self.flat_widths(&annotation.type_info.inferred_type) {
+                    let mut leaves = Vec::new();
+                    for ((_label, field), w) in sub.fields.iter().zip(sub_widths) {
+                        leaves.extend(self.flat_leaves(field, w, prelude));
+                    }
+                    return leaves;
+                }
+            }
+            Expr::Tuple(annotation, tuple) => {
+                if let Some(element_widths) = self.flat_widths(&annotation.type_info.inferred_type) {
+                    let mut leaves = Vec::new();
+                    for (element, w) in tuple.elements.iter().zip(element_widths) {
+                        leaves.extend(self.flat_leaves(element, w, prelude));
+                    }
+                    return leaves;
+                }
+            }
+            // An inlined sum literal: `[tag, active variant's leaves, zero padding]`
+            // to the union width. Padding zeros keep the blind tracer correct.
+            Expr::Inject(annotation, inject) => {
+                if let Some(layout) = self.sum_layout(&annotation.type_info.inferred_type) {
+                    let tag = self.constructor_tag(&inject.constructor);
+                    let variant = layout.variant_widths[tag as usize].clone();
+                    let mut leaves = vec![format!("VInt({tag})")];
+                    for (argument, w) in inject.arguments.iter().zip(variant) {
+                        leaves.extend(self.flat_leaves(argument, w, prelude));
+                    }
+                    while leaves.len() < width {
+                        leaves.push("((Value){0})".to_string());
+                    }
+                    return leaves;
+                }
+            }
+            _ => {}
+        }
+        // Non-literal: hoist to a temp and splat its `width` words.
+        let temp = format!("_fr{}", MATCH_ID.fetch_add(1, Ordering::Relaxed));
+        prelude.push(format!("Value {temp} = {};", self.compile_to_string(value)));
+        if self.sum_layout(&value.annotation().type_info.inferred_type).is_some() {
+            // A boxed sum -> the inline union: tag from the header, then the active
+            // variant's fields (its count is `data_len`), zero-padding the rest.
+            let mut leaves = vec![format!("VInt(data_tag({temp}))")];
+            for k in 0..width - 1 {
+                leaves.push(format!(
+                    "(({k}) < data_len({temp}) ? data_field({temp}, {k}) : ((Value){{0}}))"
+                ));
+            }
+            leaves
+        } else {
+            (0..width).map(|k| format!("proj({temp}, {k})")).collect()
+        }
+    }
+
+    // Resolve a projection into a flat record to `(base, offset, width)`: the C
+    // expression for the enclosing flat object, the projected field's word
+    // offset, and its flattened width. Nested projections into flat records
+    // accumulate their offsets, so `arr.b.y` reaches one word with no
+    // intermediate object materialised. `None` if the base is not a flat record.
+    fn flat_place(&self, projection: &phase::Projection<Closed>) -> Option<(String, usize, usize)> {
+        let ProductElement::Ordinal(index) = projection.select else {
+            return None;
+        };
+        let base_type = &projection.base.annotation().type_info.inferred_type;
+        let widths = self.flat_widths(base_type)?;
+        let offset: usize = widths[..index].iter().sum();
+        let width = widths[index];
+        // Reach through a base that is itself a flat projection (accumulating
+        // offsets), so `r.b.c` -- even through an inlined tuple field -- is one load.
+        if let Expr::Project(_, inner) = strip_ascription(&projection.base) {
+            if let Some((base, base_offset, _)) = self.flat_place(inner) {
+                return Some((base, base_offset + offset, width));
+            }
+        }
+        // The base is not a flat projection. A record value is always a flat object,
+        // so offset into it; a standalone TUPLE is boxed (only a tuple *inlined in a
+        // record* is flat, and that is the reach-through case above) -- leave it.
+        match base_type {
+            Type::Constructor(_) => Some((self.compile_to_string(&projection.base), offset, width)),
+            _ => None,
+        }
+    }
+
+    // Like `collect_pattern`, but the matched value is a region of a flat object:
+    // `base[offset .. offset+width]`, or the whole `base` when `whole`. Reads each
+    // sub-pattern's type from its annotation to thread offsets through nested flat
+    // records; a whole flat sub-record bind copies out, a further destructure
+    // reaches through with no copy.
+    fn collect_pattern_flat(
+        &self,
+        pattern: &phase::Pattern<Closed>,
+        base: &str,
+        offset: usize,
+        width: usize,
+        whole: bool,
+        tests: &mut Vec<String>,
+        binds: &mut Vec<(usize, String)>,
+    ) {
+        // The value as a single canonical word (a scalar, or a pointer to a boxed
+        // sub-object): the whole base, or the one word at `offset`.
+        let scalar = || {
+            if whole {
+                base.to_string()
+            } else {
+                format!("proj({base}, {offset})")
+            }
+        };
+        match pattern {
+            Pattern::Bind(annotation, Identifier::Local(LexicalLevel(level))) => {
+                let value = if whole {
+                    base.to_string()
+                } else if width == 1 {
+                    format!("proj({base}, {offset})")
+                } else if self.sum_layout(&annotation.type_info.inferred_type).is_some() {
+                    // copy an inlined sum out to a boxed constructor (tag at `offset`,
+                    // `width-1` payload words follow).
+                    format!(
+                        "mk_data_inline(proj({base}, {offset}), {}, &as_tuple({base})->elems[{}])",
+                        width - 1,
+                        offset + 1
+                    )
+                } else {
+                    // copy the inlined sub-record/tuple out to a fresh flat object
+                    let parts: Vec<String> =
+                        (0..width).map(|k| format!("proj({base}, {})", offset + k)).collect();
+                    format!("mk_tuple({width}, {})", parts.join(", "))
+                };
+                binds.push((*level, value));
+            }
+            Pattern::Bind(_, other) => panic!("pattern binder must be a local: {other:?}"),
+
+            Pattern::Literally(_, literal) => {
+                tests.push(format!("val_eq({}, {})", scalar(), self.compile_constant(literal)));
+            }
+
+            Pattern::Struct(annotation, the) => {
+                match self.flat_widths(&annotation.type_info.inferred_type) {
+                    Some(widths) => {
+                        // A record is always a flat object. Locate that object and
+                        // where this record's words start in it: itself (whole), a
+                        // boxed pointer read out (a width-1 boxed field), or inline
+                        // at `offset` (a width>1 inlined field).
+                        let (object, start) = if whole {
+                            (base.to_string(), 0)
+                        } else if width == 1 {
+                            (format!("proj({base}, {offset})"), 0)
+                        } else {
+                            (base.to_string(), offset)
+                        };
+                        let mut field_offset = start;
+                        for ((_label, field), w) in the.fields.iter().zip(widths) {
+                            self.collect_pattern_flat(
+                                field,
+                                &object,
+                                field_offset,
+                                w,
+                                false,
+                                tests,
+                                binds,
+                            );
+                            field_offset += w;
+                        }
+                    }
+                    None => {
+                        // Polymorphic record: a boxed record, fields by ordinal.
+                        let value = scalar();
+                        for (index, (_label, field)) in the.fields.iter().enumerate() {
+                            self.collect_pattern_flat(
+                                field,
+                                &format!("proj({value}, {index})"),
+                                0,
+                                1,
+                                true,
+                                tests,
+                                binds,
+                            );
+                        }
+                    }
+                }
+            }
+
+            Pattern::Tuple(annotation, the) => {
+                // A tuple is flat only when inlined in a flat record (width > 1,
+                // not whole): its elements are regions of `base`. Otherwise it is a
+                // boxed tuple, matched by ordinal projection.
+                if !whole && width > 1 {
+                    let element_widths = self
+                        .flat_widths(&annotation.type_info.inferred_type)
+                        .expect("an inlined tuple field has a tuple type");
+                    let mut element_offset = offset;
+                    for (element, w) in the.elements.iter().zip(element_widths) {
+                        self.collect_pattern_flat(
+                            element,
+                            base,
+                            element_offset,
+                            w,
+                            false,
+                            tests,
+                            binds,
+                        );
+                        element_offset += w;
+                    }
+                } else {
+                    let value = scalar();
+                    for (index, element) in the.elements.iter().enumerate() {
+                        self.collect_pattern_flat(
+                            element,
+                            &format!("proj({value}, {index})"),
+                            0,
+                            1,
+                            true,
+                            tests,
+                            binds,
+                        );
+                    }
+                }
+            }
+
+            Pattern::Coproduct(annotation, the) => {
+                let Identifier::Global(constructor) = &the.constructor else {
+                    panic!("constructor pattern head must be a global: {:?}", the.constructor);
+                };
+                if self.newtype_constructors.contains(constructor) {
+                    let value = scalar();
+                    self.collect_pattern_flat(&the.arguments[0], &value, 0, 1, true, tests, binds);
+                } else if !whole && width > 1 {
+                    // Inlined sum: the tag is the immediate at `offset`, its active
+                    // variant's payload the words after it.
+                    let layout = self
+                        .sum_layout(&annotation.type_info.inferred_type)
+                        .expect("an inlined sum field has a sum type");
+                    let tag = self.constructor_tag(constructor);
+                    let variant = layout.variant_widths[tag as usize].clone();
+                    tests.push(format!("as_int(proj({base}, {offset})) == {tag}"));
+                    let mut argument_offset = offset + 1;
+                    for (argument, w) in the.arguments.iter().zip(variant) {
+                        self.collect_pattern_flat(argument, base, argument_offset, w, false, tests, binds);
+                        argument_offset += w;
+                    }
+                } else {
+                    // Boxed sum (standalone whole, or a width-1 pointer field).
+                    let value = scalar();
+                    tests.push(format!("data_tag({value}) == {}", self.constructor_tag(constructor)));
+                    for (index, argument) in the.arguments.iter().enumerate() {
+                        self.collect_pattern_flat(
+                            argument,
+                            &format!("data_field({value}, {index})"),
+                            0,
+                            1,
+                            true,
+                            tests,
+                            binds,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // The runtime tag for a constructor: its position within its sum type's
     // constructor list, recorded by `lambda_lift`. Every `Inject`/`Coproduct`
     // names a real sum-type constructor, so a miss is a compiler invariant break.
@@ -465,7 +830,38 @@ impl lambda_lift::Program {
     // held in a canonical order (sorted by name at construction) and projection
     // is already lowered to `Ordinal`, so the field labels carry no runtime
     // weight -- we just emit the values in field order.
-    fn compile_record(&self, the: &phase::Record<Closed>, code: &mut CodeBuffer) -> fmt::Result {
+    fn compile_record(
+        &self,
+        annotation: &CaptureInfo,
+        the: &phase::Record<Closed>,
+        code: &mut CodeBuffer,
+    ) -> fmt::Result {
+        // Flat path: when the record has a nested inlined field (some width > 1),
+        // build ONE object whose body is the fields' flattened leaves. A record
+        // with only width-1 fields falls through to the identical tuple lowering
+        // below, so non-nested records stay byte-identical.
+        if self.flat_records_enabled() {
+            if let Some(widths) = self.flat_widths(&annotation.type_info.inferred_type) {
+                if widths.iter().any(|&w| w > 1) {
+                    let total: usize = widths.iter().sum();
+                    let mut prelude = Vec::new();
+                    let mut leaves = Vec::new();
+                    for ((_label, value), width) in the.fields.iter().zip(&widths) {
+                        leaves.extend(self.flat_leaves(value, *width, &mut prelude));
+                    }
+                    write!(code, "({{ ")?;
+                    for binding in &prelude {
+                        write!(code, "{binding} ")?;
+                    }
+                    write!(code, "mk_tuple({total}")?;
+                    for leaf in &leaves {
+                        write!(code, ", {leaf}")?;
+                    }
+                    return write!(code, "); }})");
+                }
+            }
+        }
+
         let mut written = if the.fields.len() <= 4 {
             write!(code, "mk_tuple{}(", the.fields.len())?;
             false
@@ -485,9 +881,35 @@ impl lambda_lift::Program {
 
     fn compile_projection(
         &self,
+        annotation: &CaptureInfo,
         the: &phase::Projection<Closed>,
         code: &mut CodeBuffer,
     ) -> fmt::Result {
+        // Flat path: a projection into a flat record reaches a computed word
+        // offset (nested projections accumulate, so `r.b.c` is one load); pulling
+        // out a whole inlined sub-aggregate copies it out to a fresh object -- a
+        // record/tuple to a tuple, an inlined sum to a boxed constructor.
+        if self.flat_records_enabled() {
+            if let Some((base, offset, width)) = self.flat_place(the) {
+                if width == 1 {
+                    return write!(code, "proj({base}, {offset})");
+                }
+                if self.sum_layout(&annotation.type_info.inferred_type).is_some() {
+                    return write!(
+                        code,
+                        "mk_data_inline(proj({base}, {offset}), {}, &as_tuple({base})->elems[{}])",
+                        width - 1,
+                        offset + 1
+                    );
+                }
+                write!(code, "mk_tuple({width}")?;
+                for k in 0..width {
+                    write!(code, ", proj({base}, {})", offset + k)?;
+                }
+                return write!(code, ")");
+            }
+        }
+
         match &the.select {
             ProductElement::Ordinal(i) => {
                 write!(code, "proj(")?;
@@ -519,7 +941,19 @@ impl lambda_lift::Program {
         for clause in &the.match_clauses {
             let mut tests = Vec::new();
             let mut binds = Vec::new();
-            self.collect_pattern(&clause.pattern, &scrutinee, &mut tests, &mut binds);
+            if self.flat_records_enabled() {
+                self.collect_pattern_flat(
+                    &clause.pattern,
+                    &scrutinee,
+                    0,
+                    1,
+                    true,
+                    &mut tests,
+                    &mut binds,
+                );
+            } else {
+                self.collect_pattern(&clause.pattern, &scrutinee, &mut tests, &mut binds);
+            }
 
             if tests.is_empty() {
                 write!(code, "true")?;
@@ -941,7 +1375,19 @@ impl lambda_lift::Program {
                 for clause in &the.match_clauses {
                     let mut tests = Vec::new();
                     let mut binds = Vec::new();
-                    self.collect_pattern(&clause.pattern, &scrutinee, &mut tests, &mut binds);
+                    if self.flat_records_enabled() {
+                self.collect_pattern_flat(
+                    &clause.pattern,
+                    &scrutinee,
+                    0,
+                    1,
+                    true,
+                    &mut tests,
+                    &mut binds,
+                );
+            } else {
+                self.collect_pattern(&clause.pattern, &scrutinee, &mut tests, &mut binds);
+            }
                     if !first {
                         write!(code, " else ")?;
                     }

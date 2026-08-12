@@ -57,6 +57,7 @@ witness ∀α. Eq α |- Eq (Perhaps α) :=
   { eq := λp q. p = q
   }
 
+empty :: ∀α. Perhaps α := Nope
 
 is_this :: ∀α. Perhaps α -> Bool := λpa.
   deconstruct pa into This _ -> true | _ -> false

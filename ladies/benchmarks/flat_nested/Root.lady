@@ -1,0 +1,29 @@
+use Stdlib.
+use Stdlib.Data.Array.
+
+(* Deep/recursive product join: each element is a NESTED tuple ((Int,Int),(Int,Int)). *)
+(* With flat layout the whole array is one GC object holding 4 leaf words per element  *)
+(* (no per-element and no per-inner-tuple boxes); MARM_NOFLAT keeps each element and    *)
+(* each inner tuple boxed. We build the array, churn allocations to force many GCs      *)
+(* (so mis-tracing would crash), then read an element back through the full nesting and *)
+(* sum its four leaves to prove the rebuilt canonical value is correct.                 *)
+
+module Churn:
+  burn :: Int -> Int := λn.
+    if n > 0 then
+      let s = "junk `n`" in
+      let _ = Text.length s in
+      burn (n - 1)
+    else 0
+
+module Nested:
+  mk :: Int -> ((Int, Int), (Int, Int)) := λi. (i, i + 1), (i + 2, i + 3)
+
+  sum4 :: ((Int, Int), (Int, Int)) -> Int := λ((a, b), (c, d)). a + b + c + d
+
+start := λ_.
+  let table = Mutable_Array.generate 100000 Nested.mk in
+  let _ = Churn.burn 2000000 in
+  let e = unsafe_run_IO (Mutable_Array.get_unchecked table 54321) in
+  (* expect (54321,54322),(54323,54324) -> sum 217290 *)
+  print_endline "table[54321] leaf-sum = `Nested.sum4 e`"

@@ -1,0 +1,32 @@
+use Stdlib.
+
+Inner ::=
+  { c :: Int
+    d :: Int
+  }
+
+Rec ::=
+  { n :: Int
+    pair :: (Int, Int)
+    inner :: Inner
+  }
+
+module Test:
+  mk :: Int -> Rec := λk.
+    { n := k; pair := (k + 1, k + 2); inner := { c := k + 3; d := k + 4 } }
+
+  destr :: Rec -> Int := λr.
+    deconstruct r into
+      { n: n; pair: (x, y); inner: { c: c; d: d } } -> n + x + y + c + d
+
+  reach :: Rec -> Int := λr. r.pair.#0 + r.pair.#1 + r.inner.c + r.inner.d
+
+  whole :: Rec -> Int := λr.
+    deconstruct r into
+      { n: _; pair: p; inner: i } ->
+        deconstruct p into
+          (a, b) -> a + b + i.c + i.d
+
+start := λ_.
+  let r = Test.mk 10 in
+  print_endline "destr=`Test.destr r` reach=`Test.reach r` whole=`Test.whole r`"

@@ -1,0 +1,27 @@
+use Stdlib.
+
+Rec ::=
+  { n :: Int
+    m :: Perhaps Int
+  }
+
+module T:
+  mk :: Int -> Rec := λk. { n := k; m := This (k + 1) }
+
+  mkNope :: Int -> Rec := λk. { n := k; m := Nope }
+
+  total :: Rec -> Int := λr.
+    deconstruct r into
+      { n: n; m: m } ->
+        deconstruct m into
+          This x -> n + x
+        | Nope   -> n
+
+  getm :: Rec -> Perhaps Int := λr. r.m
+
+start := λ_.
+  let a = T.mk 10 in
+  let b = T.mkNope 20 in
+  deconstruct T.getm a into
+    This x -> print_endline "a.m=This `x` totalA=`T.total a` totalB=`T.total b`"
+  | Nope   -> print_endline "unexpected Nope"

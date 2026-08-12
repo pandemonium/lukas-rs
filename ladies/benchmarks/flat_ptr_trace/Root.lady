@@ -1,0 +1,29 @@
+use Stdlib.
+use Stdlib.Data.Array.
+
+(* GC-correctness check for flat arrays with POINTER leaves: each element is a    *)
+(* record { n, label } whose `label` is a heap-allocated Text (built by interp-   *)
+(* olation, not a literal). Stored flat, the label pointer lives inline in the    *)
+(* one array object; the blind tracer must keep it alive. We then allocate a lot  *)
+(* (forcing many GCs) and read a label back -- if the inlined pointer were mis-   *)
+(* traced the Text would be collected and this would crash or print garbage.      *)
+
+Tagged ::=
+  { n :: Int
+    label :: Text
+  }
+
+module Churn:
+  burn :: Int -> Int := λn.
+    if n > 0 then
+      let s = "junk `n`" in
+      let _ = Text.length s in
+      burn (n - 1)
+    else 0
+
+start := λ_.
+  let table = Mutable_Array.generate 1000 (λi. { n := i; label := "row-`i`" }) in
+  let _ = Churn.burn 2000000 in
+  let got = unsafe_run_IO (Mutable_Array.get_unchecked table 777) in
+  deconstruct got into
+    { n: n; label: label } -> print_endline "table[777] = `n`:`label`"
