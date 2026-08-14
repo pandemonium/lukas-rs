@@ -35,6 +35,16 @@ sum_this :: Array (Perhaps Int) -> Int -> Int -> Int := λarr i acc.
       | Nope          -> acc
     in sum_this arr (i - 1) acc2
 
+Pair ::= { X :: Int; Y :: Int }
+
+pair_cell :: Int -> Perhaps Pair := λi.
+  if i = 1 then Nope else This { X := i; Y := i + 10 }
+
+pair_value :: Perhaps Pair -> Int := λcell.
+  deconstruct cell into
+    This pair -> pair.X + pair.Y
+  | Nope -> 0
+
 start :: Int -> Unit := λ_.
   print_endline "##TC"
   let arr =
@@ -47,3 +57,15 @@ start :: Int -> Unit := λ_.
   in
   print_endline "cells: `render arr 4 ""`"
   print_endline "sum: `sum_this arr 4 0`"
+
+  (* The sum payload is itself a two-word flat record. This exercises recursive *)
+  (* type-driven shapes for literals and Memory_Layout-backed generation.       *)
+  let nested = [ This { X := 3; Y := 4 }; Nope; This { X := 8; Y := 9 } ] in
+  let generated = Mutable_Array.generate 3 pair_cell in
+  let old = unsafe_run_IO (Mutable_Array.put_unchecked generated 1 (This { X := 20; Y := 22 })) in
+  let now = unsafe_run_IO (Mutable_Array.get_unchecked generated 1) in
+  let nested_first = deconstruct Array.get nested 0 into This x -> pair_value x | Nope -> 0 in
+  let nested_middle = deconstruct Array.get nested 1 into This x -> pair_value x | Nope -> 0 in
+  let nested_last = deconstruct Array.get nested 2 into This x -> pair_value x | Nope -> 0 in
+  print_endline "nested: first=`nested_first` middle=`nested_middle` last=`nested_last`"
+  print_endline "generated: old=`pair_value old` current=`pair_value now`"

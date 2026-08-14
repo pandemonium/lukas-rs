@@ -1,13 +1,16 @@
 use fmt::Write;
+use std::cell::RefCell;
 use std::rc::Rc;
-use std::{fmt, fs, io, path};
+use std::{collections::HashMap, fmt, fs, io, path};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{
     ast::{
         BUILTIN_MODULE_NAME, Binding, Literal, ProductElement, STDLIB_MODULE_NAME, Segment,
-        namer::QualifiedName, pattern::Pattern,
+        TypeExpression,
+        namer::{QualifiedName, TypeDefinition},
+        pattern::Pattern,
     },
     closed::{self, CaptureInfo, Closed, Identifier, LexicalLevel},
     lambda_lift::{
@@ -20,6 +23,80 @@ use crate::{
 // Widest inlined field before it is kept a pointer instead; must match
 // `FLAT_INLINE_CAP` in lambda_lift so codegen and the layout table agree.
 const FLAT_INLINE_CAP: usize = 8;
+const FLAT_MAX_SHAPE: usize = 128;
+const FLAT_MAX_FIELDS: usize = 64;
+
+fn direct_array_enabled() -> bool {
+    std::env::var_os("MARM_NO_DIRECT_ARRAY").is_none()
+        && std::env::var_os("MARM_NOFLAT").is_none()
+}
+
+/// Runtime packing shape for one array element. This mirrors the compact shape
+/// grammar in `c/gc.c`: `0` is a leaf, a positive value is a product arity, and
+/// `-1` introduces a tagged sum with a fixed-width union payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeShape {
+    Leaf,
+    Product(Vec<RuntimeShape>),
+    Sum {
+        payload_words: usize,
+        variants: Vec<Vec<RuntimeShape>>,
+    },
+}
+
+impl RuntimeShape {
+    fn stored_words(&self) -> usize {
+        match self {
+            Self::Leaf => 1,
+            Self::Product(fields) => fields.iter().map(Self::stored_words).sum(),
+            Self::Sum { payload_words, .. } => 1 + payload_words,
+        }
+    }
+
+    fn encode(&self, out: &mut Vec<i64>) {
+        match self {
+            Self::Leaf => out.push(0),
+            Self::Product(fields) => {
+                out.push(fields.len() as i64);
+                for field in fields {
+                    field.encode(out);
+                }
+            }
+            Self::Sum {
+                payload_words,
+                variants,
+            } => {
+                out.extend([-1, *payload_words as i64, variants.len() as i64]);
+                for variant in variants {
+                    out.push(variant.len() as i64);
+                    for field in variant {
+                        field.encode(out);
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct ShapeResult {
+    shape: RuntimeShape,
+    reaches_enclosing_type: bool,
+}
+
+#[derive(Clone)]
+struct ArrayElementPlace {
+    array: String,
+    index: String,
+    element_type: Type,
+}
+
+thread_local! {
+    /// Lexical locals whose value is represented by a packed array element rather
+    /// than an eagerly rebuilt canonical object. Entries are scoped by
+    /// `compile_let`; code generation itself is single-threaded.
+    static ARRAY_ELEMENT_PLACES: RefCell<HashMap<usize, ArrayElementPlace>> =
+        RefCell::new(HashMap::new());
+}
 
 pub struct Codegen;
 
@@ -205,6 +282,52 @@ fn array_element_type(ty: &Type) -> Option<&Type> {
     }
 }
 
+/// Peel `T a b` into `(T, [a, b])` in source order.
+fn applied_type(ty: &Type) -> Option<(&QualifiedName, Vec<Type>)> {
+    let mut head = ty;
+    let mut arguments = Vec::new();
+    while let Type::Apply {
+        constructor,
+        argument,
+    } = head
+    {
+        arguments.push((**argument).clone());
+        head = constructor;
+    }
+    arguments.reverse();
+    match head {
+        Type::Constructor(name) => Some((name, arguments)),
+        _ => None,
+    }
+}
+
+/// Instantiate a declaration-side type expression with the concrete arguments
+/// of the nominal type currently being laid out.
+fn instantiate_type_expression<A>(
+    expression: &TypeExpression<A, QualifiedName>,
+    bindings: &HashMap<crate::parser::Identifier, Type>,
+) -> Option<Type> {
+    match expression {
+        TypeExpression::Constructor(_, name) => Some(Type::Constructor(name.clone())),
+        TypeExpression::Parameter(_, parameter) => bindings.get(parameter).cloned(),
+        TypeExpression::Apply(_, application) => Some(Type::Apply {
+            constructor: instantiate_type_expression(&application.function, bindings)?.into(),
+            argument: instantiate_type_expression(&application.argument, bindings)?.into(),
+        }),
+        TypeExpression::Arrow(_, arrow) => Some(Type::Arrow {
+            domain: instantiate_type_expression(&arrow.domain, bindings)?.into(),
+            codomain: instantiate_type_expression(&arrow.codomain, bindings)?.into(),
+        }),
+        TypeExpression::Tuple(_, tuple) => Some(Type::Tuple(crate::typer::TupleType(
+            tuple
+                .0
+                .iter()
+                .map(|element| instantiate_type_expression(element, bindings))
+                .collect::<Option<Vec<_>>>()?,
+        ))),
+    }
+}
+
 // Peel type ascriptions off an expression -- they are erased at codegen. Used by
 // the flat-record path to see through to a `Record`/`Project` node.
 fn strip_ascription(mut expr: &Expr) -> &Expr {
@@ -212,6 +335,40 @@ fn strip_ascription(mut expr: &Expr) -> &Expr {
         expr = &ascription.ascribed_tree;
     }
     expr
+}
+
+fn raw_array_get_arguments(expr: &Expr) -> Option<(&Expr, &Expr)> {
+    let mut head = expr;
+    let mut arguments = Vec::new();
+    while let Expr::Apply(_, application) = head {
+        arguments.push(application.argument.as_ref());
+        head = application.function.as_ref();
+    }
+    arguments.reverse();
+    if arguments.len() != 2 {
+        return None;
+    }
+    let name = match head {
+        Expr::Variable(_, Identifier::Global(name)) => name.as_ref(),
+        Expr::InvokeBridge(_, bridge) => &bridge.qualified_name,
+        _ => return None,
+    };
+    surface_name(name)
+        .ends_with("Stdlib_Data_Array_Mutable_Array_raw_get_unchecked")
+        .then_some((arguments[0], arguments[1]))
+}
+
+fn projection_root_and_selectors(
+    projection: &phase::Projection<Closed>,
+) -> (&Expr, Vec<ProductElement>) {
+    let mut selectors = vec![projection.select.clone()];
+    let mut root = strip_ascription(&projection.base);
+    while let Expr::Project(_, inner) = root {
+        selectors.push(inner.select.clone());
+        root = strip_ascription(&inner.base);
+    }
+    selectors.reverse();
+    (root, selectors)
 }
 
 // Fresh scrutinee temporaries for `deconstruct`. A monotonic counter keeps each
@@ -480,7 +637,7 @@ impl lambda_lift::Program {
         // a type-driven shape and take the shaped constructor. Every other element
         // type keeps the element-0 path unchanged (=> byte-identical).
         let shape = array_element_type(&annotation.type_info.inferred_type)
-            .and_then(|element| self.flat_array_sum_shape(element));
+            .and_then(|element| self.flat_array_shape(element));
         let constructor = if shape.is_some() { "mk_flat_array_from_shaped" } else { "mk_flat_array_from" };
         write!(code, "{constructor}({}, (Value[]){{", elements.len())?;
         for (i, element) in elements.iter().enumerate() {
@@ -503,27 +660,218 @@ impl lambda_lift::Program {
         write!(code, ")")
     }
 
-    // The type-driven flat shape for an array element that is (directly) a flat,
-    // non-recursive sum whose every variant field is one word -- the case codegen
-    // can inline but element-0 runtime discovery cannot. Returns the pre-order
-    // shape `[SHAPE_SUM(-1), pad, nvariants, <variant nodes>]`, each variant node
-    // `[m, 0 x m]` (its field count, then that many leaves). `None` (=> the
-    // element-0 path) for any other element type, so every existing flat array
-    // stays byte-identical. A variant field wider than one word (a nested flat
-    // aggregate) falls back for now -- its sub-shape needs the field type, a later
-    // increment.
-    fn flat_array_sum_shape(&self, element: &Type) -> Option<Vec<i64>> {
-        let layout = self.sum_layout(element)?;
-        if layout.variant_widths.iter().flatten().any(|&width| width != 1) {
+    /// Derive the complete runtime shape of a ground array element. Nominal type
+    /// declarations are retained through lambda lifting so this can preserve
+    /// nested record/tuple/sum structure instead of reducing every constructor
+    /// field to a width. Recursive knots and unsupported structural inference
+    /// types stay boxed leaves. Oversized encodings fall back to element-zero
+    /// discovery, preserving the old representation.
+    fn flat_array_shape(&self, element: &Type) -> Option<Vec<i64>> {
+        if std::env::var_os("MARM_NOFLAT").is_some() || !element.variables().is_empty() {
             return None;
         }
-        let pad = layout.variant_widths.iter().map(Vec::len).max().unwrap_or(0);
-        let mut shape = vec![-1, pad as i64, layout.variant_widths.len() as i64];
-        for variant in &layout.variant_widths {
-            shape.push(variant.len() as i64);
-            shape.extend(std::iter::repeat(0).take(variant.len()));
+        let result = self.runtime_shape(element, &mut Vec::new());
+        let mut encoded = Vec::new();
+        result.shape.encode(&mut encoded);
+        (encoded.len() <= FLAT_MAX_SHAPE).then_some(encoded)
+    }
+
+    fn runtime_shape(&self, ty: &Type, on_path: &mut Vec<QualifiedName>) -> ShapeResult {
+        match ty {
+            Type::Tuple(tuple) => {
+                let children = tuple
+                    .elements()
+                    .iter()
+                    .map(|element| self.runtime_shape(element, on_path))
+                    .collect::<Vec<_>>();
+                ShapeResult {
+                    reaches_enclosing_type: children
+                        .iter()
+                        .any(|child| child.reaches_enclosing_type),
+                    shape: RuntimeShape::Product(
+                        children.into_iter().map(|child| child.shape).collect(),
+                    ),
+                }
+            }
+            Type::Constructor(name) => self.runtime_named_shape(name, &[], on_path),
+            Type::Apply { .. } => {
+                let Some((name, arguments)) = applied_type(ty) else {
+                    return ShapeResult {
+                        shape: RuntimeShape::Leaf,
+                        reaches_enclosing_type: false,
+                    };
+                };
+                self.runtime_named_shape(name, &arguments, on_path)
+            }
+            Type::Variable(..)
+            | Type::Base(..)
+            | Type::Arrow { .. }
+            | Type::Record(..)
+            | Type::Coproduct(..)
+            | Type::Array(..) => ShapeResult {
+                shape: RuntimeShape::Leaf,
+                reaches_enclosing_type: false,
+            },
         }
-        Some(shape)
+    }
+
+    fn runtime_named_shape(
+        &self,
+        name: &QualifiedName,
+        arguments: &[Type],
+        on_path: &mut Vec<QualifiedName>,
+    ) -> ShapeResult {
+        if on_path.contains(name) {
+            return ShapeResult {
+                shape: RuntimeShape::Leaf,
+                reaches_enclosing_type: true,
+            };
+        }
+        let Some(definition) = self.type_definitions.get(name) else {
+            return ShapeResult {
+                shape: RuntimeShape::Leaf,
+                reaches_enclosing_type: false,
+            };
+        };
+        let parameters = match definition {
+            TypeDefinition::Record(record) => &record.type_parameters,
+            TypeDefinition::Signature(signature) => &signature.vtable.type_parameters,
+            TypeDefinition::Coproduct(coproduct) => &coproduct.type_parameters,
+            TypeDefinition::BaseType(..) => {
+                return ShapeResult {
+                    shape: RuntimeShape::Leaf,
+                    reaches_enclosing_type: false,
+                };
+            }
+        };
+        let bindings = parameters
+            .iter()
+            .zip(arguments)
+            .map(|(parameter, argument)| (parameter.name.clone(), argument.clone()))
+            .collect::<HashMap<_, _>>();
+
+        on_path.push(name.clone());
+        let result = match definition {
+            TypeDefinition::Record(record) => {
+                let mut fields = record.fields.iter().collect::<Vec<_>>();
+                fields.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+                let children = fields
+                    .into_iter()
+                    .map(|field| {
+                        self.runtime_type_expression_shape(
+                            &field.type_signature.body,
+                            &bindings,
+                            on_path,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                ShapeResult {
+                    reaches_enclosing_type: children
+                        .iter()
+                        .any(|child| child.reaches_enclosing_type),
+                    shape: RuntimeShape::Product(
+                        children.into_iter().map(|child| child.shape).collect(),
+                    ),
+                }
+            }
+            TypeDefinition::Coproduct(coproduct) => {
+                if coproduct.constructors.is_empty() {
+                    // An opaque imported type (Text is the important case) has
+                    // no visible constructors in the retained declaration. Its
+                    // representation cannot be derived here, so keep the
+                    // canonical value as one pointer word. Encoding it as a
+                    // zero-variant sum would make `flatten` call `data_tag` on an
+                    // arbitrary opaque object.
+                    ShapeResult {
+                        shape: RuntimeShape::Leaf,
+                        reaches_enclosing_type: false,
+                    }
+                } else if let [only] = coproduct.constructors.as_slice()
+                    && only.signature.len() == 1
+                {
+                    // Newtypes are erased, so their array shape is exactly their field's.
+                    let child = self.runtime_type_expression_shape(
+                        &only.signature[0],
+                        &bindings,
+                        on_path,
+                    );
+                    ShapeResult {
+                        shape: child.shape,
+                        reaches_enclosing_type: false,
+                    }
+                } else {
+                    let variants = coproduct
+                        .constructors
+                        .iter()
+                        .map(|constructor| {
+                            constructor
+                                .signature
+                                .iter()
+                                .map(|field| {
+                                    self.runtime_type_expression_shape(field, &bindings, on_path)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    let recursive = variants.iter().flatten().any(|field| {
+                        field.reaches_enclosing_type
+                    });
+                    let too_many_fields = variants
+                        .iter()
+                        .any(|variant| variant.len() > FLAT_MAX_FIELDS);
+                    if recursive || too_many_fields {
+                        // A recursive sum remains one canonical pointer. Boxing it
+                        // here closes the recursion knot for any enclosing layout.
+                        ShapeResult {
+                            shape: RuntimeShape::Leaf,
+                            reaches_enclosing_type: false,
+                        }
+                    } else {
+                        let variants = variants
+                            .into_iter()
+                            .map(|variant| {
+                                variant.into_iter().map(|field| field.shape).collect()
+                            })
+                            .collect::<Vec<Vec<_>>>();
+                        let payload_words = variants
+                            .iter()
+                            .map(|variant| {
+                                variant.iter().map(RuntimeShape::stored_words).sum()
+                            })
+                            .max()
+                            .unwrap_or(0);
+                        ShapeResult {
+                            shape: RuntimeShape::Sum {
+                                payload_words,
+                                variants,
+                            },
+                            reaches_enclosing_type: false,
+                        }
+                    }
+                }
+            }
+            TypeDefinition::Signature(..) | TypeDefinition::BaseType(..) => ShapeResult {
+                shape: RuntimeShape::Leaf,
+                reaches_enclosing_type: false,
+            },
+        };
+        on_path.pop();
+        result
+    }
+
+    fn runtime_type_expression_shape<A>(
+        &self,
+        expression: &TypeExpression<A, QualifiedName>,
+        bindings: &HashMap<crate::parser::Identifier, Type>,
+        on_path: &mut Vec<QualifiedName>,
+    ) -> ShapeResult {
+        let Some(ty) = instantiate_type_expression(expression, bindings) else {
+            return ShapeResult {
+                shape: RuntimeShape::Leaf,
+                reaches_enclosing_type: false,
+            };
+        };
+        self.runtime_shape(&ty, on_path)
     }
 
     // Emit the `Memory_Layout τ` dictionary for the synthesised `memory_layout` marker,
@@ -544,8 +892,7 @@ impl lambda_lift::Program {
         // element type, un-monomorphised at codegen) stays on the element-0 path, so
         // its representation is unchanged (ML3 totality: an abstract payload is boxed).
         let shape = element
-            .filter(|t| t.variables().is_empty())
-            .and_then(|t| self.flat_array_sum_shape(t))
+            .and_then(|t| self.flat_array_shape(t))
             .unwrap_or_default();
         let words = shape.len() + 1; // leading `slen` word, then the entries
         write!(
@@ -813,6 +1160,437 @@ impl lambda_lift::Program {
         }
     }
 
+    /// Recognise a projection chain rooted at
+    /// `Mutable_Array.raw_get_unchecked array index` and resolve its final scalar
+    /// leaf to an offset in the packed element. This skips `flat_array_get`'s
+    /// canonical aggregate rebuild entirely. The fast path is deliberately leaf-
+    /// only; a projected aggregate still needs ordinary copy-out semantics.
+    fn flat_array_leaf_place(
+        &self,
+        projection: &phase::Projection<Closed>,
+    ) -> Option<(String, String, usize)> {
+        let (array, index, offset, _ty, shape) =
+            self.flat_array_region(&Expr::Project(CaptureInfo::dummy(), projection.clone()))?;
+        matches!(shape, RuntimeShape::Leaf).then_some((array, index, offset))
+    }
+
+    fn flat_array_region(
+        &self,
+        expression: &Expr,
+    ) -> Option<(String, String, usize, Type, RuntimeShape)> {
+        let (root, selectors) = match strip_ascription(expression) {
+            Expr::Project(_, projection) => projection_root_and_selectors(projection),
+            root => (root, Vec::new()),
+        };
+        let (array, index, root_type) = if let Some((array, index)) = self.raw_array_get_source(root) {
+            (
+                self.compile_to_string(array),
+                self.compile_to_string(index),
+                root.annotation().type_info.inferred_type.clone(),
+            )
+        } else if let Expr::Variable(_, Identifier::Local(LexicalLevel(level))) = root {
+            let place = ARRAY_ELEMENT_PLACES.with(|places| places.borrow().get(level).cloned())?;
+            let annotated_type = &root.annotation().type_info.inferred_type;
+            let element_type = if annotated_type.variables().is_empty() {
+                annotated_type.clone()
+            } else {
+                place.element_type
+            };
+            (place.array, place.index, element_type)
+        } else {
+            return None;
+        };
+
+        let mut current_type = root_type;
+        let mut word_offset = 0;
+        for selector in &selectors {
+            let (next_type, offset) =
+                self.runtime_projection_field(&current_type, selector)?;
+            word_offset += offset;
+            current_type = next_type;
+        }
+        let shape = self.runtime_shape(&current_type, &mut Vec::new()).shape;
+        Some((array, index, word_offset, current_type, shape))
+    }
+
+    /// See through the erased `Mutable` newtype unwrap that commonly surrounds
+    /// the foreign raw get after simplification.
+    fn raw_array_get_source<'a>(&self, expression: &'a Expr) -> Option<(&'a Expr, &'a Expr)> {
+        if let Some(arguments) = raw_array_get_arguments(expression) {
+            return Some(arguments);
+        }
+        let Expr::Deconstruct(_, deconstruct) = strip_ascription(expression) else {
+            return None;
+        };
+        let [clause] = deconstruct.match_clauses.as_slice() else {
+            return None;
+        };
+        let bound_level = match &clause.pattern {
+            // Newtype erasure may already have reduced `Mutable array` to an
+            // irrefutable local bind before this late code-generation pass.
+            Pattern::Bind(_, Identifier::Local(level)) => level,
+            Pattern::Coproduct(_, constructor) => {
+                let Identifier::Global(name) = &constructor.constructor else {
+                    return None;
+                };
+                if !self.newtype_constructors.contains(name.as_ref()) {
+                    return None;
+                }
+                let [Pattern::Bind(_, Identifier::Local(level))] =
+                    constructor.arguments.as_slice()
+                else {
+                    return None;
+                };
+                level
+            }
+            _ => return None,
+        };
+        let (array, index) = raw_array_get_arguments(&clause.consequent)?;
+        if !matches!(strip_ascription(array), Expr::Variable(_, Identifier::Local(level)) if level == bound_level) {
+            return None;
+        }
+        Some((&deconstruct.scrutinee, index))
+    }
+
+    fn local_uses_are_flat_array_leaves(
+        &self,
+        expression: &Expr,
+        level: usize,
+        element_type: &Type,
+    ) -> bool {
+        if let Expr::Project(_, projection) = expression {
+            let (root, selectors) = projection_root_and_selectors(projection);
+            if matches!(root, Expr::Variable(_, Identifier::Local(LexicalLevel(n))) if *n == level)
+            {
+                let annotated_type = &root.annotation().type_info.inferred_type;
+                let mut current_type = if annotated_type.variables().is_empty() {
+                    annotated_type.clone()
+                } else {
+                    element_type.clone()
+                };
+                for selector in selectors {
+                    let Some((next, _)) = self.runtime_projection_field(&current_type, &selector)
+                    else {
+                        return false;
+                    };
+                    current_type = next;
+                }
+                return self
+                    .runtime_shape(&current_type, &mut Vec::new())
+                    .shape
+                    .stored_words()
+                    == 1;
+            }
+        }
+        if let Expr::Deconstruct(_, deconstruct) = expression {
+            if let Some((_array, _index, _offset, _ty, shape)) =
+                self.flat_array_region(&deconstruct.scrutinee)
+            {
+                if self.array_match_shape(&deconstruct.match_clauses, &shape).is_some() {
+                    return deconstruct.match_clauses.iter().all(|clause| {
+                        self.local_uses_are_flat_array_leaves(
+                            &clause.consequent,
+                            level,
+                            element_type,
+                        )
+                    });
+                }
+            }
+        }
+        match expression {
+            Expr::Variable(_, Identifier::Local(LexicalLevel(n))) if *n == level => false,
+            _ => crate::simplify::children(expression).into_iter().all(|child| {
+                self.local_uses_are_flat_array_leaves(child, level, element_type)
+            }),
+        }
+    }
+
+    fn array_match_shape(
+        &self,
+        clauses: &[phase::MatchClause<Closed>],
+        fallback: &RuntimeShape,
+    ) -> Option<RuntimeShape> {
+        if clauses
+            .iter()
+            .all(|clause| self.array_pattern_supported(&clause.pattern, fallback))
+        {
+            return Some(fallback.clone());
+        }
+
+        // A polymorphic array wrapper can retain `$a` on the raw read even when
+        // its consumer is concrete.  Recover that concrete layout from the
+        // consumer pattern.  Fully destructured tuples/records are also
+        // self-describing, which covers late inlining whose annotations have not
+        // yet had the call-site substitution applied.
+        let mut shape = None;
+        for clause in clauses {
+            let candidate = self.pattern_runtime_shape(&clause.pattern)?;
+            if !self.array_pattern_supported(&clause.pattern, &candidate)
+                || shape.as_ref().is_some_and(|previous| previous != &candidate)
+            {
+                return None;
+            }
+            shape = Some(candidate);
+        }
+        shape
+    }
+
+    fn pattern_runtime_shape(&self, pattern: &phase::Pattern<Closed>) -> Option<RuntimeShape> {
+        let inferred = match pattern {
+            Pattern::Bind(annotation, _)
+            | Pattern::Literally(annotation, _)
+            | Pattern::Struct(annotation, _)
+            | Pattern::Tuple(annotation, _)
+            | Pattern::Coproduct(annotation, _) => &annotation.type_info.inferred_type,
+        };
+        if inferred.variables().is_empty() {
+            return Some(self.runtime_shape(inferred, &mut Vec::new()).shape);
+        }
+        match pattern {
+            Pattern::Bind(..) | Pattern::Literally(..) => Some(RuntimeShape::Leaf),
+            Pattern::Struct(_, record) => Some(RuntimeShape::Product(
+                record
+                    .fields
+                    .iter()
+                    .map(|(_, field)| self.pattern_runtime_shape(field))
+                    .collect::<Option<Vec<_>>>()?,
+            )),
+            Pattern::Tuple(_, tuple) => Some(RuntimeShape::Product(
+                tuple
+                    .elements
+                    .iter()
+                    .map(|element| self.pattern_runtime_shape(element))
+                    .collect::<Option<Vec<_>>>()?,
+            )),
+            // One constructor pattern does not describe the payload capacity of
+            // every variant, so a polymorphic sum cannot be reconstructed safely.
+            Pattern::Coproduct(..) => None,
+        }
+    }
+
+    fn array_pattern_supported(
+        &self,
+        pattern: &phase::Pattern<Closed>,
+        shape: &RuntimeShape,
+    ) -> bool {
+        match (pattern, shape) {
+            (Pattern::Bind(_, Identifier::Local(..)), RuntimeShape::Leaf)
+            | (Pattern::Literally(..), RuntimeShape::Leaf) => true,
+            (Pattern::Struct(_, record), RuntimeShape::Product(fields)) => {
+                record.fields.len() == fields.len()
+                    && record
+                        .fields
+                        .iter()
+                        .zip(fields)
+                        .all(|((_, pattern), shape)| {
+                            self.array_pattern_supported(pattern, shape)
+                        })
+            }
+            (Pattern::Tuple(_, tuple), RuntimeShape::Product(fields)) => {
+                tuple.elements.len() == fields.len()
+                    && tuple
+                        .elements
+                        .iter()
+                        .zip(fields)
+                        .all(|(pattern, shape)| self.array_pattern_supported(pattern, shape))
+            }
+            (Pattern::Coproduct(_, constructor), _) => {
+                let Identifier::Global(name) = &constructor.constructor else {
+                    return false;
+                };
+                if self.newtype_constructors.contains(name.as_ref()) {
+                    return matches!(constructor.arguments.as_slice(), [argument]
+                        if self.array_pattern_supported(argument, shape));
+                }
+                let RuntimeShape::Sum { variants, .. } = shape else {
+                    return false;
+                };
+                let Some(tag) = self.constructor_tags.get(name.as_ref()) else {
+                    return false;
+                };
+                let Some(fields) = variants.get(*tag as usize) else {
+                    return false;
+                };
+                constructor.arguments.len() == fields.len()
+                    && constructor
+                        .arguments
+                        .iter()
+                        .zip(fields)
+                        .all(|(pattern, shape)| self.array_pattern_supported(pattern, shape))
+            }
+            _ => false,
+        }
+    }
+
+    fn collect_array_pattern(
+        &self,
+        pattern: &phase::Pattern<Closed>,
+        array: &str,
+        index: &str,
+        offset: usize,
+        shape: &RuntimeShape,
+        tests: &mut Vec<String>,
+        binds: &mut Vec<(usize, String)>,
+    ) -> bool {
+        let word = |at: usize| {
+            format!("flat_array_get_word({array}, (size_t)as_int({index}), {at})")
+        };
+        match (pattern, shape) {
+            (Pattern::Bind(_, Identifier::Local(LexicalLevel(level))), RuntimeShape::Leaf) => {
+                binds.push((*level, word(offset)));
+                true
+            }
+            (Pattern::Literally(_, literal), RuntimeShape::Leaf) => {
+                tests.push(format!(
+                    "val_eq({}, {})",
+                    word(offset),
+                    self.compile_constant(literal)
+                ));
+                true
+            }
+            (Pattern::Struct(_, record), RuntimeShape::Product(fields))
+                if record.fields.len() == fields.len() =>
+            {
+                let mut field_offset = offset;
+                for ((_, pattern), shape) in record.fields.iter().zip(fields) {
+                    if !self.collect_array_pattern(
+                        pattern,
+                        array,
+                        index,
+                        field_offset,
+                        shape,
+                        tests,
+                        binds,
+                    ) {
+                        return false;
+                    }
+                    field_offset += shape.stored_words();
+                }
+                true
+            }
+            (Pattern::Tuple(_, tuple), RuntimeShape::Product(fields))
+                if tuple.elements.len() == fields.len() =>
+            {
+                let mut field_offset = offset;
+                for (pattern, shape) in tuple.elements.iter().zip(fields) {
+                    if !self.collect_array_pattern(
+                        pattern,
+                        array,
+                        index,
+                        field_offset,
+                        shape,
+                        tests,
+                        binds,
+                    ) {
+                        return false;
+                    }
+                    field_offset += shape.stored_words();
+                }
+                true
+            }
+            (Pattern::Coproduct(_, constructor), _) => {
+                let Identifier::Global(name) = &constructor.constructor else {
+                    return false;
+                };
+                if self.newtype_constructors.contains(name.as_ref()) {
+                    let [argument] = constructor.arguments.as_slice() else {
+                        return false;
+                    };
+                    return self.collect_array_pattern(
+                        argument, array, index, offset, shape, tests, binds,
+                    );
+                }
+                let RuntimeShape::Sum { variants, .. } = shape else {
+                    return false;
+                };
+                let Some(&tag) = self.constructor_tags.get(name.as_ref()) else {
+                    return false;
+                };
+                let Some(fields) = variants.get(tag as usize) else {
+                    return false;
+                };
+                if constructor.arguments.len() != fields.len() {
+                    return false;
+                }
+                tests.push(format!("as_int({}) == {tag}", word(offset)));
+                let mut field_offset = offset + 1;
+                for (pattern, shape) in constructor.arguments.iter().zip(fields) {
+                    if !self.collect_array_pattern(
+                        pattern,
+                        array,
+                        index,
+                        field_offset,
+                        shape,
+                        tests,
+                        binds,
+                    ) {
+                        return false;
+                    }
+                    field_offset += shape.stored_words();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Resolve one record/tuple selector according to the ARRAY element shape,
+    /// which may be wider than the record-in-record `FLAT_INLINE_CAP` layout.
+    fn runtime_projection_field(
+        &self,
+        base_type: &Type,
+        selector: &ProductElement,
+    ) -> Option<(Type, usize)> {
+        if let Type::Tuple(tuple) = base_type {
+            let ProductElement::Ordinal(index) = selector else {
+                return None;
+            };
+            let selected = tuple.elements().get(*index)?.clone();
+            let offset = tuple.elements()[..*index]
+                .iter()
+                .map(|field| {
+                    self.runtime_shape(field, &mut Vec::new())
+                        .shape
+                        .stored_words()
+                })
+                .sum();
+            return Some((selected, offset));
+        }
+
+        let (name, arguments) = match base_type {
+            Type::Constructor(name) => (name, Vec::new()),
+            Type::Apply { .. } => applied_type(base_type)?,
+            _ => return None,
+        };
+        let TypeDefinition::Record(record) = self.type_definitions.get(name)? else {
+            return None;
+        };
+        let bindings = record
+            .type_parameters
+            .iter()
+            .zip(arguments)
+            .map(|(parameter, argument)| (parameter.name.clone(), argument))
+            .collect::<HashMap<_, _>>();
+        let mut fields = record.fields.iter().collect::<Vec<_>>();
+        fields.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+        let index = match selector {
+            ProductElement::Ordinal(index) => *index,
+            ProductElement::Name(name) => fields.iter().position(|field| &field.name == name)?,
+        };
+        let selected = instantiate_type_expression(&fields.get(index)?.type_signature.body, &bindings)?;
+        let offset = fields[..index]
+            .iter()
+            .map(|field| {
+                let ty = instantiate_type_expression(&field.type_signature.body, &bindings)
+                    .expect("a named record field uses only its declared parameters");
+                self.runtime_shape(&ty, &mut Vec::new())
+                    .shape
+                    .stored_words()
+            })
+            .sum();
+        Some((selected, offset))
+    }
+
     // Like `collect_pattern`, but the matched value is a region of a flat object:
     // `base[offset .. offset+width]`, or the whole `base` when `whole`. Reads each
     // sub-pattern's type from its annotation to thread offsets through nested flat
@@ -1063,6 +1841,14 @@ impl lambda_lift::Program {
         // out a whole inlined sub-aggregate copies it out to a fresh object -- a
         // record/tuple to a tuple, an inlined sum to a boxed constructor.
         if self.flat_records_enabled() {
+            if direct_array_enabled()
+                && let Some((array, index, offset)) = self.flat_array_leaf_place(the)
+            {
+                return write!(
+                    code,
+                    "flat_array_get_word({array}, (size_t)as_int({index}), {offset})"
+                );
+            }
             if let Some((base, offset, width)) = self.flat_place(the) {
                 if width == 1 {
                     return write!(code, "proj({base}, {offset})");
@@ -1105,6 +1891,94 @@ impl lambda_lift::Program {
         code: &mut CodeBuffer,
     ) -> fmt::Result {
         let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+
+        // Match a packed ARRAY element in place.  A let-bound raw get records
+        // its (array,index) pair in `ARRAY_ELEMENT_PLACES`; matching that value
+        // can then read the tag and scalar fields directly from the backing
+        // storage instead of first rebuilding a canonical tuple/data object.
+        if direct_array_enabled()
+            && let Some((array, index, offset, _ty, fallback_shape)) =
+            self.flat_array_region(&the.scrutinee)
+        {
+            if let Some(shape) = self.array_match_shape(&the.match_clauses, &fallback_shape) {
+                let array_local = format!("_ma{id}");
+                let index_local = format!("_mi{id}");
+                write!(code, "({{ Value {array_local} = {array}; Value {index_local} = {index}; ")?;
+
+                for clause in &the.match_clauses {
+                    let mut tests = Vec::new();
+                    let mut binds = Vec::new();
+                    let supported = self.collect_array_pattern(
+                        &clause.pattern,
+                        &array_local,
+                        &index_local,
+                        offset,
+                        &shape,
+                        &mut tests,
+                        &mut binds,
+                    );
+                    debug_assert!(supported);
+
+                    if tests.is_empty() {
+                        write!(code, "true")?;
+                    } else {
+                        write!(code, "{}", tests.join(" && "))?;
+                    }
+                    write!(code, " ? ({{ ")?;
+                    for (level, path) in &binds {
+                        write!(code, "Value l{level} = {path}; ")?;
+                    }
+                    self.compile_expr(&clause.consequent, code)?;
+                    write!(code, "; }}) : ")?;
+                }
+
+                return write!(code, "match_fail(); }})");
+            }
+        }
+
+        // A multiword sum projected out of a flat record is already a readable
+        // region (tag followed by payload words).  If it is consumed immediately
+        // by a constructor match, inspect that region directly instead of calling
+        // `mk_data_inline` merely so `data_tag`/`data_field` can unpack it again.
+        if let Expr::Project(_, projection) = strip_ascription(&the.scrutinee) {
+            if let Some((base, offset, width)) = self.flat_place(projection) {
+                if width > 1
+                    && the
+                        .match_clauses
+                        .iter()
+                        .all(|clause| !matches!(clause.pattern, Pattern::Bind(..)))
+                {
+                    let flat_local = format!("_flat{id}");
+                    write!(code, "({{ Value {flat_local} = {base}; ")?;
+                    for clause in &the.match_clauses {
+                        let mut tests = Vec::new();
+                        let mut binds = Vec::new();
+                        self.collect_pattern_flat(
+                            &clause.pattern,
+                            &flat_local,
+                            offset,
+                            width,
+                            false,
+                            &mut tests,
+                            &mut binds,
+                        );
+                        if tests.is_empty() {
+                            write!(code, "true")?;
+                        } else {
+                            write!(code, "{}", tests.join(" && "))?;
+                        }
+                        write!(code, " ? ({{ ")?;
+                        for (level, path) in &binds {
+                            write!(code, "Value l{level} = {path}; ")?;
+                        }
+                        self.compile_expr(&clause.consequent, code)?;
+                        write!(code, "; }}) : ")?;
+                    }
+                    return write!(code, "match_fail(); }})");
+                }
+            }
+        }
+
         let scrutinee = format!("_scrut{id}");
 
         write!(code, "({{ Value {scrutinee} = ")?;
@@ -1447,6 +2321,72 @@ impl lambda_lift::Program {
         let Identifier::Local(LexicalLevel(level)) = binder else {
             panic!("let binder is always a local: {binder:?}");
         };
+
+        // Lazy packed-element binding: when every use of the result of an
+        // unchecked array read is a scalar projection, retain `(array,index)` as
+        // a place and compile those projections to direct word loads. The
+        // canonical aggregate is never rebuilt. Both operands are still
+        // evaluated exactly once, in source order, before the body.
+        let raw_array_source = direct_array_enabled()
+            .then(|| self.raw_array_get_source(bound))
+            .flatten();
+        if let Some((array, index)) = raw_array_source {
+            let element_type = bound.annotation().type_info.inferred_type.clone();
+            // Register a provisional place while checking the body: pattern
+            // eligibility itself resolves local-rooted deconstruct scrutinees
+            // through this map.  Restore an outer entry before emitting code.
+            let previous = ARRAY_ELEMENT_PLACES.with(|places| {
+                places.borrow_mut().insert(
+                    *level,
+                    ArrayElementPlace {
+                        array: String::new(),
+                        index: String::new(),
+                        element_type: element_type.clone(),
+                    },
+                )
+            });
+            let supported =
+                self.local_uses_are_flat_array_leaves(body, *level, &element_type);
+            ARRAY_ELEMENT_PLACES.with(|places| {
+                let mut places = places.borrow_mut();
+                if let Some(previous) = previous {
+                    places.insert(*level, previous);
+                } else {
+                    places.remove(level);
+                }
+            });
+
+            if supported {
+                let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+                let array_local = format!("_fa{id}");
+                let index_local = format!("_fi{id}");
+                write!(code, "({{ Value {array_local} = ")?;
+                self.compile_expr(array, code)?;
+                write!(code, "; Value {index_local} = ")?;
+                self.compile_expr(index, code)?;
+                write!(code, "; ")?;
+                let previous = ARRAY_ELEMENT_PLACES.with(|places| {
+                    places.borrow_mut().insert(
+                        *level,
+                        ArrayElementPlace {
+                            array: array_local,
+                            index: index_local,
+                            element_type,
+                        },
+                    )
+                });
+                self.compile_expr(body, code)?;
+                ARRAY_ELEMENT_PLACES.with(|places| {
+                    let mut places = places.borrow_mut();
+                    if let Some(previous) = previous {
+                        places.insert(*level, previous);
+                    } else {
+                        places.remove(level);
+                    }
+                });
+                return write!(code, "; }})");
+            }
+        }
         write!(code, "({{ Value l{level} = ")?;
         self.compile_expr(bound, code)?;
         write!(code, "; ")?;
@@ -1525,6 +2465,64 @@ impl lambda_lift::Program {
                 let Identifier::Local(LexicalLevel(level)) = &the.binder else {
                     panic!("let binder is always a local: {:?}", the.binder);
                 };
+                if direct_array_enabled()
+                    && let Some((array, index)) = self.raw_array_get_source(&the.bound)
+                {
+                    let element_type = the.bound.annotation().type_info.inferred_type.clone();
+                    let previous = ARRAY_ELEMENT_PLACES.with(|places| {
+                        places.borrow_mut().insert(
+                            *level,
+                            ArrayElementPlace {
+                                array: String::new(),
+                                index: String::new(),
+                                element_type: element_type.clone(),
+                            },
+                        )
+                    });
+                    let supported = self.local_uses_are_flat_array_leaves(
+                        &the.body,
+                        *level,
+                        &element_type,
+                    );
+                    ARRAY_ELEMENT_PLACES.with(|places| {
+                        let mut places = places.borrow_mut();
+                        if let Some(previous) = previous {
+                            places.insert(*level, previous);
+                        } else {
+                            places.remove(level);
+                        }
+                    });
+                    if supported {
+                        let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+                        let array_local = format!("_fa{id}");
+                        let index_local = format!("_fi{id}");
+                        write!(code, "Value {array_local} = ")?;
+                        self.compile_expr(array, code)?;
+                        write!(code, "; Value {index_local} = ")?;
+                        self.compile_expr(index, code)?;
+                        write!(code, "; ")?;
+                        let previous = ARRAY_ELEMENT_PLACES.with(|places| {
+                            places.borrow_mut().insert(
+                                *level,
+                                ArrayElementPlace {
+                                    array: array_local,
+                                    index: index_local,
+                                    element_type,
+                                },
+                            )
+                        });
+                        let result = self.compile_tail(worker, arity, &the.body, code);
+                        ARRAY_ELEMENT_PLACES.with(|places| {
+                            let mut places = places.borrow_mut();
+                            if let Some(previous) = previous {
+                                places.insert(*level, previous);
+                            } else {
+                                places.remove(level);
+                            }
+                        });
+                        return result;
+                    }
+                }
                 write!(code, "Value l{level} = ")?;
                 self.compile_expr(&the.bound, code)?;
                 write!(code, "; ")?;
@@ -1545,6 +2543,7 @@ impl lambda_lift::Program {
                 self.compile_expr(&the.scrutinee, code)?;
                 write!(code, "; ")?;
                 let mut first = true;
+                let mut exhaustive = false;
                 for clause in &the.match_clauses {
                     let mut tests = Vec::new();
                     let mut binds = Vec::new();
@@ -1567,6 +2566,7 @@ impl lambda_lift::Program {
                     first = false;
                     if tests.is_empty() {
                         write!(code, "{{ ")?;
+                        exhaustive = true;
                     } else {
                         write!(code, "if ({}) {{ ", tests.join(" && "))?;
                     }
@@ -1575,8 +2575,14 @@ impl lambda_lift::Program {
                     }
                     self.compile_tail(worker, arity, &clause.consequent, code)?;
                     write!(code, " }}")?;
+                    if exhaustive {
+                        break;
+                    }
                 }
-                write!(code, " else {{ match_fail(); }} }}")
+                if !exhaustive {
+                    write!(code, " else {{ match_fail(); }}")?;
+                }
+                write!(code, " }}")
             }
 
             _ if self.is_self_call(worker, arity, expr) => {

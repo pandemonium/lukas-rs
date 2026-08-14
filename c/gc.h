@@ -164,7 +164,11 @@ Value mk_flat_array_from_shaped(size_t n, Value *elems, const int64_t *shape, si
 Value flat_generate_shaped(int64_t length, Value mk_element, const int64_t *shape, size_t slen);
 size_t flat_array_count(Value arr);
 Value flat_array_get(Value arr, size_t i);
+void flat_array_set(Value arr, size_t i, Value elt);
 Value flat_array_put(Value arr, size_t i, Value elt);
+// Read one statically-known leaf directly from packed element storage, without
+// rebuilding the canonical aggregate around it.
+Value flat_array_get_word(Value arr, size_t i, size_t word_offset);
 
 // Box a double on the heap (OBJ_FLOAT leaf). A 64-bit IEEE-754 value cannot
 // share the word with the immediate tag bit, so every computed Float is a heap

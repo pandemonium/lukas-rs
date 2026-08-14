@@ -1246,6 +1246,12 @@ Value flat_array_get(Value arr, size_t i) {
     return unflatten(shape, &si, as_tuple(arr)->elems, &sri);
 }
 
+Value flat_array_get_word(Value arr, size_t i, size_t word_offset) {
+    Tuple *t = as_tuple(arr);
+    size_t stride = (size_t)as_int(t->elems[1]);
+    return t->elems[flat_elem_base(arr) + i * stride + word_offset];
+}
+
 // Store element `i`, returning the previous element boxed out. The box-out runs
 // before the overwrite; `elt` is a live root on the stack across it.
 Value flat_array_put(Value arr, size_t i, Value elt) {

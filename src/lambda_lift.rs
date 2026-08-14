@@ -280,6 +280,21 @@ impl closed::SymbolTable {
         // (one heap object instead of a box per nesting level). Built here while
         // the type symbols are still in the table.
         let record_layouts = self.record_layout_table();
+        // Keep the nominal declarations available to codegen as well. Array
+        // `Memory_Layout` dictionaries are instantiated from the concrete element
+        // type at each call site, so widths alone are insufficient: rebuilding a
+        // nested product/sum needs its complete structural shape.
+        let type_definitions: HashMap<QualifiedName, TypeDefinition<QualifiedName>> = self
+            .symbols
+            .values()
+            .filter_map(|symbol| match symbol {
+                Symbol::Type(type_symbol) => Some((
+                    type_symbol.qualified_name(),
+                    type_symbol.definition.clone(),
+                )),
+                Symbol::Term(..) => None,
+            })
+            .collect();
         // Per-coproduct inlined layout: (union width = tag + widest variant, per-tag
         // variant field widths). Only non-recursive sums under the cap appear.
         let mut coproduct_layouts: HashMap<QualifiedName, CoproductLayout> =
@@ -378,6 +393,7 @@ impl closed::SymbolTable {
             newtype_constructors,
             record_layouts,
             coproduct_layouts,
+            type_definitions,
             start: Expr::Apply(
                 CaptureInfo::dummy(),
                 Apply {
@@ -944,6 +960,9 @@ pub struct Program {
     pub record_layouts: HashMap<QualifiedName, Vec<usize>>,
     /// Per-coproduct inlined layout: (union width, per-tag variant field widths).
     pub coproduct_layouts: HashMap<QualifiedName, CoproductLayout>,
+    /// Nominal type declarations retained for type-driven array shapes. Unlike
+    /// record/sum width tables, these preserve nested structure and parameters.
+    pub type_definitions: HashMap<QualifiedName, TypeDefinition<QualifiedName>>,
     pub start: Expr,
 }
 
@@ -1041,6 +1060,7 @@ impl fmt::Display for Program {
             newtype_constructors: _,
             record_layouts: _,
             coproduct_layouts: _,
+            type_definitions: _,
             start,
         } = self;
 

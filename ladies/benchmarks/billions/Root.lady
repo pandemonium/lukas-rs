@@ -1,0 +1,119 @@
+use Stdlib.
+use Stdlib.Data.Tree.
+use Stdlib.Data.Hash_Table.
+use Stdlib.Control.
+use Stdlib.Control.State.
+use Stdlib.Random.
+use Stdlib.IO.
+
+Fault ::= File_IO (Binary.Mmap_Error)
+
+witness Display Fault :=
+  { display := λe.
+      deconstruct e into
+        File_IO e -> "file IO: `e`"
+  }
+
+File_Row ::=
+  { City        :: Text
+    Temperature :: Float
+  }
+
+module File_Row:
+  make :: Text -> Float -> File_Row := λcity temp.
+    { City := city; Temperature := temp }
+
+Aggregate_Stats ::=
+  { Min   :: Float
+    Max   :: Float
+    Sum   :: Float
+    Count :: Int
+  }
+
+witness From File_Row Aggregate_Stats :=
+  { from := λ({ City: city; Temperature: temp }).
+      { Min := temp; Max := temp; Sum := temp; Count := 1 }
+  }
+
+witness Semigroup Aggregate_Stats :=
+  { mappend := λp q.
+      { Min   := min p.Min q.Min
+        Max   := max p.Max q.Max
+        Sum   := p.Sum + q.Sum
+        Count := p.Count + q.Count
+      }
+  }
+
+witness Monoid Aggregate_Stats :=
+  { mempty := { Min := 0.0; Max := 0.0; Sum := 0.0; Count := 0 }
+  }
+
+witness Display File_Row :=
+  { display := λself.
+      "City `self.City`, Temperature `self.Temperature`"
+  }
+
+witness Display Aggregate_Stats :=
+  { display := λself.
+      "Min `self.Min`, Max `self.Max`, Sum `self.Sum`, count `self.Count`"
+  }
+
+read_file_data :: Text -> IO (Result Fault (List (Text, Aggregate_Stats))) := λfile_path.
+  let* file_bytes = Binary.mmap file_path in
+  deconstruct file_bytes into
+    Return file_bytes -> fmap Return (process_file_bytes file_bytes)
+  | Fault e -> pure (Fault (File_IO e))
+
+process_file_bytes :: Bytes -> IO (List (Text, Aggregate_Stats)) := λfile_bytes.
+  let* table = Hash_Table.make_default 47521 in
+  let parse_rows = λremains.
+    deconstruct parse_row remains into
+      This (row, remains) ->
+        let aggregate = from row in
+        let* _ = Hash_Table.insert row.City aggregate table in
+        parse_rows remains
+    | Nope -> pure ()
+  in
+    let* _ = parse_rows file_bytes in
+    let* table_data = Hash_Table.to_list table
+    in pure table_data
+
+(* This very clearly begs to be a State monad. *)
+parse_row :: Bytes -> Perhaps (File_Row, Bytes) := λremains.
+  let* i = Bytes.position remains (λb. b = Int.of_char ';') in
+  let city_bytes, remains1 = Bytes.split_at remains i in
+  let city = Text.from_bytes city_bytes in
+
+  print_endline "parse_row: city [`city`]"
+
+  let _, remains2 = Bytes.split_at remains1 1 in
+  let* j = Bytes.position remains2 (λb. b = 10 (* \n *)) in
+  let temperature_bytes, remains3 = Bytes.split_at remains2 j in
+  let* temp_text = Text.from_bytes temperature_bytes in
+  let temperature = from temp_text :: Perhaps Float in
+
+  print_endline "parse_row: temperature [`temperature`]"
+
+  let* file_row = liftA2 File_Row.make city temperature in
+  pure (file_row, Bytes.skip remains3 1)
+
+(* How to pass input arguments? Provide an Args array? *)
+start := λ_.
+  let program = read_file_data "ladies/benchmarks/billions/city-temperatures.txt" in
+
+  deconstruct unsafe_run_IO program into
+    Return return_value ->
+      print_endline "Billion row challenge. `List.length return_value`"
+  | Fault e ->
+      print_endline "Crashed: `e`"
+
+(* Insert `n` random draws into `tree`, threading the generator in the State monad. *)
+fill :: Int -> Tree_Set Int -> State LCG (Tree_Set Int) := λn tree.
+  if n > 0 then
+    let* x = Gen.next in
+    fill (n - 1) (Tree_Set.insert x tree)
+  else pure tree
+
+_start := λseed.
+  let tree = eval (fill 10000000 Tree_Set.empty) (LCG.from_seed seed) in
+  print_endline "size `Tree_Set.length tree`"

@@ -17,6 +17,7 @@ module Mutable_Array:
   foreign raw_get_unchecked :: ∀α. Raw_Mutable_Array -> Int -> α
   foreign raw_put :: ∀α. Raw_Mutable_Array -> Int -> α -> Perhaps α
   foreign raw_put_unchecked :: ∀α. Raw_Mutable_Array -> Int -> α -> α
+  foreign raw_set_unchecked :: ∀α. Raw_Mutable_Array -> Int -> α -> Unit
 
   (* Think about how this function could be shared with the Readonly array. They have the same backing. *)
   generate :: ∀α. Memory_Layout α |- Int -> (Int -> α) -> Mutable_Array α := λlength mk_element.
@@ -35,6 +36,9 @@ module Mutable_Array:
 
   put_unchecked :: ∀α. Mutable_Array α -> Int -> α -> IO α := λ(Mutable array) index element.
     IO.suspend (λ_. raw_put_unchecked array index element)
+
+  set_unchecked :: ∀α. Mutable_Array α -> Int -> α -> IO Unit := λ(Mutable array) index element.
+    IO.suspend (λ_. raw_set_unchecked array index element)
 
   modify_unchecked :: ∀α. Mutable_Array α -> Int -> (α -> α) -> IO α := λ(Mutable array) index f.
     let previous = raw_get_unchecked array index in

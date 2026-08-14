@@ -66,3 +66,10 @@ FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Mutable_Array_raw_get_unchecked, Valu
 FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Mutable_Array_raw_put_unchecked, Value, arr, int64_t, index, Value, elt, {
   return flat_array_put(arr, (size_t)index, elt);
 })
+
+// Write-only counterpart to `raw_put_unchecked`: copy the new canonical value
+// into the packed slot without first rebuilding and returning the old element.
+FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Mutable_Array_raw_set_unchecked, Value, arr, int64_t, index, Value, elt, {
+  flat_array_set(arr, (size_t)index, elt);
+  return VUnit();
+})

@@ -1,0 +1,317 @@
+signature Hash_Stream ::= ∀h.
+  { write_bytes :: Bytes -> State h Unit
+    write_int   :: Int -> State h Unit
+    finish      :: State h Int
+  }
+
+signature Hashable ::= ∀α.
+  { hash :: ∀h. Hash_Stream h |- α -> State h Unit
+  }
+
+(* A time-based seed source for the default hasher. Coarse and predictable: *)
+(* enough to vary the seed per map, but NOT a defence against a deliberate    *)
+(* HashDoS attacker -- that needs an OS CSPRNG seed and a keyed-PRF mix.      *)
+foreign now_millis :: Unit -> Int
+
+Simple_Hasher ::=
+  { Value :: Int
+  }
+
+module Simple_Hasher:
+  make :: Int -> Simple_Hasher := λseed.
+    { Value := seed
+    }
+
+  mix :: Int -> Int -> Int := λstate value.
+    state * 31 + value
+
+witness Hash_Stream Simple_Hasher :=
+  { write_bytes := λbytes.
+      let loop = λi.
+        let length = Bytes.length bytes in
+        if i < length then
+          let* _ = write_int (Bytes.get_u8 bytes i) in
+          loop (i + 1)
+        else
+          pure ()
+      in loop 0
+
+    write_int := λvalue.
+      modify (λ({ Value: state }). { Value := Simple_Hasher.mix state value } )
+
+    finish := let* { Value: value } = get in pure value
+  }
+
+witness Hashable Text :=
+  { hash := λtext.
+      let* _ = write_int (Text.length text) in
+      write_bytes (Text.to_bytes text)
+  }
+
+witness Hashable Int :=
+  { hash := write_int
+  }
+
+(* Hash `value` starting from initial hasher state `initial`. `h` is in the      *)
+(* argument type, so a caller pins it -- no functional dependency. `State` is     *)
+(* pure, so one `initial` seed is safely reused across keys: each call starts      *)
+(* fresh, like hashbrown building a fresh Hasher per key from a shared BuildHasher.*)
+hash_with :: ∀α h. Hashable α + Hash_Stream h |- h -> α -> Int :=
+  λinitial value.
+    eval (let* _ = hash value in finish) initial
+
+Hash_Table ::= ∀α β.
+  { Raw        :: Hash_Table.Raw_Table α β
+    Hash_Key   :: α -> Int
+    Keys_Equal :: α -> α -> Bool
+  }
+
+module Hash_Table:
+  make :: ∀α β h. Eq α + Hashable α + Hash_Stream h |- Int -> h -> Hash_Table α β :=
+    λcapacity initial.
+      { Raw        := Raw_Table.make capacity
+        Hash_Key   := hash_with initial
+        Keys_Equal := eq
+      }
+
+  with_random_seed :: ∀α β h. Eq α + Hashable α + Hash_Stream h |- Int -> (Int -> h) -> IO (Hash_Table α β) :=
+    λcapacity make_hash_stream.
+      IO.suspend (λ_. make capacity (make_hash_stream (now_millis ())))
+
+  (* The safe default: `with_random_seed` specialised to the library's default    *)
+  (* hasher -- the single place a concrete algorithm is chosen (as Rust's          *)
+  (* `HashMap::new` commits to `RandomState`). Swap `Simple_Hasher.make` for a      *)
+  (* strong keyed hasher's constructor once one exists; nothing else changes.       *)
+  make_default :: ∀α β. Eq α + Hashable α |- Int -> IO (Hash_Table α β) :=
+    λcapacity.
+      with_random_seed capacity Simple_Hasher.make
+
+  (* fold_m insead and let f compute in IO? *)
+  fold :: ∀α β z. (z -> (α, β) -> z) -> z -> Hash_Table α β -> IO z := λf z table.
+    let* state = Mutable_Array.get_unchecked table.Raw.State 0 in
+    let length = Mutable_Array.length state.Controls in
+
+    let fold_entries = λi acc.
+      if i < length then
+        let* entry = Mutable_Array.get_unchecked state.Entries i in
+        deconstruct entry into
+          This { Key: key; Value: value } ->
+            let acc' = f acc (key, value) in
+            fold_entries (1 + i) acc'
+        | Nope ->
+          fold_entries (1 + i) acc
+      else pure acc
+    in fold_entries 0 z
+
+  to_list :: ∀α β. Hash_Table α β -> IO (List (α, β)) :=
+    fold (λz kv. Cons kv z) List.empty
+
+  insert :: ∀α β. α -> β -> Hash_Table α β -> IO (Perhaps β) := λkey value table.
+    let hash = table.Hash_Key key in
+    let* found = Raw_Table.find hash (λ({ Key: existing_key; Value: _ }). table.Keys_Equal key existing_key) table.Raw in
+
+    deconstruct found into
+      This index ->
+        let* state = Mutable_Array.get_unchecked table.Raw.State 0 in
+        let* existing = Mutable_Array.get_unchecked state.Entries index in
+        traverse
+          (λ({ Key: existing_key; Value: old_value }).
+            let* _ =
+              Mutable_Array.set_unchecked
+                state.Entries
+                index
+                (This (Raw_Table.Table_Entry.make existing_key value))
+            in
+              pure old_value
+          )
+          existing
+    | Nope ->
+        let* _ = Raw_Table.reserve table.Hash_Key 1 table.Raw in
+        let entry = Raw_Table.Table_Entry.make key value in
+        let* _ = Raw_Table.insert_no_grow hash entry table.Raw in
+        pure Perhaps.empty
+
+  lookup :: ∀α β. α -> Hash_Table α β -> IO (Perhaps β) := λkey table.
+    let hash = table.Hash_Key key in
+    let* found = Raw_Table.find hash (λ({ Key: existing_key; Value: _ }). table.Keys_Equal key existing_key) table.Raw in
+
+    deconstruct found into
+      This index ->
+        let* state = Mutable_Array.get_unchecked table.Raw.State 0 in
+        let* entry = Mutable_Array.get_unchecked state.Entries index in
+        let value = fmap (λ({ Key: _; Value: value }). value) entry in
+        pure value
+    | Nope -> pure Perhaps.empty
+
+  Raw_Table ::= ∀α β.
+    { State :: Mutable_Array (Raw_Table.Raw_State α β)
+    }
+
+  module Raw_Table:
+    make :: ∀α β. Int -> Raw_Table α β := λcapacity.
+      let capacity1 = if capacity < 8 then 8 else capacity in
+      let controls = Mutable_Array.generate capacity1 (λ_. Empty) in
+      let entries = Mutable_Array.generate capacity1 (λ_. Nope) in
+      let state = Raw_State.make controls entries capacity1 in
+
+      { State := Mutable_Array.generate 1 (λ_. state)
+      }
+
+    Table_Entry ::= ∀α β.
+      { Key   :: α
+        Value :: β
+      }
+
+    module Table_Entry:
+      make :: ∀α β. α -> β -> Table_Entry α β := λkey value.
+        { Key   := key
+          Value := value
+        }
+
+    Control ::= Empty | Deleted | Full Int
+
+    fingerprint :: Int -> Int := λhash.
+      let n = hash % 127 in
+      if n < 0 then n + 127 else n
+
+    positive_mod :: Int -> Int -> Int := λn modulus.
+      let r = n % modulus in
+      if r < 0 then r + modulus else r
+
+    Raw_State ::= ∀α β.
+      { Controls    :: Mutable_Array Control
+        Entries     :: Mutable_Array (Perhaps (Table_Entry α β))
+        Length      :: Int
+        Growth_Left :: Int
+      }
+
+    module Raw_State:
+      usable_capacity :: Int -> Int := λbuckets.
+        if buckets < 8
+        then buckets - 1
+        else (buckets / 8) * 7
+
+      make :: ∀α β. Mutable_Array Control -> Mutable_Array (Perhaps (Table_Entry α β)) -> Int -> Raw_State α β :=
+        λcontrols entries capacity.
+          { Controls    := controls
+            Entries     := entries
+            Length      := 0
+            Growth_Left := usable_capacity capacity
+          }
+
+    probe_index :: Int -> Int -> Int -> Int := λhash probe capacity.
+      let offset = (probe * (probe + 1)) / 2 in
+      positive_mod (hash + offset) capacity
+
+    find :: ∀α β. Int -> (Table_Entry α β -> Bool) -> Raw_Table α β -> IO (Perhaps Int) :=
+      λhash matches table.
+        let* state = Mutable_Array.get_unchecked table.State 0 in
+        let capacity = Mutable_Array.length state.Controls in
+        let wanted_fingerprint = fingerprint hash in
+
+        let loop = λprobe.
+          if probe < capacity then
+            let index = probe_index hash probe capacity in
+            let* control = Mutable_Array.get_unchecked state.Controls index in
+
+            deconstruct control into
+              Empty -> pure Perhaps.empty
+            | Deleted -> loop (probe + 1)
+            | Full stored_fingerprint ->
+              if stored_fingerprint = wanted_fingerprint then
+                let* entry = Mutable_Array.get_unchecked state.Entries index in
+                perhaps
+                  (loop (probe + 1))
+                  (λentry.
+                    if matches entry
+                      then pure (This index)
+                      else loop (probe + 1))
+                  entry
+              else
+                loop (probe + 1)
+
+          else
+            pure Perhaps.empty
+
+        in loop 0
+
+    find_insert_slot :: ∀α β. Int -> Raw_Table α β -> IO Int := λhash table.
+      let* state = Mutable_Array.get_unchecked table.State 0 in
+      let capacity = Mutable_Array.length state.Controls in
+
+      let loop = λprobe first_deleted.
+        let index = probe_index hash probe capacity in
+        let* control = Mutable_Array.get_unchecked state.Controls index in
+
+        deconstruct control into
+          Empty -> pure (perhaps index id first_deleted)
+        | Deleted ->
+          let first_deleted' =
+            perhaps
+              (This index)
+              (λ_. first_deleted)
+              first_deleted
+          in loop (probe + 1) first_deleted'
+        | Full _ ->
+          loop (probe + 1) first_deleted
+
+      in loop 0 Perhaps.empty
+
+    insert_no_grow :: ∀α β. Int -> Table_Entry α β -> Raw_Table α β -> IO Unit :=
+      λhash entry table.
+        let* state = Mutable_Array.get_unchecked table.State 0 in
+        let* index = find_insert_slot hash table in
+        let* _ = Mutable_Array.set_unchecked state.Entries index (This entry) in
+        let* _ = Mutable_Array.set_unchecked state.Controls index (Full (fingerprint hash)) in
+
+        let* _ =
+          Mutable_Array.set_unchecked
+            table.State
+            0
+            { Controls    := state.Controls
+              Entries     := state.Entries
+              Length      := state.Length + 1
+              Growth_Left := state.Growth_Left - 1
+            }
+        in pure ()
+
+    rehash :: ∀α β. (α -> Int) -> Int -> Raw_Table α β -> IO Unit :=
+      λhash_key new_capacity table.
+        let* old_state = Mutable_Array.get_unchecked table.State 0 in
+        let new_table = Raw_Table.make new_capacity in
+        let old_capacity = Mutable_Array.length old_state.Controls in
+
+        let transfer_entries = λi.
+          if i < old_capacity then
+            let* entry = Mutable_Array.get_unchecked old_state.Entries i in
+            deconstruct entry into
+              This entry ->
+                let* _ =
+                  insert_no_grow
+                    (hash_key entry.Key)
+                    entry
+                    new_table
+                in
+                  transfer_entries (i + 1)
+            | Nope ->
+              transfer_entries (i + 1)
+          else
+            pure ()
+        in
+          let* _ = transfer_entries 0 in
+          let* new_state = Mutable_Array.get_unchecked new_table.State 0 in
+          let* _ =
+            Mutable_Array.set_unchecked
+              table.State
+              0
+              new_state
+          in pure ()
+
+    reserve :: ∀α β. (α -> Int) -> Int -> Raw_Table α β -> IO Unit :=
+      λhash_key additional table.
+        let* state = Mutable_Array.get_unchecked table.State 0 in
+        if state.Growth_Left >= additional then
+          pure ()
+        else
+          let capacity = Mutable_Array.length state.Controls in
+          rehash hash_key (capacity * 2) table

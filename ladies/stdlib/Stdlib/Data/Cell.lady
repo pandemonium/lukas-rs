@@ -1,0 +1,14 @@
+Mutable_Cell ::= ∀α. Cell (Mutable_Array α)
+
+module Mutable_Cell:
+  make :: ∀α. Memory_Layout α |- α -> IO (Mutable_Cell α) := λinitial.
+    IO.suspend (λ_. Cell (Mutable_Array.generate 1 (λ_. initial)))
+
+  put :: ∀α. α -> Mutable_Cell α -> IO α := λitem (Cell cell).
+    Mutable_Array.put_unchecked cell 0 item
+
+  get :: ∀α. Mutable_Cell α -> IO α := λ(Cell cell).
+    Mutable_Array.get_unchecked cell 0
+
+  modify :: ∀α. (α -> α) -> Mutable_Cell α -> IO α := λf (Cell cell).
+    Mutable_Array.modify_unchecked cell 0 f

@@ -607,7 +607,7 @@ fn clauses_are_small<A>(clauses: &[MatchClause<A, Identifier>]) -> bool {
 
 /// The immediate sub-trees of a node, in evaluation order. Used by size measurement
 /// (and any other structural fold that does not care which slot a child sits in).
-pub(crate) fn children<A>(expr: &Expr<A, Identifier>) -> Vec<&Tree<A, Identifier>> {
+pub(crate) fn children<A, Id>(expr: &Expr<A, Id>) -> Vec<&Tree<A, Id>> {
     match expr {
         Expr::Variable(..)
         | Expr::InvokeBridge(..)
