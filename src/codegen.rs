@@ -14,7 +14,7 @@ use crate::{
         self, ChainWorker, ClosureInfo, CoproductLayout, LiftedFunction, TopLevelBinding, Worker,
     },
     phase,
-    typer::{BaseType, Type},
+    typer::{BaseType, Type, memory_layout_evidence_name},
 };
 
 // Widest inlined field before it is kept a pointer instead; must match
@@ -188,6 +188,23 @@ fn float_prim(prim: &str) -> Option<&'static str> {
     })
 }
 
+// The element type `τ` of an `Array τ`. The array type reaches codegen either as
+// the dedicated `Type::Array` or, as the typer actually builds a non-empty array
+// literal (`infer_array`), an application of the builtin `Array` constructor:
+// `Apply { Constructor(QualifiedName::builtin("Array")), τ }`. Identity is by
+// QualifiedName equality against that same canonical constructor.
+fn array_element_type(ty: &Type) -> Option<&Type> {
+    match ty {
+        Type::Array(element) => Some(element),
+        Type::Apply { constructor, argument }
+            if matches!(constructor.as_ref(), Type::Constructor(name) if *name == QualifiedName::builtin("Array")) =>
+        {
+            Some(argument)
+        }
+        _ => None,
+    }
+}
+
 // Peel type ascriptions off an expression -- they are erased at codegen. Used by
 // the flat-record path to see through to a `Record`/`Project` node.
 fn strip_ascription(mut expr: &Expr) -> &Expr {
@@ -239,6 +256,11 @@ impl lambda_lift::Program {
         // code can reference the value, call the builder, and direct-call the
         // worker at saturated call sites.
         for name in &self.foreign {
+            // The `memory_layout` marker has no companion C global: its references are
+            // synthesised inline as layout dictionaries (see `compile_layout_dict`).
+            if *name == memory_layout_evidence_name() {
+                continue;
+            }
             writeln!(out, "extern Value {0};", c_name(name))?;
             writeln!(out, "extern Value {0}__init(void);", c_name(name))?;
             if let Some(&arity) = self.arities.get(name) {
@@ -316,6 +338,9 @@ impl lambda_lift::Program {
         // the foreign's Value -- so it must already hold its closure, not null.
         // Runs after `gc_init`/`runtime_init` (see `main`), so `mk_closure` is safe.
         for name in &self.foreign {
+            if *name == memory_layout_evidence_name() {
+                continue; // synthesised inline; no companion global to initialise
+            }
             writeln!(out, "  {0} = {0}__init();", c_name(name))?;
         }
         // User globals then init in dependency order (`in_resolvable_order`): a
@@ -342,6 +367,8 @@ impl lambda_lift::Program {
             .map(|b| &b.name)
             .filter(|name| !is_builtin(name))
             .chain(self.foreign.iter())
+            // The `memory_layout` marker has no companion Value global to root.
+            .filter(|name| **name != memory_layout_evidence_name())
             .collect::<Vec<_>>();
         writeln!(out, "Value *const gc_user_roots[] = {{")?;
         if root_names.is_empty() {
@@ -386,6 +413,12 @@ impl lambda_lift::Program {
     // expression, sequencing the comma operator.
     fn compile_expr(&self, expr: &Expr, code: &mut CodeBuffer) -> fmt::Result {
         match expr {
+            // The compiler-synthesised `memory_layout` marker (evidence for a ground
+            // `Memory_Layout τ`) is not a real global: emit the layout dictionary for
+            // `τ`, recovered from this reference's inferred type.
+            Expr::Variable(a, Identifier::Global(q)) if **q == memory_layout_evidence_name() => {
+                self.compile_layout_dict(&a.type_info.inferred_type, code)
+            }
             Expr::Variable(_, the) => write!(code, "{}", self.compile_var(the)),
             Expr::InvokeBridge(_, the) => write!(code, "{}", c_name(&the.qualified_name)),
             Expr::Constant(_, the) => write!(code, "{}", self.compile_constant(the)),
@@ -396,7 +429,7 @@ impl lambda_lift::Program {
             Expr::Tuple(_, the) => self.compile_tuple(&the.elements, code),
             Expr::Record(a, the) => self.compile_record(a, the, code),
             Expr::Inject(_, the) => self.compile_inject(the, code),
-            Expr::Array(_, the) => self.compile_array(&the.elements, code),
+            Expr::Array(a, the) => self.compile_array(a, &the.elements, code),
             Expr::Project(a, the) => self.compile_projection(a, the, code),
             Expr::Sequence(_, the) => self.compile_sequence(the, code),
             Expr::Deconstruct(_, the) => self.compile_deconstruct(the, code),
@@ -433,18 +466,99 @@ impl lambda_lift::Program {
     // evaluated into a stack `(Value[]){...}` block that `mk_flat_array_from`
     // reads, discovering the element shape from element 0. Access stays through
     // `Array.get`/`length` (arrays are never `proj`'d), so the layout is opaque.
-    fn compile_array(&self, elements: &[Rc<Expr>], code: &mut CodeBuffer) -> fmt::Result {
+    fn compile_array(
+        &self,
+        annotation: &CaptureInfo,
+        elements: &[Rc<Expr>],
+        code: &mut CodeBuffer,
+    ) -> fmt::Result {
         if elements.is_empty() {
             return write!(code, "mk_flat_array_from(0, 0)");
         }
-        write!(code, "mk_flat_array_from({}, (Value[]){{", elements.len())?;
+        // When the element type is a flat sum, the runtime cannot discover the
+        // element shape from element 0 (it never sees the other variants), so emit
+        // a type-driven shape and take the shaped constructor. Every other element
+        // type keeps the element-0 path unchanged (=> byte-identical).
+        let shape = array_element_type(&annotation.type_info.inferred_type)
+            .and_then(|element| self.flat_array_sum_shape(element));
+        let constructor = if shape.is_some() { "mk_flat_array_from_shaped" } else { "mk_flat_array_from" };
+        write!(code, "{constructor}({}, (Value[]){{", elements.len())?;
         for (i, element) in elements.iter().enumerate() {
             if i > 0 {
                 write!(code, ", ")?;
             }
             self.compile_expr(element, code)?;
         }
-        write!(code, "}})")
+        write!(code, "}}")?;
+        if let Some(shape) = shape {
+            write!(code, ", (int64_t[]){{")?;
+            for (i, entry) in shape.iter().enumerate() {
+                if i > 0 {
+                    write!(code, ", ")?;
+                }
+                write!(code, "{entry}")?;
+            }
+            write!(code, "}}, {}", shape.len())?;
+        }
+        write!(code, ")")
+    }
+
+    // The type-driven flat shape for an array element that is (directly) a flat,
+    // non-recursive sum whose every variant field is one word -- the case codegen
+    // can inline but element-0 runtime discovery cannot. Returns the pre-order
+    // shape `[SHAPE_SUM(-1), pad, nvariants, <variant nodes>]`, each variant node
+    // `[m, 0 x m]` (its field count, then that many leaves). `None` (=> the
+    // element-0 path) for any other element type, so every existing flat array
+    // stays byte-identical. A variant field wider than one word (a nested flat
+    // aggregate) falls back for now -- its sub-shape needs the field type, a later
+    // increment.
+    fn flat_array_sum_shape(&self, element: &Type) -> Option<Vec<i64>> {
+        let layout = self.sum_layout(element)?;
+        if layout.variant_widths.iter().flatten().any(|&width| width != 1) {
+            return None;
+        }
+        let pad = layout.variant_widths.iter().map(Vec::len).max().unwrap_or(0);
+        let mut shape = vec![-1, pad as i64, layout.variant_widths.len() as i64];
+        for variant in &layout.variant_widths {
+            shape.push(variant.len() as i64);
+            shape.extend(std::iter::repeat(0).take(variant.len()));
+        }
+        Some(shape)
+    }
+
+    // Emit the `Memory_Layout τ` dictionary for the synthesised `memory_layout` marker,
+    // whose inferred type is `Memory_Layout τ`. The dictionary is a one-field record
+    // `{ shape :: Raw_Shape }` (a 1-tuple); `Raw_Shape` is a static MARM_ETERNAL byte
+    // body holding `[slen, shape...]` that `raw_generate_shaped` reads. A τ with no flat
+    // sum shape reports the leaf shape `[0]` (ML3 totality: the element stays one boxed
+    // word, so a generated array is byte-identical to the element-0 discovery path).
+    fn compile_layout_dict(&self, dict_type: &Type, code: &mut CodeBuffer) -> fmt::Result {
+        let element = match dict_type {
+            Type::Apply { argument, .. } => Some(argument.as_ref()),
+            _ => None,
+        };
+        // No flat-sum shape -> an EMPTY shape (slen 0), the runtime's signal to keep
+        // element-0 discovery (so a product/scalar element still flattens exactly as
+        // before -- byte-identical, no regression). Only a fully GROUND sum element
+        // carries a shape: a type still holding variables (a polymorphic caller's
+        // element type, un-monomorphised at codegen) stays on the element-0 path, so
+        // its representation is unchanged (ML3 totality: an abstract payload is boxed).
+        let shape = element
+            .filter(|t| t.variables().is_empty())
+            .and_then(|t| self.flat_array_sum_shape(t))
+            .unwrap_or_default();
+        let words = shape.len() + 1; // leading `slen` word, then the entries
+        write!(
+            code,
+            "mk_tuple(1, ({{ static const struct {{ GcHeader gch; int64_t s[{words}]; }} __ml = \
+             {{{{{}, 0, OBJ_BYTES, MARM_ETERNAL}}, {{{}",
+            words * 8,
+            shape.len()
+        )?;
+        for entry in &shape {
+            write!(code, ", {entry}")?;
+        }
+        write!(code, "}}}}; VObject((void *)__ml.s); }}))")
     }
 
     // A constructor value (sum type) is a `Data` object: an integer tag (the
@@ -543,6 +657,41 @@ impl lambda_lift::Program {
         buf.to_string()
     }
 
+    // Fuse a constructor `C args` of an inlined sum `ty` into its inline leaves
+    // `[tag, active variant's leaves, zero padding]` to `width` words -- the
+    // sub-`Data` box is never built. Shared by the `Inject`-literal and the
+    // saturated-application forms. `None` (caller falls back to the splat) when
+    // `ty` is not an inlined sum, `C` is a newtype/foreign (not a real tag), or
+    // the application is not saturated (a partial application keeps its closure).
+    fn fuse_inlined_sum(
+        &self,
+        ty: &Type,
+        constructor: &QualifiedName,
+        arguments: &[&Expr],
+        width: usize,
+        prelude: &mut Vec<String>,
+    ) -> Option<Vec<String>> {
+        let layout = self.sum_layout(ty)?;
+        if self.newtype_constructors.contains(constructor)
+            || !self.constructor_tags.contains_key(constructor)
+        {
+            return None;
+        }
+        let tag = self.constructor_tag(constructor);
+        let variant = layout.variant_widths.get(tag as usize)?;
+        if arguments.len() != variant.len() {
+            return None; // under-/over-saturated: not a plain construction
+        }
+        let mut leaves = vec![format!("VInt({tag})")];
+        for (argument, w) in arguments.iter().zip(variant) {
+            leaves.extend(self.flat_leaves(argument, *w, prelude));
+        }
+        while leaves.len() < width {
+            leaves.push("((Value){0})".to_string());
+        }
+        Some(leaves)
+    }
+
     // The flat leaf C-expressions of a field `value` occupying `width` inline
     // words. A width-1 field is its own single value. A wider field is a nested
     // record: a record *literal* fuses (its leaves splice in directly, so the
@@ -578,17 +727,41 @@ impl lambda_lift::Program {
             // An inlined sum literal: `[tag, active variant's leaves, zero padding]`
             // to the union width. Padding zeros keep the blind tracer correct.
             Expr::Inject(annotation, inject) => {
-                if let Some(layout) = self.sum_layout(&annotation.type_info.inferred_type) {
-                    let tag = self.constructor_tag(&inject.constructor);
-                    let variant = layout.variant_widths[tag as usize].clone();
-                    let mut leaves = vec![format!("VInt({tag})")];
-                    for (argument, w) in inject.arguments.iter().zip(variant) {
-                        leaves.extend(self.flat_leaves(argument, w, prelude));
-                    }
-                    while leaves.len() < width {
-                        leaves.push("((Value){0})".to_string());
-                    }
+                let arguments: Vec<&Expr> = inject.arguments.iter().map(|a| &**a).collect();
+                if let Some(leaves) = self.fuse_inlined_sum(
+                    &annotation.type_info.inferred_type,
+                    &inject.constructor,
+                    &arguments,
+                    width,
+                    prelude,
+                ) {
                     return leaves;
+                }
+            }
+            // A saturated constructor application `C a1..an` reaches codegen as an
+            // Apply spine, NOT an `Inject` (only a syntactic literal stays an
+            // `Inject`), so fuse it too. Without this, `field := C arg` builds the
+            // box via the worker call and then splats it -- a strict loss vs. keeping
+            // the field boxed. Peel the spine; fuse only when the head is a known
+            // constructor of this inlined sum and the application is saturated.
+            application @ Expr::Apply(..) => {
+                let mut arguments: Vec<&Expr> = Vec::new();
+                let mut head: &Expr = application;
+                while let Expr::Apply(_, inner) = head {
+                    arguments.push(&inner.argument);
+                    head = &inner.function;
+                }
+                arguments.reverse();
+                if let Expr::Variable(_, Identifier::Global(constructor)) = head {
+                    if let Some(leaves) = self.fuse_inlined_sum(
+                        &application.annotation().type_info.inferred_type,
+                        constructor,
+                        &arguments,
+                        width,
+                        prelude,
+                    ) {
+                        return leaves;
+                    }
                 }
             }
             _ => {}

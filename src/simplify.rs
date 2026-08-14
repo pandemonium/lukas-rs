@@ -1545,10 +1545,10 @@ where
 fn forwardable_effectfully<A>(body: &Expr<A, Identifier>, level: usize) -> bool {
     match body {
         Expr::Deconstruct(_, d) => {
-            eliminated_head(&d.scrutinee, level) && count_level_uses(&d.scrutinee, level) == 1
+            eliminated_head(&d.scrutinee, level) && count_level_uses(body, level) == 1
         }
         Expr::Project(_, p) => {
-            eliminated_head(&p.base, level) && count_level_uses(&p.base, level) == 1
+            eliminated_head(&p.base, level) && count_level_uses(body, level) == 1
         }
         _ => false,
     }
@@ -2523,6 +2523,44 @@ mod tests {
                 )),
             },
         );
+        assert!(matches!(simplify(e), Expr::Let(..)));
+    }
+
+    #[test]
+    fn effectful_forwarding_counts_uses_in_match_consequents() {
+        // The scrutinee use is evaluated first, but #0 is also captured by the
+        // selected continuation. Forwarding (g y) here would evaluate it twice:
+        //   let #0 = (g y) in deconstruct #0 { C #1 -> (#0, #1) }
+        let e = Expr::Let(
+            (),
+            Binding {
+                binder: Identifier::Bound(0),
+                operator: BindingOperator::Identity,
+                bound: Rc::new(apply(free("g"), free("y"))),
+                body: Rc::new(Expr::Deconstruct(
+                    (),
+                    Deconstruct {
+                        scrutinee: var(0),
+                        match_clauses: vec![MatchClause {
+                            pattern: Pattern::Coproduct(
+                                (),
+                                ConstructorPattern {
+                                    constructor: Identifier::Free(Box::new(ctor("C"))),
+                                    arguments: vec![Pattern::Bind((), Identifier::Bound(1))],
+                                },
+                            ),
+                            consequent: Rc::new(Expr::Tuple(
+                                (),
+                                Tuple {
+                                    elements: vec![var(0), var(1)],
+                                },
+                            )),
+                        }],
+                    },
+                )),
+            },
+        );
+
         assert!(matches!(simplify(e), Expr::Let(..)));
     }
 

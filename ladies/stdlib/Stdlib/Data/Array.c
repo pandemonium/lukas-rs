@@ -25,8 +25,18 @@ FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Array_raw_get, Value, arr, int64_t, i
 /// one-word-per-slot layout. `raw_generate` builds the whole array in C,
 /// discovering the element width from element 0; get/put box out / copy in the
 /// flat<->canonical coercion so every caller only ever sees canonical values.
-FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Mutable_Array_raw_generate, int64_t, length, Value, mk_element, {
-  return flat_generate(length, mk_element);
+// The `Memory_Layout α` constraint threads its dictionary in as the leading value
+// argument: a one-field record `{ shape }` whose `shape` (field 0) is a `Raw_Shape`
+// -- a byte body holding `[slen, shape...]`. Packing each element by that type-driven
+// shape lets a sum element store inline (element-0 discovery could not see the other
+// variants). `dict` is a live root on the stack across `flat_generate_shaped`.
+FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Mutable_Array_raw_generate_shaped, Value, dict, int64_t, length, Value, mk_element, {
+  int64_t *entries = (int64_t *)as_ptr(proj(dict, 0));
+  size_t slen = (size_t)entries[0];
+  // An empty shape (slen 0) means the element type carries no flat sum: keep the
+  // original element-0 discovery, so a product/scalar element flattens as before.
+  if (slen == 0) return flat_generate(length, mk_element);
+  return flat_generate_shaped(length, mk_element, entries + 1, slen);
 })
 
 FOREIGN_DECL(int64_t, Root_Stdlib_Data_Array_Mutable_Array_raw_len, Value, arr, {

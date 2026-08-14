@@ -1,0 +1,49 @@
+use Stdlib.
+use Stdlib.Data.
+
+(* Array whose ELEMENT type is a flat, non-recursive sum (`Perhaps Int`).          *)
+(*                                                                                  *)
+(* A flat array stores its elements inline in one heap object. A product element    *)
+(* (tuple/record) already flattens this way, its shape discovered at runtime from   *)
+(* element 0. A SUM element cannot: element 0 reveals only one variant, so the       *)
+(* runtime would keep every element a boxed pointer. Instead codegen emits the       *)
+(* element's shape from its TYPE -- a sum node [tag, widest-variant payload,          *)
+(* zero-padding] -- so each slot here is [tag, payload] inline and the per-element    *)
+(* `This` box is gone. `Array.get` reverses the packing, boxing the active variant    *)
+(* back out, so callers still see ordinary `This`/`Nope` values.                      *)
+(*                                                                                    *)
+(* This test pins the round-trip: build a mixed This/Nope array, then read every       *)
+(* element back and both render it and sum the `This` payloads (10 + 30 + 50 = 90).    *)
+
+render :: Array (Perhaps Int) -> Int -> Text -> Text := λarr i acc.
+  if i < 0 then acc
+  else
+    let cell =
+      deconstruct (Array.get arr i) into
+        This (This x) -> "This `x`"
+      | This Nope     -> "Nope"
+      | Nope          -> "<out-of-bounds>"
+    in render arr (i - 1) "`cell`; `acc`"
+
+sum_this :: Array (Perhaps Int) -> Int -> Int -> Int := λarr i acc.
+  if i < 0 then acc
+  else
+    let acc2 =
+      deconstruct (Array.get arr i) into
+        This (This x) -> acc + x
+      | This Nope     -> acc
+      | Nope          -> acc
+    in sum_this arr (i - 1) acc2
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  let arr =
+    [ This 10
+      Nope
+      This 30
+      Nope
+      This 50
+    ]
+  in
+  print_endline "cells: `render arr 4 ""`"
+  print_endline "sum: `sum_this arr 4 0`"

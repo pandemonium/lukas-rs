@@ -56,6 +56,40 @@ where
         .join(sep)
 }
 
+/// A non-expansive local binding can be generalized without changing when its
+/// computation happens. Constrained expansive bindings stay monomorphic until
+/// local dictionary abstraction is implemented.
+fn is_generalizable_value<A, Id>(expr: &ast::Expr<A, Id>) -> bool {
+    match expr {
+        ast::Expr::Variable(..)
+        | ast::Expr::Constant(..)
+        | ast::Expr::Lambda(..)
+        | ast::Expr::RecursiveLambda(..)
+        | ast::Expr::InvokeBridge(..) => true,
+        ast::Expr::Tuple(_, Tuple { elements }) => elements
+            .iter()
+            .all(|element| is_generalizable_value(element)),
+        ast::Expr::Record(_, Record { fields }) => fields
+            .iter()
+            .all(|(_, value)| is_generalizable_value(value)),
+        ast::Expr::Inject(_, Injection { arguments, .. }) => arguments
+            .iter()
+            .all(|argument| is_generalizable_value(argument)),
+        ast::Expr::Let(_, Binding { bound, body, .. }) => {
+            is_generalizable_value(bound) && is_generalizable_value(body)
+        }
+        ast::Expr::Project(_, Projection { base, .. })
+        | ast::Expr::Ascription(
+            _,
+            TypeAscription {
+                ascribed_tree: base,
+                ..
+            },
+        ) => is_generalizable_value(base),
+        _ => false,
+    }
+}
+
 impl<A> namer::SymbolTable<A, namer::QualifiedName, namer::Identifier> {
     pub fn terms(
         &self,
@@ -2714,8 +2748,25 @@ impl BaseType {
 pub fn stdlib_text_type() -> Type {
     // `Text` lives in the always-imported primordial `Prelude` (Root.Prelude.Text) -- the
     // single deliberate compiler->stdlib reference for the string-literal type.
+    Type::Constructor(prelude_name("Text"))
+}
+
+// A member of the always-imported primordial `Prelude` (`Root.Prelude.<member>`).
+fn prelude_name(member: &str) -> namer::QualifiedName {
     let module = parser::IdentifierPath::new("Root").with_suffix("Prelude");
-    Type::Constructor(namer::QualifiedName::new(module, "Text"))
+    namer::QualifiedName::new(module, member)
+}
+
+// The compiler-derived `Memory_Layout` class (see Prelude): a ground `Memory_Layout τ`
+// constraint is discharged not by a user witness but by compiler-synthesised evidence
+// -- a reference to the `memory_layout` marker term whose inferred type is the ground
+// `Memory_Layout τ`, from which the backend recovers `τ` and emits the layout dictionary.
+pub fn memory_layout_class() -> namer::QualifiedName {
+    prelude_name("Memory_Layout")
+}
+
+pub fn memory_layout_evidence_name() -> namer::QualifiedName {
+    prelude_name("memory_layout")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -5187,16 +5238,12 @@ impl TypingContext {
             codomain: return_ty.clone().into(),
         };
 
-        let substitutions = expected_ty
+        let substitutions = function
+            .tree
+            .type_info()
+            .inferred_type
             .apply(&substitutions)
-            .unified_with(
-                &function
-                    .tree
-                    .type_info()
-                    .inferred_type
-                    .apply(&substitutions),
-                &self.types,
-            )
+            .unified_with(&expected_ty.apply(&substitutions), &self.types)
             .map_err(|e| e.at(pi))?
             .compose(&substitutions);
 
@@ -5267,19 +5314,29 @@ impl TypingContext {
     #[instrument]
     fn infer_binding(&mut self, pi: ParseInfo, binding: &phase::Binding<Named>) -> Typing {
         let typed_bound = self.infer_expr(&binding.bound)?;
-        let ctx1 = self.apply(&typed_bound.substitutions);
+        let mut ctx1 = self.apply(&typed_bound.substitutions);
 
         let bound_type = typed_bound.as_constrained_type().generalize(&ctx1);
+        let retained_constraints = typed_bound.constraints.clone();
+        let bound_scheme =
+            if retained_constraints.is_empty() || is_generalizable_value(binding.bound.as_ref()) {
+                bound_type.underlying
+            } else {
+                // Expansive constrained bindings remain monomorphic. Their result type
+                // and wanted constraints therefore share metavariables with the body,
+                // allowing later uses to ground the evidence instead of creating stale,
+                // independently-generalized dictionary parameters.
+                TypeScheme::from_constant(bound_type.underlying.underlying)
+            };
 
-        self.bind_term_and_then(binding.binder.clone(), bound_type.underlying, |ctx| {
+        ctx1.bind_term_and_then(binding.binder.clone(), bound_scheme, |ctx| {
             let typed_body = ctx.infer_expr(&binding.body)?;
 
             let substitutions = typed_bound.substitutions.compose(&typed_body.substitutions);
 
             let bound = typed_bound.tree.apply(&substitutions);
             let body = typed_body.tree.apply(&substitutions);
-            let constraints = typed_bound
-                .constraints
+            let constraints = retained_constraints
                 .apply(&substitutions)
                 .union(typed_body.constraints.apply(&substitutions));
 

@@ -21,6 +21,7 @@ foreign raw_move_range  :: Buffer -> Int -> Int -> Result Int Bytes
 foreign raw_copy_range  :: Buffer -> Int -> Int -> Result Int Bytes
 foreign raw_write_file  :: Bytes -> Text -> Int
 
+(* Reconsider this. *)
 Mmap_Error   ::= Mmap_io Int
 Buffer_Error ::= Out_of_range
 

@@ -98,8 +98,9 @@ impl closed::SymbolTable {
         on_path: &mut Vec<QualifiedName>,
     ) -> usize {
         let inlined = |total: usize| if (1..=FLAT_INLINE_CAP).contains(&total) { total } else { 1 };
-        // A coproduct field inlines only under MARM_FLAT_SUMS (codegen must handle
-        // the tag+union). Off by default: sum fields stay one boxed word.
+        // A coproduct field inlines its tag+union into the parent (codegen handles
+        // construction/pattern/copy-out). Default on; opt out with MARM_NO_FLAT_SUMS
+        // to keep sum fields one boxed word.
         let sum_width = |this: &Self, name: &QualifiedName, on_path: &mut Vec<QualifiedName>| {
             if flat_sums_enabled() {
                 this.coproduct_layout(name, on_path).map_or(1, |l| inlined(l.union_width))
@@ -191,10 +192,12 @@ impl closed::SymbolTable {
     }
 }
 
-/// Whether inlined-sum flattening is enabled (`MARM_FLAT_SUMS`). Off by default:
-/// a coproduct field stays one boxed word, and applied types are not inlined.
+/// Whether inlined-sum flattening is enabled. Default on (verified byte-identical
+/// across the whole suite and alloc-neutral on every hot benchmark, since none
+/// stores a non-recursive sum in a record field); opt out with `MARM_NO_FLAT_SUMS`
+/// to keep a coproduct field one boxed word and leave applied types un-inlined.
 fn flat_sums_enabled() -> bool {
-    std::env::var_os("MARM_FLAT_SUMS").is_some()
+    std::env::var_os("MARM_NO_FLAT_SUMS").is_none()
 }
 
 /// The head type-constructor name of an applied type: `Perhaps τ` -> `Perhaps`,

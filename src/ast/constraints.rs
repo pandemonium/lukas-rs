@@ -219,6 +219,20 @@ impl WitnessEnvironment {
             return Err(TypeError::NoWitness(constraint.clone()));
         }
 
+        // `Memory_Layout τ` is compiler-derived, never user-written: a ground query
+        // is discharged by synthesised evidence -- a reference to the `memory_layout`
+        // marker carrying the ground `Memory_Layout τ` as its type, so the backend
+        // recovers `τ` and emits the layout dictionary. (A parametric `Memory_Layout α`
+        // took the early return above, becoming a forwarded dictionary parameter --
+        // ML1's "dyn" fallback -- so a caller who knows the concrete type fills it in.)
+        if *constraint.name() == crate::typer::memory_layout_class() {
+            let pi = ParseInfo::default();
+            return Ok(Expr::Variable(
+                pi.with_inferred_type(constraint.constraint_type.clone()),
+                Identifier::Free(crate::typer::memory_layout_evidence_name().into()),
+            ));
+        }
+
         let candidates = self
             .store
             .get(constraint.name())

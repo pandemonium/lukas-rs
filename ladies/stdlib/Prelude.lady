@@ -279,6 +279,24 @@ signature Display ::= ∀α.
   { display :: α -> Text
   }
 
+(* `Memory_Layout α` is the compiler-derived per-type memory layout (the `Sized`      *)
+(* analog). Its dictionary carries a `Raw_Shape` -- the same pre-order shape the flat  *)
+(* runtime uses to pack/trace a value -- so a generic container (`Array.generate`) can  *)
+(* store elements FLAT even where the element type is only known via a type parameter.  *)
+(* Witnesses are never user-written: the compiler synthesises the shape for each ground *)
+(* type (a boxed/recursive type reports a one-pointer shape, so the constraint only     *)
+(* ever UNLOCKS flattening, never blocks). `Raw_Shape` is an opaque runtime handle.     *)
+foreign Raw_Shape
+
+signature Memory_Layout ::= ∀α.
+  { shape :: Raw_Shape
+  }
+
+(* The `memory_layout` marker is the compiler-synthesised evidence for a ground     *)
+(* `Memory_Layout τ`: the backend replaces each reference with the layout dictionary *)
+(* for `τ` (recovered from the reference's type), so it has no companion C global.    *)
+foreign memory_layout :: ∀α. Memory_Layout α
+
 witness Display Text :=
   { display := λt. prim_show t
   }

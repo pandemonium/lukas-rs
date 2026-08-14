@@ -156,6 +156,12 @@ Value mk_tuple_uninit(size_t len);
 // `Mutable_Array` foreigns.
 Value flat_generate(int64_t length, Value mk_element);
 Value mk_flat_array_from(size_t n, Value *elems);
+// Like `mk_flat_array_from` but with a caller-supplied, type-driven element shape
+// (may contain inlined-sum nodes, which element-0 discovery cannot). See gc.c.
+Value mk_flat_array_from_shaped(size_t n, Value *elems, const int64_t *shape, size_t slen);
+// Like `flat_generate` but with a caller-supplied, type-driven shape (from the
+// `Memory_Layout` dictionary) so sum elements pack inline. See gc.c.
+Value flat_generate_shaped(int64_t length, Value mk_element, const int64_t *shape, size_t slen);
 size_t flat_array_count(Value arr);
 Value flat_array_get(Value arr, size_t i);
 Value flat_array_put(Value arr, size_t i, Value elt);

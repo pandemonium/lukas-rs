@@ -1059,6 +1059,33 @@ Value mk_tuple_uninit(size_t len) {
 
 #define FLAT_MAX_SHAPE 128
 #define FLAT_MAX_DEPTH 16
+#define FLAT_ARRAY_CTAG 1 // `ctag` marker distinguishing a flat-array OBJ_TUPLE from a product
+#define FLAT_MAX_FIELDS 64 // max constructor fields rebuilt on the C stack in unflatten
+// A shape entry is: 0 = leaf (one stored word); k>0 = product/variant of arity k
+// (its k child nodes follow in pre-order); SHAPE_SUM = an inlined sum, encoded
+// `[SHAPE_SUM, pad, nvariants, <variant nodes>]` where pad is the union payload
+// width (max variant leaves) and each variant node is `[m, <m field shapes>]`
+// (m = that constructor's field count). A sum element occupies `1 + pad` stored
+// words: [tag, active variant's leaves, zero-padding]. Sum nodes are emitted only
+// by codegen from the element TYPE (via a shaped array), never by element-0
+// discovery (`build_shape`), which cannot see a sum's other variants.
+#define SHAPE_SUM (-1)
+
+// Number of int64 entries the shape node at `i` spans (pre-order). A variant node
+// `[m, ...]` shares the product/leaf span logic (span of `[0]` and of an empty
+// variant `[0]` coincide), so only the sum header needs special handling.
+static size_t shape_span(const int64_t *shape, size_t i) {
+    int64_t node = shape[i];
+    if (node >= 0) { // leaf (0) or product/variant of arity `node`
+        size_t span = 1, c = i + 1;
+        for (int64_t k = 0; k < node; k++) { size_t s = shape_span(shape, c); c += s; span += s; }
+        return span;
+    }
+    int64_t nv = shape[i + 2]; // sum: [SHAPE_SUM, pad, nvariants] then each variant node
+    size_t span = 3, c = i + 3;
+    for (int64_t k = 0; k < nv; k++) { size_t s = shape_span(shape, c); c += s; span += s; }
+    return span;
+}
 
 // Pre-order shape of a value: append product/leaf entries to `shape`, return the
 // leaf count. `*ok` is cleared (and expansion stops) past the size/depth guard,
@@ -1068,8 +1095,12 @@ static size_t build_shape(Value v, int64_t *shape, size_t *slen, int depth, bool
     static int noflat = -1;
     if (noflat < 0) noflat = getenv("MARM_NOFLAT") != NULL;
     if (*slen >= FLAT_MAX_SHAPE) { *ok = false; return 1; }
-    if (!noflat && depth <= FLAT_MAX_DEPTH && !(v.w & IMM_TAG) &&
-        HEADER(as_ptr(v))->kind == OBJ_TUPLE) {
+    // Recurse only into a genuine product tuple: a non-zero pointer to an OBJ_TUPLE
+    // that is NOT itself a flat array (a nested flat array is opaque -- one leaf). The
+    // `v.w != 0` guard rejects a zero word (e.g. a sum element's inline padding) that
+    // would otherwise be chased as a pointer and fault.
+    if (!noflat && depth <= FLAT_MAX_DEPTH && v.w != 0 && !(v.w & IMM_TAG) &&
+        HEADER(as_ptr(v))->kind == OBJ_TUPLE && HEADER(as_ptr(v))->ctag != FLAT_ARRAY_CTAG) {
         Tuple *t = as_tuple(v);
         size_t k = HEADER(t)->body / sizeof(Value);
         shape[(*slen)++] = (int64_t)k; // product node of arity k
@@ -1083,17 +1114,34 @@ static size_t build_shape(Value v, int64_t *shape, size_t *slen, int depth, bool
     return 1;
 }
 
-// Pack `v`'s leaves into `dest` in shape order (advancing both cursors).
+// Pack `v`'s leaves into `dest` in shape order (advancing both cursors). A sum
+// node writes [tag, active variant's leaves, zero-padding to the union payload];
+// the padding keeps the blind even/odd tracer correct (0 is skipped -- DD3).
 static void flatten(Value v, const int64_t *shape, size_t *si, Value *dest, size_t *di) {
-    int64_t node = shape[(*si)++];
-    if (node == 0) {
+    int64_t node = shape[*si];
+    if (node == 0) { // leaf: one stored word
+        (*si)++;
         dest[(*di)++] = v;
         return;
     }
-    Tuple *t = as_tuple(v);
-    for (int64_t i = 0; i < node; i++) {
-        flatten(t->elems[i], shape, si, dest, di);
+    if (node > 0) { // product/record: `v` is a Tuple, flatten its fields in order
+        (*si)++;
+        Tuple *t = as_tuple(v);
+        for (int64_t i = 0; i < node; i++) flatten(t->elems[i], shape, si, dest, di);
+        return;
     }
+    // sum: `v` is a Data (tag in the header, fields inline).
+    size_t node_i = *si;
+    int64_t pad = shape[node_i + 1];
+    uint64_t tag = data_tag(v);
+    dest[(*di)++] = VInt((int64_t)tag);
+    size_t c = node_i + 3; // walk past earlier variant nodes to the active one
+    for (uint64_t k = 0; k < tag; k++) c += shape_span(shape, c);
+    int64_t m = shape[c]; // active variant's field count; its field shapes follow
+    size_t vi = c + 1, di0 = *di;
+    for (int64_t i = 0; i < m; i++) flatten(data_field(v, i), shape, &vi, dest, di);
+    for (size_t p = *di - di0; p < (size_t)pad; p++) dest[(*di)++] = (Value){0}; // zero-pad
+    *si = node_i + shape_span(shape, node_i);
 }
 
 // Rebuild the canonical (nested) value from `src`'s leaves in shape order. A
@@ -1102,18 +1150,41 @@ static void flatten(Value v, const int64_t *shape, size_t *si, Value *dest, size
 // skipped), so a GC during a later field's rebuild is safe; the GC is non-moving
 // so `src` (into the rooted array) stays valid.
 static Value unflatten(const int64_t *shape, size_t *si, const Value *src, size_t *sri) {
-    int64_t node = shape[(*si)++];
+    int64_t node = shape[*si];
     if (node == 0) {
+        (*si)++;
         return src[(*sri)++];
     }
-    size_t body = sizeof(Tuple) + (size_t)node * sizeof(Value);
-    Tuple *t = gc_new(body, OBJ_TUPLE);
-    memset(t->elems, 0, (size_t)node * sizeof(Value));
-    Value out = VObject(t);
-    for (int64_t i = 0; i < node; i++) {
-        Value child = unflatten(shape, si, src, sri);
-        as_tuple(out)->elems[i] = child; // re-read: `out` may have survived a GC
+    if (node > 0) {
+        (*si)++;
+        size_t body = sizeof(Tuple) + (size_t)node * sizeof(Value);
+        Tuple *t = gc_new(body, OBJ_TUPLE);
+        memset(t->elems, 0, (size_t)node * sizeof(Value));
+        Value out = VObject(t);
+        for (int64_t i = 0; i < node; i++) {
+            Value child = unflatten(shape, si, src, sri);
+            as_tuple(out)->elems[i] = child; // re-read: `out` may have survived a GC
+        }
+        return out;
     }
+    // sum: read the tag word, rebuild the active variant's boxed Data. The fields
+    // build into a C-stack array (each is a conservative root while later fields'
+    // rebuilds may GC); `src` points into the rooted, non-moving array, so it stays
+    // valid across those allocations.
+    size_t node_i = *si;
+    int64_t pad = shape[node_i + 1];
+    uint64_t tag = (uint64_t)as_int(src[*sri]);
+    (*sri)++;
+    size_t payload0 = *sri;
+    size_t c = node_i + 3;
+    for (uint64_t k = 0; k < tag; k++) c += shape_span(shape, c);
+    int64_t m = shape[c];
+    size_t vi = c + 1;
+    Value fields[FLAT_MAX_FIELDS];
+    for (int64_t i = 0; i < m; i++) fields[i] = unflatten(shape, &vi, src, sri);
+    Value out = mk_data_inline(VInt((int64_t)tag), (size_t)m, fields);
+    *sri = payload0 + (size_t)pad; // skip the union payload (active leaves + padding)
+    *si = node_i + shape_span(shape, node_i);
     return out;
 }
 
@@ -1138,6 +1209,12 @@ static Value mk_flat_array(size_t count, size_t stride, const int64_t *shape, si
     size_t body = sizeof(Tuple) + words * sizeof(Value);
     Tuple *t = gc_new(body, OBJ_TUPLE);
     memset(t->elems, 0, words * sizeof(Value));
+    // Mark this OBJ_TUPLE as a flat array (the `ctag` header byte is otherwise unused
+    // for tuples). A flat array's body is `[count, stride, shape...]` + packed leaves,
+    // NOT a plain product, so `build_shape` must treat a NESTED flat array as one
+    // opaque leaf rather than recursing into its header/padding words (which it would
+    // misread -- and a zero-padding word would fault as a bogus pointer).
+    HEADER(t)->ctag = FLAT_ARRAY_CTAG;
     t->elems[0] = VInt((int64_t)count);
     t->elems[1] = VInt((int64_t)stride);
     t->elems[2] = VInt((int64_t)slen);
@@ -1199,6 +1276,35 @@ Value mk_flat_array_from(size_t n, Value *elems) {
     return arr;
 }
 
+// Stored-word count (stride contribution) of the shape node at `*i`, advancing
+// `*i` past it. A sum node contributes `1 + pad` (tag + union payload).
+static size_t shape_leaves(const int64_t *shape, size_t *i) {
+    int64_t node = shape[*i];
+    if (node == 0) { (*i)++; return 1; }
+    if (node > 0) {
+        (*i)++;
+        size_t sum = 0;
+        for (int64_t k = 0; k < node; k++) sum += shape_leaves(shape, i);
+        return sum;
+    }
+    size_t pad = (size_t)shape[*i + 1];
+    *i += shape_span(shape, *i);
+    return 1 + pad;
+}
+
+// Build a flat array from `n` evaluated elements using a caller-supplied,
+// type-driven shape (codegen emits it from the element type). Unlike
+// `mk_flat_array_from`, the shape may contain sum nodes: element-0 discovery
+// cannot see a sum's other variants, so a sum element's shape MUST come from the
+// type. `elems` is a live stack root across the (GC-triggering) allocation.
+Value mk_flat_array_from_shaped(size_t n, Value *elems, const int64_t *shape, size_t slen) {
+    size_t i0 = 0;
+    size_t stride = shape_leaves(shape, &i0);
+    Value arr = mk_flat_array(n, stride, shape, slen);
+    for (size_t i = 0; i < n; i++) flat_array_set(arr, i, elems[i]);
+    return arr;
+}
+
 // Build a flat array of `length` elements, each `apply(mk_element, i)`. The
 // element shape is taken from element 0; an empty array defaults to one leaf.
 Value flat_generate(int64_t length, Value mk_element) {
@@ -1220,6 +1326,23 @@ Value flat_generate(int64_t length, Value mk_element) {
     flat_array_set(arr, 0, e0);
     for (int64_t i = 1; i < length; i++) {
         Value ei = apply(mk_element, VInt(i)); // may GC; arr rooted on stack
+        flat_array_set(arr, (size_t)i, ei);
+    }
+    return arr;
+}
+
+// Like `flat_generate` but with a caller-supplied, type-driven element shape (from
+// the `Memory_Layout` dictionary), so a sum element packs inline instead of staying
+// a boxed pointer. Unlike `flat_generate`'s element-0 discovery, this shape covers
+// every variant of the element type, so a later `flat_array_put` of any variant is
+// sound. Each `apply(mk_element, i)` may GC; `arr` is rooted on the stack across it.
+Value flat_generate_shaped(int64_t length, Value mk_element, const int64_t *shape, size_t slen) {
+    size_t i0 = 0;
+    size_t stride = shape_leaves(shape, &i0);
+    if (length <= 0) return mk_flat_array(0, stride, shape, slen);
+    Value arr = mk_flat_array((size_t)length, stride, shape, slen);
+    for (int64_t i = 0; i < length; i++) {
+        Value ei = apply(mk_element, VInt(i));
         flat_array_set(arr, (size_t)i, ei);
     }
     return arr;

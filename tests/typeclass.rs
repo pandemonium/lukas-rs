@@ -200,3 +200,29 @@ start :: Int -> Int := λ_.
 
     assert_eq!(eval_start("traversable", source), Ok("6".to_string()));
 }
+
+/// A substitution learned while typing an ordinary `let` must be visible while
+/// typing its body. Here the identity `let*` binders are inferred before their
+/// integer arguments; `a + b` then refines both binders to `Int`. Interpolation
+/// after that refinement must resolve `Display Int`, rather than leaking two
+/// phantom `Display $meta` dictionary parameters into the nullary `probe` value.
+#[test]
+fn let_body_uses_substituted_context() {
+    let source = r#"
+bind :: ∀α β. (α -> β) -> α -> β := λf x. f x
+
+probe :: Int :=
+  let* a = 100 in
+  let* b = 100 in
+  let sum = a + b in
+  let rendered = "`a`+`b`=`sum`" in
+  if rendered = "100+100=200" then sum else 0
+
+start :: Int -> Int := λ_. probe
+"#;
+
+    assert_eq!(
+        eval_start("let_substituted_context", source),
+        Ok("200".to_string())
+    );
+}
