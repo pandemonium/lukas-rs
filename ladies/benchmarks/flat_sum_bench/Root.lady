@@ -1,0 +1,28 @@
+use Stdlib.
+
+(* Inlined-sum allocation benchmark (companion to flat_boxes for records). Each   *)
+(* iteration builds a Rec = an Int field plus a `Perhaps Int` field. With inlined  *)
+(* sums (default; opt out MARM_NO_FLAT_SUMS) the whole Rec is ONE object whose body *)
+(* is [n, tag, payload]; without it, the Rec object plus a separate `This` box =    *)
+(* two allocations. So default-on should allocate ~2x fewer objects. The record    *)
+(* escapes into `total`, which pattern-matches both the record and the inlined sum. *)
+
+Rec ::=
+  { n :: Int
+    m :: Perhaps Int
+  }
+
+module Bench:
+  total :: Rec -> Int := λr.
+    deconstruct r into
+      { n: n; m: This x } -> n + x
+    | { n: n; m: Nope }   -> n
+
+  loop :: Int -> Int -> Int := λn acc.
+    if n <= 0 then acc
+    else
+      let r = { n := n; m := This (n + 1) } in
+      loop (n - 1) (acc + Bench.total r)
+
+start := λ_.
+  print_endline "sum `Bench.loop 50000000 0`"

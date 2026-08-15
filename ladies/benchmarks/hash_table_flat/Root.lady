@@ -1,0 +1,41 @@
+use Stdlib.
+use Stdlib.Data.Hash_Table.
+
+(* Deterministic Int -> Int HashTable stressor. Starting at eight buckets forces *)
+(* repeated growth; the fixed Simple_Hasher seed makes paired compiler runs stable. *)
+
+insert_n :: Int -> Int -> Hash_Table Int Int -> IO Unit := λi n table.
+  if i < n then
+    let* _ = Hash_Table.insert i (i * 7 + 1) table in
+    insert_n (i + 1) n table
+  else
+    pure ()
+
+sum_present :: Int -> Int -> Int -> Hash_Table Int Int -> IO Int := λi n acc table.
+  if i < n then
+    let* found = Hash_Table.lookup i table in
+    deconstruct found into
+      This value -> sum_present (i + 1) n (acc + value) table
+    | Nope -> sum_present (i + 1) n (acc - 1) table
+  else
+    pure acc
+
+count_ghosts :: Int -> Int -> Int -> Hash_Table Int Int -> IO Int := λi n ghosts table.
+  if i < n then
+    let* found = Hash_Table.lookup (i + n) table in
+    deconstruct found into
+      This _ -> count_ghosts (i + 1) n (ghosts + 1) table
+    | Nope -> count_ghosts (i + 1) n ghosts table
+  else
+    pure ghosts
+
+main :: IO Unit :=
+  let n = 1000000 in
+  let table = Hash_Table.make 8 (Simple_Hasher.make 1) in
+  let* _ = insert_n 0 n table in
+  let* checksum = sum_present 0 n 0 table in
+  let* ghosts = count_ghosts 0 n 0 table in
+  IO.output "n=`n` checksum=`checksum` ghosts=`ghosts`"
+
+start :: Int -> Unit := λ_.
+  IO.unsafe_run_IO main

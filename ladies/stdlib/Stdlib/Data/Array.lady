@@ -34,6 +34,11 @@ module Mutable_Array:
   get_unchecked :: ∀α. Mutable_Array α -> Int -> IO α := λ(Mutable array) index.
     IO.suspend (λ_. raw_get_unchecked array index)
 
+  (* Pure escape hatch for implementing a larger atomic IO operation. Callers must *)
+  (* ensure the result does not outlive the surrounding operation or race a write.  *)
+  unsafe_get_unchecked :: ∀α. Mutable_Array α -> Int -> α := λ(Mutable array) index.
+    raw_get_unchecked array index
+
   put_unchecked :: ∀α. Mutable_Array α -> Int -> α -> IO α := λ(Mutable array) index element.
     IO.suspend (λ_. raw_put_unchecked array index element)
 

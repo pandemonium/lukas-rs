@@ -100,7 +100,11 @@ impl phase::SymbolTable<Types> {
         // the local rules; `MARM_NO_SIMPLIFY=1` bypasses the pass entirely.
         let (inlinables, leaf_inlinables, recursive) =
             if std::env::var_os("MARM_NO_INLINE").is_some() {
-                (Inlinables::default(), Inlinables::default(), HashSet::default())
+                (
+                    Inlinables::default(),
+                    Inlinables::default(),
+                    HashSet::default(),
+                )
             } else {
                 build_inlinables(&symbols)
             };
@@ -142,7 +146,10 @@ impl phase::SymbolTable<Types> {
                                 simplify_term(body, &leaf_inlinables)
                             }
                         };
-                        if dump.as_deref().is_some_and(|f| name.to_string().contains(f)) {
+                        if dump
+                            .as_deref()
+                            .is_some_and(|f| name.to_string().contains(f))
+                        {
                             eprintln!("==== {} ====\n{}\n", name, body);
                         }
                         Symbol::Term(TermSymbol {
@@ -916,9 +923,10 @@ fn pattern_min_level<A>(pattern: &Pattern<A, Identifier>) -> Option<usize> {
         Pattern::Tuple(_, TuplePattern { elements }) => {
             elements.iter().filter_map(pattern_min_level).min()
         }
-        Pattern::Struct(_, StructPattern { fields }) => {
-            fields.iter().filter_map(|(_, p)| pattern_min_level(p)).min()
-        }
+        Pattern::Struct(_, StructPattern { fields }) => fields
+            .iter()
+            .filter_map(|(_, p)| pattern_min_level(p))
+            .min(),
     }
 }
 

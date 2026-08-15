@@ -1,0 +1,35 @@
+use Stdlib.
+use Stdlib.Data.Array.
+
+(* Generic packed sum-match benchmark. The worker knows only Box alpha, while *)
+(* the concrete caller supplies the complete Box Int layout dictionary. *)
+
+Box ::= ∀α.
+  { base :: Int
+    cell :: Perhaps α
+  }
+
+module Generic:
+  modulus :: Int := 1000000007
+
+  sum :: ∀α. Memory_Layout (Box α) |- (Int -> Box α) -> Mutable_Array (Box α) -> Int -> Int -> Int :=
+    λmake table n acc.
+      if n <= 0 then
+        let _ = Mutable_Array.generate 0 make in acc
+      else
+        let index = (n * 189812531) % 1048576 in
+        let element = unsafe_run_IO (Mutable_Array.get_unchecked table index) in
+        let score =
+          deconstruct element.cell into
+            This _ -> element.base + 1
+          | Nope -> element.base
+        in sum make table (n - 1) ((acc + score) % modulus)
+
+make_box :: Int -> Box Int := λi.
+  if i % 3 = 0
+    then { base := i; cell := Nope }
+    else { base := i; cell := This (i + 1) }
+
+start := λ_.
+  let table = Mutable_Array.generate 1048576 make_box in
+  print_endline "generic-sum-read `Generic.sum make_box table 50000000 0`"

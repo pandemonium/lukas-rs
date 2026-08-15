@@ -1,0 +1,29 @@
+use Stdlib.
+use Stdlib.Data.Array.
+
+(* A dynamic structural-write benchmark: the replacement sum is constructed from *)
+(* an existing record variable, rather than from a record literal at the write site. *)
+
+Entry ::= ∀α.
+  { key   :: α
+    value :: Int
+  }
+
+module Generic:
+  write :: ∀α. Memory_Layout (Perhaps (Entry α)) |- (Int -> Perhaps (Entry α)) -> Entry α -> Mutable_Array (Perhaps (Entry α)) -> Int -> Int :=
+    λmake entry table n.
+      if n <= 0 then
+        let _ = Mutable_Array.generate 0 make in 0
+      else
+        let _ = unsafe_run_IO (Mutable_Array.set_unchecked table (n % 1048576) (This entry))
+        in write make entry table (n - 1)
+
+make_entry :: Int -> Perhaps (Entry Int) := λ_. Nope
+
+start := λ_.
+  let table = Mutable_Array.generate 1048576 make_entry in
+  let entry = { key := 41; value := 1 } in
+  let _ = Generic.write make_entry entry table 50000000 in
+  deconstruct unsafe_run_IO (Mutable_Array.get_unchecked table 1) into
+    This found -> print_endline "generic-dynamic-write `found.key + found.value`"
+  | Nope       -> print_endline "generic-dynamic-write failed"

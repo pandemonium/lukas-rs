@@ -1,0 +1,29 @@
+use Stdlib.
+use Stdlib.Data.Array.
+
+(* Generic read-modify-write fusion benchmark. The old Box never becomes a *)
+(* canonical object and the literal replacement is stored leaf-by-leaf. *)
+
+Box ::= ∀α.
+  { payload :: α
+    count :: Int
+  }
+
+module Generic:
+  update :: ∀α. Memory_Layout (Box α) |- (Int -> Box α) -> Mutable_Array (Box α) -> Int -> Int :=
+    λmake table n.
+      if n <= 0 then
+        let _ = Mutable_Array.generate 0 make in 0
+      else
+        let index = n % 1048576 in
+        let old = unsafe_run_IO (Mutable_Array.get_unchecked table index) in
+        let _ = unsafe_run_IO (Mutable_Array.set_unchecked table index { payload := old.payload; count := old.count + 1 })
+        in update make table (n - 1)
+
+make_box :: Int -> Box Int := λi. { payload := i; count := 0 }
+
+start := λ_.
+  let table = Mutable_Array.generate 1048576 make_box in
+  let _ = Generic.update make_box table 50000000 in
+  let box = unsafe_run_IO (Mutable_Array.get_unchecked table 1) in
+  print_endline "generic-rmw `box.payload + box.count`"

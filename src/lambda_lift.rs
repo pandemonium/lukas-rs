@@ -97,13 +97,20 @@ impl closed::SymbolTable {
         type_expr: &TypeExpression<A, QualifiedName>,
         on_path: &mut Vec<QualifiedName>,
     ) -> usize {
-        let inlined = |total: usize| if (1..=FLAT_INLINE_CAP).contains(&total) { total } else { 1 };
+        let inlined = |total: usize| {
+            if (1..=FLAT_INLINE_CAP).contains(&total) {
+                total
+            } else {
+                1
+            }
+        };
         // A coproduct field inlines its tag+union into the parent (codegen handles
         // construction/pattern/copy-out). Default on; opt out with MARM_NO_FLAT_SUMS
         // to keep sum fields one boxed word.
         let sum_width = |this: &Self, name: &QualifiedName, on_path: &mut Vec<QualifiedName>| {
             if flat_sums_enabled() {
-                this.coproduct_layout(name, on_path).map_or(1, |l| inlined(l.union_width))
+                this.coproduct_layout(name, on_path)
+                    .map_or(1, |l| inlined(l.union_width))
             } else {
                 1
             }
@@ -121,9 +128,12 @@ impl closed::SymbolTable {
                 on_path.pop();
                 width
             }
-            TypeExpression::Tuple(_, TupleTypeExpr(elements)) => {
-                inlined(elements.iter().map(|e| self.type_expr_width(e, on_path)).sum())
-            }
+            TypeExpression::Tuple(_, TupleTypeExpr(elements)) => inlined(
+                elements
+                    .iter()
+                    .map(|e| self.type_expr_width(e, on_path))
+                    .sum(),
+            ),
             // An applied type constructor -- `Perhaps τ`, `Result e a`, `Pair a b`:
             // its layout is fixed by the head (parameters are width-1 either way,
             // ground-field rule), so peel to the head and use its record/sum width.
@@ -184,11 +194,18 @@ impl closed::SymbolTable {
             }
             variant_widths.push(widths);
         }
-        let payload = variant_widths.iter().map(|v| v.iter().sum::<usize>()).max().unwrap_or(0);
+        let payload = variant_widths
+            .iter()
+            .map(|v| v.iter().sum::<usize>())
+            .max()
+            .unwrap_or(0);
         let union_width = 1 + payload; // tag word + widest variant's payload
         (1..=FLAT_INLINE_CAP)
             .contains(&union_width)
-            .then_some(CoproductLayout { union_width, variant_widths })
+            .then_some(CoproductLayout {
+                union_width,
+                variant_widths,
+            })
     }
 }
 
@@ -220,10 +237,15 @@ fn type_expr_references_path<A>(
     match type_expr {
         TypeExpression::Constructor(_, name) => on_path.contains(name),
         TypeExpression::Parameter(..) => false,
-        TypeExpression::Tuple(_, TupleTypeExpr(elements)) => {
-            elements.iter().any(|e| type_expr_references_path(e, on_path))
-        }
-        TypeExpression::Apply(_, ApplyTypeExpr { function, argument, .. }) => {
+        TypeExpression::Tuple(_, TupleTypeExpr(elements)) => elements
+            .iter()
+            .any(|e| type_expr_references_path(e, on_path)),
+        TypeExpression::Apply(
+            _,
+            ApplyTypeExpr {
+                function, argument, ..
+            },
+        ) => {
             type_expr_references_path(function, on_path)
                 || type_expr_references_path(argument, on_path)
         }
@@ -288,17 +310,15 @@ impl closed::SymbolTable {
             .symbols
             .values()
             .filter_map(|symbol| match symbol {
-                Symbol::Type(type_symbol) => Some((
-                    type_symbol.qualified_name(),
-                    type_symbol.definition.clone(),
-                )),
+                Symbol::Type(type_symbol) => {
+                    Some((type_symbol.qualified_name(), type_symbol.definition.clone()))
+                }
                 Symbol::Term(..) => None,
             })
             .collect();
         // Per-coproduct inlined layout: (union width = tag + widest variant, per-tag
         // variant field widths). Only non-recursive sums under the cap appear.
-        let mut coproduct_layouts: HashMap<QualifiedName, CoproductLayout> =
-            HashMap::default();
+        let mut coproduct_layouts: HashMap<QualifiedName, CoproductLayout> = HashMap::default();
         for symbol in self.symbols.values() {
             if let Symbol::Type(type_symbol) = symbol {
                 if let TypeDefinition::Coproduct(coproduct) = &type_symbol.definition {
@@ -319,7 +339,10 @@ impl closed::SymbolTable {
             let mut sums: Vec<_> = coproduct_layouts.iter().collect();
             sums.sort_by_key(|(name, _)| name.to_string());
             for (name, layout) in sums {
-                eprintln!("[layout] sum {name}: union={} variants={:?}", layout.union_width, layout.variant_widths);
+                eprintln!(
+                    "[layout] sum {name}: union={} variants={:?}",
+                    layout.union_width, layout.variant_widths
+                );
             }
         }
 
@@ -447,13 +470,14 @@ fn forwarded_self(stage_env: &Expr, marker: &SelfMarker) -> Option<usize> {
     let Expr::Tuple(_, tuple) = stage_env else {
         return None;
     };
-    tuple.elements.iter().position(|element| {
-        match (marker, element.as_ref()) {
+    tuple
+        .elements
+        .iter()
+        .position(|element| match (marker, element.as_ref()) {
             (SelfMarker::Origin, Expr::Variable(_, Identifier::SelfRef)) => true,
             (SelfMarker::Capture(k), Expr::Variable(_, Identifier::Captured(c))) => c.index() == *k,
             _ => false,
-        }
-    })
+        })
 }
 
 // The remap that flattens the innermost stage's frame into the N-ary worker

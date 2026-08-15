@@ -169,6 +169,7 @@ Value flat_array_put(Value arr, size_t i, Value elt);
 // Read one statically-known leaf directly from packed element storage, without
 // rebuilding the canonical aggregate around it.
 Value flat_array_get_word(Value arr, size_t i, size_t word_offset);
+void flat_array_set_word(Value arr, size_t i, size_t word_offset, Value value);
 
 // Box a double on the heap (OBJ_FLOAT leaf). A 64-bit IEEE-754 value cannot
 // share the word with the immediate tag bit, so every computed Float is a heap

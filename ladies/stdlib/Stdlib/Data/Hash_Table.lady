@@ -67,14 +67,14 @@ Hash_Table ::= ∀α β.
   }
 
 module Hash_Table:
-  make :: ∀α β h. Eq α + Hashable α + Hash_Stream h |- Int -> h -> Hash_Table α β :=
+  make :: ∀α β h. Eq α + Hashable α + Hash_Stream h + Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- Int -> h -> Hash_Table α β :=
     λcapacity initial.
       { Raw        := Raw_Table.make capacity
         Hash_Key   := hash_with initial
         Keys_Equal := eq
       }
 
-  with_random_seed :: ∀α β h. Eq α + Hashable α + Hash_Stream h |- Int -> (Int -> h) -> IO (Hash_Table α β) :=
+  with_random_seed :: ∀α β h. Eq α + Hashable α + Hash_Stream h + Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- Int -> (Int -> h) -> IO (Hash_Table α β) :=
     λcapacity make_hash_stream.
       IO.suspend (λ_. make capacity (make_hash_stream (now_millis ())))
 
@@ -82,12 +82,12 @@ module Hash_Table:
   (* hasher -- the single place a concrete algorithm is chosen (as Rust's          *)
   (* `HashMap::new` commits to `RandomState`). Swap `Simple_Hasher.make` for a      *)
   (* strong keyed hasher's constructor once one exists; nothing else changes.       *)
-  make_default :: ∀α β. Eq α + Hashable α |- Int -> IO (Hash_Table α β) :=
+  make_default :: ∀α β. Eq α + Hashable α + Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- Int -> IO (Hash_Table α β) :=
     λcapacity.
       with_random_seed capacity Simple_Hasher.make
 
   (* fold_m insead and let f compute in IO? *)
-  fold :: ∀α β z. (z -> (α, β) -> z) -> z -> Hash_Table α β -> IO z := λf z table.
+  fold :: ∀α β z. Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- (z -> (α, β) -> z) -> z -> Hash_Table α β -> IO z := λf z table.
     let* state = Mutable_Array.get_unchecked table.Raw.State 0 in
     let length = Mutable_Array.length state.Controls in
 
@@ -103,10 +103,10 @@ module Hash_Table:
       else pure acc
     in fold_entries 0 z
 
-  to_list :: ∀α β. Hash_Table α β -> IO (List (α, β)) :=
+  to_list :: ∀α β. Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- Hash_Table α β -> IO (List (α, β)) :=
     fold (λz kv. Cons kv z) List.empty
 
-  insert :: ∀α β. α -> β -> Hash_Table α β -> IO (Perhaps β) := λkey value table.
+  insert :: ∀α β. Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- α -> β -> Hash_Table α β -> IO (Perhaps β) := λkey value table.
     let hash = table.Hash_Key key in
     let* found = Raw_Table.find hash (λ({ Key: existing_key; Value: _ }). table.Keys_Equal key existing_key) table.Raw in
 
@@ -131,24 +131,24 @@ module Hash_Table:
         let* _ = Raw_Table.insert_no_grow hash entry table.Raw in
         pure Perhaps.empty
 
-  lookup :: ∀α β. α -> Hash_Table α β -> IO (Perhaps β) := λkey table.
+  lookup :: ∀α β. Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- α -> Hash_Table α β -> IO (Perhaps β) := λkey table.
     let hash = table.Hash_Key key in
-    let* found = Raw_Table.find hash (λ({ Key: existing_key; Value: _ }). table.Keys_Equal key existing_key) table.Raw in
-
-    deconstruct found into
-      This index ->
-        let* state = Mutable_Array.get_unchecked table.Raw.State 0 in
-        let* entry = Mutable_Array.get_unchecked state.Entries index in
-        let value = fmap (λ({ Key: _; Value: value }). value) entry in
-        pure value
-    | Nope -> pure Perhaps.empty
+    IO.suspend (λ_.
+      let found = IO.unsafe_run_IO (Raw_Table.find hash (λ({ Key: existing_key; Value: _ }). table.Keys_Equal key existing_key) table.Raw) in
+      deconstruct found into
+        This index ->
+          let state = Mutable_Array.unsafe_get_unchecked table.Raw.State 0 in
+          deconstruct Mutable_Array.unsafe_get_unchecked state.Entries index into
+            This { Key: _; Value: value } -> This value
+          | Nope -> Perhaps.empty
+      | Nope -> Perhaps.empty)
 
   Raw_Table ::= ∀α β.
     { State :: Mutable_Array (Raw_Table.Raw_State α β)
     }
 
   module Raw_Table:
-    make :: ∀α β. Int -> Raw_Table α β := λcapacity.
+    make :: ∀α β. Memory_Layout (Perhaps (Table_Entry α β)) |- Int -> Raw_Table α β := λcapacity.
       let capacity1 = if capacity < 8 then 8 else capacity in
       let controls = Mutable_Array.generate capacity1 (λ_. Empty) in
       let entries = Mutable_Array.generate capacity1 (λ_. Nope) in
@@ -203,37 +203,33 @@ module Hash_Table:
       let offset = (probe * (probe + 1)) / 2 in
       positive_mod (hash + offset) capacity
 
-    find :: ∀α β. Int -> (Table_Entry α β -> Bool) -> Raw_Table α β -> IO (Perhaps Int) :=
+    find :: ∀α β. Memory_Layout (Perhaps (Table_Entry α β)) |- Int -> (Table_Entry α β -> Bool) -> Raw_Table α β -> IO (Perhaps Int) :=
       λhash matches table.
-        let* state = Mutable_Array.get_unchecked table.State 0 in
-        let capacity = Mutable_Array.length state.Controls in
-        let wanted_fingerprint = fingerprint hash in
+        IO.suspend (λ_.
+          let state = Mutable_Array.unsafe_get_unchecked table.State 0 in
+          let capacity = Mutable_Array.length state.Controls in
+          let wanted_fingerprint = fingerprint hash in
 
-        let loop = λprobe.
-          if probe < capacity then
-            let index = probe_index hash probe capacity in
-            let* control = Mutable_Array.get_unchecked state.Controls index in
+          let loop = λprobe.
+            if probe < capacity then
+              let index = probe_index hash probe capacity in
+              deconstruct Mutable_Array.unsafe_get_unchecked state.Controls index into
+                Empty -> Perhaps.empty
+              | Deleted -> loop (probe + 1)
+              | Full stored_fingerprint ->
+                if stored_fingerprint = wanted_fingerprint then
+                  deconstruct Mutable_Array.unsafe_get_unchecked state.Entries index into
+                    This entry ->
+                      if matches entry
+                        then This index
+                        else loop (probe + 1)
+                  | Nope -> loop (probe + 1)
+                else
+                  loop (probe + 1)
+            else
+              Perhaps.empty
 
-            deconstruct control into
-              Empty -> pure Perhaps.empty
-            | Deleted -> loop (probe + 1)
-            | Full stored_fingerprint ->
-              if stored_fingerprint = wanted_fingerprint then
-                let* entry = Mutable_Array.get_unchecked state.Entries index in
-                perhaps
-                  (loop (probe + 1))
-                  (λentry.
-                    if matches entry
-                      then pure (This index)
-                      else loop (probe + 1))
-                  entry
-              else
-                loop (probe + 1)
-
-          else
-            pure Perhaps.empty
-
-        in loop 0
+          in loop 0)
 
     find_insert_slot :: ∀α β. Int -> Raw_Table α β -> IO Int := λhash table.
       let* state = Mutable_Array.get_unchecked table.State 0 in
@@ -257,7 +253,7 @@ module Hash_Table:
 
       in loop 0 Perhaps.empty
 
-    insert_no_grow :: ∀α β. Int -> Table_Entry α β -> Raw_Table α β -> IO Unit :=
+    insert_no_grow :: ∀α β. Memory_Layout (Perhaps (Table_Entry α β)) |- Int -> Table_Entry α β -> Raw_Table α β -> IO Unit :=
       λhash entry table.
         let* state = Mutable_Array.get_unchecked table.State 0 in
         let* index = find_insert_slot hash table in
@@ -275,7 +271,7 @@ module Hash_Table:
             }
         in pure ()
 
-    rehash :: ∀α β. (α -> Int) -> Int -> Raw_Table α β -> IO Unit :=
+    rehash :: ∀α β. Memory_Layout (Perhaps (Table_Entry α β)) |- (α -> Int) -> Int -> Raw_Table α β -> IO Unit :=
       λhash_key new_capacity table.
         let* old_state = Mutable_Array.get_unchecked table.State 0 in
         let new_table = Raw_Table.make new_capacity in
@@ -307,7 +303,7 @@ module Hash_Table:
               new_state
           in pure ()
 
-    reserve :: ∀α β. (α -> Int) -> Int -> Raw_Table α β -> IO Unit :=
+    reserve :: ∀α β. Memory_Layout (Perhaps (Table_Entry α β)) |- (α -> Int) -> Int -> Raw_Table α β -> IO Unit :=
       λhash_key additional table.
         let* state = Mutable_Array.get_unchecked table.State 0 in
         if state.Growth_Left >= additional then

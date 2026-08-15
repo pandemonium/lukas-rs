@@ -1,0 +1,27 @@
+use Stdlib.
+
+(* Focused A/B for immediately consuming a sum projected from a flat record.   *)
+(* Default reads the inline tag/payload region in place. MARM_NO_FLAT_SUMS=1   *)
+(* uses the canonical boxed Perhaps field.                                     *)
+
+Rec ::= { n :: Int; m :: Perhaps Int }
+
+module Bench:
+  modulus :: Int := 1000000007
+
+  score :: Rec -> Int := λr.
+    deconstruct r.m into
+      This x -> r.n + x
+    | Nope -> r.n
+
+  loop :: Int -> Int -> Int := λn acc.
+    if n <= 0 then acc
+    else
+      let r =
+        if n % 3 = 0
+          then { n := n; m := Nope }
+          else { n := n; m := This (n + 1) }
+      in loop (n - 1) ((acc + score r) % modulus)
+
+start := λ_.
+  print_endline "sum-project `Bench.loop 50000000 0`"

@@ -664,9 +664,7 @@ impl Ord for Literal {
         match (self, other) {
             (Self::Int(lhs), Self::Int(rhs)) => lhs.cmp(rhs),
 
-            (Self::Float(lhs), Self::Float(rhs)) => {
-                lhs.total_cmp(rhs)
-            }
+            (Self::Float(lhs), Self::Float(rhs)) => lhs.total_cmp(rhs),
 
             (Self::Text(lhs), Self::Text(rhs)) => lhs.cmp(rhs),
 

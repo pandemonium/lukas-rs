@@ -8,7 +8,9 @@ use crate::{
     interpreter::{Interpretation, Literal, RuntimeError, cek::Val},
     parser::{self, ParseInfo, Parsed},
     phase::Phase,
-    typer::{BaseType, ConstraintSet, MetaVariable, Type, TypeScheme, display_list, stdlib_text_type},
+    typer::{
+        BaseType, ConstraintSet, MetaVariable, Type, TypeScheme, display_list, stdlib_text_type,
+    },
 };
 
 #[derive(Clone)]

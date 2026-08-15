@@ -1,0 +1,63 @@
+(* Retained-sum GC benchmark -- the long-lived companion to flat_sum_bench (which  *)
+(* is transient: it builds a Rec and consumes it in the same breath, so every      *)
+(* object dies young and never survives a collection).                             *)
+(*                                                                                 *)
+(* Here a large List of Recs is built ONCE and kept live for the whole run while a *)
+(* churn loop allocates short-lived garbage on top of it. Each Rec is an Int plus  *)
+(* a `Perhaps Int` sum field. With inlined sums (the default) a Rec is ONE object  *)
+(* whose body is [n, tag, payload]; with MARM_NO_FLAT_SUMS the `Perhaps` becomes a *)
+(* separate `This` box, so every `This`-carrying Rec is two objects, not one:      *)
+(*     flat:   N Cons + N Rec                                                       *)
+(*     boxed:  N Cons + N Rec + (~2/3 N) This-boxes   (Nope is a shared nullary)    *)
+(* GC tracing cost tracks live-object COUNT (see notes/gc-design.md), so a smaller *)
+(* retained set means each full collection traces fewer objects -- inlined sums     *)
+(* should cut both RSS and per-collection trace time here, a survivor-sensitive win *)
+(* distinct from flat_sum_bench's pure allocation-rate win. `keep` is threaded      *)
+(* through `churn` to stay live; the churn garbage drives collection FREQUENCY while *)
+(* the retained set drives per-collection COST. The fold in `sum` destructures each *)
+(* Rec's inlined sum in place (the reach-through path, no copy-out); `sum` is        *)
+(* accumulator-tail-recursive so folding 10M elements does not overflow the stack.  *)
+(*                                                                                  *)
+(* Under the default GC (big nursery, generational) the retained set is traced only *)
+(* a handful of times, so the visible signal is modest: ~25% fewer objects allocated *)
+(* (~5% fewer bytes) and lower RSS. To expose the survivor-tracing cost, force       *)
+(* frequent FULL collections that re-mark the whole live set:                        *)
+(*     MARM_NURSERY=16384 MARM_NOGEN=1 MARM_GC_STATS=1 ./retained_sum               *)
+(* At which point inlined sums cut GC time ~1.5x (the boxed variant drags ~8M extra *)
+(* This boxes through every trace) -- the pivot this benchmark exists to measure.   *)
+
+List ::= ∀α. Nil | Cons α (List α)
+
+Rec ::=
+  { n :: Int
+    m :: Perhaps Int
+  }
+
+module Bench:
+  mk :: Int -> Rec := λn.
+    if n % 3 = 0 then { n := n; m := Nope } else { n := n; m := This n }
+
+  build :: Int -> List Rec -> List Rec := λn acc.
+    if n < 1 then acc else build (n - 1) (Cons (Bench.mk n) acc)
+
+  sum :: List Rec -> Int -> Int := λxs acc.
+    deconstruct xs into
+      Nil         -> acc
+    | Cons r rest ->
+        deconstruct r into
+          { n: n; m: This x } -> sum rest ((acc + n + x) % 1000000007)
+        | { n: n; m: Nope }   -> sum rest ((acc + n) % 1000000007)
+
+  range :: Int -> Int -> List Rec := λlo hi.
+    if hi < lo then Nil else Cons (Bench.mk lo) (range (lo + 1) hi)
+
+  churn :: List Rec -> Int -> Int -> Int := λkeep n acc.
+    if n < 1 then acc
+    else churn keep (n - 1) ((acc + Bench.sum (Bench.range 1 (10 + n % 20)) 0) % 1000000007)
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  let keep = Bench.build 10000000 Nil in    (* ~10M live Recs -> the retained set *)
+  let base = Bench.sum keep 0 in            (* touch it once, keep it live *)
+  let c = Bench.churn keep 1000000 base in  (* churn 1e6 rounds while keep lives *)
+  print_endline "`c`"

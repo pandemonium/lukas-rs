@@ -465,15 +465,9 @@ impl phase::SymbolTable<Named> {
             // this has to bind every term in TypingContext so that later elaborations
             // can discover constraints (type and order)
             // So it needs the name!
-            let expr = elaborate_term_constraints(
-                &symbol.name,
-                &witnesses,
-                given,
-                wanted,
-                term.tree,
-                ctx,
-            )
-            .map_err(|e| e.at(pi))?;
+            let expr =
+                elaborate_term_constraints(&symbol.name, &witnesses, given, wanted, term.tree, ctx)
+                    .map_err(|e| e.at(pi))?;
 
             tracing::trace!("insert {} := {}", symbol.name, expr);
             typed_symbols.insert(
@@ -1025,9 +1019,12 @@ impl phase::SymbolTable<Named> {
                 // where `h` appears only in the constraint.
                 let type_vars = declared.underlying.variables();
                 for constraint in declared.constraints.iter() {
-                    if constraint.constraint_type.variables().iter().any(|v| {
-                        declared.quantifiers.contains(v) && !type_vars.contains(v)
-                    }) {
+                    if constraint
+                        .constraint_type
+                        .variables()
+                        .iter()
+                        .any(|v| declared.quantifiers.contains(v) && !type_vars.contains(v))
+                    {
                         return Err(TypeError::AmbiguousConstraint {
                             name: qualified_name.clone(),
                             constraint: constraint.clone(),
@@ -1267,7 +1264,11 @@ fn resolve_constraints(
             let head = witness.head.constraint_type.clone();
             let mut ground = Substitutions::default();
             for c in constraints.iter() {
-                if let Ok(s) = c.constraint_type.apply(&ground).unified_with(&head, &ctx.types) {
+                if let Ok(s) = c
+                    .constraint_type
+                    .apply(&ground)
+                    .unified_with(&head, &ctx.types)
+                {
                     ground = ground.compose(&s);
                 }
             }
@@ -1284,10 +1285,16 @@ fn resolve_constraints(
 
     // The wanted (inferred) constraints split into variable-headed (`Eq α`, which
     // no instance can match) and instance-resolvable (`Eq Int`, `Eq (List α)`).
+    let is_declared_parameter = |constraint: &Constraint| {
+        constraint.is_parametric()
+            || (*constraint.name() == memory_layout_class()
+                && !constraint.variables().is_empty()
+                && given.iter().any(|declared| declared == constraint))
+    };
     let (mut wanted_parametric, resolvable) = constraints
         .clone()
         .into_iter()
-        .partition::<Vec<_>, _>(|c| c.is_parametric());
+        .partition::<Vec<_>, _>(is_declared_parameter);
 
     // A resolvable constraint like `Functor (ExceptT m e)` is discharged through a
     // witness whose premises can themselves be parametric (`Functor m`, `m`
@@ -1332,7 +1339,7 @@ fn resolve_constraints(
     // and ordinary constrained functions are unaffected.
     let given_parametric: Vec<Constraint> = given
         .iter()
-        .filter(|c| c.is_parametric())
+        .filter(|c| is_declared_parameter(c))
         .cloned()
         .collect();
 
@@ -1350,6 +1357,48 @@ fn resolve_constraints(
             projections.push((w.clone(), g, path));
         } else if !params.contains(w) {
             params.push(w.clone());
+        }
+    }
+
+    // An explicitly declared applied Memory_Layout constraint is also part of the
+    // function's public dictionary ABI when the body does not inspect the dictionary
+    // itself. Direct packed reads/writes consume its information later, after layout
+    // specialization, so wanted-only parameter selection would omit the binder while
+    // callers (following the registered source scheme) still supply it. Keep these
+    // declared layout parameters even when they are operationally implicit here.
+    for declared in &given_parametric {
+        if *declared.name() == memory_layout_class()
+            && !declared.variables().is_empty()
+            && !params.contains(declared)
+        {
+            params.push(declared.clone());
+        }
+    }
+
+    // Keep dictionary parameters in the registered type scheme's constraint
+    // order. Registration and body elaboration use independently-freshened meta
+    // variables, so BTree ordering is not stable when a function needs two
+    // dictionaries from the same class (notably two different Memory_Layout
+    // applications). The caller follows the registered scheme; translate that
+    // order into the body's variables before adding parameter lambdas.
+    if let Some(registered) = ctx.terms.lookup_free(symbol_name) {
+        let registered = registered.instantiate();
+        if let Ok(subst) = registered
+            .underlying
+            .unified_with(&tree.type_info().inferred_type, &ctx.types)
+        {
+            let mut ordered: Vec<Constraint> = registered
+                .constraints
+                .apply(&subst)
+                .into_iter()
+                .filter(|constraint| params.contains(constraint))
+                .collect();
+            for param in &params {
+                if !ordered.contains(param) {
+                    ordered.push(param.clone());
+                }
+            }
+            params = ordered;
         }
     }
 
@@ -1440,7 +1489,7 @@ fn resolve_constraints(
         let name = Identifier::Bound(1 + i);
         tracing::trace!("binding {name} to {}", c.constraint_type);
 
-        tree = add_dictionary_parameter_slot(&tree);
+        tree = add_dictionary_parameter_slot(&tree, &c.constraint_type);
 
         evidence.insert(
             c.clone(),
@@ -1713,14 +1762,24 @@ fn elaborate_constraint_method_placeholders(
     })
 }
 
-fn add_dictionary_parameter_slot(expr: &Expr) -> Expr {
+fn dictionary_arrow(annotation: &TypeInfo, dictionary_type: &Type) -> TypeInfo {
+    TypeInfo {
+        parse_info: annotation.parse_info,
+        inferred_type: Type::Arrow {
+            domain: Box::new(dictionary_type.clone()),
+            codomain: Box::new(annotation.inferred_type.clone()),
+        },
+    }
+}
+
+fn add_dictionary_parameter_slot(expr: &Expr, dictionary_type: &Type) -> Expr {
     if let Expr::Ascription(a0, ascription) = expr {
         match ascription.ascribed_tree.as_ref() {
             Expr::RecursiveLambda(a1, rec) => Expr::Ascription(
                 a0.clone(),
                 TypeAscription {
                     ascribed_tree: Expr::RecursiveLambda(
-                        a1.clone(),
+                        dictionary_arrow(a1, dictionary_type),
                         SelfReferential {
                             own_name: rec.own_name.clone(),
                             lambda: rec.lambda.clone().prepend_parameter().clone(),
@@ -1735,7 +1794,7 @@ fn add_dictionary_parameter_slot(expr: &Expr) -> Expr {
                 a0.clone(),
                 TypeAscription {
                     ascribed_tree: Expr::RecursiveLambda(
-                        a0.clone(),
+                        dictionary_arrow(a0, dictionary_type),
                         SelfReferential {
                             own_name: Identifier::Bound(0),
                             lambda: Lambda {
@@ -1759,7 +1818,7 @@ fn add_dictionary_parameter_slot(expr: &Expr) -> Expr {
         // parameter at #1.
         match expr {
             Expr::RecursiveLambda(a1, rec) => Expr::RecursiveLambda(
-                a1.clone(),
+                dictionary_arrow(a1, dictionary_type),
                 SelfReferential {
                     own_name: rec.own_name.clone(),
                     lambda: rec.lambda.clone().prepend_parameter().clone(),
@@ -1767,7 +1826,7 @@ fn add_dictionary_parameter_slot(expr: &Expr) -> Expr {
             ),
 
             other => Expr::RecursiveLambda(
-                other.annotation().clone(),
+                dictionary_arrow(other.annotation(), dictionary_type),
                 SelfReferential {
                     own_name: Identifier::Bound(0),
                     lambda: Lambda {
@@ -2340,11 +2399,9 @@ impl Constraint {
     }
 
     /// A constraint whose constrained type is a bare type variable (e.g. `Eq α`).
-    /// No instance can ever match a bare variable, so such a constraint must be
-    /// discharged by a dictionary *parameter*. Every other constraint -- ground
-    /// (`Eq Int`) or constructor-headed (`Eq (List α)`) -- is discharged by an
-    /// instance instead, with that instance's own premises satisfied by the
-    /// parameters.
+    /// Applied `Memory_Layout` givens receive additional handling while elaborating
+    /// a declared constrained term; undeclared inferred constraints cannot become
+    /// parameters because they are absent from its registered source signature.
     pub fn is_parametric(&self) -> bool {
         matches!(
             &self.constraint_type,
