@@ -6,6 +6,8 @@ use Stdlib.Control.State.
 use Stdlib.Random.
 use Stdlib.IO.
 
+module Stats.
+
 Fault ::= File_IO (Binary.Mmap_Error)
 
 witness Display Fault :=
@@ -35,6 +37,38 @@ witness From File_Row Aggregate_Stats :=
       { Min := temp; Max := temp; Sum := temp; Count := 1 }
   }
 
+witness Default Aggregate_Stats :=
+  { default_value := { Min := Float.Minimum; Max := Float.Maximum; Sum := 0.0; Count := 0 }
+  }
+
+witness Default Text :=
+  { default_value := ""
+  }
+
+module FNV1a:
+  offset_basis := 0 - 3750763034362895579
+  prime        := 1099511628211
+
+  hash :: Bytes -> Int := λbytes.
+    let length = Bytes.length bytes in
+
+    let loop = λi hash.
+      if i < length then
+        loop
+          (i + 1)
+          ((hash xor Bytes.get_u8 bytes i) * prime)
+      else
+        hash
+    in
+      loop 0 offset_basis
+
+witness Stats.Hashable Text :=
+  { compute_hash := λt.
+      let bs = Text.to_bytes t in
+      let length = Bytes.length bs in
+      1
+  }
+
 witness Semigroup Aggregate_Stats :=
   { mappend := λp q.
       { Min   := min p.Min q.Min
@@ -45,7 +79,7 @@ witness Semigroup Aggregate_Stats :=
   }
 
 witness Monoid Aggregate_Stats :=
-  { mempty := { Min := 0.0; Max := 0.0; Sum := 0.0; Count := 0 }
+  { mempty := default_value
   }
 
 witness Display File_Row :=
@@ -55,7 +89,7 @@ witness Display File_Row :=
 
 witness Display Aggregate_Stats :=
   { display := λself.
-      "Min `self.Min`, Max `self.Max`, Sum `self.Sum`, count `self.Count`"
+      "min `self.Min`, max `self.Max`, avg `self.Sum / Float.of_int self.Count`"
   }
 
 read_file_data :: Text -> IO (Result Fault (List (Text, Aggregate_Stats))) := λfile_path.
@@ -64,56 +98,86 @@ read_file_data :: Text -> IO (Result Fault (List (Text, Aggregate_Stats))) := λ
     Return file_bytes -> fmap Return (process_file_bytes file_bytes)
   | Fault e -> pure (Fault (File_IO e))
 
+(* The checked-in fixture has only three rows. Repeat it so this remains a *)
+(* meaningful HashTable/update benchmark without committing a huge data file. *)
+(* Fix the seed so allocation and probe counts are comparable between builds. *)
+(* let table = Hash_Table.make 47521 (Simple_Hasher.make 1) in *)
+(* let* _ = Hash_Table.modify row.City aggregate table in *)
 process_file_bytes :: Bytes -> IO (List (Text, Aggregate_Stats)) := λfile_bytes.
-  let* table = Hash_Table.make_default 47521 in
+  let* table = Stats.Cheeky_Map.make_default 47521 in
   let parse_rows = λremains.
-    deconstruct parse_row remains into
-      This (row, remains) ->
+    deconstruct State_T.run parse_row remains into
+      This (remains, row) ->
         let aggregate = from row in
-        let* _ = Hash_Table.insert row.City aggregate table in
+        let* _ = Stats.Cheeky_Map.modify row.City aggregate table in
         parse_rows remains
-    | Nope -> pure ()
+    | Nope ->
+        pure ()
   in
     let* _ = parse_rows file_bytes in
-    let* table_data = Hash_Table.to_list table
+    (* let* table_data = Hash_Table.to_list table *)
+    let* table_data = Stats.Cheeky_Map.to_list table
     in pure table_data
 
-(* This very clearly begs to be a State monad. *)
-parse_row :: Bytes -> Perhaps (File_Row, Bytes) := λremains.
-  let* i = Bytes.position remains (λb. b = Int.of_char ';') in
-  let city_bytes, remains1 = Bytes.split_at remains i in
-  let city = Text.from_bytes city_bytes in
+parse_text_until :: Int -> State_T Bytes Perhaps Text := λdelimiter.
+  let* bytes =  take_until delimiter in
+  State_T.lift (Text.from_bytes bytes)
 
-  print_endline "parse_row: city [`city`]"
+parse_float_until :: Int -> State_T Bytes Perhaps Float := λdelimiter.
+  let* text = parse_text_until delimiter in
+  State_T.lift (from text :: Perhaps Float)
 
-  let _, remains2 = Bytes.split_at remains1 1 in
-  let* j = Bytes.position remains2 (λb. b = 10 (* \n *)) in
-  let temperature_bytes, remains3 = Bytes.split_at remains2 j in
-  let* temp_text = Text.from_bytes temperature_bytes in
-  let temperature = from temp_text :: Perhaps Float in
+(* Is there constant hoising/ folding or whatever in this backend? Int.of_char etc. *)
+(* Also: don't use Float, use Int at * 10 or something. This cuts the boxes. *)
+parse_temperature :: State_T Bytes Perhaps Float :=
+  let* input = State_T.get in
+  let neg = Bytes.get_u8 input 0 = Int.of_char '-' in
 
-  print_endline "parse_row: temperature [`temperature`]"
+  let index, whole =
+    if neg then
+      2, Float.of_int (Bytes.get_u8 input 1 - Int.of_char '0')
+    else
+      1, Float.of_int (Bytes.get_u8 input 0 - Int.of_char '0')
+  in
 
-  let* file_row = liftA2 File_Row.make city temperature in
-  pure (file_row, Bytes.skip remains3 1)
+    let value, consumed =
+      if Bytes.get_u8 input index = Int.of_char '.' then
+        whole + Float.of_int (Bytes.get_u8 input (index + 1) - Int.of_char '0') / 10.0, index + 3
+      else
+        10.0 * whole + Float.of_int (Bytes.get_u8 input index - Int.of_char '0') + Float.of_int (Bytes.get_u8 input (index + 2) - Int.of_char '0') / 10.0, index + 4
+    in
+      let* _ = State_T.put (Bytes.skip input consumed) in
+      pure (if neg then (0.0 - value) else value)
+
+
+(* Calling this segfaults. *)
+parse_until :: ∀a. From Text (Perhaps a) |- Int -> State_T Bytes Perhaps a := λdelimiter.
+  let* text = parse_text_until delimiter in
+  State_T.lift (from text)
+
+parse_row :: State_T Bytes Perhaps File_Row :=
+   liftA2 File_Row.make
+    (parse_text_until (Int.of_char ';'))
+    parse_temperature
+
+take_until :: Int -> State_T Bytes Perhaps Bytes := λdelimiter.
+  let* input = State_T.get in
+  let* i = State_T.lift (Bytes.position input (λb. b = delimiter)) in
+  let field, remains = Bytes.split_at input i in
+  let* _ = State_T.put (Bytes.skip remains 1) in
+  pure field
+
+main :: IO Unit :=
+  let* collated = read_file_data "ladies/benchmarks/billions/city-temperatures.txt" in
+
+  deconstruct collated into
+    Return data_list ->
+      let* _ = IO.output "Billion row challenge. `List.length data_list` cities." in
+      let* _ = traverse (λ(city,stat). IO.output "`city`: `stat`") data_list in
+      pure ()
+  | Fault e ->
+      IO.output "Crashed: `e`"
 
 (* How to pass input arguments? Provide an Args array? *)
 start := λ_.
-  let program = read_file_data "ladies/benchmarks/billions/city-temperatures.txt" in
-
-  deconstruct unsafe_run_IO program into
-    Return return_value ->
-      print_endline "Billion row challenge. `List.length return_value`"
-  | Fault e ->
-      print_endline "Crashed: `e`"
-
-(* Insert `n` random draws into `tree`, threading the generator in the State monad. *)
-fill :: Int -> Tree_Set Int -> State LCG (Tree_Set Int) := λn tree.
-  if n > 0 then
-    let* x = Gen.next in
-    fill (n - 1) (Tree_Set.insert x tree)
-  else pure tree
-
-_start := λseed.
-  let tree = eval (fill 10000000 Tree_Set.empty) (LCG.from_seed seed) in
-  print_endline "size `Tree_Set.length tree`"
+  unsafe_run_IO main

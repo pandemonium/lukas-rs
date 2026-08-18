@@ -33,7 +33,7 @@ use crate::{
     },
     lexer::BindingOperator,
     phase,
-    typer::Types,
+    typer::{MetaVariable, Substitutable, Substitutions, Type, TypeInfo, Types},
 };
 
 /// Largest term body (in AST nodes) the inliner will unfold. Combinators, method
@@ -183,10 +183,10 @@ impl phase::SymbolTable<Types> {
 /// constructor wrapper) and the local rules then collapse whatever that exposed --
 /// the construct/deconstruct pair, the beta redex, the case-of-known-constructor.
 /// Peeling one layer per round is what walks the whole monad-transformer stack down.
-fn simplify_term<A>(body: Expr<A, Identifier>, inlinables: &Inlinables<A>) -> Expr<A, Identifier>
-where
-    A: Clone,
-{
+fn simplify_term(
+    body: Expr<TypeInfo, Identifier>,
+    inlinables: &Inlinables<TypeInfo>,
+) -> Expr<TypeInfo, Identifier> {
     let mut current = simplify_expr(body);
     for _ in 0..MAX_ROUNDS {
         let inliner = Inliner {
@@ -672,19 +672,20 @@ pub(crate) fn children<A, Id>(expr: &Expr<A, Id>) -> Vec<&Tree<A, Id>> {
 /// can carry it into the selector body, where it then meets the projection and gets
 /// inlined as a record. Because inlined bodies are closed, relocating one to depth
 /// `d` is a uniform `shift(_, 0, d)`.
-struct Inliner<'a, A> {
-    bodies: &'a Inlinables<A>,
+struct Inliner<'a> {
+    bodies: &'a Inlinables<TypeInfo>,
     fuel: Cell<usize>,
     changed: Cell<bool>,
 }
 
-impl<A> Inliner<'_, A>
-where
-    A: Clone,
-{
+impl Inliner<'_> {
     /// If `tree` is an inlinable `Free`, return its body relocated to `depth`.
-    fn try_head(&self, tree: &Tree<A, Identifier>, depth: usize) -> Option<Tree<A, Identifier>> {
-        let Expr::Variable(_, Identifier::Free(name)) = &**tree else {
+    fn try_head(
+        &self,
+        tree: &Tree<TypeInfo, Identifier>,
+        depth: usize,
+    ) -> Option<Tree<TypeInfo, Identifier>> {
+        let Expr::Variable(call_info, Identifier::Free(name)) = &**tree else {
             return None;
         };
         let body = self.bodies.get(name)?;
@@ -693,13 +694,26 @@ where
         }
         self.fuel.set(self.fuel.get() - 1);
         self.changed.set(true);
-        Some(Rc::new(shift(body, 0, depth)))
+        let instantiated = if std::env::var_os("MARM_NO_TYPED_INLINE").is_some() {
+            (**body).clone()
+        } else {
+            inline_type_substitutions(&body.annotation().inferred_type, &call_info.inferred_type)
+                .map_or_else(
+                    || (**body).clone(),
+                    |substitutions| (**body).apply(&substitutions),
+                )
+        };
+        Some(Rc::new(shift(&Rc::new(instantiated), 0, depth)))
     }
 
     /// Inline `tree` at absolute binder depth `depth` (the number of enclosing
     /// binders; equivalently the level the next binder would receive).
-    fn inline(&self, tree: &Tree<A, Identifier>, depth: usize) -> Tree<A, Identifier> {
-        let go = |t: &Tree<A, Identifier>, d: usize| self.inline(t, d);
+    fn inline(
+        &self,
+        tree: &Tree<TypeInfo, Identifier>,
+        depth: usize,
+    ) -> Tree<TypeInfo, Identifier> {
+        let go = |t: &Tree<TypeInfo, Identifier>, d: usize| self.inline(t, d);
 
         let rebuilt = match &**tree {
             // Head position: try to inline the callee, else recurse into it.
@@ -889,6 +903,72 @@ where
 
         Rc::new(rebuilt)
     }
+}
+
+/// Instantiate annotations in an inlined polymorphic body from the type of the
+/// particular free-variable occurrence being unfolded. Elaboration has already
+/// checked this application, so this pass only needs directional pattern matching;
+/// it must not invent new unification constraints.
+fn inline_type_substitutions(template: &Type, concrete: &Type) -> Option<Substitutions> {
+    fn match_pattern(
+        template: &Type,
+        concrete: &Type,
+        bindings: &mut HashMap<MetaVariable, Type>,
+    ) -> Option<()> {
+        match (template, concrete) {
+            (Type::Variable(variable), concrete) => match bindings.get(variable) {
+                Some(previous) if previous != concrete => None,
+                Some(_) => Some(()),
+                None => {
+                    bindings.insert(variable.clone(), concrete.clone());
+                    Some(())
+                }
+            },
+            (
+                Type::Apply {
+                    constructor: tc,
+                    argument: ta,
+                },
+                Type::Apply {
+                    constructor: cc,
+                    argument: ca,
+                },
+            ) => {
+                match_pattern(tc, cc, bindings)?;
+                match_pattern(ta, ca, bindings)
+            }
+            (
+                Type::Arrow {
+                    domain: td,
+                    codomain: tc,
+                },
+                Type::Arrow {
+                    domain: cd,
+                    codomain: cc,
+                },
+            ) => {
+                match_pattern(td, cd, bindings)?;
+                match_pattern(tc, cc, bindings)
+            }
+            (Type::Array(template), Type::Array(concrete)) => {
+                match_pattern(template, concrete, bindings)
+            }
+            (Type::Tuple(template), Type::Tuple(concrete))
+                if template.arity() == concrete.arity() =>
+            {
+                for (template, concrete) in template.elements().iter().zip(concrete.elements()) {
+                    match_pattern(template, concrete, bindings)?;
+                }
+                Some(())
+            }
+            (template, concrete) if template == concrete => Some(()),
+            _ => None,
+        }
+    }
+
+    let mut bindings = HashMap::new();
+    match_pattern(template, concrete, &mut bindings)?;
+    Some(bindings.into_iter().collect::<Vec<_>>().into())
 }
 
 /// Number of variables a pattern binds -- one per `Bind` leaf, counted in the DFS
@@ -2223,6 +2303,7 @@ where
 mod tests {
     use super::*;
     use crate::ast::{Literal, ProductElement};
+    use crate::typer::BaseType;
 
     type E = Expr<(), Identifier>;
 
@@ -2268,6 +2349,37 @@ mod tests {
 
     fn simplify(e: E) -> E {
         simplify_expr(e)
+    }
+
+    #[test]
+    fn inline_types_instantiate_repeated_variables_consistently() {
+        let variable = MetaVariable::fresh();
+        let template = Type::Arrow {
+            domain: Type::Variable(variable.clone()).into(),
+            codomain: Type::Array(Type::Variable(variable).into()).into(),
+        };
+        let concrete = Type::Arrow {
+            domain: Type::Base(BaseType::Int).into(),
+            codomain: Type::Array(Type::Base(BaseType::Int).into()).into(),
+        };
+
+        let substitutions = inline_type_substitutions(&template, &concrete).unwrap();
+        assert_eq!(template.apply(&substitutions), concrete);
+    }
+
+    #[test]
+    fn inline_types_reject_inconsistent_repeated_variables() {
+        let variable = MetaVariable::fresh();
+        let template = Type::Arrow {
+            domain: Type::Variable(variable.clone()).into(),
+            codomain: Type::Variable(variable).into(),
+        };
+        let concrete = Type::Arrow {
+            domain: Type::Base(BaseType::Int).into(),
+            codomain: Type::Base(BaseType::Bool).into(),
+        };
+
+        assert!(inline_type_substitutions(&template, &concrete).is_none());
     }
 
     // ---- shift ----

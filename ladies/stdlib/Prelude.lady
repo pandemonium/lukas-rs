@@ -23,9 +23,46 @@ fst :: ∀α β. (α, β) -> α := λ(a, _). a
 
 snd :: ∀α β. (α, β) -> β := λ(_, b). b
 
+signature From ::= ∀α β.
+  { from :: α -> β
+  }
+
+signature Default :: ∀α.
+  { default_value :: α
+  }
+
+module Default:
+  unless :: ∀α. Default α |- Perhaps α -> α := λpa.
+    deconstruct pa into
+      This a -> a
+    | Nope   -> default_value
+
+(* Why does this complain over not finding a witness? The function is *)
+(* never called and the error is here. *)
+(* module From: *)
+(*  parse :: ∀α β. From α (Perhaps β) |- α -> Perhaps β := from *)
+
+module Float:
+  foreign raw_max_of_float :: Float
+  foreign raw_min_of_float :: Float
+  foreign raw_float_of_int :: Int -> Float
+
+  of_int :: Int -> Float := raw_float_of_int
+
+  Maximum :: Float := raw_max_of_float
+  Minimum :: Float := raw_min_of_float
+
+
 module Int:
   foreign raw_int_of_char :: Char -> Int
+  foreign raw_max_of_int :: Int
+  foreign raw_min_of_int :: Int
+
   of_char :: Char -> Int := raw_int_of_char
+
+  Maximum :: Int := raw_max_of_int
+  Minimum :: Int := raw_min_of_int
+
 
 (* ---------------------------------------------------------------- core ADTs *)
 (* Types + eliminators only. Every typeclass WITNESS (Functor/Monad/Foldable/...) and    *)

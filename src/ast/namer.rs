@@ -1032,30 +1032,57 @@ impl phase::SymbolTable<Parsed> {
         let path = use_declaration.path;
 
         if path.tail.is_empty() {
-            let name = parser::Identifier::from_str(&path.head);
-            let root = IdentifierPath::new(ROOT_MODULE_NAME);
-            self.add_module_term_member(root.clone(), name.clone());
-            let canonical = root.with_suffix(&path.head);
-            self.add_import_prefix(canonical.clone());
-
-            if loaded.insert(canonical.clone()) {
-                let (declarations, child_dir) = compiler.load_top_level_module(&path.head)?;
-                self.add_module_contents(compiler, canonical, &child_dir, declarations, loaded)?;
-            }
+            let canonical = self.ensure_top_level_loaded(compiler, &path.head, loaded)?;
+            self.add_import_prefix(canonical);
             Ok(())
         } else {
+            // A multi-segment `use Stdlib.Data.Tree` names a nested module whose
+            // top-level ancestor (`Stdlib`) may not have been loaded from disk yet:
+            // unlike the single-segment form, nothing here pulls the file in, so the
+            // whole tree is registered only as a side effect of a prior bare
+            // `use Stdlib.`. Load the head's top-level module on demand so the nested
+            // path resolves on its own. Skip the load when the path already resolves
+            // relative to the current scope/imports (a sibling or already-loaded
+            // module), which also avoids treating a relative head as a top-level file.
+            if self.try_resolve_module_path(&path, module_path).is_none() {
+                self.ensure_top_level_loaded(compiler, &path.head, loaded)?;
+            }
             let canonical = self.resolve_module_path(&path, module_path, pi)?;
             self.add_import_prefix(canonical);
             Ok(())
         }
     }
 
-    fn resolve_module_path(
+    /// Load (once) the top-level module named `head` from disk, registering it and
+    /// its nested `module` children under `Root.<head>`. Returns its canonical path.
+    fn ensure_top_level_loaded(
+        &mut self,
+        compiler: &Compiler,
+        head: &str,
+        loaded: &mut HashSet<IdentifierPath>,
+    ) -> Compilation<IdentifierPath> {
+        let root = IdentifierPath::new(ROOT_MODULE_NAME);
+        self.add_module_term_member(root.clone(), parser::Identifier::from_str(head));
+        let canonical = root.with_suffix(head);
+
+        if loaded.insert(canonical.clone()) {
+            let (declarations, child_dir) = compiler.load_top_level_module(head)?;
+            self.add_module_contents(
+                compiler,
+                canonical.clone(),
+                &child_dir,
+                declarations,
+                loaded,
+            )?;
+        }
+        Ok(canonical)
+    }
+
+    fn try_resolve_module_path(
         &self,
         path: &IdentifierPath,
         scope: &IdentifierPath,
-        pi: ParseInfo,
-    ) -> Compilation<IdentifierPath> {
+    ) -> Option<IdentifierPath> {
         prefix_chain(scope)
             .chain(self.imports.iter().rev().cloned())
             .find_map(|base| {
@@ -1072,6 +1099,15 @@ impl phase::SymbolTable<Parsed> {
                     .contains_key(&candidate)
                     .then_some(candidate)
             })
+    }
+
+    fn resolve_module_path(
+        &self,
+        path: &IdentifierPath,
+        scope: &IdentifierPath,
+        pi: ParseInfo,
+    ) -> Compilation<IdentifierPath> {
+        self.try_resolve_module_path(path, scope)
             .ok_or_else(|| NameError::UnknownName(path.clone()).at(pi).into())
     }
 

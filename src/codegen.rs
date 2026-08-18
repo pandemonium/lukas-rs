@@ -155,6 +155,8 @@ fn map_builtin_name(q: &QualifiedName) -> &'static str {
         "and" => "builtin_and",
         "xor" => "builtin_xor",
         "or" => "builtin_or",
+        "not" => "builtin_not",
+        "negate" => "builtin_neg",
         "prim_gte" => "builtin_ge",
         "prim_lte" => "builtin_le",
         "text_fold_right" => "builtin_text_fold_right",
@@ -223,6 +225,8 @@ fn builtin_prim(head: &Expr) -> Option<(&'static str, usize)> {
         "and" => ("prim_and", 2),
         "or" => ("prim_or", 2),
         "xor" => ("prim_xor", 2),
+        "not" => ("prim_not", 1),
+        "negate" => ("prim_neg", 1),
         "prim_show" => ("prim_show", 1),
         "print_endline" => ("prim_print_endline", 1),
         _otherwise => return None,
@@ -264,6 +268,20 @@ fn float_prim(prim: &str) -> Option<&'static str> {
         "prim_gt" => "prim_fgt",
         "prim_le" => "prim_fle",
         "prim_ge" => "prim_fge",
+        "prim_neg" => "prim_fneg",
+        _otherwise => return None,
+    })
+}
+
+// `and`/`or`/`xor` are logical on Bool and bitwise on Int. `builtin_prim` yields the
+// Bool (logical) prim; when the operands' static type is Int, remap to the bitwise
+// variant (`prim_band`, ...). Mirrors `float_prim` for the arithmetic operators.
+fn bitwise_prim(prim: &str) -> Option<&'static str> {
+    Some(match prim {
+        "prim_and" => "prim_band",
+        "prim_or" => "prim_bor",
+        "prim_xor" => "prim_bxor",
+        "prim_not" => "prim_bnot",
         _otherwise => return None,
     })
 }
@@ -1476,12 +1494,17 @@ impl lambda_lift::Program {
             }
         }
         if let Expr::Deconstruct(_, deconstruct) = expression {
-            if let Some((_array, _index, _offset, _ty, shape)) =
+            if let Some((_array, _index, _offset, matched_type, shape)) =
                 self.flat_array_region(&deconstruct.scrutinee)
             {
-                if self
-                    .array_match_shape(&deconstruct.match_clauses, &shape)
-                    .is_some()
+                // Keep this eligibility test exactly as conservative as
+                // `compile_deconstruct`: otherwise the lazy let omits the
+                // canonical local, only for the matcher to decline the direct
+                // path and emit a reference to that missing local.
+                if matched_type.variables().is_empty()
+                    && self
+                        .array_match_shape(&deconstruct.match_clauses, &shape)
+                        .is_some()
                 {
                     return deconstruct.match_clauses.iter().all(|clause| {
                         self.local_uses_are_flat_array_leaves(
@@ -2118,8 +2141,9 @@ impl lambda_lift::Program {
         // can then read the tag and scalar fields directly from the backing
         // storage instead of first rebuilding a canonical tuple/data object.
         if direct_array_enabled()
-            && let Some((array, index, offset, _ty, fallback_shape)) =
+            && let Some((array, index, offset, element_type, fallback_shape)) =
                 self.flat_array_region(&the.scrutinee)
+            && element_type.variables().is_empty()
         {
             if std::env::var_os("DUMP_DIRECT_READ").is_some() {
                 eprintln!(
@@ -2435,15 +2459,16 @@ impl lambda_lift::Program {
                 // values are rendered by their `Display` witnesses.
                 let prim = if prim == "prim_show" {
                     show_prim(args[0])
-                } else if matches!(
-                    args[0].annotation().type_info.inferred_type,
-                    Type::Base(BaseType::Float)
-                ) {
-                    // A Float-typed operand routes the arithmetic/ordering op to its
-                    // boxed-double prim; everything else keeps the int/generic prim.
-                    float_prim(prim).unwrap_or(prim)
                 } else {
-                    prim
+                    // The arithmetic/ordering/logical prims are monomorphised on the
+                    // operands' static type: a Float operand routes to the boxed-double
+                    // prim, an Int operand routes `and`/`or`/`xor` to their bitwise
+                    // variant; everything else keeps the int/generic prim.
+                    match &args[0].annotation().type_info.inferred_type {
+                        Type::Base(BaseType::Float) => float_prim(prim).unwrap_or(prim),
+                        Type::Base(BaseType::Int) => bitwise_prim(prim).unwrap_or(prim),
+                        _otherwise => prim,
+                    }
                 };
                 write!(code, "{prim}(")?;
                 for (i, arg) in args.iter().enumerate() {

@@ -106,6 +106,31 @@ module Hash_Table:
   to_list :: ∀α β. Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- Hash_Table α β -> IO (List (α, β)) :=
     fold (λz kv. Cons kv z) List.empty
 
+  modify_with :: ∀α β. (β -> β -> β) -> α -> β -> Hash_Table α β -> IO Unit := λcombine key value table.
+    let hash = table.Hash_Key key in
+    let* found = Raw_Table.find hash (λ({ Key: existing_key; Value: _ }). table.Keys_Equal key existing_key) table.Raw in
+
+    deconstruct found into
+      This index ->
+        let* state = Mutable_Array.get_unchecked table.Raw.State 0 in
+        let* existing = Mutable_Array.get_unchecked state.Entries index in
+
+        deconstruct existing into
+          This { Key: existing_key; Value: old_value } ->
+            let* _ =
+              let new_value = combine old_value value in
+              insert existing_key new_value table
+            in pure ()
+        | Nope ->
+          let* _ = insert key value table
+          in pure ()
+    | Nope ->
+      let* _ = insert key value table
+      in pure ()
+
+  modify :: ∀α β. Semigroup β |- α -> β -> Hash_Table α β -> IO Unit :=
+    modify_with mappend
+
   insert :: ∀α β. Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- α -> β -> Hash_Table α β -> IO (Perhaps β) := λkey value table.
     let hash = table.Hash_Key key in
     let* found = Raw_Table.find hash (λ({ Key: existing_key; Value: _ }). table.Keys_Equal key existing_key) table.Raw in
@@ -131,6 +156,7 @@ module Hash_Table:
         let* _ = Raw_Table.insert_no_grow hash entry table.Raw in
         pure Perhaps.empty
 
+  (* Wtf is this doing?! *)
   lookup :: ∀α β. Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- α -> Hash_Table α β -> IO (Perhaps β) := λkey table.
     let hash = table.Hash_Key key in
     IO.suspend (λ_.

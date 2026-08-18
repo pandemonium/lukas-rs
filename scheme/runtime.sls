@@ -4,6 +4,10 @@
     show
     print-endline
     bool-xor
+    marm-and
+    marm-or
+    marm-xor
+    marm-not
     text-fold-right
     )
   (import (chezscheme))
@@ -22,6 +26,18 @@
 
   (define (bool-xor a b)
     (if a (not b) b))
+
+  ;; `and`/`or`/`xor` are overloaded: logical on Bool, bitwise on Int. The C backend
+  ;; monomorphises on the static type; here (types are erased) we dispatch at run time
+  ;; on the operand, which is a Scheme boolean for Bool and a fixnum for Int.
+  (define (marm-and a b)
+    (if (boolean? a) (and a b) (bitwise-and a b)))
+  (define (marm-or a b)
+    (if (boolean? a) (or a b) (bitwise-ior a b)))
+  (define (marm-xor a b)
+    (if (boolean? a) (bool-xor a b) (bitwise-xor a b)))
+  (define (marm-not a)
+    (if (boolean? a) (not a) (bitwise-not a)))
 
   (define text-fold-right
       (lambda (f z s)

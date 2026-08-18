@@ -1,0 +1,43 @@
+use Stdlib.
+use Stdlib.Data.Array.
+
+(* Same workload as flat_records, but writes through set_unchecked. This isolates *)
+(* the cost of rebuilding the previous packed record in put_unchecked even though *)
+(* the program discards that return value.                                        *)
+
+Slot ::= { key :: Int; tally :: Int }
+
+module Flat:
+  cap :: Int := 33554432
+  empty :: Int := 4294967296
+  mul :: Int := 189812531
+
+  hash :: Int -> Int := λk. (k * mul) % cap
+
+  insert :: Mutable_Array Slot -> Int -> IO Int := λtable k.
+    let probe = λi.
+      let* slot = Mutable_Array.get_unchecked table i in
+      deconstruct slot into
+        { key: key; tally: tally } ->
+          if key = k then
+            let* _ = Mutable_Array.set_unchecked table i { key := k; tally := tally + 1 } in
+            pure 0
+          else if key = empty then
+            let* _ = Mutable_Array.set_unchecked table i { key := k; tally := 1 } in
+            pure 1
+          else
+            let next = i + 1 in
+            probe (if next < cap then next else 0)
+    in probe (hash k)
+
+  fill :: Mutable_Array Slot -> Int -> Int -> Int -> IO Int := λtable n seed count.
+    if n > 0 then
+      let seed2 = (1664525 * seed + 1013904223) % 4294967296 in
+      let* added = insert table seed2 in
+      fill table (n - 1) seed2 (count + added)
+    else pure count
+
+start := λseed.
+  let table = Mutable_Array.generate Flat.cap (λ_. { key := Flat.empty; tally := 0 }) in
+  let count = unsafe_run_IO (Flat.fill table 10000000 seed 0) in
+  print_endline "distinct `count`"

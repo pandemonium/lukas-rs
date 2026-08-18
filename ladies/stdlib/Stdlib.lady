@@ -15,10 +15,6 @@ use Stdlib.IO.
 (* class methods opened last so polymorphic bind/fold_left shadow the concrete leaks *)
 use Stdlib.Control.
 
-signature From ::= ∀α β.
-  { from :: α -> β
-  }
-
 (* Any Foldable container converts to a List. Defined here, not in Data.List, so that `fold_right` dispatches through the `Foldable t` dictionary (class methods are opened last below) rather than binding to List's own concrete `fold_right` -- which would collapse the witness to List-only and crash on any other container. *)
 witness ∀t : *->* α. Foldable t |- From (t α) (List α) :=
   { from := fold_right Cons Nil

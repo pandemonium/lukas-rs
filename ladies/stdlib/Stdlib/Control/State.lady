@@ -53,3 +53,57 @@ put :: ∀s. s -> State s Unit :=
 
 modify :: ∀s. (s -> s) -> State s Unit :=
   λf. MkState (λs. f s, ())
+
+
+State_T ::= ∀s m : *->* α. Make_State_T (s -> m (s, α))
+
+witness ∀s m : *->*. Functor m |- Functor (State_T s m) :=
+  { fmap := λg (Make_State_T f).
+      Make_State_T (λs0.
+        fmap (λ(s1, value). s1, g value) (f s0)
+      )
+  }
+
+witness ∀s m : *->*. Monad m |- Applicative (State_T s m) :=
+  { pure := λa. Make_State_T (λs. pure (s, a))
+    apply := λ(Make_State_T ff) (Make_State_T fa).
+      Make_State_T (λs0.
+        let* s1, g = ff s0 in
+        let* s2, a = fa s1 in
+        pure (s2, g a)
+      )
+  }
+
+witness ∀s m : *->*. Monad m |- Monad (State_T s m) :=
+  { bind := λg (Make_State_T f).
+      Make_State_T (λs0.
+        let* s1, a = f s0 in
+        let Make_State_T h = g a in
+        h s1
+      )
+  }
+
+module State_T:
+  run :: ∀s m : *->* α. State_T s m α -> s -> m (s, α) :=
+    λ(Make_State_T f). f
+
+  eval :: ∀s m : *->* α. Functor m |- State_T s m α -> s -> m α :=
+    λ(Make_State_T f) s.
+      fmap (λ(_, a). a) (f s)
+
+  exec :: ∀s m : *->* α. Functor m |- State_T s m α -> s -> m s :=
+    λ(Make_State_T f) s.
+      fmap (λ(s, _). s) (f s)
+
+  get :: ∀s m : *->*. Applicative m |- State_T s m s :=
+    Make_State_T (λs. pure (s, s))
+
+  put :: ∀s m : *->*. Applicative m |- s -> State_T s m Unit := λs.
+    Make_State_T (λ_.
+      pure (s, ())
+    )
+
+  lift :: ∀s m : *->* α. Functor m |- m α -> State_T s m α := λf.
+    Make_State_T (λs.
+      fmap (λvalue. s, value) f
+    )

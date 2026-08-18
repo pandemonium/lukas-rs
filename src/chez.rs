@@ -196,9 +196,13 @@ fn map_builtin_name(name: &QualifiedName) -> &'static str {
         "%" => "mod",
         "prim_lt" => "<",
         "prim_gt" => ">",
-        "and" => "and",
-        "xor" => "bool-xor",
-        "or" => "or",
+        "and" => "marm-and",
+        "xor" => "marm-xor",
+        "or" => "marm-or",
+        "not" => "marm-not",
+        // Scheme `-` is already unary negation: `(- x)`. `negate` is emitted as an
+        // arity-1 intrinsic, so it uncurries to `(lambda (a) (- a))`.
+        "negate" => "-",
         "prim_gte" => ">=",
         "prim_lte" => "<=",
         "text_fold_right" => "text-fold-right",

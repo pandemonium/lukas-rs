@@ -5,10 +5,19 @@
 // `Root_Prelude_<Submodule>_<member>` -- the symbol the compiler emits at the call site.
 // The Buffer/Bytes handles are GC objects, crossing the boundary through the `Value`
 // escape-hatch tag so the collector keeps tracing them.
+#include <limits.h>
+#include <float.h>
 #include "gc.h"
 
 // ------------------------------------------------------------------- Int
 FOREIGN_DECL(int64_t, Root_Prelude_Int_raw_int_of_char, int64_t, c, { return c; })
+
+FOREIGN_DECL(int64_t, Root_Prelude_Int_raw_max_of_int, { return INT_MAX; })
+FOREIGN_DECL(int64_t, Root_Prelude_Int_raw_min_of_int, { return INT_MIN; })
+
+FOREIGN_DECL(Value, Root_Prelude_Float_raw_max_of_float, { return VFloat(DBL_MAX); })
+FOREIGN_DECL(Value, Root_Prelude_Float_raw_min_of_float, { return VFloat(DBL_MIN); })
+FOREIGN_DECL(Value, Root_Prelude_Float_raw_float_of_int, int64_t, i, { return VFloat((double) i); })
 
 // ------------------------------------------------------------ Buffer (mutable)
 FOREIGN_DECL(Value, Root_Prelude_Buffer_raw_new_buffer, int64_t, cap, {

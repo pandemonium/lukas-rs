@@ -1,3 +1,7 @@
+witness ∀α. Default α |- Default (Perhaps α) :=
+  { default_value := Perhaps.empty
+  }
+
 witness Functor Perhaps :=
   { fmap := λf fa.
       deconstruct fa into
@@ -58,6 +62,11 @@ empty :: ∀α. Perhaps α := Nope
 
 is_this :: ∀α. Perhaps α -> Bool := λpa.
   deconstruct pa into This _ -> true | _ -> false
+
+is_this_and :: ∀α. Perhaps α -> (α -> Bool) -> Bool := λpa p.
+  deconstruct pa into
+    This a -> p a
+  | Nope   -> false
 
 (* not (is_this pa) -- not is not implemented, lol. *)
 is_empty :: ∀α. Perhaps α -> Bool := λpa.

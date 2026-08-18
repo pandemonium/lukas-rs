@@ -268,6 +268,9 @@ pub enum RuntimeError {
     #[error("expired self referential: {0}")]
     ExpiredSelfReferential(String),
 
+    #[error("function not applicable to {a}")]
+    NotApplicable1 { a: Val },
+
     #[error("function not applicable to {a} {b}")]
     NotApplicable2 { a: Val, b: Val },
 

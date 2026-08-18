@@ -3,12 +3,12 @@ use crate::{
         BUILTIN_MODULE_NAME, Kind, STDLIB_MODULE_NAME,
         namer::{Access, QualifiedName, Symbol, TypeDefinition, TypeOrigin, TypeSymbol},
     },
-    bridge::{Intrinsic, Lambda1, Lambda2, PartialRawLambda2, RawLambda1, RawLambda3},
+    bridge::{Intrinsic, Lambda1, PartialRawLambda1, PartialRawLambda2, RawLambda1, RawLambda3},
     interpreter::{
         Literal,
         cek::{Val, interpret_closure},
     },
-    lambda1, lambda2,
+    lambda1,
     lexer::Operator,
     parser::{self, ParseInfo, Parsed},
     phase::Phase,
@@ -47,6 +47,27 @@ fn artithmetic_signature() -> TypeScheme {
         },
         // todo: Some sort of Artih constraint here? Be an interesting test!
         constraints: ConstraintSet::default(),
+    }
+}
+
+// `not` is polymorphic `∀a. a -> a` -- logical complement on Bool, bitwise on Int --
+// mirroring the (binary) arithmetic scheme. The operand type selects the meaning.
+fn unary_signature() -> TypeScheme {
+    let tp = MetaVariable::fresh();
+    TypeScheme {
+        quantifiers: vec![tp.clone()],
+        underlying: Type::Arrow {
+            domain: Type::Variable(tp.clone()).into(),
+            codomain: Type::Variable(tp).into(),
+        },
+        constraints: ConstraintSet::default(),
+    }
+}
+
+fn mk_unary_op(op: fn(Literal) -> Option<Literal>) -> impl Fn(Val) -> Option<Val> {
+    move |t| match t {
+        Val::Constant(t) => op(t).map(Val::Constant),
+        _otherwise => None,
     }
 }
 
@@ -141,6 +162,42 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
         type_scheme: artithmetic_signature(),
     };
 
+    // `and`/`or`/`xor` are overloaded exactly like the arithmetic operators: one
+    // polymorphic `∀a. a -> a -> a` builtin whose meaning is chosen by the operand
+    // type -- logical on `Bool`, bitwise on `Int`. The interpreter dispatches on the
+    // literal it actually holds (below); the backends monomorphise on the static type.
+    let conjunction = PartialRawLambda2 {
+        name: Operator::And.name(),
+        apply: mk_artithmetic_op(and),
+        type_scheme: artithmetic_signature(),
+    };
+
+    let disjunction = PartialRawLambda2 {
+        name: Operator::Or.name(),
+        apply: mk_artithmetic_op(or),
+        type_scheme: artithmetic_signature(),
+    };
+
+    let exclusive_or = PartialRawLambda2 {
+        name: Operator::Xor.name(),
+        apply: mk_artithmetic_op(xor),
+        type_scheme: artithmetic_signature(),
+    };
+
+    let complement = PartialRawLambda1 {
+        name: Operator::Not.name(),
+        apply: mk_unary_op(not),
+        type_scheme: unary_signature(),
+    };
+
+    // Unary minus. It has no operator token of its own (the lexer sees the same `-`
+    // as binary subtraction); the parser desugars prefix `-e` to `negate e`.
+    let negation = PartialRawLambda1 {
+        name: "negate",
+        apply: mk_unary_op(negate),
+        type_scheme: unary_signature(),
+    };
+
     let text_fold_right_lambda = RawLambda3 {
         name: "text_fold_right",
         apply: text_fold_right,
@@ -182,9 +239,11 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
         prim_gt.into_symbol(&stdlib),
         prim_lt.into_symbol(&stdlib),
         prim_eq.into_symbol(&stdlib),
-        lambda2!(and).into_symbol(&builtins),
-        lambda2!(or).into_symbol(&builtins),
-        lambda2!(xor).into_symbol(&builtins),
+        conjunction.into_symbol(&builtins),
+        disjunction.into_symbol(&builtins),
+        exclusive_or.into_symbol(&builtins),
+        complement.into_symbol(&builtins),
+        negation.into_symbol(&builtins),
         plus.into_symbol(&builtins),
         minus.into_symbol(&builtins),
         times.into_symbol(&builtins),
@@ -328,16 +387,49 @@ pub fn lt(p: Literal, q: Literal) -> Option<bool> {
     }
 }
 
-fn and(p: bool, q: bool) -> bool {
-    p && q
+// `and`/`or`/`xor` are logical on `Bool` and bitwise on `Int` -- the same operand
+// overloading the arithmetic operators use (see `plus`). `None` for any other pair
+// mirrors `plus` on non-numbers: an ill-typed application the type checker rejects.
+pub fn and(p: Literal, q: Literal) -> Option<Literal> {
+    match (p, q) {
+        (Literal::Bool(p), Literal::Bool(q)) => Some(Literal::Bool(p && q)),
+        (Literal::Int(p), Literal::Int(q)) => Some(Literal::Int(p & q)),
+        _otherwise => None,
+    }
 }
 
-fn or(p: bool, q: bool) -> bool {
-    p || q
+pub fn or(p: Literal, q: Literal) -> Option<Literal> {
+    match (p, q) {
+        (Literal::Bool(p), Literal::Bool(q)) => Some(Literal::Bool(p || q)),
+        (Literal::Int(p), Literal::Int(q)) => Some(Literal::Int(p | q)),
+        _otherwise => None,
+    }
 }
 
-fn xor(p: bool, q: bool) -> bool {
-    p ^ q
+pub fn xor(p: Literal, q: Literal) -> Option<Literal> {
+    match (p, q) {
+        (Literal::Bool(p), Literal::Bool(q)) => Some(Literal::Bool(p ^ q)),
+        (Literal::Int(p), Literal::Int(q)) => Some(Literal::Int(p ^ q)),
+        _otherwise => None,
+    }
+}
+
+// Unary `not`: logical negation on Bool, bitwise complement on Int.
+pub fn not(p: Literal) -> Option<Literal> {
+    match p {
+        Literal::Bool(p) => Some(Literal::Bool(!p)),
+        Literal::Int(p) => Some(Literal::Int(!p)),
+        _otherwise => None,
+    }
+}
+
+// Unary minus: arithmetic negation on Int and Float (mirrors `plus`'s operand set).
+pub fn negate(p: Literal) -> Option<Literal> {
+    match p {
+        Literal::Int(p) => Some(Literal::Int(-p)),
+        Literal::Float(p) => Some(Literal::Float(-p)),
+        _otherwise => None,
+    }
 }
 
 pub fn plus(p: Literal, q: Literal) -> Option<Literal> {

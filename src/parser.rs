@@ -1583,6 +1583,62 @@ impl<'a> Parser<'a> {
 
             [
                 Token {
+                    kind: TokenKind::Keyword(Keyword::Not),
+                    position,
+                },
+                ..,
+            ] => {
+                // `not` is the sole prefix operator: `not e` desugars to an application
+                // of the like-named builtin. The operand binds at `not`'s own precedence,
+                // so tighter operators (`=`, comparisons, arithmetic) are drawn into it
+                // while the looser `and`/`or`/`xor` stay outside (`not a and b` = `(not a) and b`).
+                let position = *position;
+                self.advance(1);
+                let parse_info = ParseInfo::from_position(position);
+                let operand = self.parse_expression(Operator::Not.precedence())?;
+                Ok(Expr::Apply(
+                    parse_info,
+                    Apply {
+                        function: Expr::Variable(
+                            parse_info,
+                            IdentifierPattern::from_atom(parse_info, Operator::Not.term_name()),
+                        )
+                        .into(),
+                        argument: operand.into(),
+                    },
+                ))
+            }
+
+            [
+                Token {
+                    kind: TokenKind::Minus,
+                    position,
+                },
+                ..,
+            ] => {
+                // Unary minus: prefix `-e` desugars to `negate e`. Only prefix position
+                // reaches here -- a `-` after an operand is consumed as binary subtraction
+                // by `parse_expr_infix` -- so the two never conflict. The operand binds at
+                // `-`'s precedence, so `-a * b` = `-(a * b)` and `-a - b` = `(-a) - b`.
+                let position = *position;
+                self.advance(1);
+                let parse_info = ParseInfo::from_position(position);
+                let operand = self.parse_expression(Operator::Minus.precedence())?;
+                Ok(Expr::Apply(
+                    parse_info,
+                    Apply {
+                        function: Expr::Variable(
+                            parse_info,
+                            IdentifierPattern::from_atom(parse_info, "negate"),
+                        )
+                        .into(),
+                        argument: operand.into(),
+                    },
+                ))
+            }
+
+            [
+                Token {
                     kind: TokenKind::Interpolate(Interpolation::Interlude(prelude)),
                     position,
                 },

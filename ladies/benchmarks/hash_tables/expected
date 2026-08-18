@@ -1,0 +1,7 @@
+Int   / default: n=5000 miss=0 ghost=0 -> PASS
+Text  / default: n=5000 miss=0 ghost=0 -> PASS
+Coord / default: n=4000 miss=0 ghost=0 -> PASS
+Int   / custom : n=5000 miss=0 ghost=0 -> PASS
+Coord / custom : n=4000 miss=0 ghost=0 -> PASS
+overwrite      : old-ok=true new-ok=true list-ok=true -> PASS
+mutable-cell  : first=1 replaced=1 modified=2 current=42 label=two -> PASS

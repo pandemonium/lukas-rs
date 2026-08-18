@@ -1,0 +1,53 @@
+use Stdlib.
+use Stdlib.Data.Array.
+
+(* A concrete packed array reached through a generic state record captured by a *)
+(* nested worker. The complete Memory_Layout dictionary must ground the capture *)
+(* so matching an entry can stay in the backing array instead of reconstructing *)
+(* a canonical Perhaps/Entry value. *)
+
+Entry ::= ∀α β.
+  { Captured_Key   :: α
+    Captured_Value :: β
+  }
+
+Captured_State ::= ∀α β.
+  { Captured_Entries :: Mutable_Array (Perhaps (Entry α β))
+  }
+
+module Generic:
+  modulus :: Int := 1000000007
+
+  sum :: ∀α β. Memory_Layout (Perhaps (Entry α β)) |- (α -> β -> Int) -> Captured_State α β -> Int -> Int :=
+    λscore state n.
+      let loop = λi acc.
+        if i <= 0 then
+          acc
+        else
+          let index = (i * 189812531) % 1048576 in
+          deconstruct Mutable_Array.unsafe_get_unchecked state.Captured_Entries index into
+            This { Captured_Key: key; Captured_Value: value } ->
+              loop (i - 1) ((acc + score key value) % modulus)
+          | Nope ->
+              loop (i - 1) acc
+      in loop n 0
+
+make_entry :: Int -> Perhaps (Entry Int Int) := λi.
+  This { Captured_Key := i; Captured_Value := i + 1 }
+
+repeat :: (Int -> Int -> Int) -> Captured_State Int Int -> Int -> Int -> Int :=
+  λscore state n acc.
+    if n <= 0 then
+      acc
+    else
+      repeat
+        score
+        state
+        (n - 1)
+        ((acc + Generic.sum score state 10000) % Generic.modulus)
+
+start := λ_.
+  let entries = Mutable_Array.generate 1048576 make_entry in
+  let state = { Captured_Entries := entries } in
+  let score = λkey value. key + value in
+  print_endline "generic-captured-read `repeat score state 5000 0`"

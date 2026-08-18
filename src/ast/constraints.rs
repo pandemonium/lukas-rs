@@ -226,6 +226,25 @@ impl WitnessEnvironment {
         // took the early return above, becoming a forwarded dictionary parameter --
         // ML1's "dyn" fallback -- so a caller who knows the concrete type fills it in.)
         if *constraint.name() == crate::typer::memory_layout_class() {
+            // A still-abstract obligation whose SHAPE depends on those variables
+            // (`Memory_Layout (Perhaps (Entry α β))` inside a polymorphic wrapper)
+            // reaches here only when it was NOT held as an assumption -- the
+            // enclosing declaration does not carry the component layouts needed to
+            // build it. We cannot synthesise a shape for such a type: the backend
+            // would emit a garbage/empty descriptor that the callee then trusts,
+            // segfaulting at ground use. Reject instead, so the caller must declare
+            // the component layout constraints (which composition below discharges).
+            //
+            // A non-ground shape that does NOT depend on the variables (e.g.
+            // `Memory_Layout (Raw_State α β)`, whose fields all sit behind one-word
+            // boundaries) is safe: element-zero discovery / boxing is identical
+            // whether the parameters are ground or abstract, so synthesise it. A
+            // ground query likewise synthesises the marker the backend lowers.
+            if !constraint.constraint_type.variables().is_empty()
+                && crate::typer::memory_layout_requires_parameter(constraint, ctx)
+            {
+                return Err(TypeError::NoWitness(constraint.clone()));
+            }
             let pi = ParseInfo::default();
             return Ok(Expr::Variable(
                 pi.with_inferred_type(constraint.constraint_type.clone()),

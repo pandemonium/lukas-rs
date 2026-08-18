@@ -26,6 +26,12 @@ const SPEC_MARK: &str = "$spec$";
 const LAYOUT_SPEC_MARK: &str = "$layout$";
 const MAX_LAYOUT_SPECIALIZATIONS: usize = 64;
 
+#[derive(Debug, Clone)]
+struct LayoutSlot {
+    argument: usize,
+    template: Type,
+}
+
 impl phase::SymbolTable<Types> {
     pub fn specialize(mut self) -> Self {
         // On by default; a program opts out by setting `MARM_SPECIALIZE` to a falsy
@@ -77,6 +83,32 @@ impl phase::SymbolTable<Types> {
             })
             .collect();
 
+        // Every compiler-derived layout dictionary among the leading constraint
+        // arguments. A generic wrapper may have ordinary class dictionaries before
+        // its layouts (`Eq beta, Memory_Layout entry, Memory_Layout state`), so the
+        // old first-argument-only recognizer could never specialize that wrapper.
+        let layout_slots: HashMap<QualifiedName, Vec<LayoutSlot>> = self
+            .symbols
+            .iter()
+            .filter_map(|(name, sym)| match (name, sym) {
+                (SymbolName::Term(qn), Symbol::Term(term))
+                    if !qn.member().as_str().contains(SPEC_MARK)
+                        && !qn.member().as_str().contains(LAYOUT_SPEC_MARK) =>
+                {
+                    let slots = leading_layout_slots(&term.body, &self.signatures);
+                    (!slots.is_empty()).then(|| (qn.clone(), slots))
+                }
+                _ => None,
+            })
+            .collect();
+        if std::env::var_os("DUMP_LAYOUT_SPECIALIZE").is_some() {
+            let mut entries = layout_slots.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(name, _)| *name);
+            for (name, slots) in entries {
+                eprintln!("[layout-slots] {name} {slots:?}");
+            }
+        }
+
         // Ground call sites `f w …` (f recursive-constrained, w a ground witness).
         let mut pairs: Vec<(QualifiedName, QualifiedName)> = Vec::new();
         for sym in self.symbols.values() {
@@ -126,22 +158,27 @@ impl phase::SymbolTable<Types> {
             let mut layout_pairs = Vec::new();
             for sym in self.symbols.values() {
                 if let Symbol::Term(t) = sym {
-                    collect_layout_pairs(&t.body, &dict_levels, &mut layout_pairs);
+                    collect_layout_pairs(&t.body, &layout_slots, &mut layout_pairs);
                 }
             }
             layout_pairs.sort();
             layout_pairs.dedup();
             layout_pairs.truncate(MAX_LAYOUT_SPECIALIZATIONS);
+            if std::env::var_os("DUMP_LAYOUT_SPECIALIZE").is_some() {
+                for pair in &layout_pairs {
+                    eprintln!("[layout-pair] {pair:?}");
+                }
+            }
 
             let mut layout_specs = HashMap::new();
             let mut layout_fresh = Vec::new();
-            for (function, dict_type) in layout_pairs {
+            for (function, dict_types) in layout_pairs {
                 let clone_qn = QualifiedName::new(
                     function.module().clone(),
                     &format!(
                         "{}{LAYOUT_SPEC_MARK}{:016x}",
                         function.member().as_str(),
-                        stable_hash(&dict_type)
+                        stable_hash(&dict_types)
                     ),
                 );
                 if !self
@@ -150,19 +187,12 @@ impl phase::SymbolTable<Types> {
                     && let Some(Symbol::Term(term)) =
                         self.symbols.get(&SymbolName::Term(function.clone()))
                 {
-                    let evidence = layout_evidence(dict_type.clone());
-                    let substitutions =
-                        layout_substitutions(&term.body, dict_levels[&function], &dict_type)
-                            .unwrap_or_default();
-                    let body = substitute_evidence(
-                        term.body.apply(&substitutions),
-                        dict_levels[&function],
-                        own_level(&term.body),
-                        &evidence,
-                    );
+                    let substitutions = layout_substitutions(&layout_slots[&function], &dict_types)
+                        .unwrap_or_default();
+                    let body = term.body.apply(&substitutions);
                     layout_fresh.push((clone_qn.clone(), term.type_signature.clone(), body));
                 }
-                layout_specs.insert((function, dict_type), clone_qn);
+                layout_specs.insert((function, dict_types), clone_qn);
             }
             for (qn, sig, body) in layout_fresh {
                 self.symbols.insert(
@@ -181,7 +211,7 @@ impl phase::SymbolTable<Types> {
                 .map(|(name, sym)| {
                     let sym = match sym {
                         Symbol::Term(t) => Symbol::Term(TermSymbol {
-                            body: rewrite_layout_calls(t.body, &layout_specs),
+                            body: rewrite_layout_calls(t.body, &layout_specs, &layout_slots),
                             ..t
                         }),
                         other => other,
@@ -216,42 +246,73 @@ fn stable_hash(value: &impl Hash) -> u64 {
     hasher.finish()
 }
 
-fn layout_evidence(dict_type: Type) -> phase::Expr<Types> {
-    let annotation = crate::parser::ParseInfo::default().with_inferred_type(dict_type);
-    Expr::Variable(
-        annotation,
-        Identifier::Free(Box::new(memory_layout_evidence_name())),
-    )
+fn layout_substitutions(slots: &[LayoutSlot], concrete: &[Type]) -> Option<Substitutions> {
+    (slots.len() == concrete.len()).then_some(())?;
+    let mut bindings = HashMap::new();
+    for (slot, concrete) in slots.iter().zip(concrete) {
+        match_type_pattern(&slot.template, concrete, &mut bindings)?;
+    }
+    Some(bindings.into_iter().collect::<Vec<_>>().into())
 }
 
-fn layout_substitutions(
-    body: &phase::Expr<Types>,
-    _dict: usize,
-    concrete: &Type,
-) -> Option<Substitutions> {
-    fn leading_dict_type(mut body: &phase::Expr<Types>) -> Option<&Type> {
-        while let Expr::Ascription(_, ascription) = body {
-            body = &ascription.ascribed_tree;
-        }
-        let Expr::RecursiveLambda(annotation, _) = body else {
-            return None;
-        };
-        let Type::Arrow { domain, .. } = &annotation.inferred_type else {
-            return None;
-        };
-        matches!(
-            domain.as_ref(),
-            Type::Apply { constructor, .. }
-                if matches!(constructor.as_ref(), Type::Constructor(name)
-                    if *name == memory_layout_class())
-        )
-        .then_some(domain.as_ref())
+fn applied_constructor(ty: &Type) -> Option<&QualifiedName> {
+    match ty {
+        Type::Apply { constructor, .. } => applied_constructor(constructor),
+        Type::Constructor(name) => Some(name),
+        _ => None,
+    }
+}
+
+/// Locate every Memory_Layout dictionary in a term's leading constraint-argument
+/// prefix. Constraint parameters precede source parameters and may contain other
+/// classes, so keep their true application index and bound level rather than
+/// assuming the first parameter is the layout.
+fn leading_layout_slots(
+    mut body: &phase::Expr<Types>,
+    signatures: &HashSet<QualifiedName>,
+) -> Vec<LayoutSlot> {
+    while let Expr::Ascription(_, ascription) = body {
+        body = &ascription.ascribed_tree;
     }
 
-    let template = leading_dict_type(body)?;
-    let mut bindings = HashMap::new();
-    match_type_pattern(template, concrete, &mut bindings)?;
-    Some(bindings.into_iter().collect::<Vec<_>>().into())
+    let Expr::RecursiveLambda(annotation, recursive) = body else {
+        return Vec::new();
+    };
+    let mut annotation = annotation;
+    let mut parameter = &recursive.lambda.parameter;
+    let mut next = recursive.lambda.body.as_ref();
+    let mut argument = 0;
+    let mut slots = Vec::new();
+
+    loop {
+        let Type::Arrow { domain, .. } = &annotation.inferred_type else {
+            break;
+        };
+        let Some(class) = applied_constructor(domain) else {
+            break;
+        };
+        if !signatures.contains(class) {
+            break;
+        }
+        if *class == memory_layout_class() && matches!(parameter, Identifier::Bound(_)) {
+            slots.push(LayoutSlot {
+                argument,
+                template: domain.as_ref().clone(),
+            });
+        }
+
+        argument += 1;
+        while let Expr::Ascription(_, ascription) = next {
+            next = &ascription.ascribed_tree;
+        }
+        let Expr::Lambda(next_annotation, lambda) = next else {
+            break;
+        };
+        annotation = next_annotation;
+        parameter = &lambda.parameter;
+        next = lambda.body.as_ref();
+    }
+    slots
 }
 
 fn match_type_pattern(
@@ -428,74 +489,78 @@ fn concrete_layout_type(expr: &phase::Expr<Types>) -> Option<Type> {
 
 fn collect_layout_pairs(
     body: &phase::Expr<Types>,
-    dict_levels: &HashMap<QualifiedName, usize>,
-    out: &mut Vec<(QualifiedName, Type)>,
+    layout_slots: &HashMap<QualifiedName, Vec<LayoutSlot>>,
+    out: &mut Vec<(QualifiedName, Vec<Type>)>,
 ) {
-    if let Expr::Apply(_, app) = body
-        && let Expr::Variable(_, Identifier::Free(function)) = &*app.function
-        && dict_levels.contains_key(function.as_ref())
-        && let Some(dict_type) = concrete_layout_type(&app.argument)
+    if let Some((function, arguments)) = application_spine(body)
+        && let Some(slots) = layout_slots.get(function)
+        && let Some(types) = slots
+            .iter()
+            .map(|slot| {
+                arguments
+                    .get(slot.argument)
+                    .and_then(|argument| concrete_layout_type(argument))
+            })
+            .collect::<Option<Vec<_>>>()
     {
-        out.push((function.as_ref().clone(), dict_type));
+        out.push((function.clone(), types));
     }
     for child in crate::simplify::children(body) {
-        collect_layout_pairs(&**child, dict_levels, out);
+        collect_layout_pairs(&**child, layout_slots, out);
     }
 }
 
-fn substitute_evidence(
-    body: phase::Expr<Types>,
-    dict: usize,
-    own: usize,
-    _evidence: &phase::Expr<Types>,
-) -> phase::Expr<Types> {
-    body.map(&mut |node| match node {
-        // Keep the dictionary parameter itself. Replacing every use with a free
-        // evidence marker made the binder dead; simplification then removed it from
-        // non-self-recursive workers while rewritten callers still supplied the
-        // dictionary. The call-site type substitution already grounds all layout
-        // annotations, which is what direct packed codegen needs.
-        Expr::Apply(a, mut app)
-            if matches!(&*app.function, Expr::Variable(_, Identifier::Bound(n)) if *n == own) =>
-        {
-            let annotation = app.argument.annotation().clone();
-            app.argument = Rc::new(Expr::Variable(annotation, Identifier::Bound(dict)));
-            Expr::Apply(a, app)
+fn application_spine<A>(
+    body: &Expr<A, Identifier>,
+) -> Option<(&QualifiedName, Vec<&Expr<A, Identifier>>)> {
+    let mut arguments = Vec::new();
+    let mut head = body;
+    while let Expr::Apply(_, application) = head {
+        arguments.push(application.argument.as_ref());
+        head = application.function.as_ref();
+    }
+    arguments.reverse();
+    match head {
+        Expr::Variable(_, Identifier::Free(function)) => Some((function, arguments)),
+        _ => None,
+    }
+}
+
+fn replace_application_head(node: phase::Expr<Types>, clone: &QualifiedName) -> phase::Expr<Types> {
+    match node {
+        Expr::Apply(annotation, mut application) => {
+            application.function = Rc::new(replace_application_head(
+                Rc::unwrap_or_clone(application.function),
+                clone,
+            ));
+            Expr::Apply(annotation, application)
+        }
+        Expr::Variable(annotation, Identifier::Free(_)) => {
+            Expr::Variable(annotation, Identifier::Free(Box::new(clone.clone())))
         }
         other => other,
-    })
+    }
 }
 
 fn rewrite_layout_calls(
     body: phase::Expr<Types>,
-    specs: &HashMap<(QualifiedName, Type), QualifiedName>,
+    specs: &HashMap<(QualifiedName, Vec<Type>), QualifiedName>,
+    slots: &HashMap<QualifiedName, Vec<LayoutSlot>>,
 ) -> phase::Expr<Types> {
-    body.map(&mut |node| match node {
-        Expr::Apply(a, app) => {
-            let target = match (&*app.function, concrete_layout_type(&app.argument)) {
-                (
-                    Expr::Variable(function_annotation, Identifier::Free(function)),
-                    Some(dict_type),
-                ) => specs
-                    .get(&(function.as_ref().clone(), dict_type))
-                    .map(|clone| (function_annotation.clone(), clone.clone())),
-                _ => None,
-            };
-            match target {
-                Some((function_annotation, clone)) => Expr::Apply(
-                    a,
-                    Apply {
-                        function: Rc::new(Expr::Variable(
-                            function_annotation,
-                            Identifier::Free(Box::new(clone)),
-                        )),
-                        argument: app.argument,
-                    },
-                ),
-                None => Expr::Apply(a, app),
-            }
-        }
-        other => other,
+    body.map(&mut |node| {
+        let target = application_spine(&node).and_then(|(function, arguments)| {
+            let function_slots = slots.get(function)?;
+            let types = function_slots
+                .iter()
+                .map(|slot| {
+                    arguments
+                        .get(slot.argument)
+                        .and_then(|argument| concrete_layout_type(argument))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            specs.get(&(function.clone(), types)).cloned()
+        });
+        target.map_or(node.clone(), |clone| replace_application_head(node, &clone))
     })
 }
 

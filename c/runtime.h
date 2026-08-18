@@ -152,9 +152,22 @@ static inline Value prim_gt(Value a, Value b) { return VBool(as_int(a) > as_int(
 static inline Value prim_le(Value a, Value b) { return VBool(as_int(a) <= as_int(b)); }
 static inline Value prim_ge(Value a, Value b) { return VBool(as_int(a) >= as_int(b)); }
 static inline Value prim_eq(Value a, Value b) { return VBool(val_eq(a, b)); }
+// `and`/`or`/`xor` are logical on Bool (these) and bitwise on Int (the `prim_b*`
+// forms below); codegen picks between them on the operands' static type, exactly as
+// it picks the Float arithmetic prims.
 static inline Value prim_and(Value a, Value b) { return VBool(as_bool(a) && as_bool(b)); }
 static inline Value prim_or(Value a, Value b) { return VBool(as_bool(a) || as_bool(b)); }
 static inline Value prim_xor(Value a, Value b) { return VBool(as_bool(a) != as_bool(b)); }
+static inline Value prim_band(Value a, Value b) { return VInt(as_int(a) & as_int(b)); }
+static inline Value prim_bor(Value a, Value b)  { return VInt(as_int(a) | as_int(b)); }
+static inline Value prim_bxor(Value a, Value b) { return VInt(as_int(a) ^ as_int(b)); }
+// Unary `not`: logical complement on Bool, bitwise complement on Int (codegen picks
+// `prim_bnot` when the operand's static type is Int).
+static inline Value prim_not(Value a)  { return VBool(!as_bool(a)); }
+static inline Value prim_bnot(Value a) { return VInt(~as_int(a)); }
+// Unary minus: arithmetic negation. `prim_neg` is Int; codegen picks `prim_fneg`
+// (defined with the Float prims below) when the operand's static type is Float.
+static inline Value prim_neg(Value a) { return VInt(-as_int(a)); }
 // Float arithmetic: unbox -> compute -> rebox. Codegen picks these (over the `prim_*`
 // int forms) when the operands' static type is Float. Each result is a fresh heap box.
 // `prim_fmod` is C `fmod` (IEEE remainder toward zero), matching the interpreter's `%`.
@@ -168,6 +181,7 @@ static inline Value prim_fgt(Value a, Value b) { return VBool(as_float(a) > as_f
 static inline Value prim_fle(Value a, Value b) { return VBool(as_float(a) <= as_float(b)); }
 static inline Value prim_fge(Value a, Value b) { return VBool(as_float(a) >= as_float(b)); }
 static inline Value prim_feq(Value a, Value b) { return VBool(as_float(a) == as_float(b)); }
+static inline Value prim_fneg(Value a) { return VFloat(-as_float(a)); }
 // `prim_show` is monomorphised: codegen picks the right leaf from the argument's
 // static type. Only the primitive (leaf) types reach these -- compound values are
 // rendered by their `Display` witnesses, which recurse through the leaves.
@@ -236,6 +250,8 @@ extern Value builtin_ge;
 extern Value builtin_and;
 extern Value builtin_or;
 extern Value builtin_xor;
+extern Value builtin_not;
+extern Value builtin_neg;
 extern Value builtin_print_endline;
 extern Value builtin_text_fold_right;
 

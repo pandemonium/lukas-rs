@@ -1,0 +1,25 @@
+use Stdlib.
+use Stdlib.Data.Array.
+
+(* Focused A/B for packed-element read lowering. Default codegen keeps the raw *)
+(* array element as an (array,index) place and binds x/y with two direct word   *)
+(* loads. MARM_NO_DIRECT_ARRAY=1 rebuilds one canonical Pair per iteration.     *)
+
+Pair ::= { x :: Int; y :: Int }
+
+module Bench:
+  cap :: Int := 1048576
+  modulus :: Int := 1000000007
+
+  loop :: Mutable_Array Pair -> Int -> Int -> Int := λtable n acc.
+    if n <= 0 then acc
+    else
+      let index = (n * 189812531) % cap in
+      let pair = unsafe_run_IO (Mutable_Array.get_unchecked table index) in
+      let x = pair.x in
+      let y = pair.y in
+      loop table (n - 1) ((acc + x + y) % modulus)
+
+start := λ_.
+  let table = Mutable_Array.generate Bench.cap (λi. { x := i; y := i + 1 }) in
+  print_endline "read-sum `Bench.loop table 50000000 0`"

@@ -998,7 +998,7 @@ impl phase::SymbolTable<Named> {
         };
 
         let scheme = if let Some(signature) = &symbol.type_signature {
-            let declared = signature.type_scheme(&HashMap::default(), ctx)?;
+            let mut declared = signature.type_scheme(&HashMap::default(), ctx)?;
             // Witnesses are verified on the separate dictionary-elaboration path.
             if !self.witnesses.contains(&qualified_name) {
                 let inferred = expr
@@ -1008,6 +1008,32 @@ impl phase::SymbolTable<Named> {
                     .apply(&expr.substitutions);
                 let pi = *symbol.body.annotation();
                 declared.reject_if_more_general_than(&inferred, &qualified_name, pi, ctx)?;
+
+                // `Memory_Layout` evidence is compiler-derived, so a surface
+                // signature need not repeat layout obligations introduced by an
+                // implementation detail such as calling `Hash_Table.lookup`.
+                // Nevertheless, an abstract layout cannot be manufactured inside
+                // the generic worker: it must become part of that worker's hidden
+                // dictionary ABI so concrete callers can supply and specialize it.
+                // Re-express the inferred constraints in the declared scheme's
+                // quantified variables before registering the enriched scheme.
+                let inferred_to_declared = inferred
+                    .unified_with(&declared.underlying, &ctx.types)
+                    .map_err(|e| e.at(pi))?;
+                let inferred_layouts = expr
+                    .constraints
+                    .apply(&expr.substitutions)
+                    .apply(&inferred_to_declared)
+                    .into_iter()
+                    .filter(|constraint| {
+                        *constraint.name() == memory_layout_class()
+                            && !constraint.variables().is_empty()
+                            && memory_layout_requires_parameter(constraint, &ctx.types)
+                    })
+                    .collect::<Vec<_>>();
+                declared.constraints = declared
+                    .constraints
+                    .union(ConstraintSet::from(inferred_layouts.as_slice()));
 
                 // Ambiguity: a quantified variable that occurs in the constraint
                 // context but nowhere in the declared type is fixed by nothing at a
@@ -1220,8 +1246,6 @@ fn elaborate_term_constraints(
 ) -> Result<ast::Expr<TypeInfo, Identifier>, TypeError> {
     tracing::trace!("{symbol_name} given {given} wanted {constraints} tree {tree}");
 
-    let selectors = SelectorTable::from_constraints(&constraints, &ctx.types)?;
-
     Ok(resolve_constraints(
         symbol_name,
         tree,
@@ -1235,7 +1259,7 @@ fn elaborate_term_constraints(
 #[instrument(skip_all)]
 fn resolve_constraints(
     symbol_name: &QualifiedName,
-    mut tree: Expr,
+    tree: Expr,
     given: ConstraintSet,
     constraints: ConstraintSet,
     witnesses: &WitnessEnvironment,
@@ -1285,16 +1309,16 @@ fn resolve_constraints(
 
     // The wanted (inferred) constraints split into variable-headed (`Eq α`, which
     // no instance can match) and instance-resolvable (`Eq Int`, `Eq (List α)`).
-    let is_declared_parameter = |constraint: &Constraint| {
+    let is_wanted_parameter = |constraint: &Constraint| {
         constraint.is_parametric()
             || (*constraint.name() == memory_layout_class()
                 && !constraint.variables().is_empty()
-                && given.iter().any(|declared| declared == constraint))
+                && memory_layout_requires_parameter(constraint, &ctx.types))
     };
     let (mut wanted_parametric, resolvable) = constraints
         .clone()
         .into_iter()
-        .partition::<Vec<_>, _>(is_declared_parameter);
+        .partition::<Vec<_>, _>(is_wanted_parameter);
 
     // A resolvable constraint like `Functor (ExceptT m e)` is discharged through a
     // witness whose premises can themselves be parametric (`Functor m`, `m`
@@ -1339,7 +1363,13 @@ fn resolve_constraints(
     // and ordinary constrained functions are unaffected.
     let given_parametric: Vec<Constraint> = given
         .iter()
-        .filter(|c| is_declared_parameter(c))
+        // An explicit layout constraint is an intentional part of the source ABI,
+        // even when element-zero discovery would also be safe for that particular
+        // abstract product. Only inferred implementation-detail layouts use the
+        // narrower `is_wanted_parameter` rule above.
+        .filter(|c| {
+            c.is_parametric() || (*c.name() == memory_layout_class() && !c.variables().is_empty())
+        })
         .cloned()
         .collect();
 
@@ -1480,16 +1510,21 @@ fn resolve_constraints(
 
     let mut evidence = HashMap::new();
 
-    // Bind a dictionary parameter (#1, #2, ...) for each given/undeclared
-    // constraint. `add_dictionary_parameter_slot` always yields a self-referential
-    // tree -- `own_name` at slot #0 and parameters from #1 -- both when prepending
-    // to an existing lambda and when wrapping a non-lambda body (e.g. a witness
-    // whose body is a record), so the i-th parameter is at #(1 + i).
+    // `add_dictionary_parameter_slot` truly prepends: the last constraint added
+    // becomes argument #1. Add in reverse scheme order so the finished lambda and
+    // its callers both see params[0], params[1], ... at Bound(1), Bound(2), ... .
+    // This matters once a generic worker carries three dictionaries (for example
+    // Eq plus two inferred Memory_Layouts); layout markers previously made the
+    // accidental swap hard to observe at runtime, but their annotations no longer
+    // matched the actual slots and specialization could not follow them.
+    for c in params.iter().rev() {
+        tree = add_dictionary_parameter_slot(&tree, &c.constraint_type);
+    }
+
+    // Bind evidence to the now-stable parameter levels.
     for (i, c) in params.iter().enumerate() {
         let name = Identifier::Bound(1 + i);
         tracing::trace!("binding {name} to {}", c.constraint_type);
-
-        tree = add_dictionary_parameter_slot(&tree, &c.constraint_type);
 
         evidence.insert(
             c.clone(),
@@ -1670,33 +1705,6 @@ fn discharge_constraints(
     })
 }
 
-struct SelectorTable<'a>(HashMap<parser::Identifier, Vec<&'a Constraint>>);
-
-impl<'a> SelectorTable<'a> {
-    fn from_constraints(set: &'a ConstraintSet, ctx: &TypeEnvironment) -> Result<Self, TypeError> {
-        let mut constraint_signatures = HashMap::<_, Vec<_>>::new();
-
-        for c in set.iter() {
-            let signature = c.signature(&ctx)?;
-            for method in signature.vtable.into_vec() {
-                if is_super_field(&method) {
-                    continue;
-                }
-                constraint_signatures.entry(method).or_default().push(c);
-            }
-        }
-
-        Ok(Self(constraint_signatures))
-    }
-
-    // This could give an iterator instead
-    fn selector_names(&self, placeholder: &QualifiedName) -> Vec<(&Constraint, QualifiedName)> {
-        let candidates = self.0.get(placeholder.member()).unwrap_or(&vec![]);
-
-        todo!()
-    }
-}
-
 #[instrument(skip_all)]
 fn elaborate_constraint_method_placeholders(
     tree: Expr,
@@ -1708,6 +1716,7 @@ fn elaborate_constraint_method_placeholders(
     // merely shares a method's name -- e.g. `State.bind` vs the `Monad` method
     // `bind` -- would be clobbered into the class selector.
     let mut constraint_signatures: HashMap<QualifiedName, &Constraint> = HashMap::new();
+
     for c in evidence.iter() {
         let signature = c.signature(&ctx.types).expect("expr.typed");
         for method in signature.vtable.into_vec() {
@@ -1782,7 +1791,7 @@ fn add_dictionary_parameter_slot(expr: &Expr, dictionary_type: &Type) -> Expr {
                         dictionary_arrow(a1, dictionary_type),
                         SelfReferential {
                             own_name: rec.own_name.clone(),
-                            lambda: rec.lambda.clone().prepend_parameter().clone(),
+                            lambda: rec.lambda.clone().prepend_parameter(a1.clone()).clone(),
                         },
                     )
                     .into(),
@@ -1821,7 +1830,7 @@ fn add_dictionary_parameter_slot(expr: &Expr, dictionary_type: &Type) -> Expr {
                 dictionary_arrow(a1, dictionary_type),
                 SelfReferential {
                     own_name: rec.own_name.clone(),
-                    lambda: rec.lambda.clone().prepend_parameter().clone(),
+                    lambda: rec.lambda.clone().prepend_parameter(a1.clone()).clone(),
                 },
             ),
 
@@ -1843,7 +1852,7 @@ fn add_dictionary_parameter_slot(expr: &Expr, dictionary_type: &Type) -> Expr {
 }
 
 impl phase::Lambda<Types> {
-    fn prepend_parameter(self) -> Self {
+    fn prepend_parameter(self, previous_annotation: TypeInfo) -> Self {
         let Identifier::Bound(first_level) = self.parameter else {
             panic!("expected locally bound")
         };
@@ -1851,7 +1860,7 @@ impl phase::Lambda<Types> {
         Lambda {
             parameter: Identifier::Bound(first_level),
             body: Expr::Lambda(
-                self.body.annotation().clone(),
+                previous_annotation,
                 Lambda {
                     parameter: Identifier::Bound(1 + first_level),
                     body: Rc::unwrap_or_clone(self.body)
@@ -2271,7 +2280,7 @@ impl Typed {
         }
     }
 
-    fn map_tree<F>(self, f: &mut F) -> Self
+    fn _map_tree<F>(self, f: &mut F) -> Self
     where
         F: FnMut(Expr) -> Expr,
     {
@@ -2287,11 +2296,11 @@ impl Typed {
 pub struct ConstraintSet(BTreeSet<Constraint>);
 
 impl ConstraintSet {
-    fn len(&self) -> usize {
+    fn _len(&self) -> usize {
         self.0.len()
     }
 
-    fn contains(&self, constraint: &Constraint) -> bool {
+    fn _contains(&self, constraint: &Constraint) -> bool {
         self.0.contains(constraint)
     }
 
@@ -2824,6 +2833,94 @@ pub fn memory_layout_class() -> namer::QualifiedName {
 
 pub fn memory_layout_evidence_name() -> namer::QualifiedName {
     prelude_name("memory_layout")
+}
+
+/// Whether an abstract layout must be forwarded from a concrete caller.
+///
+/// Element-zero discovery is complete for products whose abstract parameters sit
+/// behind one-word boundaries (for example `Raw_State a b`, whose polymorphic
+/// entries field is itself a `Mutable_Array`). It is not complete for a sum such as
+/// `Perhaps (Entry a b)`: an array initialized with `Nope` has no payload from which
+/// to discover the `This` shape. Keep a hidden dictionary only for the latter class
+/// of layout, instead of charging every HashTable operation for its product-state
+/// descriptor too.
+pub(crate) fn memory_layout_requires_parameter(
+    constraint: &Constraint,
+    types: &TypeEnvironment,
+) -> bool {
+    let Type::Apply { argument, .. } = &constraint.constraint_type else {
+        return false;
+    };
+    let required = layout_shape_depends_on_parameters(argument, types, &mut Vec::new());
+    if std::env::var_os("DUMP_LAYOUT_PARAMETERS").is_some() {
+        eprintln!("[layout-parameter] {argument} required={required}");
+    }
+    required
+}
+
+fn layout_shape_depends_on_parameters(
+    ty: &Type,
+    types: &TypeEnvironment,
+    on_path: &mut Vec<QualifiedName>,
+) -> bool {
+    match ty {
+        // A naked abstract element can later be any representation, including a
+        // sum, so its concrete caller must decide the layout.
+        Type::Variable(..) => true,
+        Type::Tuple(tuple) => tuple
+            .elements()
+            .iter()
+            .any(|field| layout_shape_depends_on_parameters(field, types, on_path)),
+        Type::Record(record) => record
+            .0
+            .iter()
+            .any(|(_, field)| layout_shape_depends_on_parameters(field, types, on_path)),
+        Type::Coproduct(coproduct) => {
+            if coproduct.0.is_empty() {
+                // Opaque/foreign types have no visible constructors and are stored
+                // as one canonical reference word.
+                return false;
+            }
+            // A single-field newtype is erased, so look through it. Every real sum
+            // needs all variants described before element zero is initialized.
+            if let [(_, fields)] = coproduct.0.as_slice()
+                && let [field] = fields.as_slice()
+            {
+                layout_shape_depends_on_parameters(field, types, on_path)
+            } else {
+                true
+            }
+        }
+        Type::Constructor(..) | Type::Apply { .. } => {
+            let name = match ty {
+                Type::Constructor(name) => name,
+                Type::Apply { .. } => ty.applied_name(),
+                _ => unreachable!(),
+            };
+            // Recursive representation knots and unknown/foreign constructors are
+            // one boxed word, independent of their arguments.
+            if on_path.contains(name) {
+                return false;
+            }
+            let Some(constructor) = types.lookup(name) else {
+                return false;
+            };
+            let Ok(substitutions) = constructor.make_spine().unified_with(ty, types) else {
+                return true;
+            };
+            let Ok(structure) = constructor.structure() else {
+                return true;
+            };
+            let structure = structure.materialize_monotype().apply(&substitutions);
+            on_path.push(name.clone());
+            let result = layout_shape_depends_on_parameters(&structure, types, on_path);
+            on_path.pop();
+            result
+        }
+        // Scalars, functions, arrays, and other canonical references occupy one
+        // word regardless of any type hidden behind them.
+        Type::Base(..) | Type::Arrow { .. } | Type::Array(..) => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -51,6 +51,13 @@ pub struct RawLambda3 {
 }
 
 #[derive(Debug)]
+pub struct PartialRawLambda1<F> {
+    pub name: &'static str,
+    pub apply: F,
+    pub type_scheme: TypeScheme,
+}
+
+#[derive(Debug)]
 pub struct PartialRawLambda2<F> {
     pub name: &'static str,
     pub apply: F,
@@ -344,6 +351,29 @@ impl Intrinsic for RawLambda3 {
             arguments[2].clone(),
         )
         .into())
+    }
+
+    fn type_scheme(&self) -> TypeScheme {
+        self.type_scheme.clone()
+    }
+}
+
+impl<F> Intrinsic for PartialRawLambda1<F>
+where
+    F: Fn(Val) -> Option<Val>,
+{
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn arity(&self) -> usize {
+        1
+    }
+
+    fn invoke(&self, arguments: &[Val]) -> Interpretation {
+        let Self { apply, .. } = self;
+        let a = &arguments[0];
+        apply(a.clone()).ok_or_else(|| RuntimeError::NotApplicable1 { a: a.clone() })
     }
 
     fn type_scheme(&self) -> TypeScheme {

@@ -71,10 +71,22 @@ impl LexicalAnalyzer {
                     self.close_paren();
                     self.emit(1, TokenKind::RightParen, remains)
                 }
-                ['{', remains @ ..] => self.emit(1, TokenKind::LeftBrace, remains),
-                ['}', remains @ ..] => self.emit(1, TokenKind::RightBrace, remains),
-                ['[', remains @ ..] => self.emit(1, TokenKind::LeftBracket, remains),
-                [']', remains @ ..] => self.emit(1, TokenKind::RightBracket, remains),
+                ['{', remains @ ..] => {
+                    self.paren_marks.push(self.indentation.len());
+                    self.emit(1, TokenKind::LeftBrace, remains)
+                }
+                ['}', remains @ ..] => {
+                    self.close_paren();
+                    self.emit(1, TokenKind::RightBrace, remains)
+                }
+                ['[', remains @ ..] => {
+                    self.paren_marks.push(self.indentation.len());
+                    self.emit(1, TokenKind::LeftBracket, remains)
+                }
+                [']', remains @ ..] => {
+                    self.close_paren();
+                    self.emit(1, TokenKind::RightBracket, remains)
+                }
                 ['_', remains @ ..] => self.emit(1, TokenKind::Underscore, remains),
                 ['|', remains @ ..] => self.emit(1, TokenKind::Pipe, remains),
                 [';', remains @ ..] => self.emit(1, TokenKind::Semicolon, remains),
@@ -97,23 +109,34 @@ impl LexicalAnalyzer {
         }
     }
 
-    fn scan_block_comment<'a>(&mut self, mut remains: &'a [char]) -> &'a [char] {
-        while let Some(pos) = remains.iter().position(|&c| c == '*') {
-            if remains[pos..].len() > 1 {
-                self.compute_location(remains, pos);
-                if remains[pos + 1] == ')' {
-                    return &remains[(pos + 2)..];
+    fn scan_block_comment<'a>(&mut self, input: &'a [char]) -> &'a [char] {
+        // `input` starts with the opening `(*`. A comment is whitespace: consume it up
+        // to (and including) the first closing `*)`, advancing the source location over
+        // its contents -- newlines included -- but WITHOUT emitting any layout tokens.
+        // The interior of a comment must not drive the offside rule; layout for the
+        // following token is decided by the next `scan_whitespace`/token at its real
+        // position. Comments do not nest: a stray `(*` in the text (e.g. an operator
+        // section like `(*2)` written in prose) is just more comment text.
+        let mut remains = input;
+
+        loop {
+            remains = match remains {
+                ['*', ')', rest @ ..] => {
+                    self.location.move_right(2);
+                    return rest;
                 }
-                remains = &remains[pos + 2..];
-            }
+                ['\n', rest @ ..] => {
+                    self.location.new_line();
+                    rest
+                }
+                [_c, rest @ ..] => {
+                    self.location.move_right(1);
+                    rest
+                }
+                // Unterminated comment: consume to end of input.
+                [] => return remains,
+            };
         }
-
-        &remains[..0]
-    }
-
-    fn compute_location(&mut self, remains: &[char], pos: usize) {
-        let new_location = self.compute_next_location(&remains[..=pos + 1]);
-        self.update_location(new_location);
     }
 
     fn scan_identifier<'a>(&mut self, input: &'a [char]) -> &'a [char] {
@@ -212,7 +235,18 @@ impl LexicalAnalyzer {
             input.split_at(input.iter().take_while(|c| c.is_whitespace()).count());
 
         let next_location = self.compute_next_location(whitespace_prefix);
-        self.update_location(next_location);
+
+        // A comment is whitespace and must never drive the offside rule -- not even by
+        // the column at which it happens to begin. If a comment follows this run of
+        // whitespace, advance the location over it but DEFER the layout decision to the
+        // next real token, whose own leading whitespace re-enters here. Otherwise a
+        // comment that starts left of the enclosing block (e.g. at column 1 between two
+        // indented statements) would emit a spurious dedent.
+        if let ['(', '*', ..] = remains {
+            self.location = next_location;
+        } else {
+            self.update_location(next_location);
+        }
 
         remains
     }
@@ -270,6 +304,12 @@ impl LexicalAnalyzer {
         self.emit_layout(next, Layout::Indent);
     }
 
+    // Closing a bracket -- `)`, `}`, or `]` -- unwinds any indentation levels opened
+    // inside it back to the depth recorded by its opener (`paren_marks`, a single stack
+    // shared by all three bracket kinds since they nest). This keeps layout emitted
+    // inside a bracketed group (e.g. a multi-line record literal `{ ... }` whose `{` is
+    // not on its own indented line) from leaking a stray intermediate-level `Dedent`
+    // past the closer, which would otherwise desync the enclosing declaration's layout.
     fn close_paren(&mut self) {
         if let Some(mark) = self.paren_marks.pop() {
             while self.indentation.len() > mark {

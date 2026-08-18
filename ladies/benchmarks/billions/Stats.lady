@@ -1,0 +1,68 @@
+Cheeky_Map ::= ∀α β.
+  { Buckets :: Mutable_Array (Entry α β)
+  }
+
+Entry ::= ∀α β.
+  { Entry_Key   :: Perhaps α
+    Entry_Value :: β
+  }
+
+signature Hashable ::= ∀α.
+  { compute_hash :: α -> Int
+  }
+
+witness ∀α β. Default α + Default β |- Default (Entry α β) :=
+  { default_value := { Entry_Key := default_value; Entry_Value := default_value }
+  }
+
+module Cheeky_Map:
+  make_default :: ∀α β. Default α + Default β |- Int -> IO (Cheeky_Map α β) :=
+    λcapacity.
+      let bucket_store = Mutable_Array.generate capacity (λ_. default_value) in
+      pure { Buckets := bucket_store }
+
+  modify :: ∀α β. Eq α + Hashable α + Semigroup β |- α -> β -> Cheeky_Map α β -> IO Unit :=
+    λkey new_value table.
+      let hash = compute_hash key in
+      let table_length = Mutable_Array.length table.Buckets in
+      let initial_index = hash  % table_length in
+
+      let loop = λindex.
+        let* elt = Mutable_Array.get_unchecked table.Buckets index in
+        deconstruct elt.Entry_Key into
+          This existing_key ->
+            if existing_key = key then
+                let new_entry =
+                  { Entry_Key   := This key
+                    Entry_Value := mappend elt.Entry_Value new_value
+                  }
+                in
+                  Mutable_Array.set_unchecked table.Buckets index new_entry
+            else
+              loop (index * index % table_length)
+
+        | Nope ->
+            let new_entry =
+              { Entry_Key   := This key
+                Entry_Value := new_value
+              }
+            in
+              Mutable_Array.set_unchecked table.Buckets index new_entry
+
+      in
+        let* _ = loop initial_index in
+        pure ()
+
+  to_list :: ∀α β. Cheeky_Map α β -> IO (List (α, β)) := λ({ Buckets: buckets }).
+    let length = Mutable_Array.length buckets in
+    let loop = λi acc.
+      if i < length then
+        let* e = Mutable_Array.get_unchecked buckets i in
+
+        deconstruct e.Entry_Key into
+          This key -> loop (1 + i) (Cons (key, e.Entry_Value) acc)
+        | Nope     -> loop (1 + 1) acc
+
+      else
+        pure acc
+    in loop 0 List.empty
