@@ -16,19 +16,22 @@ witness Display Fault :=
         File_IO e -> "file IO: `e`"
   }
 
+(* Temperatures are stored as tenths -- an `Int` scaled by 10 (22.6 -> 226) -- so the
+   hot path never boxes a `Float`. The `.1`-decimal is reconstructed only at display. *)
 File_Row ::=
   { City        :: Text
-    Temperature :: Float
+    Temperature :: Int
   }
 
 module File_Row:
-  make :: Text -> Float -> File_Row := λcity temp.
+  make :: Text -> Int -> File_Row := λcity temp.
     { City := city; Temperature := temp }
 
+(* All tenths (x10 ints); avg keeps its precision because Sum stays integral. *)
 Aggregate_Stats ::=
-  { Min   :: Float
-    Max   :: Float
-    Sum   :: Float
+  { Min   :: Int
+    Max   :: Int
+    Sum   :: Int
     Count :: Int
   }
 
@@ -38,7 +41,7 @@ witness From File_Row Aggregate_Stats :=
   }
 
 witness Default Aggregate_Stats :=
-  { default_value := { Min := Float.Minimum; Max := Float.Maximum; Sum := 0.0; Count := 0 }
+  { default_value := { Min := Int.Maximum; Max := Int.Minimum; Sum := 0; Count := 0 }
   }
 
 witness Default Text :=
@@ -46,27 +49,26 @@ witness Default Text :=
   }
 
 module FNV1a:
-  offset_basis := 0 - 3750763034362895579
+  offset_basis := -3750763034362895579
   prime        := 1099511628211
 
   hash :: Bytes -> Int := λbytes.
     let length = Bytes.length bytes in
 
-    let loop = λi hash.
+    let loop = λi hash_value.
       if i < length then
         loop
           (i + 1)
-          ((hash xor Bytes.get_u8 bytes i) * prime)
+          ((hash_value xor Bytes.get_u8 bytes i) * prime)
       else
-        hash
+        hash_value
     in
       loop 0 offset_basis
 
 witness Stats.Hashable Text :=
   { compute_hash := λt.
       let bs = Text.to_bytes t in
-      let length = Bytes.length bs in
-      1
+      FNV1a.hash bs
   }
 
 witness Semigroup Aggregate_Stats :=
@@ -82,14 +84,28 @@ witness Monoid Aggregate_Stats :=
   { mempty := default_value
   }
 
+(* Present a tenths-scaled Int as a `.1`-decimal: 226 -> "22.6", -91 -> "-9.1". *)
+format_tenths :: Int -> Text := λtenths.
+  let sign      = if tenths < 0 then "-" else "" in
+  let magnitude = if tenths < 0 then 0 - tenths else tenths in
+  "`sign``magnitude / 10`.`magnitude % 10`"
+
+(* Mean in tenths, rounded to the nearest tenth (half away from zero) -- Sum is already
+   tenths, so this is just round(Sum / Count). Integer-only, so no Float ever appears. *)
+mean_tenths :: Int -> Int -> Int := λsum count.
+  if sum < 0 then
+    0 - ((2 * (0 - sum) + count) / (2 * count))
+  else
+    (2 * sum + count) / (2 * count)
+
 witness Display File_Row :=
   { display := λself.
-      "City `self.City`, Temperature `self.Temperature`"
+      "City `self.City`, Temperature `format_tenths self.Temperature`"
   }
 
 witness Display Aggregate_Stats :=
   { display := λself.
-      "min `self.Min`, max `self.Max`, avg `self.Sum / Float.of_int self.Count`"
+      "min `format_tenths self.Min`, max `format_tenths self.Max`, avg `format_tenths (mean_tenths self.Sum self.Count)`"
   }
 
 read_file_data :: Text -> IO (Result Fault (List (Text, Aggregate_Stats))) := λfile_path.
@@ -105,67 +121,58 @@ read_file_data :: Text -> IO (Result Fault (List (Text, Aggregate_Stats))) := λ
 (* let* _ = Hash_Table.modify row.City aggregate table in *)
 process_file_bytes :: Bytes -> IO (List (Text, Aggregate_Stats)) := λfile_bytes.
   let* table = Stats.Cheeky_Map.make_default 47521 in
-  let parse_rows = λremains.
-    deconstruct State_T.run parse_row remains into
-      This (remains, row) ->
-        let aggregate = from row in
-        let* _ = Stats.Cheeky_Map.modify row.City aggregate table in
-        parse_rows remains
-    | Nope ->
-        pure ()
+  let length = Bytes.length file_bytes in
+  let loop = λi.
+    if i < length then
+      let city_bytes, temperature, next = parse_row file_bytes i in
+      deconstruct Text.from_bytes city_bytes into
+        This city ->
+          let aggregate = from (File_Row.make city temperature) in
+          let* _ = Stats.Cheeky_Map.modify city aggregate table in
+          loop next
+      | Nope ->
+          loop next
+    else
+      pure ()
   in
-    let* _ = parse_rows file_bytes in
-    (* let* table_data = Hash_Table.to_list table *)
+    let* _ = loop 0 in
     let* table_data = Stats.Cheeky_Map.to_list table
     in pure table_data
 
-parse_text_until :: Int -> State_T Bytes Perhaps Text := λdelimiter.
-  let* bytes =  take_until delimiter in
-  State_T.lift (Text.from_bytes bytes)
+(* Direct-style parser: instead of a `State_T Bytes` monad that threads (and reslices)
+   the remaining bytes -- allocating a bind closure + a (value, bytes) pair per step --
+   we thread a single `Int` cursor over the FIXED source. No monad, no reslicing: just
+   an index, exactly the `loop i` shape used elsewhere (FNV1a.hash, Cheeky_Map.to_list). *)
 
-parse_float_until :: Int -> State_T Bytes Perhaps Float := λdelimiter.
-  let* text = parse_text_until delimiter in
-  State_T.lift (from text :: Perhaps Float)
+(* First index at or after `i` whose byte equals `delim`. *)
+scan_to :: Bytes -> Int -> Int -> Int := λsource i delim.
+  if Bytes.get_u8 source i = delim then i
+  else scan_to source (i + 1) delim
 
-(* Is there constant hoising/ folding or whatever in this backend? Int.of_char etc. *)
-(* Also: don't use Float, use Int at * 10 or something. This cuts the boxes. *)
-parse_temperature :: State_T Bytes Perhaps Float :=
-  let* input = State_T.get in
-  let neg = Bytes.get_u8 input 0 = Int.of_char '-' in
-
+(* Parse the temperature `[-]D[D].D` starting at `start` as TENTHS (x10 Int) -- no Float
+   boxing at all. `22.6` -> 226, `-9.1` -> -91. Returns the value paired with the index
+   of the next row. `digit = byte - '0'`. *)
+parse_temperature :: Bytes -> Int -> (Int, Int) := λsource start.
+  let neg = Bytes.get_u8 source start = Int.of_char '-' in
   let index, whole =
     if neg then
-      2, Float.of_int (Bytes.get_u8 input 1 - Int.of_char '0')
+      2, (Bytes.get_u8 source (start + 1) - Int.of_char '0')
     else
-      1, Float.of_int (Bytes.get_u8 input 0 - Int.of_char '0')
+      1, (Bytes.get_u8 source start - Int.of_char '0')
   in
-
     let value, consumed =
-      if Bytes.get_u8 input index = Int.of_char '.' then
-        whole + Float.of_int (Bytes.get_u8 input (index + 1) - Int.of_char '0') / 10.0, index + 3
+      if Bytes.get_u8 source (start + index) = Int.of_char '.' then
+        whole * 10 + (Bytes.get_u8 source (start + index + 1) - Int.of_char '0'), index + 3
       else
-        10.0 * whole + Float.of_int (Bytes.get_u8 input index - Int.of_char '0') + Float.of_int (Bytes.get_u8 input (index + 2) - Int.of_char '0') / 10.0, index + 4
+        (10 * whole + (Bytes.get_u8 source (start + index) - Int.of_char '0')) * 10 + (Bytes.get_u8 source (start + index + 2) - Int.of_char '0'), index + 4
     in
-      let* _ = State_T.put (Bytes.skip input consumed) in
-      pure (if neg then (0.0 - value) else value)
+      ((if neg then 0 - value else value), start + consumed)
 
-
-(* Calling this segfaults. *)
-parse_until :: ∀a. From Text (Perhaps a) |- Int -> State_T Bytes Perhaps a := λdelimiter.
-  let* text = parse_text_until delimiter in
-  State_T.lift (from text)
-
-parse_row :: State_T Bytes Perhaps File_Row :=
-   liftA2 File_Row.make
-    (parse_text_until (Int.of_char ';'))
-    parse_temperature
-
-take_until :: Int -> State_T Bytes Perhaps Bytes := λdelimiter.
-  let* input = State_T.get in
-  let* i = State_T.lift (Bytes.position input (λb. b = delimiter)) in
-  let field, remains = Bytes.split_at input i in
-  let* _ = State_T.put (Bytes.skip remains 1) in
-  pure field
+parse_row :: Bytes -> Int -> (Bytes, Int, Int) := λsource i.
+  let semicolon = scan_to source i (Int.of_char ';') in
+  let city_bytes = Bytes.slice source i (semicolon - i) in
+  let temperature, next = parse_temperature source (semicolon + 1) in
+  (city_bytes, temperature, next)
 
 main :: IO Unit :=
   let* collated = read_file_data "ladies/benchmarks/billions/city-temperatures.txt" in

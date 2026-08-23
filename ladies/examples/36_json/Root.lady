@@ -1,0 +1,96 @@
+use Stdlib.
+use Stdlib.Json.
+
+(* Test harness for the Stdlib.Json parser.
+
+   `Parse.json_bytes` takes UTF-8 `Bytes` and returns `Result Fault Node`.
+   Both arms render through the Display witnesses in Stdlib.Json:
+     - a parsed `Node`  shows as its JSON-ish shape, e.g. `[1.0; ]` or `{(a, 1.0); }`
+       (array elements and object fields print in reverse insertion order, since the
+        parser conses onto an accumulator, and strings print WITHOUT quotes);
+     - a `Fault` shows as a human message, e.g. `End of file` or `Unexpected input !`.
+
+   `check` parses one snippet and prints it beside the outcome, so every line reads
+   `[id] input => outcome`. Each case carries a short stable `id` (e.g. `num3`) so a
+   result can be referenced directly. The `>>` tag makes the result lines easy to
+   eyeball (and grep) amid any tracing the parser itself emits. *)
+check :: Text -> Text -> Unit := λid input.
+  let outcome = Parse.json_bytes (Text.to_bytes input) in
+  print_endline ">> [`id`] `input`  =>  `outcome`"
+
+start := λ_.
+  print_endline "##TC"
+
+  print_endline "-- objects --"
+  check "obj1" "{}"
+  check "obj2" "{\"a\": 1}"
+  check "obj3" "{\"a\": 1,\"b\": 2}"
+  check "obj4" "{\"a\": \"x\"}"
+  check "obj5" "{\"a\": 1,\"b\": 2,\"c\": 3,\"d\": 4}"
+  check "obj6" "{\"a\": {}}"
+  check "obj7" "{\"a\": []}"
+  check "obj8" "{\"outer\": {\"inner\": 7}}"
+  check "obj9" "{\"\": 1}"
+
+  print_endline "-- arrays --"
+  check "arr1" "[]"
+  check "arr2" "[1]"
+  check "arr3" "[1,2,3]"
+  check "arr4" "[\"a\",\"b\"]"
+  check "arr5" "[1,2,3,4,5,6,7,8,9,10]"
+  check "arr6" "[[]]"
+  check "arr7" "[{},{}]"
+  check "arr8" "[[1],[2],[3]]"
+
+  print_endline "-- numbers --"
+  check "num1" "[0]"
+  check "num2" "[42]"
+  check "num3" "[1234567890]"
+  check "num4" "[1.5]"
+  check "num5" "[-1]"
+  check "num6" "[3.14159]"
+  check "num7" "[1e5]"
+  check "num8" "[007]"
+
+  print_endline "-- strings --"
+  check "str1" "[\"\"]"
+  check "str2" "[\"hello world\"]"
+  check "str3" "[\"a,b\"]"
+  check "str4" "[\"a]b\"]"
+  check "str5" "[\"a}b\"]"
+  check "str6" "[\"it's fine\"]"
+  check "str7" "[\"a\\\"b\"]"
+  check "str8" "[\"café\"]"
+  check "str9" "{\"key with spaces\": 1}"
+
+  print_endline "-- whitespace --"
+  check "ws1" " [1] "
+  check "ws2" "[ 1 , 2 ]"
+  check "ws3" "{ \"a\" : 1 }"
+  check "ws4" "[\t1,\t2]"
+  check "ws5" "[1,  2,   3]"
+
+  print_endline "-- deep nesting --"
+  check "deep1" "[[[[1]]]]"
+  check "deep2" "{\"a\": {\"b\": {\"c\": 1}}}"
+  check "deep3" "[{\"a\": [{\"b\": 2}]}]"
+  check "deep4" "{\"xs\": [1,2,3],\"ys\": [\"p\",\"q\"]}"
+
+  print_endline "-- malformed (expect a Fault) --"
+  check "bad1" ""
+  check "bad2" "["
+  check "bad3" "{"
+  check "bad4" "!"
+  check "bad5" "1"
+  check "bad6" "\"bare\""
+  check "bad7" "[1,]"
+  check "bad8" "[1 2]"
+  check "bad9" "{\"a\"}"
+  check "bad10" "{\"a\":}"
+  check "bad11" "{a: 1}"
+  check "bad12" "[1,2,3"
+  check "bad13" "]"
+  check "bad14" "[1,2]extra"
+  check "bad15" "[1,2,]"
+  check "bad16" "{\"a\": 1,}"
+  check "bad17" "[,1]"

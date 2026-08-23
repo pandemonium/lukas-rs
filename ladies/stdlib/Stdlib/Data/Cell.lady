@@ -1,3 +1,5 @@
+use Stdlib.Data.Array.
+
 Mutable_Cell ::= ∀α. Cell (Mutable_Array α)
 
 module Mutable_Cell:

@@ -45,23 +45,27 @@ module Default:
 module Float:
   foreign raw_max_of_float :: Float
   foreign raw_min_of_float :: Float
-  foreign raw_float_of_int :: Int -> Float
 
-  of_int :: Int -> Float := raw_float_of_int
+  (* Widening coercion: a compiler builtin, not a foreign, so it folds on a literal. *)
+  of_int :: Int -> Float := float_of_int
 
   Maximum :: Float := raw_max_of_float
   Minimum :: Float := raw_min_of_float
 
 
 module Int:
-  foreign raw_int_of_char :: Char -> Int
   foreign raw_max_of_int :: Int
   foreign raw_min_of_int :: Int
 
-  of_char :: Char -> Int := raw_int_of_char
+  (* Widening coercion: a compiler builtin (erased to identity), not a foreign. *)
+  of_char :: Char -> Int := int_of_char
 
   Maximum :: Int := raw_max_of_int
   Minimum :: Int := raw_min_of_int
+
+
+module Char:
+  of_byte :: Int -> Char := char_of_byte
 
 
 (* ---------------------------------------------------------------- core ADTs *)
@@ -183,14 +187,28 @@ module Bytes:
   skip :: Bytes -> Int -> Bytes := λ(Bytes s) n.
     Bytes (raw_sub s n (raw_slice_len s - n))
 
+  take_while :: Bytes -> (Int -> Bool) -> Bytes := λbytes.
+    take_while' bytes 0
+
+  take_while' :: Bytes -> Int -> (Int -> Bool) -> Bytes := λbytes offset p.
+    let loop = λi.
+      if p (get_u8 bytes i)
+      then loop (1 + i)
+      else Bytes.slice bytes offset (i - offset)
+    in loop offset
+
   (* First index whose byte satisfies `p`, else Nope. *)
-  position :: Bytes -> (Int -> Bool) -> Perhaps Int := λ(Bytes s) p.
+  position :: Bytes -> (Int -> Bool) -> Perhaps Int := λbytes.
+    position' bytes 0
+
+  (* First index whose byte satisfies `p`, else Nope. *)
+  position' :: Bytes -> Int -> (Int -> Bool) -> Perhaps Int := λ(Bytes s) offset p.
     let length = raw_slice_len s in
     let scan = λi.
       if p (raw_get_u8 s i) then This i
       else if i + 1 < length then scan (i + 1)
       else Nope
-    in if length > 0 then scan 0 else Nope
+    in if length > 0 then scan offset else Nope
 
   get_u8     :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_u8 s i
   get_u16_le :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_u16_le s i

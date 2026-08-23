@@ -41,3 +41,7 @@ witness ∀e. Traversable (Result e) :=
   { traverse := λf. result (compose pure Fault) (compose (fmap Return) f)
   }
 
+return_or :: ∀α e. (Unit -> e) -> Perhaps α -> Result e α := λmk_fault pa.
+  deconstruct pa into
+    This a -> Return a
+  | Nope   -> Fault (mk_fault ())

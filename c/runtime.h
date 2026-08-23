@@ -168,6 +168,14 @@ static inline Value prim_bnot(Value a) { return VInt(~as_int(a)); }
 // Unary minus: arithmetic negation. `prim_neg` is Int; codegen picks `prim_fneg`
 // (defined with the Float prims below) when the operand's static type is Float.
 static inline Value prim_neg(Value a) { return VInt(-as_int(a)); }
+// Widening coercions. `Char -> Int` is a no-op: a Char and its code point share the
+// immediate encoding (`VChar('0')` is bit-identical to `VInt(48)`), so this compiles
+// away. `Int -> Float` boxes (Float is a heap OBJ_FLOAT), so it does real work.
+static inline Value prim_int_of_char(Value a) { return a; }
+static inline Value prim_float_of_int(Value a) { return VFloat((double)as_int(a)); }
+// `Int -> Char` (`Char.of_byte`): total, masks to the low byte. Char and Int share the
+// immediate encoding, so this is just the masked int re-tagged as itself.
+static inline Value prim_char_of_byte(Value a) { return VInt(as_int(a) & 0xFF); }
 // Float arithmetic: unbox -> compute -> rebox. Codegen picks these (over the `prim_*`
 // int forms) when the operands' static type is Float. Each result is a fresh heap box.
 // `prim_fmod` is C `fmod` (IEEE remainder toward zero), matching the interpreter's `%`.
@@ -252,6 +260,9 @@ extern Value builtin_or;
 extern Value builtin_xor;
 extern Value builtin_not;
 extern Value builtin_neg;
+extern Value builtin_int_of_char;
+extern Value builtin_float_of_int;
+extern Value builtin_char_of_byte;
 extern Value builtin_print_endline;
 extern Value builtin_text_fold_right;
 

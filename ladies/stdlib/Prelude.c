@@ -10,14 +10,13 @@
 #include "gc.h"
 
 // ------------------------------------------------------------------- Int
-FOREIGN_DECL(int64_t, Root_Prelude_Int_raw_int_of_char, int64_t, c, { return c; })
-
+// `Int.of_char` and `Float.of_int` are now compiler builtins (see runtime.h
+// prim_int_of_char / prim_float_of_int), not foreigns -- no companion needed.
 FOREIGN_DECL(int64_t, Root_Prelude_Int_raw_max_of_int, { return INT_MAX; })
 FOREIGN_DECL(int64_t, Root_Prelude_Int_raw_min_of_int, { return INT_MIN; })
 
 FOREIGN_DECL(Value, Root_Prelude_Float_raw_max_of_float, { return VFloat(DBL_MAX); })
 FOREIGN_DECL(Value, Root_Prelude_Float_raw_min_of_float, { return VFloat(DBL_MIN); })
-FOREIGN_DECL(Value, Root_Prelude_Float_raw_float_of_int, int64_t, i, { return VFloat((double) i); })
 
 // ------------------------------------------------------------ Buffer (mutable)
 FOREIGN_DECL(Value, Root_Prelude_Buffer_raw_new_buffer, int64_t, cap, {

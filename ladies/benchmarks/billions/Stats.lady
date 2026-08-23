@@ -15,6 +15,10 @@ witness ∀α β. Default α + Default β |- Default (Entry α β) :=
   { default_value := { Entry_Key := default_value; Entry_Value := default_value }
   }
 
+positive_mod :: Int -> Int -> Int := λn modulus.
+  let r = n % modulus in
+  if r < 0 then r + modulus else r
+
 module Cheeky_Map:
   make_default :: ∀α β. Default α + Default β |- Int -> IO (Cheeky_Map α β) :=
     λcapacity.
@@ -25,7 +29,7 @@ module Cheeky_Map:
     λkey new_value table.
       let hash = compute_hash key in
       let table_length = Mutable_Array.length table.Buckets in
-      let initial_index = hash  % table_length in
+      let initial_index = positive_mod hash table_length in
 
       let loop = λindex.
         let* elt = Mutable_Array.get_unchecked table.Buckets index in
@@ -39,7 +43,7 @@ module Cheeky_Map:
                 in
                   Mutable_Array.set_unchecked table.Buckets index new_entry
             else
-              loop (index * index % table_length)
+              loop (positive_mod (1 + index) table_length)
 
         | Nope ->
             let new_entry =
@@ -61,7 +65,7 @@ module Cheeky_Map:
 
         deconstruct e.Entry_Key into
           This key -> loop (1 + i) (Cons (key, e.Entry_Value) acc)
-        | Nope     -> loop (1 + 1) acc
+        | Nope     -> loop (1 + i) acc
 
       else
         pure acc

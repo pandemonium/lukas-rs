@@ -1,3 +1,5 @@
+use Stdlib.Data.Array.
+
 signature Hash_Stream ::= ∀h.
   { write_bytes :: Bytes -> State h Unit
     write_int   :: Int -> State h Unit

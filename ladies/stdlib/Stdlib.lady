@@ -4,6 +4,7 @@ module Data.
 module Binary.
 module Text.
 module Random.
+module Json.
 (* module Files. *)
 
 use Stdlib.Data.

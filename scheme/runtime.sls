@@ -8,6 +8,7 @@
     marm-or
     marm-xor
     marm-not
+    char-of-byte
     text-fold-right
     )
   (import (chezscheme))
@@ -38,6 +39,11 @@
     (if (boolean? a) (bool-xor a b) (bitwise-xor a b)))
   (define (marm-not a)
     (if (boolean? a) (not a) (bitwise-not a)))
+
+  ;; `Char.of_byte`: total Int -> Char, masking to the low byte so every input is a
+  ;; valid Scheme char (a Marmelade Char is a Scheme char).
+  (define (char-of-byte n)
+    (integer->char (bitwise-and n 255)))
 
   (define text-fold-right
       (lambda (f z s)
