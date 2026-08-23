@@ -1,0 +1,150 @@
+use Stdlib.
+use Stdlib.Data.Hash_Table.
+use Stdlib.Data.Cell.
+
+(* Hash_Table stress test (Stdlib.Data.Hash_Table). Hammers the open-addressed table with *)
+(* tens of thousands of live keys per case -- forcing repeated rehash/growth from a tiny  *)
+(* capacity -- across THREE key types (Int, Text, and a hand-rolled `Coord` record with    *)
+(* its own Eq + Hashable), and across TWO hashers (the library default plus a second        *)
+(* `Hash_Stream`, `My_Hasher`, with a different mix). Every case asserts: each inserted key  *)
+(* looks up to the right value (no present-key MISSES), and keys never inserted look up to    *)
+(* `Nope` (no absent-key GHOSTS). A separate case checks that re-inserting a key returns the   *)
+(* old value and updates to the new one. Output is a deterministic PASS/FAIL line per case,     *)
+(* with fixed seeds so performance and allocation remain comparable between builds.             *)
+
+(* ---- A third key type: a 2-D coordinate, with hand-written Eq + Hashable. ---- *)
+Coord ::= { X :: Int; Y :: Int }
+
+Foo ::= { Number :: Int; Label :: Text }
+
+witness Eq Coord :=
+  { eq := λa b. a.X = b.X and a.Y = b.Y
+  }
+
+witness Hashable Coord :=
+  { hash := λc.
+      let* _ = write_int c.X in
+      write_int c.Y
+  }
+
+(* ---- A second Hash_Stream: same shape as Simple_Hasher, a different (still dumb) mix. ---- *)
+My_Hasher ::= { Hash_State :: Int }
+
+module My_Hasher:
+  make :: Int -> My_Hasher := λseed. { Hash_State := seed }
+
+  (* A different multiplier from Simple_Hasher's 31; bounded by a prime so the running *)
+  (* state never overflows. Not a good hash -- deliberately -- just DIFFERENT, to prove *)
+  (* the table is agnostic to the algorithm.                                            *)
+  mix :: Int -> Int -> Int := λstate value. (state * 65599 + value) % 2147483647
+
+witness Hash_Stream My_Hasher :=
+  { write_bytes := λbytes.
+      let loop = λi.
+        if i < Bytes.length bytes then
+          let* _ = write_int (Bytes.get_u8 bytes i) in
+          loop (i + 1)
+        else
+          pure ()
+      in loop 0
+
+    write_int := λvalue.
+      modify (λ({ Hash_State: s }). { Hash_State := My_Hasher.mix s value })
+
+    finish := let* { Hash_State: value } = get in pure value
+  }
+
+(* ---- Generic harness (agnostic to key type and to the hasher baked into `table`). ---- *)
+
+insert_n :: ∀α β. (Int -> α) -> (Int -> β) -> Int -> Int -> Hash_Table α β -> IO Unit :=
+  λkey val i n table.
+    if i < n then
+      let* _ = Hash_Table.insert (key i) (val i) table in
+      insert_n key val (i + 1) n table
+    else
+      pure ()
+
+(* How many inserted keys fail to look up to their value (a MISS = wrong or missing). *)
+present_misses :: ∀α β. Eq β |- (Int -> α) -> (Int -> β) -> Int -> Int -> Int -> Hash_Table α β -> IO Int :=
+  λkey val i n misses table.
+    if i < n then
+      let* found = Hash_Table.lookup (key i) table in
+      deconstruct found into
+        This v -> present_misses key val (i + 1) n (if v = val i then misses else misses + 1) table
+      | Nope   -> present_misses key val (i + 1) n (misses + 1) table
+    else
+      pure misses
+
+(* How many NEVER-inserted keys wrongly look up to something (a GHOST). *)
+absent_ghosts :: ∀α β. (Int -> α) -> Int -> Int -> Int -> Hash_Table α β -> IO Int :=
+  λkey i n ghosts table.
+    if i < n then
+      let* found = Hash_Table.lookup (key i) table in
+      deconstruct found into
+        This _ -> absent_ghosts key (i + 1) n (ghosts + 1) table
+      | Nope   -> absent_ghosts key (i + 1) n ghosts table
+    else
+      pure ghosts
+
+(* Combining and subsequently displaying two `let*`-bound results is a regression test *)
+(* for the stale-substitution bug that used to add phantom Display dictionaries here.   *)
+run_case :: ∀α β. Eq β |- Text -> Int -> (Int -> α) -> (Int -> β) -> Hash_Table α β -> IO Unit :=
+  λlabel n key val table.
+    let* _     = insert_n key val 0 n table in
+    let* miss  = present_misses key val 0 n 0 table in
+    let* ghost = absent_ghosts key n (2 * n) 0 table in
+    let fails = miss + ghost in
+    let verdict = if fails = 0 then "PASS" else "FAIL" in
+    IO.output "`label`: n=`n` miss=`miss` ghost=`ghost` -> `verdict`"
+
+(* Re-inserting a key returns the OLD value and updates the map to the NEW one. *)
+overwrite_case :: IO Unit :=
+  let table = Hash_Table.make 8 (Simple_Hasher.make 6) in
+  let* _   = Hash_Table.insert 42 100 table in
+  let* old = Hash_Table.insert 42 200 table in
+  let* now = Hash_Table.lookup 42 table in
+  let* entries = Hash_Table.to_list table in
+  let old_ok = deconstruct old into This v -> v = 100 | Nope -> false in
+  let now_ok = deconstruct now into This v -> v = 200 | Nope -> false in
+  let list_ok = List.length entries = 1 in
+  let verdict = if old_ok then (if now_ok then (if list_ok then "PASS" else "FAIL-list") else "FAIL-new") else "FAIL-old" in
+  IO.output "overwrite      : old-ok=`old_ok` new-ok=`now_ok` list-ok=`list_ok` -> `verdict`"
+
+(* Mutable_Cell is a one-element shaped Mutable_Array. Exercise make/get/put/modify *)
+(* with a flat record so its layout dictionary and unchecked-array ABI are both tested. *)
+mutable_cell_case :: IO Unit :=
+  let one = { Number := 1; Label := "one" } in
+  let two = { Number := 2; Label := "two" } in
+  let* cell = Mutable_Cell.make one in
+  let* first = Mutable_Cell.get cell in
+  let* replaced = Mutable_Cell.put two cell in
+  let* modified = Mutable_Cell.modify (λfoo. { Number := foo.Number + 40; Label := foo.Label }) cell in
+  let* current = Mutable_Cell.get cell in
+  let ok = first.Number = 1 and replaced.Number = 1 and modified.Number = 2 and current.Number = 42 and current.Label = "two" in
+    let verdict = if ok then "PASS" else "FAIL" in
+    IO.output "mutable-cell  : first=`first.Number` replaced=`replaced.Number` modified=`modified.Number` current=`current.Number` label=`current.Label` -> `verdict`"
+
+(* Every table starts at capacity 8. These sizes are large enough to make the generic *)
+(* layout-specialized path measurable while remaining suitable for the full panel.    *)
+main :: IO Unit :=
+  let t1 = Hash_Table.make 8 (Simple_Hasher.make 1) in
+  let* _ = run_case "Int   / default" 50000 (λi. i)                            (λi. i * 7 + 1) t1 in
+
+  let t2 = Hash_Table.make 8 (Simple_Hasher.make 2) in
+  let* _ = run_case "Text  / default" 50000 (λi. "key-`i`")                    (λi. i * 3)     t2 in
+
+  let t3 = Hash_Table.make 8 (Simple_Hasher.make 3) in
+  let* _ = run_case "Coord / default" 40000 (λi. { X := i % 200; Y := i / 200 }) (λi. i)         t3 in
+
+  let t4 = Hash_Table.make 8 (My_Hasher.make 4) in
+  let* _ = run_case "Int   / custom " 50000 (λi. i)                            (λi. i * 7 + 1) t4 in
+
+  let t5 = Hash_Table.make 8 (My_Hasher.make 5) in
+  let* _ = run_case "Coord / custom " 40000 (λi. { X := i % 200; Y := i / 200 }) (λi. i)         t5 in
+
+  let* _ = overwrite_case in
+  mutable_cell_case
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  IO.unsafe_run_IO main

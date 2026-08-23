@@ -1,0 +1,77 @@
+(* ============================================================================
+   COMMENT TORTURE TEST                                                (banner)
+   A multi-line comment at the very top of the file, before anything else.
+   It is packed with characters that could confuse a naive lexer:
+     - lone stars:  *  **  ***   and lone parens:  (  )  )  (
+     - a fake operator "section" written in prose:  (*2)  and  (*3)
+     - something that merely looks like code:  x := 1 ; deconstruct y into This z
+     - an almost-closer that is not one:  a star, a space, a paren  *   )
+   None of the above ends the comment early; only the real closer does.
+   ============================================================================ *)
+
+use (* a comment wedged between `use` and the module path *) Stdlib.
+
+(*
+   A lone multi-line comment sitting between two top-level declarations,
+   with erratically indented lines:
+       way over here,
+   back to the left,
+             and out again,
+   including a line that begins in column 1:
+(this line starts at column 1 and must not disturb the file's layout)
+*)
+
+(* --- a signature + lambda with a comment jammed between (almost) every token --- *)
+double (* the name *) :: (* the :: *) Int (* domain *) -> (* the -> *) Int (* codomain *) := (* the := *) λ (* the lambda *) n (* the parameter *) . (* the dot *)
+  n (* the left operand is here, the right operand is on the far side of this
+       comment, which itself spans several lines -- the line breaks belong to
+       the comment, so the whole `n + n` stays one expression *) + n
+
+(* deconstruct with comments before arms, around guards, and after arrows *)
+classify :: Int -> Text := λ n .
+  deconstruct n (* the scrutinee *) into
+    (* arm 1 *) 0 (* zero *) -> (* the arrow *) "zero"
+  | (* arm 2 *) 1 -> "one"
+(* a comment sitting at column 1 between two match arms *)
+  | otherwise (* the catch-all *) -> "many"
+
+Point ::=
+  { X :: Int (* the abscissa *)
+(* a column-1 comment between two record fields *)
+    Y :: Int (* the ordinate *)
+  }
+
+(* A non-lambda top-level binding whose body is a multi-line record literal with
+   the opening brace on the `:=` line -- the layout inside the braces must not leak
+   out and desync the declaration that follows. *)
+origin :: Point := { X := 0
+                     Y := 0 }
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+
+  (* an ordinary leading comment *)
+  print_endline "`double 21`"                            (* 42 *)
+
+  print_endline (classify (* the argument *) ( (* ( *) 1 (* 1 *) ))   (* one *)
+(* a column-1 comment between two statements of the `start` block *)
+  print_endline (classify 9)                             (* many *)
+
+  (* comments jammed tight against tokens, with no surrounding whitespace *)
+  print_endline "`1(*a*)+2(*b*)*3(*c*)`"                 (* 7 *)
+
+  (* a comment living inside a string-interpolation expression, plus record
+     construction whose fields carry comments *)
+  let p = { X := 3 (* x *) ; Y := 4 (* y *) } in
+  print_endline "`p.X (* dot-x *) * p.X + p.Y * p.Y`"    (* 25 *)
+
+  (* empty comments of both spellings, wrapped around a tuple's elements *)
+  let t = (**)10 (* *), 20(**), 30 in
+  print_endline "`t.0 (**) + t.1 + t.2`"                 (* 60 *)
+
+  (* the multi-line record literal bound at top level above *)
+  print_endline "`origin.X + origin.Y`"                  (* 0 *)
+
+  print_endline "done"
+
+(* a trailing comment at the very end of the file, terminated just before EOF *)
