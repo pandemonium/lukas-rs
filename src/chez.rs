@@ -81,7 +81,11 @@ impl QualifiedName {
         buffer.push(head.clone());
         buffer.extend_from_slice(tail.as_slice());
         buffer.push(member.as_str().to_owned());
-        buffer.join("-")
+        // The lexer allows `'` (prime) in identifiers -- e.g. `take_while'` -- but in
+        // Scheme `'` is the quote reader macro, not an identifier character. Rewrite it
+        // to a `_prime` suffix (valid in a Scheme symbol); definitions and uses both
+        // flow through here, so the rewrite stays consistent.
+        buffer.join("-").replace('\'', "_prime")
     }
 
     fn into_scheme_name(&self) -> String {
@@ -117,7 +121,22 @@ impl ast::Literal {
             // not the exact integer `1` -- the difference decides whether `/` is flonum
             // division or exact rational division downstream.
             ast::Literal::Float(x) => write!(code, "{x:?}")?,
-            ast::Literal::Text(x) => write!(code, "\"{x}\"")?,
+            // Re-escape characters that are special in a Scheme string literal (the
+            // `Text` may hold quotes/backslashes/newlines from source escapes).
+            ast::Literal::Text(x) => {
+                write!(code, "\"")?;
+                for c in x.chars() {
+                    match c {
+                        '"' => write!(code, "\\\"")?,
+                        '\\' => write!(code, "\\\\")?,
+                        '\n' => write!(code, "\\n")?,
+                        '\t' => write!(code, "\\t")?,
+                        '\r' => write!(code, "\\r")?,
+                        c => write!(code, "{c}")?,
+                    }
+                }
+                write!(code, "\"")?;
+            }
             ast::Literal::Bool(true) => write!(code, "#t")?,
             ast::Literal::Bool(false) => write!(code, "#f")?,
             ast::Literal::Unit => write!(code, "'()")?,
@@ -203,6 +222,12 @@ fn map_builtin_name(name: &QualifiedName) -> &'static str {
         // Scheme `-` is already unary negation: `(- x)`. `negate` is emitted as an
         // arity-1 intrinsic, so it uncurries to `(lambda (a) (- a))`.
         "negate" => "-",
+        // Widening coercions. A Marmelade Char is a Scheme char; Int/Float are exact/
+        // inexact numbers.
+        "int_of_char" => "char->integer",
+        "float_of_int" => "exact->inexact",
+        // Total byte->char: mask to the low byte, then to a Scheme char.
+        "char_of_byte" => "char-of-byte",
         "prim_gte" => ">=",
         "prim_lte" => "<=",
         "text_fold_right" => "text-fold-right",

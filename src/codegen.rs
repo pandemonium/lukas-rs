@@ -20,6 +20,15 @@ use crate::{
     typer::{BaseType, Type, memory_layout_evidence_name},
 };
 
+/// What a worker's own recursive call looks like, for tail-call loopification. A top-level
+/// `Worker` names itself by its global name; a lifted (recursive) lambda names itself through
+/// `self` (`Identifier::SelfRef`).
+#[derive(Clone, Copy)]
+enum SelfCall<'a> {
+    Named(&'a QualifiedName),
+    SelfRef,
+}
+
 // Widest inlined field before it is kept a pointer instead; must match
 // `FLAT_INLINE_CAP` in lambda_lift so codegen and the layout table agree.
 const FLAT_INLINE_CAP: usize = 8;
@@ -128,15 +137,56 @@ fn is_builtin(q: &QualifiedName) -> bool {
 }
 
 // Qualified name flattened to a C identifier: module path and member joined
-// with `_`. The lexer restricts identifiers to alphanumerics and `_`, and
-// operators reach `c_name` only as builtins (named via `map_builtin_name`), so
-// the join is already a valid C identifier.
+// with `_`. The lexer allows `'` (prime) in identifiers -- e.g. `take_while'` --
+// which is not a valid C identifier character, so it is rewritten to a readable
+// `_prime` suffix. Operators reach `c_name` only as builtins (named via
+// `map_builtin_name`), so nothing else here needs escaping. Definitions and uses
+// both flow through this function, so the rewrite stays consistent.
+// Escape a string for embedding in a C string literal: the delimiters/backslash and
+// control characters that would otherwise break the literal (or `sizeof`'s byte count).
+// Non-ASCII UTF-8 is emitted verbatim -- valid in a C string literal in a UTF-8 source.
+fn c_string_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            // Any other control character as a fixed-width octal escape (three digits, so
+            // a following literal digit can't extend it).
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\{:03o}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+// A `VChar('...')` C char constant for a Marmelade char. A raw newline, quote, or
+// backslash cannot appear literally inside a char constant, so escape those (plus the
+// common control escapes); printable ASCII is emitted verbatim. Everything else --
+// other control characters and non-ASCII -- becomes a fixed-width octal escape of the
+// low byte, matching the runtime's single-byte `Char` (`as_char` masks to 0xFF).
+fn c_char_literal(c: char) -> String {
+    let body = match c {
+        '\'' => "\\'".to_owned(),
+        '\\' => "\\\\".to_owned(),
+        '\n' => "\\n".to_owned(),
+        '\t' => "\\t".to_owned(),
+        '\r' => "\\r".to_owned(),
+        c if (0x20..0x7f).contains(&(c as u32)) => c.to_string(),
+        c => format!("\\{:03o}", (c as u32) & 0xFF),
+    };
+    format!("VChar('{body}')")
+}
+
 fn surface_name(q: &QualifiedName) -> String {
     let mut parts = Vec::with_capacity(2 + q.module.tail.len());
     parts.push(q.module.head.clone());
     parts.extend_from_slice(q.module.tail.as_slice());
     parts.push(q.member.as_str().to_owned());
-    parts.join("_")
+    parts.join("_").replace('\'', "_prime")
 }
 
 // Runtime function names for builtin/foreign primitives -- these name the C
@@ -157,6 +207,9 @@ fn map_builtin_name(q: &QualifiedName) -> &'static str {
         "or" => "builtin_or",
         "not" => "builtin_not",
         "negate" => "builtin_neg",
+        "int_of_char" => "builtin_int_of_char",
+        "float_of_int" => "builtin_float_of_int",
+        "char_of_byte" => "builtin_char_of_byte",
         "prim_gte" => "builtin_ge",
         "prim_lte" => "builtin_le",
         "text_fold_right" => "builtin_text_fold_right",
@@ -227,6 +280,9 @@ fn builtin_prim(head: &Expr) -> Option<(&'static str, usize)> {
         "xor" => ("prim_xor", 2),
         "not" => ("prim_not", 1),
         "negate" => ("prim_neg", 1),
+        "int_of_char" => ("prim_int_of_char", 1),
+        "float_of_int" => ("prim_float_of_int", 1),
+        "char_of_byte" => ("prim_char_of_byte", 1),
         "prim_show" => ("prim_show", 1),
         "print_endline" => ("prim_print_endline", 1),
         _otherwise => return None,
@@ -469,9 +525,21 @@ impl lambda_lift::Program {
             tracing::trace!("generate_code: {name}");
             writeln!(out, "Value {}(Value self, Value l0) {{", c_name(name))?;
             writeln!(out, "  (void)self; (void)l0;")?;
-            write!(out, "  return ")?;
-            self.compile_expr(code, out)?;
-            writeln!(out, ";\n}}\n")?;
+            // A lifted lambda that tail-calls itself (through `self`) is emitted as a loop, so a
+            // deep recursion -- e.g. a strictified IO loop after `deforest_io` -- runs in constant
+            // stack instead of `apply(self, …)` per turn. Its captures live in `self`, which is
+            // loop-invariant, so only the parameter is reassigned. Arity is 1 (a lifted frame binds
+            // one parameter); a curried self-call applies more and simply does not match.
+            let loopify = std::env::var_os("MARM_NO_LOOPIFY").is_none();
+            if loopify && self.has_tail_self_call(SelfCall::SelfRef, 1, code) {
+                write!(out, "  for (;;) {{ ")?;
+                self.compile_tail(SelfCall::SelfRef, 1, code, out)?;
+                writeln!(out, " }}\n}}\n")?;
+            } else {
+                write!(out, "  return ")?;
+                self.compile_expr(code, out)?;
+                writeln!(out, ";\n}}\n")?;
+            }
         }
 
         // Uncurried workers: an N-ary function whose parameters are the flat frame
@@ -492,9 +560,9 @@ impl lambda_lift::Program {
             // tail-call elimination. Workers with no self-tail-call keep the
             // plain `return <expr>;` form (output-identical to before).
             let loopify = std::env::var_os("MARM_NO_LOOPIFY").is_none();
-            if loopify && self.has_tail_self_call(name, *params, body) {
+            if loopify && self.has_tail_self_call(SelfCall::Named(name), *params, body) {
                 write!(out, "\n  for (;;) {{ ")?;
-                self.compile_tail(name, *params, body, out)?;
+                self.compile_tail(SelfCall::Named(name), *params, body, out)?;
                 writeln!(out, " }}\n}}\n")?;
             } else {
                 write!(out, "\n  return ")?;
@@ -518,9 +586,18 @@ impl lambda_lift::Program {
             for i in 0..*arity {
                 write!(out, " Value l{i} = args[{i}];")?;
             }
-            write!(out, "\n  return ")?;
-            self.compile_expr(body, out)?;
-            writeln!(out, ";\n}}\n")?;
+            // Same loopification as the arity-1 lifted lambda, for an uncurried recursive frame:
+            // a saturated tail `self`-call reassigns `l0..l{arity-1}` and continues.
+            let loopify = std::env::var_os("MARM_NO_LOOPIFY").is_none();
+            if loopify && self.has_tail_self_call(SelfCall::SelfRef, *arity, body) {
+                write!(out, "\n  for (;;) {{ ")?;
+                self.compile_tail(SelfCall::SelfRef, *arity, body, out)?;
+                writeln!(out, " }}\n}}\n")?;
+            } else {
+                write!(out, "\n  return ")?;
+                self.compile_expr(body, out)?;
+                writeln!(out, ";\n}}\n")?;
+            }
         }
 
         writeln!(out, "void startup(void) {{")?;
@@ -2646,17 +2723,24 @@ impl lambda_lift::Program {
             // `sizeof("...")` sizes the body (escapes handled by the C compiler); the
             // slice length excludes the trailing NUL. `static` locals in a statement
             // expression have static storage duration -> they land in .rodata.
-            Literal::Text(x) => format!(
-                "({{ static const struct {{ GcHeader gch; char b[sizeof(\"{x}\")]; }} \
-                 __marm_b = {{{{sizeof(\"{x}\"), 0, OBJ_BYTES, MARM_ETERNAL}}, \"{x}\"}}; \
-                 static const struct {{ GcHeader gch; Slice s; }} \
-                 __marm_s = {{{{sizeof(Slice), 0, OBJ_SLICE, MARM_ETERNAL}}, \
-                 {{(void *)__marm_b.b, 0, sizeof(\"{x}\") - 1}}}}; \
-                 VObject((void *)&__marm_s.s); }})"
-            ),
+            Literal::Text(x) => {
+                // The `Text` may hold characters that are special in a C string literal
+                // (quotes, backslashes, newlines from source escapes), so re-escape it.
+                // `sizeof` then still counts the C-decoded byte length, sizing the body
+                // and the slice correctly.
+                let x = c_string_escape(x);
+                format!(
+                    "({{ static const struct {{ GcHeader gch; char b[sizeof(\"{x}\")]; }} \
+                     __marm_b = {{{{sizeof(\"{x}\"), 0, OBJ_BYTES, MARM_ETERNAL}}, \"{x}\"}}; \
+                     static const struct {{ GcHeader gch; Slice s; }} \
+                     __marm_s = {{{{sizeof(Slice), 0, OBJ_SLICE, MARM_ETERNAL}}, \
+                     {{(void *)__marm_b.b, 0, sizeof(\"{x}\") - 1}}}}; \
+                     VObject((void *)&__marm_s.s); }})"
+                )
+            }
             Literal::Bool(x) => format!("VBool({x})"),
             Literal::Unit => "VUnit()".to_owned(),
-            Literal::Char(x) => format!("VChar('{x}')"),
+            Literal::Char(x) => c_char_literal(*x),
         }
     }
 
@@ -2762,7 +2846,7 @@ impl lambda_lift::Program {
 
     // Whether `expr`, in tail position, is a saturated self-call to `worker`
     // (which has `arity` parameters) -- the shape that becomes a loop back-edge.
-    fn is_self_call(&self, worker: &QualifiedName, arity: usize, expr: &Expr) -> bool {
+    fn is_self_call(&self, target: SelfCall, arity: usize, expr: &Expr) -> bool {
         let mut count = 0usize;
         let mut head: &Expr = expr;
         while let Expr::Apply(_, inner) = head {
@@ -2770,26 +2854,34 @@ impl lambda_lift::Program {
             head = &inner.function;
         }
         count == arity
-            && matches!(head, Expr::Variable(_, Identifier::Global(qn)) if qn.as_ref() == worker)
+            && match target {
+                SelfCall::Named(name) => {
+                    matches!(head, Expr::Variable(_, Identifier::Global(qn)) if qn.as_ref() == name)
+                }
+                // A lifted (recursive) lambda calls itself through `self`, the closure
+                // it was invoked with; the captures in `self` are loop-invariant, so a
+                // saturated tail `self`-call is a genuine loop back-edge.
+                SelfCall::SelfRef => matches!(head, Expr::Variable(_, Identifier::SelfRef)),
+            }
     }
 
     // Whether any tail position of `expr` is a self-call -- i.e. whether this
     // worker needs the loop wrapper. Mirrors the tail structure `compile_tail`
     // walks, so the two agree on exactly which positions are tail positions.
-    fn has_tail_self_call(&self, worker: &QualifiedName, arity: usize, expr: &Expr) -> bool {
+    fn has_tail_self_call(&self, target: SelfCall, arity: usize, expr: &Expr) -> bool {
         match expr {
-            Expr::Ascription(_, the) => self.has_tail_self_call(worker, arity, &the.ascribed_tree),
+            Expr::Ascription(_, the) => self.has_tail_self_call(target, arity, &the.ascribed_tree),
             Expr::If(_, the) => {
-                self.has_tail_self_call(worker, arity, &the.consequent)
-                    || self.has_tail_self_call(worker, arity, &the.alternate)
+                self.has_tail_self_call(target, arity, &the.consequent)
+                    || self.has_tail_self_call(target, arity, &the.alternate)
             }
-            Expr::Let(_, the) => self.has_tail_self_call(worker, arity, &the.body),
-            Expr::Sequence(_, the) => self.has_tail_self_call(worker, arity, &the.and_then),
+            Expr::Let(_, the) => self.has_tail_self_call(target, arity, &the.body),
+            Expr::Sequence(_, the) => self.has_tail_self_call(target, arity, &the.and_then),
             Expr::Deconstruct(_, the) => the
                 .match_clauses
                 .iter()
-                .any(|clause| self.has_tail_self_call(worker, arity, &clause.consequent)),
-            _ => self.is_self_call(worker, arity, expr),
+                .any(|clause| self.has_tail_self_call(target, arity, &clause.consequent)),
+            _ => self.is_self_call(target, arity, expr),
         }
     }
 
@@ -2799,21 +2891,21 @@ impl lambda_lift::Program {
     // and `continue`); every other tail value becomes `return <expr>;`.
     fn compile_tail(
         &self,
-        worker: &QualifiedName,
+        target: SelfCall,
         arity: usize,
         expr: &Expr,
         code: &mut CodeBuffer,
     ) -> fmt::Result {
         match expr {
-            Expr::Ascription(_, the) => self.compile_tail(worker, arity, &the.ascribed_tree, code),
+            Expr::Ascription(_, the) => self.compile_tail(target, arity, &the.ascribed_tree, code),
 
             Expr::If(_, the) => {
                 write!(code, "if (as_bool(")?;
                 self.compile_expr(&the.predicate, code)?;
                 write!(code, ")) {{ ")?;
-                self.compile_tail(worker, arity, &the.consequent, code)?;
+                self.compile_tail(target, arity, &the.consequent, code)?;
                 write!(code, " }} else {{ ")?;
-                self.compile_tail(worker, arity, &the.alternate, code)?;
+                self.compile_tail(target, arity, &the.alternate, code)?;
                 write!(code, " }}")
             }
 
@@ -2869,7 +2961,7 @@ impl lambda_lift::Program {
                                 },
                             )
                         });
-                        let result = self.compile_tail(worker, arity, &the.body, code);
+                        let result = self.compile_tail(target, arity, &the.body, code);
                         ARRAY_ELEMENT_PLACES.with(|places| {
                             let mut places = places.borrow_mut();
                             if let Some(previous) = previous {
@@ -2884,14 +2976,14 @@ impl lambda_lift::Program {
                 write!(code, "Value l{level} = ")?;
                 self.compile_expr(&the.bound, code)?;
                 write!(code, "; ")?;
-                self.compile_tail(worker, arity, &the.body, code)
+                self.compile_tail(target, arity, &the.body, code)
             }
 
             Expr::Sequence(_, the) => {
                 write!(code, "(void)(")?;
                 self.compile_expr(&the.this, code)?;
                 write!(code, "); ")?;
-                self.compile_tail(worker, arity, &the.and_then, code)
+                self.compile_tail(target, arity, &the.and_then, code)
             }
 
             Expr::Deconstruct(_, the) => {
@@ -2931,7 +3023,7 @@ impl lambda_lift::Program {
                     for (level, path) in &binds {
                         write!(code, "Value l{level} = {path}; ")?;
                     }
-                    self.compile_tail(worker, arity, &clause.consequent, code)?;
+                    self.compile_tail(target, arity, &clause.consequent, code)?;
                     write!(code, " }}")?;
                     if exhaustive {
                         break;
@@ -2943,7 +3035,7 @@ impl lambda_lift::Program {
                 write!(code, " }}")
             }
 
-            _ if self.is_self_call(worker, arity, expr) => {
+            _ if self.is_self_call(target, arity, expr) => {
                 let mut args: Vec<&Expr> = Vec::new();
                 let mut head: &Expr = expr;
                 while let Expr::Apply(_, inner) = head {

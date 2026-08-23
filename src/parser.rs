@@ -18,7 +18,7 @@ use crate::{
         BindingOperator, Interpolation, Keyword, Layout, Literal, Operator, SourceLocation, Token,
         TokenKind,
     },
-    phase,
+    phase, source_map,
 };
 
 pub struct Parsed;
@@ -62,11 +62,19 @@ impl<Id> ast::Expr<ParseInfo, Id> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParseInfo {
     pub location: SourceLocation,
+    /// The source file these tokens came from, resolvable via [`crate::source_map`].
+    /// Stamped from the file being parsed; `FileId::UNKNOWN` for synthetic nodes.
+    pub file: source_map::FileId,
 }
 
 impl ParseInfo {
+    /// Build a `ParseInfo` for a node at `location`, tagging it with the file
+    /// currently being parsed (see [`crate::source_map::with_current`]).
     pub fn from_position(location: SourceLocation) -> Self {
-        Self { location }
+        Self {
+            location,
+            file: source_map::current(),
+        }
     }
 }
 
@@ -279,11 +287,21 @@ impl TypeExprOperator {
 pub struct Parser<'a> {
     remains: &'a [Token],
     offset: usize,
+    /// Indent columns of the blocks currently open through [`parse_block`], outermost
+    /// first. Lets a block tell its *own* closing `Dedent` (which returns to the
+    /// enclosing block's column) from a `Dedent` that dedents further out because the
+    /// body already consumed this block's closer -- e.g. a coproduct whose `|`
+    /// alternatives dedent back before the bar, eating the type body's dedent.
+    indent_columns: Vec<u32>,
 }
 
 impl<'a> Parser<'a> {
     pub fn from_tokens(remains: &'a [Token]) -> Self {
-        Self { remains, offset: 0 }
+        Self {
+            remains,
+            offset: 0,
+            indent_columns: Vec::new(),
+        }
     }
 
     pub fn remains(&self) -> &'a [Token] {
@@ -1217,11 +1235,27 @@ impl<'a> Parser<'a> {
         let _t = self.trace();
 
         if self.peek()?.is_indent() {
+            // The column this block returns to when it closes -- the enclosing block's
+            // indent (or column 1 at the top level).
+            let enclosing_base = self.indent_columns.last().copied().unwrap_or(1);
+            let indent_column = self.peek()?.position.column;
             self.consume()?; // the opening Indent
+            self.indent_columns.push(indent_column);
             let body = parse_body(self)?;
+            self.indent_columns.pop();
 
             let token = self.peek()?;
             match token.kind {
+                // The body already consumed this block's own closing `Dedent` (its
+                // matching level was eaten mid-parse, e.g. by a coproduct's `|`
+                // continuation). The `Dedent` we see now returns *past* our enclosing
+                // level, so it belongs to an outer block -- leave it for that block to
+                // close on, rather than stealing it and swallowing following siblings.
+                TokenKind::Layout(Layout::Dedent)
+                    if token.position.column < enclosing_base =>
+                {
+                    Ok(body)
+                }
                 TokenKind::Layout(Layout::Dedent) | TokenKind::End => {
                     self.advance(1);
                     Ok(body)
@@ -1281,8 +1315,9 @@ impl<'a> Parser<'a> {
             self.consume()?;
         }
         let body = self.parse_expression_block()?;
+        let body = self.extend_let_body(body, position)?;
         Ok(Expr::Let(
-            ParseInfo { location: position },
+            ParseInfo::from_position(position),
             Binding {
                 binder,
                 operator: binding_operator,
@@ -1290,6 +1325,53 @@ impl<'a> Parser<'a> {
                 body: body.into(),
             },
         ))
+    }
+
+    // A `let` owns its own column: after `in`, everything to the end of the enclosing
+    // block is the body, and the bound name stays in scope throughout. When the immediate
+    // body is inline or lands on a following line at the `let`'s column, `parse_sequence`
+    // already absorbs the whole tail (its reference column is the body's own column, which
+    // equals the `let`'s). The gap is an *indented* body: `parse_block` closes at its
+    // `Dedent`, so a continuation dedented back to the `let`'s column would otherwise become
+    // a sibling of the whole `let` and lose sight of the binding. Here we fold any such
+    // continuation back into the body, comparing against the `let`'s column rather than the
+    // (deeper) body block's.
+    fn extend_let_body(&mut self, body: Expr, let_position: SourceLocation) -> Result<Expr> {
+        let continues = match self.remains() {
+            // The closing `Dedent` of the indented body doubled as the separator, so the
+            // continuation sits directly at the `let`'s column with no separator token.
+            remains @ [t, ..]
+                if self.is_expr_start(&t.kind)
+                    && t.location().is_same_block(&let_position)
+                    && !self.is_toplevel_start(remains) =>
+            {
+                true
+            }
+            // An explicit separator (`;` or a surviving newline) precedes the continuation.
+            remains @ [t, u, ..]
+                if t.is_sequence_separator()
+                    && self.is_expr_start(&u.kind)
+                    && u.location().is_same_block(&let_position)
+                    && !self.is_toplevel_start(&remains[1..]) =>
+            {
+                self.advance(1);
+                true
+            }
+            _ => false,
+        };
+
+        if continues {
+            let and_then = self.parse_sequence()?;
+            Ok(Expr::Sequence(
+                *body.parse_info(),
+                Sequence {
+                    this: body.into(),
+                    and_then: and_then.into(),
+                },
+            ))
+        } else {
+            Ok(body)
+        }
     }
 
     fn parse_record(&mut self) -> Result<Expr> {
@@ -2193,10 +2275,13 @@ impl<'a> Parser<'a> {
 
         let mut constructors = vec![self.parse_coproduct_constructor()?];
 
-        if self.peek()?.is_dedent() {
-            self.consume()?;
-        }
-
+        // NB: do *not* unconditionally swallow a trailing `Dedent` here. When the
+        // first constructor is indented and a `|` alternative dedents back before the
+        // bar, the `is_constructor_separator` `Some(2)` case below already consumes the
+        // `[<Dedent> |]` pair. A `Dedent` that is *not* followed by a bar instead closes
+        // an enclosing block -- e.g. when this coproduct is the last member of an inline
+        // `module X:` block -- and eating it would make that block never see its closer,
+        // absorbing every following sibling declaration as one of its own members.
         let is_constructor_separator = |remains: &[Token]| match remains {
             [
                 Token {
@@ -2273,6 +2358,12 @@ impl<'a> Parser<'a> {
             self.advance(1);
         }
 
+        // The clauses of one `deconstruct` all align their patterns at this column --
+        // the first token of the first clause's pattern. Taken from the token rather
+        // than the parsed pattern's annotation, since a tuple pattern is annotated at
+        // its comma, not its start (`Cons x xs, Cons y ys` would anchor on the comma).
+        let clause_column = self.peek()?.location().column;
+
         let mut match_clauses = vec![self.parse_match_clause()?];
 
         // Annoying
@@ -2302,6 +2393,21 @@ impl<'a> Parser<'a> {
         };
 
         while let Some(separator) = is_match_clause_separator(self.remains()) {
+            // A `|` alternative whose pattern dedents to a shallower column than the
+            // first clause belongs to an *enclosing* `deconstruct`: when a nested match
+            // is the last thing inside an outer clause, the outer match's next `|`
+            // arrives here as `[<Dedent> |]` and would otherwise be swallowed as one of
+            // the inner match's clauses (turning an outer catch-all into a redundant
+            // inner one). Stop so the outer parser claims it. The pattern token sits
+            // just past the `|` (and any leading layout).
+            let dedented_to_enclosing = self
+                .remains()
+                .get(separator)
+                .is_some_and(|pattern_start| pattern_start.location().column < clause_column);
+            if dedented_to_enclosing {
+                break;
+            }
+
             // |
             self.advance(separator);
             match_clauses.push(self.parse_match_clause()?);
@@ -2637,7 +2743,9 @@ impl fmt::Display for IdentifierPath {
 
 impl fmt::Display for ParseInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { location } = self;
+        // File-free by design: this is also printed inside inferred-type dumps.
+        // The file is surfaced only on the error path (see `Located`'s `Display`).
+        let Self { location, file: _ } = self;
         write!(f, "{location}")
     }
 }

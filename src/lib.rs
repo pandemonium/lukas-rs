@@ -11,6 +11,7 @@ pub mod lexer;
 pub mod parser;
 pub mod phase;
 pub mod simplify;
+pub mod source_map;
 pub mod specialize;
 pub mod trace;
 pub mod typer;

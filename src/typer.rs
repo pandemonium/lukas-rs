@@ -338,7 +338,9 @@ impl phase::SymbolTable<Named> {
             module_members: self.module_members,
             member_modules: self.member_modules,
             symbols,
-            imports: self.imports,
+            base_imports: self.base_imports,
+            module_imports: self.module_imports,
+            scope_roots: self.scope_roots,
             foreign_terms: self.foreign_terms,
             signatures: self.signatures,
             witnesses: self.witnesses,
@@ -1996,8 +1998,8 @@ pub enum TypeError {
     InfiniteType { param: MetaVariable, ty: Type },
 
     #[error(
-        "bad projection\nfrom type: {inferred_base_type}\n{} does not have a member: {}",
-        projection.base, projection.select
+        "bad projection: type `{inferred_base_type}` has no member `{}`",
+        projection.select
     )]
     BadProjection {
         projection: phase::Projection<Named>,
@@ -2068,6 +2070,15 @@ pub enum TypeError {
     #[error("{0} is not a known coproduct constructor")]
     NoSuchCoproductConstructor(namer::QualifiedName),
 
+    #[error(
+        "constructor {constructor} takes {expected} argument(s), but this pattern binds {got}"
+    )]
+    ConstructorPatternArity {
+        constructor: namer::QualifiedName,
+        expected: usize,
+        got: usize,
+    },
+
     #[error("tuple expression {base} does not have element {select}")]
     TupleOrdinalOutOfBounds {
         base: ast::Expr<ParseInfo, Identifier>,
@@ -2083,10 +2094,8 @@ pub enum TypeError {
     #[error("{clause} is not useful")]
     UselessMatchClause { clause: phase::MatchClause<Types> },
 
-    #[error("all of {} is not covered", deconstruct.scrutinee)]
-    MatchNotExhaustive {
-        deconstruct: phase::Deconstruct<Types>,
-    },
+    #[error("this deconstruction is not exhaustive; unmatched: {}", missing.join(", "))]
+    MatchNotExhaustive { missing: Vec<String> },
 
     #[error(
         "the declared signature of `{name}` is more general than its definition\n       \
@@ -2448,6 +2457,11 @@ impl RecordType {
 pub struct CoproductType(Vec<(QualifiedName, Vec<Type>)>);
 
 impl CoproductType {
+    /// The constructors (name + argument types) of this coproduct, in sorted order.
+    pub fn constructors(&self) -> impl Iterator<Item = &(QualifiedName, Vec<Type>)> {
+        self.0.iter()
+    }
+
     fn from_constructors(constructors: &[(QualifiedName, Vec<Type>)]) -> Self {
         let mut constructors = constructors.to_vec();
         constructors.sort_by(|(t, _), (u, _)| t.cmp(u));
@@ -2815,6 +2829,19 @@ pub fn stdlib_text_type() -> Type {
     // `Text` lives in the always-imported primordial `Prelude` (Root.Prelude.Text) -- the
     // single deliberate compiler->stdlib reference for the string-literal type.
     Type::Constructor(prelude_name("Text"))
+}
+
+/// The primordial `IO` type constructor (`Root.Prelude.IO`) and its sole constructor
+/// `Suspend` (`Root.Prelude.IO = Suspend (Unit -> α)`). These are the single sanctioned
+/// compiler->stdlib references for IO, mirroring [`stdlib_text_type`] for string literals;
+/// the strict-IO lowering (`simplify::deforest_io`) compares against them by identity rather
+/// than matching mangled names.
+pub fn io_type_name() -> namer::QualifiedName {
+    prelude_name("IO")
+}
+
+pub fn suspend_constructor_name() -> namer::QualifiedName {
+    prelude_name("Suspend")
 }
 
 // A member of the always-imported primordial `Prelude` (`Root.Prelude.<member>`).
@@ -3919,6 +3946,16 @@ impl TypingContext {
                 self.check_deconstruction(*pi, expected_type, deconstruct)
             }
 
+            // Push the expected type through a `let`/sequence to its tail expression,
+            // rather than inferring the whole chain and blaming the outer node. A
+            // `let a = .. in let b = .. in body` carries the outermost `let`'s
+            // parse-info, so inferring-then-unifying reports a body/expected mismatch at
+            // the first `let`; checking the tail attributes it to the actual returning
+            // expression instead.
+            UntypedExpr::Let(pi, binding) => self.check_binding(*pi, expected_type, binding),
+
+            UntypedExpr::Sequence(_pi, sequence) => self.check_sequence(expected_type, sequence),
+
             _ => self.check_expr_fallback_inferencing(expected_type, expr),
         }
     }
@@ -4464,14 +4501,9 @@ impl TypingContext {
             }
         }
 
-        if !space.is_exhaustive(pi, &scrutinee_type.apply(&substitutions), self)? {
-            Err(TypeError::MatchNotExhaustive {
-                deconstruct: Deconstruct {
-                    scrutinee: scrutinee.into(),
-                    match_clauses: typed_match_clauses,
-                },
-            }
-            .at(pi))
+        let missing = space.uncovered(pi, &scrutinee_type.apply(&substitutions), self)?;
+        if !missing.is_empty() {
+            Err(TypeError::MatchNotExhaustive { missing }.at(pi))
         } else {
             let type_info = pi.with_inferred_type(expected_type.apply(&substitutions));
             Ok(Typed::computed(
@@ -4560,14 +4592,9 @@ impl TypingContext {
             }
         }
 
-        if !match_space.is_exhaustive(pi, &scrutinee.type_info().inferred_type, self)? {
-            Err(TypeError::MatchNotExhaustive {
-                deconstruct: Deconstruct {
-                    scrutinee: scrutinee.clone().into(),
-                    match_clauses: clauses.clone(),
-                },
-            }
-            .at(pi))
+        let missing = match_space.uncovered(pi, &scrutinee.type_info().inferred_type, self)?;
+        if !missing.is_empty() {
+            Err(TypeError::MatchNotExhaustive { missing }.at(pi))
         } else {
             Ok(Typed::computed(
                 substitutions,
@@ -4742,37 +4769,53 @@ impl TypingContext {
                 Pattern::Coproduct(pi, pattern),
                 TypeStructure::Monotype(Type::Coproduct(coproduct)),
             ) => {
-                if let namer::Identifier::Free(constructor) = &pattern.constructor
-                    && let Some(signature) = coproduct.signature(constructor)
-                    && pattern.arguments.len() == signature.len()
-                {
-                    let mut arguments = Vec::with_capacity(signature.len());
-                    let mut substitutions = Substitutions::default();
-
-                    for (scrutinee, pattern) in signature.iter().zip(&pattern.arguments) {
-                        let (subs, argument) = self.check_pattern(
-                            pattern,
-                            bindings,
-                            &scrutinee.apply(&substitutions),
-                        )?;
-                        self.substitute_mut(&subs);
-                        arguments.push(argument.apply(&substitutions));
-                        substitutions = substitutions.compose(&subs);
+                let namer::Identifier::Free(constructor) = &pattern.constructor else {
+                    // After naming, a constructor-pattern head is always a free qualified
+                    // name; a bound one is a compiler invariant break, not user error.
+                    return Err(TypeError::InternalAssertion(
+                        "constructor pattern head is not a free name".to_owned(),
+                    )
+                    .at(*pi));
+                };
+                // The constructor must belong to the coproduct being deconstructed, with a
+                // matching argument count. Both failures used to panic ("Bad coproduct
+                // deconstruction") with no location; report them as located type errors so
+                // a bad `deconstruct ... into C ...` names `C` and points at the pattern.
+                let Some(signature) = coproduct.signature(constructor) else {
+                    return Err(
+                        TypeError::NoSuchCoproductConstructor((**constructor).clone()).at(*pi)
+                    );
+                };
+                if pattern.arguments.len() != signature.len() {
+                    return Err(TypeError::ConstructorPatternArity {
+                        constructor: (**constructor).clone(),
+                        expected: signature.len(),
+                        got: pattern.arguments.len(),
                     }
-
-                    Ok((
-                        substitutions,
-                        Pattern::Coproduct(
-                            (*pi).with_inferred_type(scrutinee.clone()),
-                            ConstructorPattern {
-                                constructor: namer::Identifier::Free(constructor.clone()),
-                                arguments,
-                            },
-                        ),
-                    ))
-                } else {
-                    panic!("Bad coproduct deconstruction")
+                    .at(*pi));
                 }
+
+                let mut arguments = Vec::with_capacity(signature.len());
+                let mut substitutions = Substitutions::default();
+
+                for (scrutinee, pattern) in signature.iter().zip(&pattern.arguments) {
+                    let (subs, argument) =
+                        self.check_pattern(pattern, bindings, &scrutinee.apply(&substitutions))?;
+                    self.substitute_mut(&subs);
+                    arguments.push(argument.apply(&substitutions));
+                    substitutions = substitutions.compose(&subs);
+                }
+
+                Ok((
+                    substitutions,
+                    Pattern::Coproduct(
+                        (*pi).with_inferred_type(scrutinee.clone()),
+                        ConstructorPattern {
+                            constructor: namer::Identifier::Free(constructor.clone()),
+                            arguments,
+                        },
+                    ),
+                ))
             }
 
             (Pattern::Tuple(pi, tuple), _) => {
@@ -5466,6 +5509,85 @@ impl TypingContext {
     }
 
     #[instrument]
+    // Check-mode counterpart of [`infer_binding`]: the bound is still inferred (and
+    // generalized) exactly the same way, but the body is *checked* against the expected
+    // type instead of inferred-then-unified. That pushes the expectation down to the
+    // body's tail expression, so a mismatch is reported there rather than at this `let`.
+    fn check_binding(
+        &mut self,
+        pi: ParseInfo,
+        expected_type: &Type,
+        binding: &phase::Binding<Named>,
+    ) -> Typing {
+        let typed_bound = self.infer_expr(&binding.bound)?;
+        let mut ctx1 = self.apply(&typed_bound.substitutions);
+
+        let bound_type = typed_bound.as_constrained_type().generalize(&ctx1);
+        let retained_constraints = typed_bound.constraints.clone();
+        let bound_scheme =
+            if retained_constraints.is_empty() || is_generalizable_value(binding.bound.as_ref()) {
+                bound_type.underlying
+            } else {
+                TypeScheme::from_constant(bound_type.underlying.underlying)
+            };
+
+        let expected = expected_type.apply(&typed_bound.substitutions);
+        ctx1.bind_term_and_then(binding.binder.clone(), bound_scheme, |ctx| {
+            let typed_body = ctx.check_expr(&expected, &binding.body)?;
+
+            let substitutions = typed_bound.substitutions.compose(&typed_body.substitutions);
+
+            let bound = typed_bound.tree.apply(&substitutions);
+            let body = typed_body.tree.apply(&substitutions);
+            let constraints = retained_constraints
+                .apply(&substitutions)
+                .union(typed_body.constraints.apply(&substitutions));
+
+            Ok(Typed::computed(
+                substitutions,
+                constraints,
+                Expr::Let(
+                    pi.with_inferred_type(body.type_info().inferred_type.clone()),
+                    Binding {
+                        binder: binding.binder.clone(),
+                        operator: binding.operator,
+                        bound: bound.into(),
+                        body: body.into(),
+                    },
+                ),
+            ))
+        })
+    }
+
+    // Check-mode counterpart of [`infer_sequence`]: `this` is inferred for its effect,
+    // and `and_then` is checked against the expected type so a mismatch lands on the
+    // sequence's tail rather than the sequence node.
+    fn check_sequence(
+        &mut self,
+        expected_type: &Type,
+        sequence: &phase::Sequence<Named>,
+    ) -> Typing {
+        let this = self.infer_expr(&sequence.this)?;
+        self.substitute_mut(&this.substitutions);
+        let and_then = self.check_expr(&expected_type.apply(&this.substitutions), &sequence.and_then)?;
+        let substitutions = this.substitutions.compose(&and_then.substitutions);
+        let constraints = this
+            .constraints
+            .apply(&substitutions)
+            .union(and_then.constraints.apply(&substitutions));
+        Ok(Typed::computed(
+            substitutions,
+            constraints,
+            Expr::Sequence(
+                and_then.tree.type_info().clone(),
+                Sequence {
+                    this: this.tree.into(),
+                    and_then: and_then.tree.into(),
+                },
+            ),
+        ))
+    }
+
     fn infer_binding(&mut self, pi: ParseInfo, binding: &phase::Binding<Named>) -> Typing {
         let typed_bound = self.infer_expr(&binding.bound)?;
         let mut ctx1 = self.apply(&typed_bound.substitutions);
@@ -5630,22 +5752,35 @@ impl ParseInfo {
 
 // todo: move to pattern.rs
 impl Denotation {
-    // Instead of doing it this way, I could have used a denotation directed
-    // universe creator
-    fn covers(&self, pi: ParseInfo, scrutinee: &Type, ctx: &TypingContext) -> Typing<bool> {
+    // The uncovered cases of this denotation against `scrutinee`, each a human-readable
+    // pattern description (empty = exhaustive). Mirrors the old boolean `covers`, but
+    // collects *which* cases are missing so the exhaustiveness error can name them.
+    fn uncovered(
+        &self,
+        pi: ParseInfo,
+        scrutinee: &Type,
+        ctx: &TypingContext,
+    ) -> Typing<Vec<String>> {
         match self {
-            Self::Structured(shape) => shape.covers(pi, scrutinee, ctx),
+            Self::Structured(shape) => shape.uncovered(pi, scrutinee, ctx),
 
-            Self::Universal => Ok(true),
+            Self::Universal => Ok(vec![]),
 
-            Self::Empty | Self::Finite(..) => Ok(false),
+            // Nothing matched (an empty match), or only specific literals over a type we
+            // do not finitely enumerate here (Int/Char/...): report a wildcard gap.
+            Self::Empty | Self::Finite(..) => Ok(vec!["_".to_owned()]),
         }
     }
 }
 
 // todo: move to pattern.rs
 impl Shape {
-    fn covers(&self, pi: ParseInfo, scrutinee: &Type, ctx: &TypingContext) -> Typing<bool> {
+    fn uncovered(
+        &self,
+        pi: ParseInfo,
+        scrutinee: &Type,
+        ctx: &TypingContext,
+    ) -> Typing<Vec<String>> {
         let scrutinee = ctx
             .expand_type_constructor(pi, scrutinee)?
             .unwrap_or_else(|| TypeStructure::Monotype(scrutinee.clone()));
@@ -5655,48 +5790,47 @@ impl Shape {
                 Self::Coproduct(denotations),
                 TypeStructure::Monotype(Type::Coproduct(CoproductType(constructors))),
             ) => {
-                let mut covers = true;
+                let mut missing = Vec::new();
 
-                'outer: for (constructor, arguments) in constructors {
-                    if !denotations.contains_key(&constructor) {
-                        covers = false;
-                        break;
-                    }
-
-                    for (denotation, scrutinee) in denotations[&constructor].iter().zip(arguments) {
-                        covers &= denotation.covers(pi, &scrutinee, ctx)?;
-                        if !covers {
-                            break 'outer;
+                // Iterated in the coproduct type's stored constructor order, so the
+                // reported list is deterministic.
+                for (constructor, arguments) in constructors {
+                    match denotations.get(&constructor) {
+                        // The constructor is never matched at all.
+                        None => missing.push(constructor.member.as_str().to_owned()),
+                        // Matched, but an argument leaves a gap -- e.g. `This Nope`.
+                        Some(argument_denotations) => {
+                            for (denotation, scrutinee) in
+                                argument_denotations.iter().zip(arguments)
+                            {
+                                for sub in denotation.uncovered(pi, &scrutinee, ctx)? {
+                                    missing.push(format!("{} {sub}", constructor.member.as_str()));
+                                }
+                            }
                         }
                     }
                 }
 
-                Ok(covers)
+                Ok(missing)
             }
 
             (Self::Struct(denotations), TypeStructure::PolyRecord(record_type)) => {
-                let mut covers = true;
+                let mut missing = Vec::new();
                 for (field, scrutinee) in record_type.fields() {
                     let scrutinee = scrutinee.instantiate();
-                    covers &= denotations[field].covers(pi, &scrutinee.underlying, ctx)?;
-                    if !covers {
-                        break;
+                    for sub in denotations[field].uncovered(pi, &scrutinee.underlying, ctx)? {
+                        missing.push(format!("{{ {field} = {sub} }}"));
                     }
                 }
-
-                Ok(covers)
+                Ok(missing)
             }
 
             (Self::Tuple(denotations), TypeStructure::Monotype(Type::Tuple(TupleType(types)))) => {
-                let mut covers = true;
+                let mut missing = Vec::new();
                 for (denotation, scrutinee) in denotations.iter().zip(types) {
-                    //let scrutinee = ctx.expand_type_constructor(pi, &scrutinee)?;
-                    covers &= denotation.covers(pi, &scrutinee, ctx)?;
-                    if !covers {
-                        break;
-                    }
+                    missing.extend(denotation.uncovered(pi, &scrutinee, ctx)?);
                 }
-                Ok(covers)
+                Ok(missing)
             }
 
             otherwise => panic!("Latent type error. {otherwise:?}"),
@@ -5790,13 +5924,15 @@ pub struct MatchSpace {
 
 // todo: move to pattern.rs
 impl MatchSpace {
-    pub fn is_exhaustive(
+    // The uncovered cases of this match against `scrutinee` (empty = exhaustive), each a
+    // readable pattern description for the exhaustiveness diagnostic.
+    pub fn uncovered(
         &self,
         pi: ParseInfo,
         scrutinee: &Type,
         ctx: &TypingContext,
-    ) -> Typing<bool> {
-        self.covered.normalize().covers(pi, scrutinee, ctx)
+    ) -> Typing<Vec<String>> {
+        self.covered.normalize().uncovered(pi, scrutinee, ctx)
     }
 
     pub fn join(&mut self, p: &phase::Pattern<Types>) -> bool {
@@ -5818,7 +5954,20 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { parse_info, error } = self;
-        write!(f, "{parse_info}: {error}")
+        // Prefix with the source file when we know it. `ParseInfo`'s own `Display`
+        // stays file-free on purpose -- it's also printed inside inferred-type dumps,
+        // which shouldn't be cluttered with paths.
+        match crate::source_map::path_of(parse_info.file) {
+            Some(path) => write!(f, "{}:{parse_info}: {error}", path.display())?,
+            None => write!(f, "{parse_info}: {error}")?,
+        }
+        // Quote the offending source line beneath the message, so a diagnostic points
+        // at real code rather than a phase-internal term rendering (e.g. `#3`).
+        let loc = parse_info.location;
+        if let Some(snippet) = crate::source_map::snippet(parse_info.file, loc.row, loc.column) {
+            write!(f, "\n{snippet}")?;
+        }
+        Ok(())
     }
 }
 

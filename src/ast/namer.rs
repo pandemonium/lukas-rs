@@ -590,7 +590,23 @@ pub struct SymbolTable<A, GlobalName, LocalId> {
 
     // Why only one table?
     pub symbols: HashMap<SymbolName, Symbol<A, GlobalName, LocalId>>,
-    pub imports: Vec<IdentifierPath>,
+
+    /// Namespace opens (`use`) that apply everywhere: the primordial `Builtin`,
+    /// `Stdlib`, and `Prelude` prefixes. The module *tree* is global (mounting via
+    /// `module X.`), but a `use`'s *open* is otherwise file/module-local -- see
+    /// `module_imports`.
+    pub base_imports: Vec<IdentifierPath>,
+
+    /// Per-module namespace opens, keyed by the module a `use` was written in. A name
+    /// in module M sees the opens of M and of the modules lexically enclosing it in the
+    /// *same file* (walking up to, and including, M's file root -- see `scope_roots`),
+    /// plus `base_imports`. So a `use` in `Root` does not leak into a library module.
+    pub module_imports: HashMap<IdentifierPath, Vec<IdentifierPath>>,
+
+    /// Modules that begin a fresh file/import scope: `Root` and every externally loaded
+    /// file (a `module X.` mount or a top-level load). Import inheritance stops here, so
+    /// a separate file never inherits its mount-ancestors' opens.
+    pub scope_roots: HashSet<IdentifierPath>,
 
     pub foreign_terms: Vec<ForeignTerm<GlobalName>>,
 
@@ -607,13 +623,47 @@ pub struct SymbolTable<A, GlobalName, LocalId> {
     pub member_visibility: HashMap<SymbolName, Access>,
 }
 
+impl<A, GlobalName, LocalId> SymbolTable<A, GlobalName, LocalId> {
+    /// The namespace opens active for a name written in `scope`, most-recent first: the
+    /// opens of `scope` and of the modules enclosing it in the same file (up to and
+    /// including its file root), then the global `base_imports`. This is the local
+    /// namespace configuration -- a `use` in an unrelated file never appears here.
+    fn active_imports(&self, scope: &IdentifierPath) -> Vec<IdentifierPath> {
+        let mut opens = Vec::new();
+        for module in prefix_chain(scope) {
+            if let Some(local) = self.module_imports.get(&module) {
+                opens.extend(local.iter().rev().cloned());
+            }
+            if self.scope_roots.contains(&module) {
+                break;
+            }
+        }
+        // Re-export: opening a module also brings in what THAT module opened -- its
+        // public namespace. So `use Stdlib.` gives a consumer the prelude `Stdlib.lady`
+        // itself opens (Control/Data/State/...), without a `use` in one file leaking into
+        // an unrelated one. One level: a module re-exports its own opens, not its opens'
+        // opens.
+        let mut result = Vec::with_capacity(opens.len());
+        for open in opens {
+            if let Some(reexports) = self.module_imports.get(&open) {
+                result.extend(reexports.iter().rev().cloned());
+            }
+            result.push(open);
+        }
+        result.extend(self.base_imports.iter().rev().cloned());
+        result
+    }
+}
+
 impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
     fn default() -> Self {
         Self {
             module_members: HashMap::default(),
             member_modules: HashMap::default(),
             symbols: HashMap::default(),
-            imports: Vec::default(),
+            base_imports: Vec::default(),
+            module_imports: HashMap::default(),
+            scope_roots: HashSet::default(),
             foreign_terms: Vec::default(),
             signatures: HashSet::default(),
             witnesses: HashSet::default(),
@@ -641,7 +691,7 @@ impl phase::SymbolTable<Desugared> {
 
         let parents = prefix_chain(semantic_scope);
 
-        let search_order = parents.chain(self.imports.iter().rev().cloned());
+        let search_order = parents.chain(self.active_imports(semantic_scope));
 
         let resolved = search_order
             .filter(|m| search_space.contains(m))
@@ -673,7 +723,29 @@ impl phase::SymbolTable<Desugared> {
                     )))
                     .is_some_and(|modules| modules.contains(&name_expr.module_prefix));
 
-                (!name_expr.projections.is_empty() || names_a_real_member).then_some(name_expr)
+                // A bare (unprojected) term name must not bind to a name that is *only* a
+                // MODULE. `module M:` registers `M` as a `Term` member so that `M.member`
+                // access resolves, but bare `M` in value position must fall through to a
+                // real value rather than shadowing a same-named constructor (a local
+                // `module Fault:` vs the `Result` `Fault` constructor). We reject only a
+                // name that names a module *and* has no value symbol behind it: a name
+                // that is both a module and a constructor (e.g. `Bytes`, with a
+                // `module Bytes:` and a `Bytes` constructor) still resolves to its value,
+                // and signature-method members (no symbol, not a module) are unaffected.
+                let names_a_module = self.module_members.contains_key(
+                    &name_expr
+                        .module_prefix
+                        .clone()
+                        .with_suffix(name_expr.member.as_str()),
+                );
+                let denotes_value = self
+                    .symbols
+                    .contains_key(&SymbolName::Term(name_expr.qualified_name()));
+                let names_only_a_module = names_a_module && !denotes_value;
+
+                (!name_expr.projections.is_empty()
+                    || (names_a_real_member && !names_only_a_module))
+                .then_some(name_expr)
             })?;
 
         let qualified_name = resolved.qualified_name();
@@ -704,7 +776,7 @@ impl phase::SymbolTable<Desugared> {
             .ok_or_else(|| NameError::UnknownMember(member).at(pi))?;
 
         let mut search_order =
-            prefix_chain(semantic_scope).chain(self.imports.iter().rev().cloned());
+            prefix_chain(semantic_scope).chain(self.active_imports(semantic_scope));
 
         let resolved = search_order
             .find_map(|m| {
@@ -898,6 +970,11 @@ impl phase::SymbolTable<Parsed> {
                     (declarations, dir.join(decl.name.as_str()))
                 }
                 ModuleDeclarator::External(_) => {
+                    // A `module X.` mount is a separate file but the SAME crate as its
+                    // declaring parent, so it is not a scope root: it inherits opens up
+                    // the mount tree to the crate root (the top-level loaded module). Only
+                    // a top-level load (`ensure_top_level_loaded`) or `Root` cuts the
+                    // chain -- that is the crate boundary a `use` in `Root` cannot cross.
                     compiler.load_nested_module(dir, decl.name.as_str())?
                 }
             };
@@ -1031,26 +1108,21 @@ impl phase::SymbolTable<Parsed> {
         }
         let path = use_declaration.path;
 
-        if path.tail.is_empty() {
-            let canonical = self.ensure_top_level_loaded(compiler, &path.head, loaded)?;
-            self.add_import_prefix(canonical);
-            Ok(())
-        } else {
-            // A multi-segment `use Stdlib.Data.Tree` names a nested module whose
-            // top-level ancestor (`Stdlib`) may not have been loaded from disk yet:
-            // unlike the single-segment form, nothing here pulls the file in, so the
-            // whole tree is registered only as a side effect of a prior bare
-            // `use Stdlib.`. Load the head's top-level module on demand so the nested
-            // path resolves on its own. Skip the load when the path already resolves
-            // relative to the current scope/imports (a sibling or already-loaded
-            // module), which also avoids treating a relative head as a top-level file.
-            if self.try_resolve_module_path(&path, module_path).is_none() {
-                self.ensure_top_level_loaded(compiler, &path.head, loaded)?;
-            }
-            let canonical = self.resolve_module_path(&path, module_path, pi)?;
-            self.add_import_prefix(canonical);
-            Ok(())
+        // A `use` first tries to resolve its path relative to the current scope and
+        // imports -- an already-mounted module, which may be nested (e.g. a bare
+        // `use Syntax_Tree.` opening `Stdlib.Json.Syntax_Tree` when `Json` is in scope).
+        // Only if that fails do we treat the path's head as a top-level module and load
+        // it from disk. This unifies single- and multi-segment `use`: any `use A(.B...).`
+        // opens what is reachable and loads on demand, rather than a single segment
+        // meaning "load the top-level file `A.lady`" regardless of what is in scope.
+        if self.try_resolve_module_path(&path, module_path).is_none() {
+            self.ensure_top_level_loaded(compiler, &path.head, loaded)?;
         }
+        let canonical = self.resolve_module_path(&path, module_path, pi)?;
+        // The open is local to the module the `use` was written in (its file/module
+        // namespace), not global -- so it never leaks into an unrelated file.
+        self.add_module_import(module_path.clone(), canonical);
+        Ok(())
     }
 
     /// Load (once) the top-level module named `head` from disk, registering it and
@@ -1066,6 +1138,8 @@ impl phase::SymbolTable<Parsed> {
         let canonical = root.with_suffix(head);
 
         if loaded.insert(canonical.clone()) {
+            // A top-level module is its own file, so it begins a fresh import scope.
+            self.add_scope_root(canonical.clone());
             let (declarations, child_dir) = compiler.load_top_level_module(head)?;
             self.add_module_contents(
                 compiler,
@@ -1084,7 +1158,7 @@ impl phase::SymbolTable<Parsed> {
         scope: &IdentifierPath,
     ) -> Option<IdentifierPath> {
         prefix_chain(scope)
-            .chain(self.imports.iter().rev().cloned())
+            .chain(self.active_imports(scope))
             .find_map(|base| {
                 let candidate = IdentifierPath {
                     head: base.head.clone(),
@@ -1111,18 +1185,30 @@ impl phase::SymbolTable<Parsed> {
             .ok_or_else(|| NameError::UnknownName(path.clone()).at(pi).into())
     }
 
-    pub fn add_import_prefix(&mut self, prefix: IdentifierPath) {
-        self.imports.push(prefix);
+    /// Open `prefix` globally (a primordial: `Builtin`/`Stdlib`/`Prelude`).
+    pub fn add_base_import(&mut self, prefix: IdentifierPath) {
+        self.base_imports.push(prefix);
+    }
+
+    /// Open `prefix` within `module` only (a `use` declaration's namespace effect).
+    fn add_module_import(&mut self, module: IdentifierPath, prefix: IdentifierPath) {
+        self.module_imports.entry(module).or_default().push(prefix);
+    }
+
+    /// Mark `module` as the root of a fresh file/import scope (import inheritance stops
+    /// walking up here).
+    fn add_scope_root(&mut self, module: IdentifierPath) {
+        self.scope_roots.insert(module);
     }
 
     pub fn import_compilation_unit(program: CompilationUnit<ParseInfo>) -> Compilation<Self> {
         let mut symtab = Self::default();
 
-        symtab.add_import_prefix(IdentifierPath::new(BUILTIN_MODULE_NAME));
+        symtab.add_base_import(IdentifierPath::new(BUILTIN_MODULE_NAME));
 
         // this is probably not stdlib--but what is it?
         let stdlib = IdentifierPath::new(STDLIB_MODULE_NAME);
-        symtab.add_import_prefix(stdlib.clone());
+        symtab.add_base_import(stdlib.clone());
 
         for symbol in builtin::import() {
             match symbol {
@@ -1146,16 +1232,21 @@ impl phase::SymbolTable<Parsed> {
             }
         }
 
-        let mut loaded = HashSet::from([IdentifierPath::new(program.root_module.name.as_str())]);
+        let root = IdentifierPath::new(program.root_module.name.as_str());
+        let mut loaded = HashSet::from([root.clone()]);
 
-        // The always-imported primordial `Prelude` is loaded+opened via a `use Prelude.`
-        // injected into the root module (see `Compiler::parse_compilation_unit`); no
-        // special pre-load is needed here.
+        // `Root` is a file scope root, and the always-imported primordial `Prelude` is a
+        // GLOBAL open (a base import), not a `use` in `Root` -- otherwise library files,
+        // which do not inherit `Root`'s opens, would not see it. Load it and open it for
+        // everyone here (it was previously injected as a `use Prelude.` into `Root`).
+        symtab.add_scope_root(root.clone());
+        let prelude = symtab.ensure_top_level_loaded(&program.compiler, "Prelude", &mut loaded)?;
+        symtab.add_base_import(prelude);
 
         let root_dir = program.compiler.source_path.clone();
         symtab.add_module_contents(
             &program.compiler,
-            IdentifierPath::new(program.root_module.name.as_str()),
+            root,
             &root_dir,
             Self::module_declarations(&program.compiler, program.root_module.declarator)?,
             &mut loaded,
@@ -2147,7 +2238,9 @@ impl phase::SymbolTable<Desugared> {
                         })
                 })
                 .collect::<Naming<_>>()?,
-            imports: self.imports,
+            base_imports: self.base_imports,
+            module_imports: self.module_imports,
+            scope_roots: self.scope_roots,
             signatures: self.signatures.clone(),
             witnesses: self.witnesses.clone(),
             constructor_opacity: self.constructor_opacity.clone(),

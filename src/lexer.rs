@@ -43,8 +43,13 @@ impl LexicalAnalyzer {
                 }
                 [c, ..] if is_number_prefix(*c) => self.scan_number(input),
                 ['"', remains @ ..] => self.scan_text_literal(remains),
+                ['\'', '\\', esc, '\'', remains @ ..] => self.emit(
+                    4,
+                    TokenKind::Literal(Literal::Char(decode_escape(*esc))),
+                    remains,
+                ),
                 ['\'', c, '\'', remains @ ..] => {
-                    self.emit(1, TokenKind::Literal(Literal::Char(*c)), remains)
+                    self.emit(3, TokenKind::Literal(Literal::Char(*c)), remains)
                 }
 
                 [':', ':', '=', remains @ ..] => self.emit(3, TokenKind::TypeAssign, remains),
@@ -157,67 +162,123 @@ impl LexicalAnalyzer {
         )
     }
 
-    fn scan_text_literal<'a>(&mut self, input: &'a [char]) -> &'a [char] {
-        // This pattern repeats itself a lot.
-        // Can I use split?
-        let (prefix, mut remains) =
-            if let Some(end) = input.iter().position(|&c| c == '"' || c == '`') {
-                input.split_at(end)
-            } else {
-                (input, &input[..0])
-            };
-
-        let mut image = prefix.iter().collect::<String>();
-        let mut length = image.len() as u32;
-
-        if matches!(remains, ['"', ..]) {
-            self.emit(
-                length,
-                TokenKind::Literal(Literal::Text(image)),
-                &remains[1..],
-            )
-        } else {
-            loop {
-                if remains.is_empty() {
-                    break remains;
+    /// Scan a text segment up to (but not including) the next unescaped `"` (end of the
+    /// literal) or `` ` `` (an interpolation splice), decoding backslash escapes. Returns
+    /// the decoded text, the number of SOURCE characters consumed (so escapes still
+    /// advance the column correctly, even though the decoded text is shorter), and the
+    /// terminating delimiter (`"`, `` ` ``, or `None` at end of input).
+    ///
+    /// A backslash escapes the delimiters, so `\"` and `` \` `` are literal characters
+    /// rather than terminators; the usual `\n \t \r \0 \\` are decoded too. An unknown
+    /// escape (`\x`) yields the character verbatim (`x`).
+    fn scan_text_segment(input: &[char]) -> (String, usize, Option<char>) {
+        let mut image = String::new();
+        let mut consumed = 0;
+        while let Some(&c) = input.get(consumed) {
+            match c {
+                '"' | '`' => return (image, consumed, Some(c)),
+                '\\' if consumed + 1 < input.len() => {
+                    image.push(decode_escape(input[consumed + 1]));
+                    consumed += 2;
                 }
-
-                remains = self.emit(
-                    length,
-                    TokenKind::Interpolate(Interpolation::Interlude(Literal::Text(image))),
-                    &remains[1..],
-                );
-
-                let (quoted_expression, remains1) =
-                    if let Some(end) = remains.iter().position(|&c| c == '`') {
-                        (&remains[..end], &remains[end + 1..])
-                    } else {
-                        (remains, &remains[..0])
-                    };
-
-                self.tokenize(quoted_expression);
-
-                let (literal, remains1) =
-                    if let Some(end) = remains1.iter().position(|&c| c == '"' || c == '`') {
-                        remains1.split_at(end)
-                    } else {
-                        (remains1, &remains1[..0])
-                    };
-
-                image = literal.iter().collect::<String>();
-                length = image.len() as u32;
-
-                if matches!(remains1, ['"', ..]) {
-                    break self.emit(
-                        image.len() as u32,
-                        TokenKind::Interpolate(Interpolation::Epilogue(Literal::Text(image))),
-                        &remains1[1..],
-                    );
+                _ => {
+                    image.push(c);
+                    consumed += 1;
                 }
-
-                remains = remains1;
             }
         }
+        (image, consumed, None)
+    }
+
+    fn scan_text_literal<'a>(&mut self, input: &'a [char]) -> &'a [char] {
+        let (image, consumed, terminator) = Self::scan_text_segment(input);
+        let mut content = &input[..consumed];
+        let mut remains = &input[consumed..];
+
+        match terminator {
+            // A plain `"..."` literal (no interpolation), or an unterminated one at EOF.
+            Some('"') => {
+                self.emit_text(content, TokenKind::Literal(Literal::Text(image)), &remains[1..])
+            }
+            None => self.emit_text(content, TokenKind::Literal(Literal::Text(image)), remains),
+
+            // An interpolation splice: emit the leading text, tokenize the `` `expr` ``,
+            // then continue with the following segment (another splice, or the epilogue).
+            _ => {
+                let mut image = image;
+                loop {
+                    // remains starts with the opening `` ` ``.
+                    remains = self.emit_text(
+                        content,
+                        TokenKind::Interpolate(Interpolation::Interlude(Literal::Text(image))),
+                        &remains[1..],
+                    );
+
+                    let (quoted_expression, after_expr) =
+                        if let Some(end) = remains.iter().position(|&c| c == '`') {
+                            (&remains[..end], &remains[end + 1..])
+                        } else {
+                            (remains, &remains[..0])
+                        };
+                    self.tokenize(quoted_expression);
+
+                    let (segment, consumed, terminator) = Self::scan_text_segment(after_expr);
+                    image = segment;
+                    content = &after_expr[..consumed];
+                    remains = &after_expr[consumed..];
+
+                    match terminator {
+                        // Another splice: loop and emit the next interlude.
+                        Some('`') => continue,
+                        // End of the literal (`"`), or unterminated at EOF: the epilogue.
+                        Some('"') => {
+                            break self.emit_text(
+                                content,
+                                TokenKind::Interpolate(Interpolation::Epilogue(Literal::Text(
+                                    image,
+                                ))),
+                                &remains[1..],
+                            );
+                        }
+                        _ => {
+                            break self.emit_text(
+                                content,
+                                TokenKind::Interpolate(Interpolation::Epilogue(Literal::Text(
+                                    image,
+                                ))),
+                                remains,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Emit a token spanning `content` source characters, advancing the location over
+    /// them -- a real newline in the source bumps the row (a text literal may span
+    /// lines), so tokens after a multiline literal keep correct positions. The token's
+    /// position is the start of `content`. (Escapes still occupy their source columns:
+    /// `content` is the raw source, so `\n` is two columns here, one real newline is a
+    /// row.)
+    fn emit_text<'a>(
+        &mut self,
+        content: &[char],
+        token_type: TokenKind,
+        remains: &'a [char],
+    ) -> &'a [char] {
+        self.output.push(Token {
+            kind: token_type,
+            position: self.location,
+        });
+        for &c in content {
+            if c == '\n' {
+                self.location.new_line();
+            } else {
+                self.location.move_right(1);
+            }
+        }
+        remains
     }
 
     fn emit<'a>(&mut self, length: u32, token_type: TokenKind, remains: &'a [char]) -> &'a [char] {
@@ -375,6 +436,19 @@ impl LexicalAnalyzer {
         self.emit(buf.len() as u32, TokenKind::Literal(literal), remains);
 
         remains
+    }
+}
+
+/// Decode the character following a backslash in a text or character literal.
+/// `\n \t \r \0` map to the usual control characters; the delimiters, the escape
+/// character itself, and any other escaped character all decode to themselves.
+const fn decode_escape(escaped: char) -> char {
+    match escaped {
+        'n' => '\n',
+        't' => '\t',
+        'r' => '\r',
+        '0' => '\0',
+        other => other,
     }
 }
 
@@ -957,5 +1031,65 @@ impl fmt::Display for BindingOperator {
             Self::Monadic => write!(f, "*"),
             Self::Applicative => write!(f, "+"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn char_literals(source: &str) -> Vec<char> {
+        let input: Vec<char> = source.chars().collect();
+        let mut lexer = LexicalAnalyzer::default();
+        lexer
+            .tokenize(&input)
+            .iter()
+            .filter_map(|token| match token.kind {
+                TokenKind::Literal(Literal::Char(c)) => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plain_char_literal() {
+        assert_eq!(char_literals("'a'"), vec!['a']);
+    }
+
+    #[test]
+    fn escaped_char_literals_decode() {
+        // Control escapes decode to their control character, exactly as in text literals.
+        assert_eq!(char_literals(r"'\n'"), vec!['\n']);
+        assert_eq!(char_literals(r"'\t'"), vec!['\t']);
+        assert_eq!(char_literals(r"'\r'"), vec!['\r']);
+        assert_eq!(char_literals(r"'\0'"), vec!['\0']);
+    }
+
+    #[test]
+    fn escaped_delimiters_and_backslash() {
+        // A quote or backslash can only appear in a char literal via an escape.
+        assert_eq!(char_literals(r"'\''"), vec!['\'']);
+        assert_eq!(char_literals(r"'\\'"), vec!['\\']);
+    }
+
+    #[test]
+    fn unknown_escape_is_verbatim() {
+        assert_eq!(char_literals(r"'\x'"), vec!['x']);
+    }
+
+    #[test]
+    fn char_literal_advances_columns() {
+        // `'\n'` is four source columns; the token after it must not have drifted.
+        let input: Vec<char> = r"'\n' 'a'".chars().collect();
+        let mut lexer = LexicalAnalyzer::default();
+        let positions: Vec<u32> = lexer
+            .tokenize(&input)
+            .iter()
+            .filter(|t| matches!(t.kind, TokenKind::Literal(Literal::Char(_))))
+            .map(|t| t.position.column)
+            .collect();
+        // Columns are 1-based: `'\n'` spans columns 1-4, a space is column 5, `'a'`
+        // starts at column 6. With the old length-1 advance the second token drifted to 3.
+        assert_eq!(positions, vec![1, 6]);
     }
 }

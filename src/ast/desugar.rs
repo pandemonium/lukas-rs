@@ -362,7 +362,9 @@ impl phase::SymbolTable<Parsed> {
                     )
                 })
                 .collect(),
-            imports: self.imports.clone(),
+            base_imports: self.base_imports.clone(),
+            module_imports: self.module_imports.clone(),
+            scope_roots: self.scope_roots.clone(),
             foreign_terms: self.foreign_terms.clone(),
             signatures: self.signatures.clone(),
             witnesses: self.witnesses.clone(),

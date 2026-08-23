@@ -16,7 +16,7 @@ use crate::{
     },
     lexer::LexicalAnalyzer,
     parser::{self, ParseError, ParseInfo, Parsed},
-    phase,
+    phase, source_map,
     typer::TypeError,
 };
 
@@ -24,8 +24,8 @@ pub type CompilationUnit = ast::CompilationUnit<ParseInfo>;
 
 #[derive(Debug, Error)]
 pub enum CompilationError {
-    #[error("parse error: {0}")]
-    ParseError(#[from] ParseError),
+    #[error("parse error in {}: {error}", .path.display())]
+    ParseError { path: PathBuf, error: ParseError },
 
     #[error("name error: {0}")]
     NameError(#[from] Located<NameError>),
@@ -142,20 +142,9 @@ impl Compiler {
         let module_name = parser::Identifier::from_str(ROOT_MODULE_NAME);
         let mut root_module = self.load_module(&module_name)?;
 
-        // Always import the primordial `Prelude` (Text/Bytes/Buffer/IO + core ADTs). A
-        // single-segment `use` both LOADS and OPENS it, so string literals resolve and the
-        // byte/text primitives are in scope with zero imports. The primordial carries no
-        // typeclass witnesses, so -- unlike opening all of Stdlib -- it never pollutes a
-        // program's scope. Programs never write `use Prelude` themselves.
-        if let ast::ModuleDeclarator::Inline(declarations) = &mut root_module.declarator {
-            declarations.insert(
-                0,
-                ast::Declaration::Use(
-                    ParseInfo::default(),
-                    ast::UseDeclaration::new(None, parser::IdentifierPath::new("Prelude")),
-                ),
-            );
-        }
+        // The primordial `Prelude` (Text/Bytes/Buffer/IO + core ADTs) is loaded and opened
+        // as a GLOBAL base import by the namer (`import_compilation_unit`), so it is in
+        // scope in every file -- not only `Root`. Programs never write `use Prelude`.
 
         // Every Root.lady must define `start`, the program entry point. Check it
         // here so a missing (or, thanks to a parse desync, dropped) `start` is a
@@ -295,7 +284,19 @@ impl Compiler {
                         .into_iter()
                         .cloned()
                         .collect::<Vec<_>>();
-                    let lifted = program.simplify().closure_conversion().lambda_lift(&order);
+                    // Default path: a single `simplify()`. With `MARM_DEFOREST_IO` set, the first
+                    // `simplify()` inlines `unsafe_run_IO` into its force marker (leaving the
+                    // recursive IO loop un-inlined behind the leak guard); `deforest_io()`
+                    // strictifies that loop in place; the second `simplify()` finishes the
+                    // straight-line cancellation the strict worker exposes. Gated so the default
+                    // path stays byte-identical (no second simplify pass when the flag is off).
+                    let program = program.simplify();
+                    let program = if std::env::var_os("MARM_DEFOREST_IO").is_some() {
+                        program.deforest_io().simplify()
+                    } else {
+                        program
+                    };
+                    let lifted = program.closure_conversion().lambda_lift(&order);
                     lifted.generate_code(&mut code).map_err(io::Error::other)?;
                 }
             }
@@ -378,28 +379,39 @@ impl Compiler {
 }
 
 fn load_and_parse_module(source_path: PathBuf) -> Compilation<Vec<ast::Declaration<ParseInfo>>> {
-    let source = fs::read_to_string(&source_path)?
-        .chars()
-        .collect::<Vec<_>>();
+    let source_text = fs::read_to_string(&source_path)?;
+    let source = source_text.chars().collect::<Vec<_>>();
 
-    let mut lexer = LexicalAnalyzer::default();
-    let tokens = lexer.tokenize(&source);
+    // Every `ParseInfo` built while parsing this module is stamped with `file`, so
+    // name/type errors raised long after all modules are merged can still name their
+    // source -- and quote it (see `source_map`). Parse errors, raised here, get the
+    // path attached directly below.
+    let file = source_map::register(&source_path, &source_text);
+    let attach = |error| CompilationError::ParseError {
+        path: source_path.clone(),
+        error,
+    };
 
-    let mut parser = parser::Parser::from_tokens(tokens);
+    source_map::with_current(file, || {
+        let mut lexer = LexicalAnalyzer::default();
+        let tokens = lexer.tokenize(&source);
 
-    let declarations = parser.parse_declaration_list()?;
+        let mut parser = parser::Parser::from_tokens(tokens);
 
-    // A fully-parsed module leaves only the `End` sentinel. Any other leftover
-    // token means the declaration loop desynced (usually an unexpected layout
-    // indent/dedent) and silently abandoned the rest of the file. Report it
-    // instead of dropping it -- otherwise the failure only surfaces much later
-    // as a missing `start` at run time.
-    if let Some(token) = parser.remains().iter().find(|t| !t.is_end()) {
-        Err(parser::ParseError::UnconsumedInput {
-            found: token.kind.clone(),
-            position: *token.location(),
-        })?;
-    }
+        let declarations = parser.parse_declaration_list().map_err(attach)?;
 
-    Ok(declarations)
+        // A fully-parsed module leaves only the `End` sentinel. Any other leftover
+        // token means the declaration loop desynced (usually an unexpected layout
+        // indent/dedent) and silently abandoned the rest of the file. Report it
+        // instead of dropping it -- otherwise the failure only surfaces much later
+        // as a missing `start` at run time.
+        if let Some(token) = parser.remains().iter().find(|t| !t.is_end()) {
+            return Err(attach(parser::ParseError::UnconsumedInput {
+                found: token.kind.clone(),
+                position: *token.location(),
+            }));
+        }
+
+        Ok(declarations)
+    })
 }

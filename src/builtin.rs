@@ -198,6 +198,39 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
         type_scheme: unary_signature(),
     };
 
+    // Widening coercions, exposed to source as `Int.of_char` / `Float.of_int` (thin
+    // module wrappers in the Prelude alias these). Monomorphic, unlike the overloaded
+    // arithmetic builtins.
+    let char_to_int = PartialRawLambda1 {
+        name: "int_of_char",
+        apply: mk_unary_op(int_of_char),
+        type_scheme: TypeScheme::from_constant(Type::Arrow {
+            domain: Type::Base(BaseType::Char).into(),
+            codomain: Type::Base(BaseType::Int).into(),
+        }),
+    };
+
+    let int_to_float = PartialRawLambda1 {
+        name: "float_of_int",
+        apply: mk_unary_op(float_of_int),
+        type_scheme: TypeScheme::from_constant(Type::Arrow {
+            domain: Type::Base(BaseType::Int).into(),
+            codomain: Type::Base(BaseType::Float).into(),
+        }),
+    };
+
+    // `Int -> Char`, exposed as `Char.of_byte`. Total (masks to the low byte), so
+    // unlike a general unchecked `Int -> Char` there is no narrowing: every byte is a
+    // valid Char. A compiler builtin, so it folds on a literal.
+    let byte_to_char = PartialRawLambda1 {
+        name: "char_of_byte",
+        apply: mk_unary_op(char_of_byte),
+        type_scheme: TypeScheme::from_constant(Type::Arrow {
+            domain: Type::Base(BaseType::Int).into(),
+            codomain: Type::Base(BaseType::Char).into(),
+        }),
+    };
+
     let text_fold_right_lambda = RawLambda3 {
         name: "text_fold_right",
         apply: text_fold_right,
@@ -244,6 +277,9 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
         exclusive_or.into_symbol(&builtins),
         complement.into_symbol(&builtins),
         negation.into_symbol(&builtins),
+        char_to_int.into_symbol(&builtins),
+        int_to_float.into_symbol(&builtins),
+        byte_to_char.into_symbol(&builtins),
         plus.into_symbol(&builtins),
         minus.into_symbol(&builtins),
         times.into_symbol(&builtins),
@@ -428,6 +464,33 @@ pub fn negate(p: Literal) -> Option<Literal> {
     match p {
         Literal::Int(p) => Some(Literal::Int(-p)),
         Literal::Float(p) => Some(Literal::Float(-p)),
+        _otherwise => None,
+    }
+}
+
+// Widening coercions. Each is a total, lossless conversion into a wider type, so
+// unlike an arbitrary foreign the compiler may treat it as a known pure primitive:
+// fold it on a literal, and (for `int_of_char`) erase it entirely, since a `Char` and
+// its `Int` code point share the same immediate word. See the backends' `prim_*` forms.
+pub fn int_of_char(p: Literal) -> Option<Literal> {
+    match p {
+        Literal::Char(c) => Some(Literal::Int(c as u32 as i64)),
+        _otherwise => None,
+    }
+}
+
+pub fn float_of_int(p: Literal) -> Option<Literal> {
+    match p {
+        Literal::Int(n) => Some(Literal::Float(n as f64)),
+        _otherwise => None,
+    }
+}
+
+// `Int -> Char` (`Char.of_byte`). Total: `n as u8` masks to the low byte and every
+// byte 0..255 is a valid Char, so this never fails and needs no narrowing check.
+pub fn char_of_byte(p: Literal) -> Option<Literal> {
+    match p {
+        Literal::Int(n) => Some(Literal::Char(n as u8 as char)),
         _otherwise => None,
     }
 }
