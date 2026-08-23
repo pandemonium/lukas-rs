@@ -3,3 +3,4 @@
 runtime.so
 *.generated.c
 *.dSYM/
+ladies/benchmarks/billions/city-temperatures.txt

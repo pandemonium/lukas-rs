@@ -1,3 +1,0 @@
-Enköping;12.4
-Uppsala;1.2
-Stockholm;27.0
