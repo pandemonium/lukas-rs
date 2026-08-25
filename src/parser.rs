@@ -2564,7 +2564,8 @@ impl<'a> Parser<'a> {
         let _t = self.trace();
 
         // There are nullary constructors
-        let (pos, id) = self.identifier()?;
+        let pos = *self.peek()?.location();
+        let constructor = self.parse_identifier_path()?;
         let mut arguments = vec![];
 
         while !matches!(
@@ -2582,7 +2583,7 @@ impl<'a> Parser<'a> {
         Ok(Pattern::Coproduct(
             ParseInfo::from_position(pos),
             ConstructorPattern {
-                constructor: IdentifierPath::new(&id),
+                constructor,
                 arguments,
             },
         ))

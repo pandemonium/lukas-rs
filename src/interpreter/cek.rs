@@ -260,6 +260,13 @@ enum AndThen {
         k: Box<AndThen>,
     },
 
+    EvalArrayElement {
+        input: Rc<Vec<Tree>>,
+        output: Vec<Val>,
+        environment: Env,
+        k: Box<AndThen>,
+    },
+
     EvalRecordField {
         input: Rc<Vec<(parser::Identifier, Tree)>>,
         output: Vec<Val>,
@@ -475,6 +482,29 @@ fn and_then(value: Val, k: AndThen) -> Suspension {
                 })
             } else {
                 Suspension::return_and(Val::Product(output), *k)
+            }
+        }
+
+        AndThen::EvalArrayElement {
+            input,
+            mut output,
+            environment,
+            k,
+        } => {
+            output.push(value);
+            if output.len() < input.len() {
+                Suspension::Suspend(Suspended::Eval {
+                    expression: Rc::clone(&input[output.len()]),
+                    environment: environment.shared(),
+                    k: AndThen::EvalArrayElement {
+                        input,
+                        output,
+                        environment,
+                        k,
+                    },
+                })
+            } else {
+                Suspension::return_and(Val::Array(output), *k)
             }
         }
 
@@ -729,9 +759,20 @@ impl Expr {
                 },
             ),
 
-            Self::Array(_, the) => {
-                Suspension::eval_and(&the.elements[0], environment.shared(), todo!())
+            Self::Array(_, the) if the.elements.is_empty() => {
+                Suspension::return_and(Val::Array(Vec::new()), k)
             }
+
+            Self::Array(_, the) => Suspension::eval_and(
+                &the.elements[0],
+                environment.shared(),
+                AndThen::EvalArrayElement {
+                    input: Rc::new(the.elements.clone()),
+                    output: Vec::with_capacity(the.elements.len()),
+                    environment,
+                    k: k.into(),
+                },
+            ),
 
             Self::Record(_, the) => Suspension::eval_and(
                 &the.fields[0].1,
