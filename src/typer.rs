@@ -322,6 +322,7 @@ fn classify_self_reference(body: &UntypedExpr, own: &QualifiedName) -> SelfRefer
 impl phase::SymbolTable<Named> {
     pub fn elaborate_compilation_unit(mut self) -> Typing<phase::SymbolTable<Types>> {
         self.check_supersignature_acyclicity()?;
+        self.check_type_alias_acyclicity()?;
 
         let mut ctx = self.elaborate_types()?;
 
@@ -375,6 +376,67 @@ impl phase::SymbolTable<Named> {
         signatures.sort();
         for sig in &signatures {
             self.detect_super_cycle(sig, &mut Vec::new(), &mut done)?;
+        }
+        Ok(())
+    }
+
+    fn check_type_alias_acyclicity(&self) -> Typing<()> {
+        fn visit(
+            table: &phase::SymbolTable<Named>,
+            name: &QualifiedName,
+            path: &mut Vec<QualifiedName>,
+            done: &mut HashSet<QualifiedName>,
+        ) -> Typing<()> {
+            if done.contains(name) {
+                return Ok(());
+            }
+            if let Some(start) = path.iter().position(|candidate| candidate == name) {
+                let mut cycle = path[start..].to_vec();
+                cycle.push(name.clone());
+                return Err(TypeError::CyclicTypeAlias { cycle }.at(ParseInfo::default()));
+            }
+            let Some(Symbol::Type(TypeSymbol {
+                definition: TypeDefinition::Alias(alias),
+                ..
+            })) = table.symbols.get(&SymbolName::Type(name.clone()))
+            else {
+                return Ok(());
+            };
+
+            path.push(name.clone());
+            let mut dependencies = alias
+                .body
+                .free_variables()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            dependencies.sort();
+            for dependency in dependencies {
+                visit(table, &dependency, path, done)?;
+            }
+            path.pop();
+            done.insert(name.clone());
+            Ok(())
+        }
+
+        let mut aliases = self
+            .symbols
+            .iter()
+            .filter_map(|(name, symbol)| {
+                matches!(
+                    symbol,
+                    Symbol::Type(TypeSymbol {
+                        definition: TypeDefinition::Alias(_),
+                        ..
+                    })
+                )
+                .then(|| name.name().clone())
+            })
+            .collect::<Vec<_>>();
+        aliases.sort();
+        let mut done = HashSet::new();
+        for alias in aliases {
+            visit(self, &alias, &mut Vec::new(), &mut done)?;
         }
         Ok(())
     }
@@ -539,16 +601,141 @@ impl phase::SymbolTable<Named> {
         Ok(witnesses)
     }
 
+    fn infer_alias_kinds(&self) -> Typing<HashMap<QualifiedName, Kind>> {
+        fn expression_kind(
+            table: &phase::SymbolTable<Named>,
+            expression: &phase::TypeExpression<Named>,
+            parameters: &HashMap<parser::Identifier, Kind>,
+            cache: &mut HashMap<QualifiedName, Kind>,
+            path: &mut Vec<QualifiedName>,
+        ) -> Typing<Kind> {
+            match expression {
+                TypeExpression::Constructor(pi, name) => {
+                    let Symbol::Type(symbol) = table
+                        .symbols
+                        .get(&SymbolName::Type(name.clone()))
+                        .ok_or_else(|| TypeError::UndefinedType(name.clone()).at(*pi))?
+                    else {
+                        return Err(TypeError::UndefinedType(name.clone()).at(*pi));
+                    };
+                    if matches!(symbol.definition, TypeDefinition::Alias(_)) {
+                        alias_kind(table, name, cache, path)
+                    } else {
+                        Ok(symbol.kind.clone())
+                    }
+                }
+                TypeExpression::Parameter(pi, parameter) => parameters
+                    .get(parameter)
+                    .cloned()
+                    .ok_or_else(|| {
+                        TypeError::UnquantifiedTypeParameter(parameter.clone()).at(*pi)
+                    }),
+                TypeExpression::Apply(pi, application) => expression_kind(
+                    table,
+                    &application.function,
+                    parameters,
+                    cache,
+                    path,
+                )?
+                .apply(expression_kind(
+                    table,
+                    &application.argument,
+                    parameters,
+                    cache,
+                    path,
+                )?)
+                .map_err(|error| error.at(*pi)),
+                TypeExpression::Arrow(pi, arrow) => {
+                    for component in [&arrow.domain, &arrow.codomain] {
+                        let kind = expression_kind(table, component, parameters, cache, path)?;
+                        if kind != Kind::Star {
+                            return Err(TypeError::ExpectedMonotypeKind { kind }.at(*pi));
+                        }
+                    }
+                    Ok(Kind::Star)
+                }
+                TypeExpression::Tuple(pi, tuple) => {
+                    for element in &tuple.0 {
+                        let kind = expression_kind(table, element, parameters, cache, path)?;
+                        if kind != Kind::Star {
+                            return Err(TypeError::ExpectedMonotypeKind { kind }.at(*pi));
+                        }
+                    }
+                    Ok(Kind::Star)
+                }
+            }
+        }
+
+        fn alias_kind(
+            table: &phase::SymbolTable<Named>,
+            name: &QualifiedName,
+            cache: &mut HashMap<QualifiedName, Kind>,
+            path: &mut Vec<QualifiedName>,
+        ) -> Typing<Kind> {
+            if let Some(kind) = cache.get(name) {
+                return Ok(kind.clone());
+            }
+            if let Some(start) = path.iter().position(|candidate| candidate == name) {
+                let mut cycle = path[start..].to_vec();
+                cycle.push(name.clone());
+                return Err(TypeError::CyclicTypeAlias { cycle }.at(ParseInfo::default()));
+            }
+            let Some(Symbol::Type(TypeSymbol {
+                definition: TypeDefinition::Alias(alias),
+                ..
+            })) = table.symbols.get(&SymbolName::Type(name.clone()))
+            else {
+                return Err(TypeError::UndefinedType(name.clone()).at(ParseInfo::default()));
+            };
+            path.push(name.clone());
+            let parameters = alias
+                .type_parameters
+                .iter()
+                .map(|parameter| (parameter.name.clone(), parameter.kind.clone()))
+                .collect::<HashMap<_, _>>();
+            let body_kind = expression_kind(table, &alias.body, &parameters, cache, path)?;
+            let kind = alias.type_parameters.iter().rfold(body_kind, |result, parameter| {
+                Kind::Arrow(parameter.kind.clone().into(), result.into())
+            });
+            path.pop();
+            cache.insert(name.clone(), kind.clone());
+            Ok(kind)
+        }
+
+        let mut aliases = self
+            .symbols
+            .values()
+            .filter_map(|symbol| match symbol {
+                Symbol::Type(TypeSymbol {
+                    definition: TypeDefinition::Alias(alias),
+                    ..
+                }) => Some(alias.name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        aliases.sort();
+        let mut kinds = HashMap::new();
+        for alias in aliases {
+            alias_kind(self, &alias, &mut kinds, &mut Vec::new())?;
+        }
+        Ok(kinds)
+    }
+
     fn elaborate_types(&self) -> Typing<TypingContext> {
         let mut ctx = TypingContext::default();
+        let alias_kinds = self.infer_alias_kinds()?;
 
         for symbol in self.symbols.iter().filter_map(|(_, sym)| match sym {
             Symbol::Type(symbol) => Some(symbol),
             _ => None,
         }) {
+            let mut symbol = symbol.clone();
+            if let Some(kind) = alias_kinds.get(&symbol.qualified_name()) {
+                symbol.kind = kind.clone();
+            }
             ctx.bind_type(
                 symbol.qualified_name().clone(),
-                TypeConstructor::from_symbol(symbol),
+                TypeConstructor::from_symbol(&symbol),
             );
         }
 
@@ -2122,6 +2309,12 @@ pub enum TypeError {
     #[error("cyclic supersignatures: {}", display_list(" requires ", cycle))]
     CyclicSupersignature { cycle: Vec<QualifiedName> },
 
+    #[error("cyclic type alias: {}", display_list(" expands to ", cycle))]
+    CyclicTypeAlias { cycle: Vec<QualifiedName> },
+
+    #[error("expected a monotype of kind *; found kind {kind}")]
+    ExpectedMonotypeKind { kind: Kind },
+
     #[error("no witness found for {0}")]
     NoWitness(Constraint),
 
@@ -2691,6 +2884,15 @@ impl Type {
         rhs: &Self,
         ctx: &TypeEnvironment,
     ) -> Result<Substitutions, TypeError> {
+        let lhs_normalized = ctx.normalize_alias(self)?;
+        let rhs_normalized = ctx.normalize_alias(rhs)?;
+        if lhs_normalized.is_some() || rhs_normalized.is_some() {
+            return lhs_normalized
+                .as_ref()
+                .unwrap_or(self)
+                .unified_with(rhs_normalized.as_ref().unwrap_or(rhs), ctx);
+        }
+
         let lhs_kind = self.kind(ctx)?;
         let rhs_kind = rhs.kind(ctx)?;
         if lhs_kind != rhs_kind {
@@ -3317,12 +3519,13 @@ fn from_definition(
     definition: &TypeConstructorDefinition,
     ctx: &TypingContext,
 ) -> Typing<TypeConstructor> {
+    let structure = definition
+        .defining_symbol
+        .definition
+        .synthesize_type(&definition.instantiated_params, ctx)?;
     Ok(TypeConstructor::Elaborated(ElaboratedTypeConstructor {
         definition: definition.clone(),
-        structure: definition
-            .defining_symbol
-            .definition
-            .synthesize_type(&definition.instantiated_params, ctx)?,
+        structure,
     }))
 }
 
@@ -3352,6 +3555,9 @@ impl TypeDefinition<QualifiedName> {
             Self::Signature(sig) => sig.vtable.synthesize_type(type_param_map, ctx),
             Self::Coproduct(coproduct) => Ok(TypeStructure::Monotype(
                 coproduct.synthesize_type(type_param_map, ctx)?,
+            )),
+            Self::Alias(alias) => Ok(TypeStructure::Monotype(
+                alias.body.synthesize_type(type_param_map, ctx)?,
             )),
             Self::BaseType(base_type) => Ok(TypeStructure::Monotype(Type::Base(base_type.clone()))),
         }
@@ -3668,6 +3874,78 @@ impl TypeEnvironment {
         self.bindings.get_mut(name)
     }
 
+    fn normalize_alias(&self, ty: &Type) -> Result<Option<Type>, TypeError> {
+        self.normalize_alias_on_path(ty, &mut Vec::new())
+    }
+
+    fn normalize_alias_on_path(
+        &self,
+        ty: &Type,
+        path: &mut Vec<QualifiedName>,
+    ) -> Result<Option<Type>, TypeError> {
+        let mut head = ty;
+        while let Type::Apply { constructor, .. } = head {
+            head = constructor;
+        }
+
+        let Type::Constructor(name) = head else {
+            return Ok(None);
+        };
+        let Some(constructor) = self.lookup(name) else {
+            return Ok(None);
+        };
+        let TypeDefinition::Alias(_) = &constructor.definition().defining_symbol.definition else {
+            return Ok(None);
+        };
+        let mut arguments = Vec::new();
+        let mut application = ty;
+        while let Type::Apply {
+            constructor,
+            argument,
+        } = application
+        {
+            arguments.push(argument.as_ref());
+            application = constructor;
+        }
+        arguments.reverse();
+        if arguments.len() < constructor.arity() {
+            return Ok(None);
+        }
+        if let Some(start) = path.iter().position(|candidate| candidate == name) {
+            let mut cycle = path[start..].to_vec();
+            cycle.push(name.clone());
+            return Err(TypeError::CyclicTypeAlias { cycle });
+        }
+
+        let TypeConstructor::Elaborated(alias) = constructor else {
+            return Err(TypeError::UnelaboratedConstructor(name.clone()));
+        };
+        path.push(name.clone());
+        let parameter_count = alias.definition.defining_symbol.type_parameters().len();
+        let substitutions = Substitutions::from(
+            alias
+                .definition
+                .defining_symbol
+                .type_parameters()
+                .iter()
+                .map(|parameter| alias.definition.instantiated_params[&parameter.name].clone())
+                .zip(arguments.iter().take(parameter_count).map(|argument| (*argument).clone()))
+                .collect::<Vec<_>>(),
+        );
+        let expanded = arguments[parameter_count..].iter().fold(
+            alias.structure.materialize_monotype().apply(&substitutions),
+            |constructor, argument| Type::Apply {
+                constructor: constructor.into(),
+                argument: (*argument).clone().into(),
+            },
+        );
+        let result = self
+            .normalize_alias_on_path(&expanded, path)
+            .map(|normalized| Some(normalized.unwrap_or(expanded)));
+        path.pop();
+        result
+    }
+
     fn query_record_type_constructor(&self, shape: &RecordShape) -> Vec<&TypeConstructor> {
         self.record_shapes
             .type_constructor_names_by_shape(shape)
@@ -3728,6 +4006,18 @@ impl TypingContext {
         pi: ParseInfo,
         ty: &Type,
     ) -> Typing<Option<TypeStructure>> {
+        let normalized = self
+            .types
+            .normalize_alias(ty)
+            .map_err(|error| error.at(pi))?;
+        if let Some(normalized) = normalized {
+            return if matches!(normalized, Type::Constructor { .. } | Type::Apply { .. }) {
+                self.reduce_applied_constructor(pi, &normalized, &mut vec![])
+                    .map(Some)
+            } else {
+                Ok(Some(TypeStructure::Monotype(normalized)))
+            };
+        }
         if let Type::Constructor { .. } | Type::Apply { .. } = ty {
             self.reduce_applied_constructor(pi, ty, &mut vec![])
                 .map(Some)

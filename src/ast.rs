@@ -162,6 +162,7 @@ pub struct TypeDeclaration<A> {
 pub enum TypeDeclarator<A> {
     Record(A, RecordDeclarator<A>),
     Coproduct(A, CoproductDeclarator<A>),
+    Alias(A, TypeExpression<A, parser::IdentifierPath>),
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -1128,6 +1129,7 @@ impl<A> fmt::Display for TypeDeclarator<A> {
         match self {
             Self::Record(_, decl) => write!(f, "{decl}"),
             Self::Coproduct(_, decl) => write!(f, "{decl}"),
+            Self::Alias(_, body) => write!(f, "{body}"),
         }
     }
 }

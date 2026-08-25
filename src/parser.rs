@@ -481,6 +481,7 @@ impl<'a> Parser<'a> {
                             | Keyword::Signature
                             | Keyword::Witness
                             | Keyword::Foreign
+                            | Keyword::Alias
                             // `opaque <id> ::=` -- without this, an opaque declaration
                             // after a binding whose body is on its own indented line
                             // (which ends in a Dedent, not a Newline separator) is not
@@ -499,6 +500,36 @@ impl<'a> Parser<'a> {
         let _t = self.trace();
 
         match self.remains() {
+            [
+                t,
+                Token {
+                    kind: TokenKind::Identifier(name),
+                    position,
+                },
+                Token {
+                    kind: TokenKind::TypeAssign,
+                    ..
+                },
+                ..,
+            ] if t.is_keyword(Keyword::Alias) => {
+                self.advance(3);
+                let type_parameters = self.parse_forall_clause()?;
+                let body = self.parse_block(|parser| parser.parse_type_expression(0))?;
+                Ok(Declaration::Type(
+                    ParseInfo::from_position(*position),
+                    TypeDeclaration {
+                        name: Identifier::from_str(name),
+                        type_parameters,
+                        declarator: TypeDeclarator::Alias(
+                            ParseInfo::from_position(*position),
+                            body,
+                        ),
+                        origin: TypeOrigin::UserDefined,
+                        opaque: false,
+                    },
+                ))
+            }
+
             [
                 Token {
                     kind: TokenKind::Identifier(name),
@@ -1251,9 +1282,7 @@ impl<'a> Parser<'a> {
                 // continuation). The `Dedent` we see now returns *past* our enclosing
                 // level, so it belongs to an outer block -- leave it for that block to
                 // close on, rather than stealing it and swallowing following siblings.
-                TokenKind::Layout(Layout::Dedent)
-                    if token.position.column < enclosing_base =>
-                {
+                TokenKind::Layout(Layout::Dedent) if token.position.column < enclosing_base => {
                     Ok(body)
                 }
                 TokenKind::Layout(Layout::Dedent) | TokenKind::End => {

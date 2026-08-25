@@ -930,6 +930,23 @@ impl phase::SymbolTable<Parsed> {
                         ),
                     );
                 }
+
+                ast::TypeDeclarator::Alias(_, body) => {
+                    self.add_type_symbol(
+                        name.clone(),
+                        TypeSymbol {
+                            definition: TypeDefinition::Alias(AliasSymbol {
+                                name: name.clone(),
+                                type_parameters: type_parameters.clone(),
+                                body,
+                            }),
+                            origin,
+                            opacity,
+                            arity: type_parameters.len(),
+                            kind: compute_type_constructor_kind(&type_parameters),
+                        },
+                    );
+                }
             };
         }
     }
@@ -1353,7 +1370,15 @@ pub enum TypeDefinition<GlobalName> {
     Record(RecordSymbol<GlobalName>),
     Signature(SignatureSymbol<GlobalName>),
     Coproduct(CoproductSymbol<GlobalName>),
+    Alias(AliasSymbol<GlobalName>),
     BaseType(BaseType),
+}
+
+#[derive(Debug, Clone)]
+pub struct AliasSymbol<GlobalName> {
+    pub name: QualifiedName,
+    pub type_parameters: Vec<TypeVariable>,
+    pub body: ast::TypeExpression<ParseInfo, GlobalName>,
 }
 
 impl<GlobalName> TypeDefinition<GlobalName> {
@@ -1366,6 +1391,7 @@ impl<GlobalName> TypeDefinition<GlobalName> {
             Self::Record(the) => the.name.clone(),
             Self::Signature(the) => the.vtable.name.clone(),
             Self::Coproduct(the) => the.name.clone(),
+            Self::Alias(the) => the.name.clone(),
             Self::BaseType(the) => the.qualified_name(),
         }
     }
@@ -1377,6 +1403,7 @@ impl TypeSymbol<QualifiedName> {
             TypeDefinition::Record(symbol) => symbol.name.clone(),
             TypeDefinition::Signature(symbol) => symbol.vtable.name.clone(),
             TypeDefinition::Coproduct(symbol) => symbol.name.clone(),
+            TypeDefinition::Alias(symbol) => symbol.name.clone(),
             TypeDefinition::BaseType(base_type) => base_type.qualified_name(),
         }
     }
@@ -1386,6 +1413,7 @@ impl TypeSymbol<QualifiedName> {
             TypeDefinition::Record(sym) => &sym.type_parameters,
             TypeDefinition::Signature(sym) => &sym.vtable.type_parameters,
             TypeDefinition::Coproduct(sym) => &sym.type_parameters,
+            TypeDefinition::Alias(sym) => &sym.type_parameters,
             TypeDefinition::BaseType(..) => &[],
         }
     }
@@ -2346,6 +2374,18 @@ impl phase::SymbolTable<Desugared> {
                                         })
                                 })
                                 .collect::<Naming<_>>()?,
+                        }),
+                        origin: symbol.origin,
+                        opacity: symbol.opacity.clone(),
+                        arity: symbol.arity,
+                        kind: symbol.kind.clone(),
+                    },
+
+                    TypeDefinition::Alias(alias) => TypeSymbol {
+                        definition: TypeDefinition::Alias(AliasSymbol {
+                            name: alias.name.clone(),
+                            type_parameters: alias.type_parameters.clone(),
+                            body: alias.body.resolve_names(self, pi, semantic_scope)?,
                         }),
                         origin: symbol.origin,
                         opacity: symbol.opacity.clone(),

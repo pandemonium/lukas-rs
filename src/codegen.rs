@@ -854,6 +854,7 @@ impl lambda_lift::Program {
             TypeDefinition::Record(record) => &record.type_parameters,
             TypeDefinition::Signature(signature) => &signature.vtable.type_parameters,
             TypeDefinition::Coproduct(coproduct) => &coproduct.type_parameters,
+            TypeDefinition::Alias(alias) => &alias.type_parameters,
             TypeDefinition::BaseType(..) => {
                 return ShapeResult {
                     shape: RuntimeShape::Leaf,
@@ -960,6 +961,9 @@ impl lambda_lift::Program {
                         }
                     }
                 }
+            }
+            TypeDefinition::Alias(alias) => {
+                self.runtime_type_expression_shape(&alias.body, &bindings, on_path)
             }
             TypeDefinition::Signature(..) | TypeDefinition::BaseType(..) => ShapeResult {
                 shape: RuntimeShape::Leaf,
