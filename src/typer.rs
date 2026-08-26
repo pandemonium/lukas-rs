@@ -321,19 +321,29 @@ fn classify_self_reference(body: &UntypedExpr, own: &QualifiedName) -> SelfRefer
 
 impl phase::SymbolTable<Named> {
     pub fn elaborate_compilation_unit(mut self) -> Typing<phase::SymbolTable<Types>> {
-        self.check_supersignature_acyclicity()?;
-        self.check_type_alias_acyclicity()?;
+        crate::profile::time("type checker: check signature cycles", || {
+            self.check_supersignature_acyclicity()
+        })?;
+        crate::profile::time("type checker: check alias cycles", || {
+            self.check_type_alias_acyclicity()
+        })?;
 
-        let mut ctx = self.elaborate_types()?;
+        let mut ctx =
+            crate::profile::time("type checker: elaborate types", || self.elaborate_types())?;
 
-        self.elaborate_foreign_terms(&mut ctx)?;
+        crate::profile::time("type checker: elaborate foreign terms", || {
+            self.elaborate_foreign_terms(&mut ctx)
+        })?;
 
         // Gives rise to signature method placeholders -- term typer needs this
-        let selectors_names = self.elaborate_constraints(&mut ctx)?;
+        let selectors_names = crate::profile::time("type checker: elaborate constraints", || {
+            self.elaborate_constraints(&mut ctx)
+        })?;
 
         // This runs the term typer core
-        let symbols =
-            self.elaborate_terms(&selectors_names.iter().collect::<Vec<_>>(), &mut ctx)?;
+        let symbols = crate::profile::time("type checker: elaborate terms", || {
+            self.elaborate_terms(&selectors_names.iter().collect::<Vec<_>>(), &mut ctx)
+        })?;
 
         Ok(SymbolTable {
             module_members: self.module_members,
@@ -563,7 +573,11 @@ impl phase::SymbolTable<Named> {
                 && let Symbol::Term(symbol) = &self.symbols[&name]
             {
                 //                tracing::trace!("@@@ {} := {:?}", symbol.name, symbol.body);
-                typed_terms.push((symbol, self.type_term(symbol, ctx)?))
+                let label = format!("type term: {}", symbol.name);
+                typed_terms.push((
+                    symbol,
+                    crate::profile::time_if_slow(label, 10.0, || self.type_term(symbol, ctx))?,
+                ))
             }
 
             if let SymbolName::Type(..) = name
@@ -611,10 +625,11 @@ impl phase::SymbolTable<Named> {
         ) -> Typing<Kind> {
             match expression {
                 TypeExpression::Constructor(pi, name) => {
-                    let Symbol::Type(symbol) = table
-                        .symbols
-                        .get(&SymbolName::Type(name.clone()))
-                        .ok_or_else(|| TypeError::UndefinedType(name.clone()).at(*pi))?
+                    let Symbol::Type(symbol) =
+                        table
+                            .symbols
+                            .get(&SymbolName::Type(name.clone()))
+                            .ok_or_else(|| TypeError::UndefinedType(name.clone()).at(*pi))?
                     else {
                         return Err(TypeError::UndefinedType(name.clone()).at(*pi));
                     };
@@ -627,24 +642,18 @@ impl phase::SymbolTable<Named> {
                 TypeExpression::Parameter(pi, parameter) => parameters
                     .get(parameter)
                     .cloned()
-                    .ok_or_else(|| {
-                        TypeError::UnquantifiedTypeParameter(parameter.clone()).at(*pi)
-                    }),
-                TypeExpression::Apply(pi, application) => expression_kind(
-                    table,
-                    &application.function,
-                    parameters,
-                    cache,
-                    path,
-                )?
-                .apply(expression_kind(
-                    table,
-                    &application.argument,
-                    parameters,
-                    cache,
-                    path,
-                )?)
-                .map_err(|error| error.at(*pi)),
+                    .ok_or_else(|| TypeError::UnquantifiedTypeParameter(parameter.clone()).at(*pi)),
+                TypeExpression::Apply(pi, application) => {
+                    expression_kind(table, &application.function, parameters, cache, path)?
+                        .apply(expression_kind(
+                            table,
+                            &application.argument,
+                            parameters,
+                            cache,
+                            path,
+                        )?)
+                        .map_err(|error| error.at(*pi))
+                }
                 TypeExpression::Arrow(pi, arrow) => {
                     for component in [&arrow.domain, &arrow.codomain] {
                         let kind = expression_kind(table, component, parameters, cache, path)?;
@@ -694,9 +703,12 @@ impl phase::SymbolTable<Named> {
                 .map(|parameter| (parameter.name.clone(), parameter.kind.clone()))
                 .collect::<HashMap<_, _>>();
             let body_kind = expression_kind(table, &alias.body, &parameters, cache, path)?;
-            let kind = alias.type_parameters.iter().rfold(body_kind, |result, parameter| {
-                Kind::Arrow(parameter.kind.clone().into(), result.into())
-            });
+            let kind = alias
+                .type_parameters
+                .iter()
+                .rfold(body_kind, |result, parameter| {
+                    Kind::Arrow(parameter.kind.clone().into(), result.into())
+                });
             path.pop();
             cache.insert(name.clone(), kind.clone());
             Ok(kind)
@@ -2257,9 +2269,7 @@ pub enum TypeError {
     #[error("{0} is not a known coproduct constructor")]
     NoSuchCoproductConstructor(namer::QualifiedName),
 
-    #[error(
-        "constructor {constructor} takes {expected} argument(s), but this pattern binds {got}"
-    )]
+    #[error("constructor {constructor} takes {expected} argument(s), but this pattern binds {got}")]
     ConstructorPatternArity {
         constructor: namer::QualifiedName,
         expected: usize,
@@ -2276,6 +2286,12 @@ pub enum TypeError {
     BadRecordPatternField {
         record_type: Type,
         field: parser::Identifier,
+    },
+
+    #[error("pattern `{pattern}` cannot match a value of type `{scrutinee}`")]
+    PatternTypeMismatch {
+        pattern: String,
+        scrutinee: TypeStructure,
     },
 
     #[error("{clause} is not useful")]
@@ -3929,7 +3945,12 @@ impl TypeEnvironment {
                 .type_parameters()
                 .iter()
                 .map(|parameter| alias.definition.instantiated_params[&parameter.name].clone())
-                .zip(arguments.iter().take(parameter_count).map(|argument| (*argument).clone()))
+                .zip(
+                    arguments
+                        .iter()
+                        .take(parameter_count)
+                        .map(|argument| (*argument).clone()),
+                )
                 .collect::<Vec<_>>(),
         );
         let expanded = arguments[parameter_count..].iter().fold(
@@ -5073,7 +5094,7 @@ impl TypingContext {
                 // a bad `deconstruct ... into C ...` names `C` and points at the pattern.
                 let Some(signature) = coproduct.signature(constructor) else {
                     return Err(
-                        TypeError::NoSuchCoproductConstructor((**constructor).clone()).at(*pi)
+                        TypeError::NoSuchCoproductConstructor((**constructor).clone()).at(*pi),
                     );
                 };
                 if pattern.arguments.len() != signature.len() {
@@ -5192,9 +5213,11 @@ impl TypingContext {
                 ))
             }
 
-            (pattern, _) => {
-                panic!("Type error. Illegal pattern. `{pattern}` `{normalized_scrutinee}`",)
+            (pattern, _) => Err(TypeError::PatternTypeMismatch {
+                pattern: pattern.to_string(),
+                scrutinee: normalized_scrutinee,
             }
+            .at(pi)),
         }
     }
 
@@ -5859,7 +5882,10 @@ impl TypingContext {
     ) -> Typing {
         let this = self.infer_expr(&sequence.this)?;
         self.substitute_mut(&this.substitutions);
-        let and_then = self.check_expr(&expected_type.apply(&this.substitutions), &sequence.and_then)?;
+        let and_then = self.check_expr(
+            &expected_type.apply(&this.substitutions),
+            &sequence.and_then,
+        )?;
         let substitutions = this.substitutions.compose(&and_then.substitutions);
         let constraints = this
             .constraints

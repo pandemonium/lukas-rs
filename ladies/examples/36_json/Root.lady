@@ -18,6 +18,12 @@ check :: Text -> Text -> Unit := λid input.
   let outcome = Parse.json_bytes (Text.to_bytes input) in
   print_endline ">> [`id`] `input`  =>  `outcome`"
 
+check_decode :: ∀α. Display α |- Text -> Decoder α -> Text -> Unit := λid decoder input.
+  let outcome =
+    let* tree = parse input in
+    decoder tree
+  in print_endline ">> [`id`] `input`  =>  `outcome`"
+
 start := λ_.
   print_endline "##TC"
 
@@ -75,6 +81,32 @@ start := λ_.
   check "deep2" "{\"a\": {\"b\": {\"c\": 1}}}"
   check "deep3" "[{\"a\": [{\"b\": 2}]}]"
   check "deep4" "{\"xs\": [1,2,3],\"ys\": [\"p\",\"q\"]}"
+
+  print_endline "-- decoding --"
+  check_decode "dec1" (Decode.array Decode.int) "[1,2,3]"
+  check_decode "dec2" (Decode.array Decode.float) "[1.5,-2,3.25]"
+  check_decode "dec3" (Decode.array Decode.text) "[\"a\",\"b\",\"c\"]"
+  check_decode "dec4" (Decode.object (Decode.field "age" Decode.int)) "{\"age\": 42}"
+  check_decode "dec5" (Decode.object (Decode.field "name" Decode.text)) "{\"name\": \"Ada\"}"
+
+  let person = Decode.object (λfields.
+    let* name = Decode.field "name" Decode.text fields in
+    let* age = Decode.field "age" Decode.int fields in
+    pure (name, age)
+  ) in
+  check_decode "dec6" person "{\"name\": \"Ada\",\"age\": 42}"
+
+  let nested = Decode.object (λfields.
+    Decode.field "values" (Decode.array Decode.int) fields
+  ) in
+  check_decode "dec7" nested "{\"values\": [1,2,3]}"
+
+  print_endline "-- decoding faults --"
+  check_decode "dec_bad1" (Decode.object (Decode.field "missing" Decode.text)) "{}"
+  check_decode "dec_bad2" (Decode.object (Decode.field "age" Decode.int)) "{\"age\": \"old\"}"
+  check_decode "dec_bad3" (Decode.array Decode.int) "[1,\"two\",3]"
+  check_decode "dec_bad4" (Decode.array Decode.int) "{}"
+  check_decode "dec_bad5" (Decode.object (Decode.field "x" Decode.int)) "[]"
 
   print_endline "-- malformed (expect a Fault) --"
   check "bad1" ""

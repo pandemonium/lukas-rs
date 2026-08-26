@@ -1360,6 +1360,70 @@ Value flat_generate_shaped(int64_t length, Value mk_element, const int64_t *shap
     return arr;
 }
 
+// Consume exactly `length` elements from an Enumeratee state. `next` returns
+// `Perhaps (element, state)`: This has constructor tag 1 and its sole field is
+// the pair. The witness is responsible for supplying enough elements; failure
+// before the promised size is an invalid witness, just like an out-of-range
+// index from the indexed enumerator.
+Value flat_from_enumerator_shaped(int64_t length, Value enumeration, Value next,
+                                  const int64_t *shape, size_t slen) {
+    size_t i0 = 0;
+    size_t element_stride = shape_leaves(shape, &i0);
+    if (length <= 0) return mk_flat_array(0, element_stride, shape, slen);
+
+    Value arr = mk_flat_array((size_t)length, element_stride, shape, slen);
+    for (int64_t produced = 0; produced < length; produced++) {
+        Value step = apply(next, enumeration);
+        if (data_tag(step) != 1) match_fail();
+        Value pair = data_field(step, 0);
+        Value indexed_element = proj(pair, 0);
+        enumeration = proj(pair, 1);
+        int64_t index = as_int(proj(indexed_element, 0));
+        Value element = proj(indexed_element, 1);
+        flat_array_set(arr, (size_t)index, element);
+    }
+    return arr;
+}
+
+Value flat_from_enumerator(int64_t length, Value enumeration, Value next) {
+    int64_t shape[FLAT_MAX_SHAPE];
+    if (length <= 0) {
+        shape[0] = 0;
+        return mk_flat_array(0, 1, shape, 1);
+    }
+
+    Value first_step = apply(next, enumeration);
+    if (data_tag(first_step) != 1) match_fail();
+    Value first_pair = data_field(first_step, 0);
+    Value first_indexed_element = proj(first_pair, 0);
+    int64_t first_index = as_int(proj(first_indexed_element, 0));
+    Value first_element = proj(first_indexed_element, 1);
+    enumeration = proj(first_pair, 1);
+
+    size_t slen = 0;
+    bool ok = true;
+    size_t element_stride = build_shape(first_element, shape, &slen, 0, &ok);
+    if (!ok) {
+        slen = 0;
+        shape[slen++] = 0;
+        element_stride = 1;
+    }
+
+    Value arr = mk_flat_array((size_t)length, element_stride, shape, slen);
+    flat_array_set(arr, (size_t)first_index, first_element);
+    for (int64_t produced = 1; produced < length; produced++) {
+        Value step = apply(next, enumeration);
+        if (data_tag(step) != 1) match_fail();
+        Value pair = data_field(step, 0);
+        Value indexed_element = proj(pair, 0);
+        enumeration = proj(pair, 1);
+        int64_t index = as_int(proj(indexed_element, 0));
+        Value element = proj(indexed_element, 1);
+        flat_array_set(arr, (size_t)index, element);
+    }
+    return arr;
+}
+
 // Rebuild a boxed constructor from an INLINED sum's region (copy-out): `tag_imm`
 // is the inline tag (an immediate VInt), `payload_words` the union payload width,
 // `src` the payload words (active variant's fields, then zeroed padding). The

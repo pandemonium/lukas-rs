@@ -91,3 +91,4 @@ mconcat :: ∀α. Monoid α |- List α -> α :=
   fold_right mappend mempty
 
 module State.
+module Enumerator.

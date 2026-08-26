@@ -1,0 +1,321 @@
+is_whitespace :: Char -> Bool := λc.
+  c = ' ' or c = '\t' or c = '\n' or c = '\r'
+
+Input ::=
+  { Data     :: Bytes
+    Position :: Int
+    Limit    :: Int
+  }
+
+module Input:
+  from_data :: Bytes -> Input := λdata.
+    { Data     := data
+      Position := 0
+      Limit    := Bytes.length data - 1
+    }
+
+  (* scan past all whitespace *)
+  scan :: Input -> Result Fault Input := λinput.
+    let is_non_whitespace = λc. not (is_whitespace (Char.of_byte c)) in
+
+    if has_remaining input then
+      deconstruct Bytes.position' input.Data input.Position is_non_whitespace into
+        This position ->
+          skip input (position - input.Position)
+      | Nope          ->
+          Fault Eof
+    else
+      Fault Eof
+
+  skip :: Input -> Int -> Result Fault Input := λinput by.
+    if input.Position + by <= input.Limit then
+      let input' =
+        { Data     := input.Data
+          Position := by + input.Position
+          Limit    := input.Limit
+        }
+      in pure input'
+    else
+      Fault Eof
+
+  has_remaining :: Input -> Bool := λinput.
+    input.Position <= input.Limit
+
+  set_at_end :: Input -> Input := λinput.
+    { Data     := input.Data
+      Position := input.Limit
+      Limit    := input.Limit
+    }
+
+  at_end :: Input -> Bool := λinput.
+    input.Position = input.Limit
+
+  peek :: Input -> Int := λinput.
+    Bytes.get_u8 input.Data input.Position
+
+  expect :: Input -> Char -> Result Fault Input := λinput expected.
+    let* remains = scan input in
+    if peek remains = Int.of_char expected
+    then Input.skip remains 1
+    else Fault.expected expected (Char.of_byte (peek input))
+
+json_bytes :: Bytes -> Result Fault Syntax_Tree.Node := λdata.
+  let input = Input.from_data data in
+
+  let* remains, root = toplevel input in
+  if not (Input.at_end remains)
+    then Fault (Unexpected_Remains remains)
+    else pure (Syntax_Tree.Branch root)
+
+toplevel :: Input -> Result Fault (Input, Syntax_Tree.Composite) := λinput.
+  let string_literal = λinput.
+    let string_start = 1 (* Opening " *) + input.Position in
+
+    let unescape =
+      let remaining = input.Limit - input.Position in
+      let capacity = min remaining 32 in
+      let* out = Buffer.new_buffer capacity in
+
+      let emit_utf8 = λcp.
+        if cp <= 127 then
+          Buffer.put_u8 out cp
+        else if cp <= 2047 then
+          let* _ = Buffer.put_u8 out (192 + cp / 64) in
+          Buffer.put_u8 out (128 + (cp and 63))
+        else if cp <= 65535 then
+          let* _ = Buffer.put_u8 out (224 + cp / 4096) in
+          let* _ = Buffer.put_u8 out (128 + ((cp / 64) and 63)) in
+          Buffer.put_u8 out (128 + (cp and 63))
+        else
+          let* _ = Buffer.put_u8 out (240 + cp / 262144) in
+          let* _ = Buffer.put_u8 out (128 + ((cp / 4096) and 63)) in
+          let* _ = Buffer.put_u8 out (128 + ((cp / 64) and 63)) in
+          Buffer.put_u8 out (128 + (cp and 63))
+      in
+
+      let loop = λi.
+        let escape_sequence = λj.
+          let byte_at = λk. Bytes.get_u8 input.Data (j + k + 1 (* skip u in \u *)) in
+
+          deconstruct Char.of_byte (Bytes.get_u8 input.Data j) into
+            't'  -> let* _ = Buffer.put_u8 out (Int.of_char '\t') in loop (1 + j)
+          | 'n'  -> let* _ = Buffer.put_u8 out (Int.of_char '\n') in loop (1 + j)
+          | 'r'  -> let* _ = Buffer.put_u8 out (Int.of_char '\r') in loop (1 + j)
+          | 'b'  -> let* _ = Buffer.put_u8 out 8 in loop (1 + j)
+          | 'f'  -> let* _ = Buffer.put_u8 out 12 in loop (1 + j)
+          | '"'  -> let* _ = Buffer.put_u8 out (Int.of_char '"') in loop (1 + j)
+          | '\\' -> let* _ = Buffer.put_u8 out (Int.of_char '\\') in loop (1 + j)
+          | '/'  -> let* _ = Buffer.put_u8 out (Int.of_char '/') in loop (1 + j)
+          | 'u' ->
+              let code_unit =
+                let nibble = λc.
+                  if c >= Int.of_char '0' and c <= Int.of_char '9' then pure (c - Int.of_char '0')
+                  else if c >= Int.of_char 'a' and c <= Int.of_char 'f' then pure (c - Int.of_char 'a' + 10)
+                  else if c >= Int.of_char 'A' and c <= Int.of_char 'F' then pure (c - Int.of_char 'A' + 10)
+                  else Fault (Unexpected_Input (Char.of_byte c))
+                in
+
+                if j + 1 (* skip u in \u *) + 3 (* len(nibble) *) <= input.Limit then
+                  let* d0 = nibble (byte_at 0) in
+                  let* d1 = nibble (byte_at 1) in
+                  let* d2 = nibble (byte_at 2) in
+                  let* d3 = nibble (byte_at 3) in
+                  pure (d0 * 4096 + d1 * 256 + d2 * 16 + d3)
+                else Fault Eof
+
+              in
+                let* emitted = traverse emit_utf8 code_unit in
+                deconstruct emitted into
+                  Return _ -> loop (5 + j)
+                | Fault e  -> pure (Fault e)
+          | c -> pure (Fault (Unexpected_Input c))
+        in
+
+        if i <= input.Limit then
+          deconstruct Char.of_byte (Bytes.get_u8 input.Data i) into
+            '\\' ->
+              if i < input.Limit then escape_sequence (1 + i)
+              else pure (Fault Eof)
+          | '"' ->
+            let* text_bytes = Buffer.move out in
+            deconstruct Text.from_bytes text_bytes into
+              This text -> pure (Return (i, text))
+            | Nope -> pure (Fault (Bad_Utf_Bytes text_bytes))
+          | c ->
+            if Int.of_char c < 32 then
+              pure (Fault (Unexpected_Input c))
+            else
+              let* _ = Buffer.put_u8 out (Int.of_char c) in
+              loop (1 + i)
+        else pure (Fault Eof)
+      in loop string_start
+    in
+
+    let stops_fast_path = λc.
+         c = Int.of_char '"'
+      or c = Int.of_char '\\'
+      or c < 32
+    in
+
+    deconstruct Bytes.position' input.Data string_start stops_fast_path into
+      This position ->
+        deconstruct Char.of_byte (Bytes.get_u8 input.Data position) into
+          '"' ->
+            let text_bytes = Bytes.slice input.Data string_start (position - string_start) in
+            let* text = Result.return_or (λ_. Bad_Utf_Bytes text_bytes) (Text.from_bytes text_bytes) in
+            let remains =
+              { Data     := input.Data
+                Position := if position < input.Limit then position + 1 else position
+                Limit    := input.Limit
+              }
+            in pure (remains, text)
+        | '\\' ->
+            deconstruct IO.unsafe_run_IO unescape (* Local effect in still pure function *) into
+              Return (end_position, text) ->
+                let remains =
+                  { Data     := input.Data
+                    Position := if end_position < input.Limit then end_position + 1 else end_position
+                    Limit    := input.Limit
+                  }
+                in pure (remains, text)
+            | Fault e -> Fault e
+        | c    -> Fault (Unexpected_Input c)
+    | Nope -> Fault Eof
+  in
+
+  let is_numeric = λc.
+     c >= Int.of_char '0' and c <= Int.of_char '9'
+  or c = Int.of_char '-'
+  or c = Int.of_char '.'
+  or c = Int.of_char '+'
+  or c = Int.of_char 'e'
+  or c = Int.of_char 'E'
+  in
+
+  let number = λinput.
+    (* Move combinator to Input. *)
+    let number_bytes = Bytes.take_while' input.Data input.Position is_numeric in
+    let* remains = Input.skip input (Bytes.length number_bytes) in
+    let* number_text = Result.return_or (λ_. Bad_Utf_Bytes number_bytes) (Text.from_bytes number_bytes) in
+    let* number = Result.return_or (λ_. Expected_Number) (from number_text :: Perhaps Float) in
+    pure (remains, Syntax_Tree.Number number)
+  in
+
+  let array = λparse_value input.
+    let parse_elements = λinput elements.
+      let* remains, element = parse_value input in
+      let elements = Cons element elements in
+      let* remains = Input.scan remains in
+
+      deconstruct Char.of_byte (Input.peek remains) into
+        ',' ->
+          let* remains = Input.skip remains 1 in
+          let* remains = Input.scan remains in
+          parse_elements remains elements
+      | ']' ->
+        let* remains =
+          if not (Input.at_end remains)
+            then Input.skip remains 1 (* ] *)
+            else pure remains
+        in pure (remains, Syntax_Tree.Array (List.reverse elements))
+      | c -> Fault (Unexpected_Input c)
+    in
+
+    let* remains = Input.skip input 1 (* [ *) in
+    let* remains = Input.scan remains in
+
+    if Int.of_char ']' = Input.peek remains then
+      let* remains =
+        if not (Input.at_end remains)
+          then Input.skip remains 1 (* ] *)
+          else pure remains
+      in pure (remains, Syntax_Tree.Array List.empty)
+    else
+      parse_elements remains List.empty
+  in
+
+  let object = λparse_value input.
+    let* remains = Input.skip input 1 (* { *) in
+
+    let field = λinput.
+      let* remains, name = string_literal input in
+      let* remains' = Input.expect remains ':' in
+      let* remains'', rhs = parse_value remains' in
+      pure (remains'', (name, rhs))
+    in
+
+    let parse_fields = λinput size fields.
+      deconstruct Char.of_byte (Input.peek input) into
+        '"' ->
+          let* remains, f = field input in
+          let fields = Cons f fields in
+          let* remains = Input.scan remains in
+          deconstruct Char.of_byte (Input.peek remains) into
+            ',' ->
+              let* remains = Input.skip remains 1 in
+              let* remains = Input.scan remains in
+              parse_fields remains (size + 1) fields
+          | '}' ->
+            let* remains =
+              if not (Input.at_end remains)
+              then Input.skip remains 1 (* } *)
+              else pure remains
+            in pure (remains, Syntax_Tree.Object (Syntax_Tree.Object_Fields.from_reversed (size + 1) fields))
+          | c -> Fault (Unexpected_Input c)
+      | c -> Fault (Unexpected_Input c)
+    in
+
+    let* remains = Input.scan remains in
+    if Int.of_char '}' = Input.peek remains then
+      let* remains =
+        if not (Input.at_end remains)
+        then Input.skip remains 1 (* } *)
+        else pure remains
+      in pure (remains, Syntax_Tree.Object Syntax_Tree.Object_Fields.empty)
+    else parse_fields remains 0 List.empty
+  in
+
+  let value = λinput.
+    let* remains = Input.scan input in
+    let c = Input.peek remains in
+
+    deconstruct Char.of_byte c into
+      '"' ->
+        let* remains', literal = string_literal remains in
+        pure (remains', Syntax_Tree.Leaf (Syntax_Tree.String literal))
+    | '[' ->
+      let* remains, arr = array value remains in
+      pure (remains, Syntax_Tree.Branch arr)
+    | '{' ->
+      let* remains', obj = object value remains in
+      pure (remains', Syntax_Tree.Branch obj)
+    | c   ->
+      if is_numeric (Int.of_char c)
+      then
+        let* remains', literal = number remains in
+        pure (remains', Syntax_Tree.Leaf literal)
+      else Fault (Unexpected_Input c)
+  in
+
+  (* It is the responsbility of this section of code to deal with end of file conditions. *)
+  let* remains = Input.scan input in
+  deconstruct Char.of_byte (Input.peek remains) into
+    '[' ->
+      let* remains', arr = array value remains in
+      deconstruct Input.scan remains' into
+        Return remains ->
+          if Input.at_end remains
+          then pure (remains, arr)
+          else Fault (Unexpected_Remains remains)
+      | Fault _        -> pure (Input.set_at_end remains', arr)
+  | '{' ->
+    let* remains, obj = object value remains in
+
+    deconstruct Input.scan remains into
+      Return remains ->
+        if Input.at_end remains
+        then pure (remains, obj)
+        else Fault (Unexpected_Remains remains)
+    | Fault _        -> pure (Input.set_at_end remains, obj)
+  | c ->
+    Fault (Unexpected_Input c)

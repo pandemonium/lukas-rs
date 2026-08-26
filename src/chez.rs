@@ -226,6 +226,7 @@ fn map_builtin_name(name: &QualifiedName) -> &'static str {
         // inexact numbers.
         "int_of_char" => "char->integer",
         "float_of_int" => "exact->inexact",
+        "int_of_float" => "int-of-float",
         // Total byte->char: mask to the low byte, then to a Scheme char.
         "char_of_byte" => "char-of-byte",
         "prim_gte" => ">=",

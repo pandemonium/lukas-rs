@@ -166,20 +166,32 @@ impl Compiler {
     }
 
     pub fn compile_and_initialize(&self) -> Compilation<interpreter::Environment> {
-        let program = self.parse_compilation_unit()?;
-        self.typecheck_and_initialize(program)
+        let program =
+            crate::profile::time("pipeline: parse root", || self.parse_compilation_unit())?;
+        crate::profile::time("pipeline: typecheck + initialize", || {
+            self.typecheck_and_initialize(program)
+        })
     }
 
     pub fn compiler_main(&self) -> Compilation<()> {
-        let program = self.parse_compilation_unit()?;
-        self.typecheck_and_compile(program)
+        let program =
+            crate::profile::time("pipeline: parse root", || self.parse_compilation_unit())?;
+        crate::profile::time("pipeline: typecheck + codegen", || {
+            self.typecheck_and_compile(program)
+        })
     }
 
     pub fn typecheck_and_initialize(&self, program: CompilationUnit) -> Compilation<Environment> {
-        let symbols = phase::SymbolTable::<Parsed>::import_compilation_unit(program)?;
-        let resolved_symbols = symbols.desugar().resolve_names()?;
+        let symbols = crate::profile::time("front end: import modules", || {
+            phase::SymbolTable::<Parsed>::import_compilation_unit(program)
+        })?;
+        let symbols = crate::profile::time("front end: desugar", || symbols.desugar());
+        let resolved_symbols =
+            crate::profile::time("front end: resolve names", || symbols.resolve_names())?;
 
-        let dependencies = resolved_symbols.dependency_matrix();
+        let dependencies = crate::profile::time("front end: dependency graph", || {
+            resolved_symbols.dependency_matrix()
+        });
 
         if dependencies.are_sound() {
             // Shared, live globals: `clone()` shares the underlying map, so a
@@ -187,7 +199,9 @@ impl Compiler {
             // (mutually recursive dictionaries / lifted methods).
             let globals = Globals::default();
 
-            let compilation_unit = resolved_symbols.elaborate_compilation_unit()?;
+            let compilation_unit = crate::profile::time("type checker: total", || {
+                resolved_symbols.elaborate_compilation_unit()
+            })?;
 
             // The interpreter has no foreign/byte backend (foreigns are provided by the C /
             // Scheme companions). Bind each `foreign` term to a placeholder so a program that
@@ -217,10 +231,16 @@ impl Compiler {
     }
 
     pub fn typecheck_and_compile(&self, program: CompilationUnit) -> Compilation<()> {
-        let symbols = namer::SymbolTable::import_compilation_unit(program)?;
-        let resolved_symbols = symbols.desugar().resolve_names()?;
+        let symbols = crate::profile::time("front end: import modules", || {
+            namer::SymbolTable::import_compilation_unit(program)
+        })?;
+        let symbols = crate::profile::time("front end: desugar", || symbols.desugar());
+        let resolved_symbols =
+            crate::profile::time("front end: resolve names", || symbols.resolve_names())?;
 
-        let dependencies = resolved_symbols.dependency_matrix();
+        let dependencies = crate::profile::time("front end: dependency graph", || {
+            resolved_symbols.dependency_matrix()
+        });
 
         if dependencies.are_sound() {
             //            let program = compilation
@@ -228,7 +248,9 @@ impl Compiler {
             //                .closure_conversion()
             //                .lambda_lift();
 
-            let program = resolved_symbols.elaborate_compilation_unit()?;
+            let program = crate::profile::time("type checker: total", || {
+                resolved_symbols.elaborate_compilation_unit()
+            })?;
 
             if std::env::var("DUMP_C").is_ok() {
                 // Dependency-resolvable order lives on the pre-closure table;
@@ -271,13 +293,16 @@ impl Compiler {
                                 .push(self.get_source_path(&module.to_string(), Artifact::Foreign));
                         }
                     }
-                    program.emit_scheme_code(&mut code, &foreign_files)?;
+                    crate::profile::time("codegen: emit Scheme", || {
+                        program.emit_scheme_code(&mut code, &foreign_files)
+                    })?;
                 }
                 Backend::Native => {
                     // C has no closures: convert them away and lambda-lift before
                     // emitting. Dependency-resolvable order lives on the pre-closure
                     // table, so eager top-level values initialise after what they read.
-                    let program = program.specialize();
+                    let program =
+                        crate::profile::time("codegen: specialize", || program.specialize());
                     let order = program
                         .dependency_matrix()
                         .in_resolvable_order()
@@ -290,14 +315,20 @@ impl Compiler {
                     // strictifies that loop in place; the second `simplify()` finishes the
                     // straight-line cancellation the strict worker exposes. Gated so the default
                     // path stays byte-identical (no second simplify pass when the flag is off).
-                    let program = program.simplify();
+                    let program = crate::profile::time("codegen: simplify", || program.simplify());
                     let program = if std::env::var_os("MARM_DEFOREST_IO").is_some() {
                         program.deforest_io().simplify()
                     } else {
                         program
                     };
-                    let lifted = program.closure_conversion().lambda_lift(&order);
-                    lifted.generate_code(&mut code).map_err(io::Error::other)?;
+                    let program = crate::profile::time("codegen: closure conversion", || {
+                        program.closure_conversion()
+                    });
+                    let lifted = crate::profile::time("codegen: lambda lift", || {
+                        program.lambda_lift(&order)
+                    });
+                    crate::profile::time("codegen: emit C", || lifted.generate_code(&mut code))
+                        .map_err(io::Error::other)?;
                 }
             }
 
@@ -379,7 +410,11 @@ impl Compiler {
 }
 
 fn load_and_parse_module(source_path: PathBuf) -> Compilation<Vec<ast::Declaration<ParseInfo>>> {
-    let source_text = fs::read_to_string(&source_path)?;
+    let source_text = crate::profile::time_if_slow(
+        format!("module read: {}", source_path.display()),
+        10.0,
+        || fs::read_to_string(&source_path),
+    )?;
     let source = source_text.chars().collect::<Vec<_>>();
 
     // Every `ParseInfo` built while parsing this module is stamped with `file`, so
@@ -394,11 +429,20 @@ fn load_and_parse_module(source_path: PathBuf) -> Compilation<Vec<ast::Declarati
 
     source_map::with_current(file, || {
         let mut lexer = LexicalAnalyzer::default();
-        let tokens = lexer.tokenize(&source);
+        let tokens = crate::profile::time_if_slow(
+            format!("module lex: {}", source_path.display()),
+            10.0,
+            || lexer.tokenize(&source),
+        );
 
         let mut parser = parser::Parser::from_tokens(tokens);
 
-        let declarations = parser.parse_declaration_list().map_err(attach)?;
+        let declarations = crate::profile::time_if_slow(
+            format!("module parse: {}", source_path.display()),
+            10.0,
+            || parser.parse_declaration_list(),
+        )
+        .map_err(attach)?;
 
         // A fully-parsed module leaves only the `End` sentinel. Any other leftover
         // token means the declaration loop desynced (usually an unexpected layout

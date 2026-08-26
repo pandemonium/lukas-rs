@@ -21,6 +21,10 @@ witness ∀t : *->* α. Foldable t |- From (t α) (List α) :=
   { from := fold_right Cons Nil
   }
 
+witness From Char Int :=
+  { from := Int.of_char
+  }
+
 (* `Display` (signature + Int/Char/Text witnesses) is in the primordial Prelude, because *)
 (* string interpolation desugars to `display`. This module adds Display for its own types. *)
 

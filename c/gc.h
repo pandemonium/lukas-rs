@@ -162,6 +162,14 @@ Value mk_flat_array_from_shaped(size_t n, Value *elems, const int64_t *shape, si
 // Like `flat_generate` but with a caller-supplied, type-driven shape (from the
 // `Memory_Layout` dictionary) so sum elements pack inline. See gc.c.
 Value flat_generate_shaped(int64_t length, Value mk_element, const int64_t *shape, size_t slen);
+// Allocate an exactly-sized shaped array and initialize it by consuming an
+// enumeration. Each successful step is written at `index`, after which index is
+// advanced by `stride`. The Enumeratee witness promises at least `length` steps.
+Value flat_from_enumerator_shaped(int64_t length, Value enumeration, Value next,
+                                  const int64_t *shape, size_t slen);
+// Element-0-discovering counterpart used when Memory_Layout carries no explicit
+// sum shape, preserving the product flattening behaviour of `flat_generate`.
+Value flat_from_enumerator(int64_t length, Value enumeration, Value next);
 size_t flat_array_count(Value arr);
 Value flat_array_get(Value arr, size_t i);
 void flat_array_set(Value arr, size_t i, Value elt);

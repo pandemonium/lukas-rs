@@ -173,6 +173,7 @@ static inline Value prim_neg(Value a) { return VInt(-as_int(a)); }
 // away. `Int -> Float` boxes (Float is a heap OBJ_FLOAT), so it does real work.
 static inline Value prim_int_of_char(Value a) { return a; }
 static inline Value prim_float_of_int(Value a) { return VFloat((double)as_int(a)); }
+static inline Value prim_int_of_float(Value a) { return VInt((int64_t)as_float(a)); }
 // `Int -> Char` (`Char.of_byte`): total, masks to the low byte. Char and Int share the
 // immediate encoding, so this is just the masked int re-tagged as itself.
 static inline Value prim_char_of_byte(Value a) { return VInt(as_int(a) & 0xFF); }
@@ -262,6 +263,7 @@ extern Value builtin_not;
 extern Value builtin_neg;
 extern Value builtin_int_of_char;
 extern Value builtin_float_of_int;
+extern Value builtin_int_of_float;
 extern Value builtin_char_of_byte;
 extern Value builtin_print_endline;
 extern Value builtin_text_fold_right;

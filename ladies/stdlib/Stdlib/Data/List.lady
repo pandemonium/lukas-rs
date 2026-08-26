@@ -1,4 +1,17 @@
+use Stdlib.Control.Enumerator.
+
 List ::= ∀α. Nil | Cons α (List α)
+
+witness ∀α. Enumerator α (List α) :=
+  { size_hint := λ_. Nope
+    next := λxs.
+      deconstruct xs into
+        Nil -> Nope
+      | Cons element remains -> This (element, remains)
+  }
+
+indexed_sized :: ∀α. Int -> List α -> Indexed_Enumerator α (List α) := λsize xs.
+  Make_Indexed_Enumerator Increasing xs 0 size
 
 (* The generic `From (Foldable t) (List α)` witness lives in Stdlib (not here): in this *)
 (* module `fold_right` binds to the concrete function below, which would collapse it to  *)
@@ -134,3 +147,17 @@ concat :: List Text -> Text := λxs.
   | Nil -> ""
 
 singleton :: ∀α. α -> List α := λa. Cons a Nil
+
+
+module Associative:
+  lookup :: ∀α β. Eq α |- α -> List (α, β) -> Perhaps β := λkey assoc.
+    let loop = λxs.
+      deconstruct xs into
+        Cons (key', value) xs' ->
+          if key' = key then pure value
+          else loop xs'
+      | Nil -> Nope
+    in loop assoc
+
+  insert :: ∀α β. Eq α |- α -> β -> List (α, β) -> List (α, β) :=
+    λkey value. Cons (key, value)

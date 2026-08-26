@@ -219,6 +219,15 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
         }),
     };
 
+    let float_to_int = PartialRawLambda1 {
+        name: "int_of_float",
+        apply: mk_unary_op(int_of_float),
+        type_scheme: TypeScheme::from_constant(Type::Arrow {
+            domain: Type::Base(BaseType::Float).into(),
+            codomain: Type::Base(BaseType::Int).into(),
+        }),
+    };
+
     // `Int -> Char`, exposed as `Char.of_byte`. Total (masks to the low byte), so
     // unlike a general unchecked `Int -> Char` there is no narrowing: every byte is a
     // valid Char. A compiler builtin, so it folds on a literal.
@@ -279,6 +288,7 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
         negation.into_symbol(&builtins),
         char_to_int.into_symbol(&builtins),
         int_to_float.into_symbol(&builtins),
+        float_to_int.into_symbol(&builtins),
         byte_to_char.into_symbol(&builtins),
         plus.into_symbol(&builtins),
         minus.into_symbol(&builtins),
@@ -482,6 +492,16 @@ pub fn int_of_char(p: Literal) -> Option<Literal> {
 pub fn float_of_int(p: Literal) -> Option<Literal> {
     match p {
         Literal::Int(n) => Some(Literal::Float(n as f64)),
+        _otherwise => None,
+    }
+}
+
+// Narrow a Float to an Int by truncating toward zero, matching Rust/C casts and
+// Scheme's `truncate`. This is the inverse operation exposed as `Int.of_float`;
+// unlike `Float.of_int`, it may discard a fractional part.
+pub fn int_of_float(p: Literal) -> Option<Literal> {
+    match p {
+        Literal::Float(n) => Some(Literal::Int(n as i64)),
         _otherwise => None,
     }
 }

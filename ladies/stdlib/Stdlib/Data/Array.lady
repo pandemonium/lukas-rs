@@ -1,3 +1,5 @@
+use Stdlib.Control.Enumerator.
+
 module Array:
   foreign raw_len :: ∀α. Array α -> Int
   foreign raw_get :: ∀α. Array α -> Int -> Perhaps α
@@ -12,6 +14,7 @@ opaque Mutable_Array ::= ∀α. Mutable Raw_Mutable_Array
 
 module Mutable_Array:
   foreign raw_generate_shaped :: ∀α. Memory_Layout α |- Int -> (Int -> α) -> Raw_Mutable_Array
+  foreign raw_from_enumerator_shaped :: ∀α enumeration. Memory_Layout α |- Int -> enumeration -> (enumeration -> Perhaps ((Int, α), enumeration)) -> Raw_Mutable_Array
   foreign raw_len :: ∀α. Raw_Mutable_Array -> Int
   foreign raw_get :: ∀α. Raw_Mutable_Array -> Int -> Perhaps α
   foreign raw_get_unchecked :: ∀α. Raw_Mutable_Array -> Int -> α
@@ -22,6 +25,12 @@ module Mutable_Array:
   (* Think about how this function could be shared with the Readonly array. They have the same backing. *)
   generate :: ∀α. Memory_Layout α |- Int -> (Int -> α) -> Mutable_Array α := λlength mk_element.
     Mutable (raw_generate_shaped length mk_element)
+
+  from_enumerator :: ∀α enumeration. Memory_Layout α + Enumerator α enumeration |- Indexed_Enumerator α enumeration -> Mutable_Array α :=
+    λenumerator.
+      let size = Indexed_Enumerator.size enumerator in
+      Mutable (raw_from_enumerator_shaped size enumerator Indexed_Enumerator.advance)
+
 
   length :: ∀α. Mutable_Array α -> Int := λ(Mutable array). raw_len array
 

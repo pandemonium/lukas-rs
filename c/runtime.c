@@ -167,6 +167,7 @@ UNOP(builtin_not, prim_not);
 UNOP(builtin_neg, prim_neg);
 UNOP(builtin_int_of_char, prim_int_of_char);
 UNOP(builtin_float_of_int, prim_float_of_int);
+UNOP(builtin_int_of_float, prim_int_of_float);
 UNOP(builtin_char_of_byte, prim_char_of_byte);
 UNOP(builtin_print_endline, prim_print_endline);
 
@@ -211,6 +212,7 @@ void runtime_init(void) {
     builtin_neg = mk_closure(builtin_neg_1, 0);
     builtin_int_of_char = mk_closure(builtin_int_of_char_1, 0);
     builtin_float_of_int = mk_closure(builtin_float_of_int_1, 0);
+    builtin_int_of_float = mk_closure(builtin_int_of_float_1, 0);
     builtin_char_of_byte = mk_closure(builtin_char_of_byte_1, 0);
     builtin_print_endline = mk_closure(builtin_print_endline_1, 0);
     builtin_text_fold_right = mk_closure(tfr_1, 0);

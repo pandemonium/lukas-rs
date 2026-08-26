@@ -9,6 +9,7 @@
     marm-xor
     marm-not
     char-of-byte
+    int-of-float
     text-fold-right
     )
   (import (chezscheme))
@@ -44,6 +45,10 @@
   ;; valid Scheme char (a Marmelade Char is a Scheme char).
   (define (char-of-byte n)
     (integer->char (bitwise-and n 255)))
+
+  ;; Float -> Int narrows by discarding the fractional part toward zero.
+  (define (int-of-float n)
+    (inexact->exact (truncate n)))
 
   (define text-fold-right
       (lambda (f z s)

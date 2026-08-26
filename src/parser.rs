@@ -572,7 +572,7 @@ impl<'a> Parser<'a> {
                 let type_signature = self.parse_type_signature().map(Some)?;
 
                 // <:=>
-                self.advance(1);
+                self.expect(TokenKind::Assign)?;
 
                 let own_name = IdentifierPath::new(name);
 
@@ -2352,19 +2352,7 @@ impl<'a> Parser<'a> {
             self.peek()?.kind,
             TokenKind::Identifier(..) | TokenKind::LeftParen
         ) {
-            if self.peek()?.is_identifier() {
-                let (pos, id) = self.identifier()?;
-                let pi = ParseInfo::from_position(pos);
-                signature.push(if is_lowercase(&id) {
-                    TypeExpression::Parameter(pi, Identifier::from_str(&id))
-                } else {
-                    TypeExpression::Constructor(pi, IdentifierPath::new(&id))
-                });
-            } else {
-                self.expect(TokenKind::LeftParen)?;
-                signature.push(self.parse_type_expression(0)?);
-                self.expect(TokenKind::RightParen)?;
-            }
+            signature.push(self.parse_type_expr_prefix()?);
         }
 
         Ok(CoproductConstructor {
@@ -2777,6 +2765,49 @@ impl fmt::Display for ParseInfo {
         // The file is surfaced only on the error path (see `Located`'s `Display`).
         let Self { location, file: _ } = self;
         write!(f, "{location}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::LexicalAnalyzer;
+
+    #[test]
+    fn malformed_constraint_separator_reports_expected_assignment() {
+        let source =
+            "insert :: ∀α β. Eq α. α -> β -> List (α, β) :=\n  λkey value. Cons (key, value)\n";
+        let characters = source.chars().collect::<Vec<_>>();
+        let mut lexer = LexicalAnalyzer::default();
+        let tokens = lexer.tokenize(&characters);
+        let mut parser = Parser::from_tokens(tokens);
+
+        let error = parser.parse_declaration_list().unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseError::Expected {
+                expected: TokenKind::Assign,
+                found: TokenKind::Period,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn qualified_coproduct_payload_does_not_need_parentheses() {
+        let source = "Wrapper ::= Make_Wrapper Namespace.Member\n";
+        let characters = source.chars().collect::<Vec<_>>();
+        let mut lexer = LexicalAnalyzer::default();
+        let tokens = lexer.tokenize(&characters);
+        let mut parser = Parser::from_tokens(tokens);
+
+        let declarations = parser.parse_declaration_list().unwrap();
+
+        assert_eq!(
+            declarations[0].to_string(),
+            "type Wrapper ::= Make_Wrapper(Namespace.Member)"
+        );
     }
 }
 

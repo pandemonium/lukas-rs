@@ -60,6 +60,9 @@ module Int:
   (* Widening coercion: a compiler builtin (erased to identity), not a foreign. *)
   of_char :: Char -> Int := int_of_char
 
+  (* Narrowing coercion: truncates the fractional part toward zero. *)
+  of_float :: Float -> Int := int_of_float
+
   Maximum :: Int := raw_max_of_int
   Minimum :: Int := raw_min_of_int
 

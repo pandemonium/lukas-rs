@@ -1,0 +1,54 @@
+signature Enumerator ::= ∀element enumeration.
+  { size_hint :: enumeration -> Perhaps Int
+    next      :: enumeration -> Perhaps (element, enumeration)
+  }
+
+Indexed_Enumerator ::= ∀α enumeration.
+  Make_Indexed_Enumerator Direction enumeration Int Int
+
+Direction ::= Increasing | Decreasing
+
+module Enumerator:
+  with_index_sized :: ∀α enumeration. Enumerator α enumeration |- Int -> enumeration -> Indexed_Enumerator α enumeration :=
+    λsize enumeration. Make_Indexed_Enumerator Increasing enumeration 0 size
+
+  with_index :: ∀α enumeration. Enumerator α enumeration |- enumeration -> Indexed_Enumerator α enumeration := λenumeration.
+    let compute_size = λsize xs.
+      deconstruct next xs into
+        This (_, xs') -> compute_size (1 + size) xs'
+      | Nope -> size
+    in
+
+    let size =
+      deconstruct size_hint enumeration into
+        This hinted -> hinted
+      | Nope -> compute_size 0 enumeration
+    in with_index_sized size enumeration
+
+module Indexed_Enumerator:
+  size :: ∀α enumeration. Indexed_Enumerator α enumeration -> Int :=
+    λ(Make_Indexed_Enumerator _ _ offset size). size - offset
+
+  reversed :: ∀α enumeration. Indexed_Enumerator α enumeration -> Indexed_Enumerator α enumeration :=
+    λ(Make_Indexed_Enumerator direction enumeration offset size).
+      let reversed_direction =
+        deconstruct direction into
+          Increasing -> Decreasing
+        | Decreasing -> Increasing
+      in Make_Indexed_Enumerator reversed_direction enumeration offset size
+
+  advance :: ∀α enumeration. Enumerator α enumeration |- Indexed_Enumerator α enumeration -> Perhaps ((Int, α), Indexed_Enumerator α enumeration) :=
+    λ(Make_Indexed_Enumerator direction enumeration offset size).
+      deconstruct next enumeration into
+        Nope -> Nope
+      | This (element, enumeration') ->
+          let index =
+            deconstruct direction into
+              Increasing -> offset
+            | Decreasing -> size - offset - 1
+          in This ((index, element), Make_Indexed_Enumerator direction enumeration' (offset + 1) size)
+
+witness ∀α enumeration. Enumerator α enumeration |- Enumerator (Int, α) (Indexed_Enumerator α enumeration) :=
+  { size_hint := λenumerator. This (Indexed_Enumerator.size enumerator)
+    next := Indexed_Enumerator.advance
+  }

@@ -39,6 +39,15 @@ FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Mutable_Array_raw_generate_shaped, Va
   return flat_generate_shaped(length, mk_element, entries + 1, slen);
 })
 
+FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Mutable_Array_raw_from_enumerator_shaped, Value, dict, int64_t, length, Value, enumeration, Value, next, {
+  int64_t *entries = (int64_t *)as_ptr(proj(dict, 0));
+  size_t slen = (size_t)entries[0];
+  if (slen == 0)
+    return flat_from_enumerator(length, enumeration, next);
+  return flat_from_enumerator_shaped(length, enumeration, next,
+                                     entries + 1, slen);
+})
+
 FOREIGN_DECL(int64_t, Root_Stdlib_Data_Array_Mutable_Array_raw_len, Value, arr, {
   return (int64_t)flat_array_count(arr);
 })

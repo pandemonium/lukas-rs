@@ -1,3 +1,6 @@
+use Stdlib.Control.Enumerator.
+use Stdlib.Data.Array.
+
 witness Display Fault :=
   { display := λself.
       deconstruct self into
@@ -6,6 +9,10 @@ witness Display Fault :=
       | Unexpected_Input c       -> "Unexpected input `c`"
       | Expected expectation     -> "Found `expectation.Received`; expected `expectation.Expected`"
       | Expected_Number          -> "Expected a number"
+      | Expected_Text            -> "Expected text"
+      | Expected_Array           -> "Expected an array"
+      | Expected_Object          -> "Expected an object"
+      | Expected_Field name      -> "Expected field \"`name`\" in object"
       | Bad_Utf_Bytes bytes      -> "Bad UTF `1`"
   }
 
@@ -16,11 +23,37 @@ module Syntax_Tree:
 
   Composite ::=
     Array (List Node)
-  | Object (List (Text, Node))
+  | Object Object_Fields
 
   Literal ::=
     String Text
   | Number Float
+
+  opaque Object_Fields ::= Make_Object_Fields (Mutable_Array (Text, Node))
+
+  module Object_Fields:
+    from_reversed :: Int -> List (Text, Node) -> Object_Fields := λsize fields.
+      let enumerator =
+        Indexed_Enumerator.reversed (List.indexed_sized size fields)
+      in Make_Object_Fields (Mutable_Array.from_enumerator enumerator)
+
+    empty :: Object_Fields := from_reversed 0 List.empty
+
+    to_list :: Object_Fields -> List (Text, Node) := λ(Make_Object_Fields fields).
+      let loop = λi result.
+        if i < 0 then result
+        else loop (i - 1) (Cons (Mutable_Array.unsafe_get_unchecked fields i) result)
+      in loop (Mutable_Array.length fields - 1) List.empty
+
+    at :: Text -> Object_Fields -> Perhaps Node := λname (Make_Object_Fields fields).
+      let size = Mutable_Array.length fields in
+      let loop = λi.
+        if i >= size then Nope
+        else
+          let field_name, node = Mutable_Array.unsafe_get_unchecked fields i in
+          if field_name = name then This node
+          else loop (i + 1)
+      in loop 0
 
   witness Display Node :=
     { display := λself.
@@ -28,7 +61,7 @@ module Syntax_Tree:
           Leaf (Number n)        -> "`n`"
         | Leaf (String s)        -> "`s`"
         | Branch (Array elts)    -> "[`elts`]"
-        | Branch (Object fields) -> "{`fields`}"
+        | Branch (Object fields) -> "{`Object_Fields.to_list fields`}"
     }
 
 Fault ::=
@@ -37,6 +70,10 @@ Fault ::=
 | Unexpected_Input Char
 | Expected Expectation
 | Expected_Number
+| Expected_Text
+| Expected_Array
+| Expected_Object
+| Expected_Field Text
 | Bad_Utf_Bytes Bytes
 
 Expectation ::=
@@ -66,10 +103,44 @@ signature Decodes ::= ∀α.
 alias Decoder ::= ∀α. Syntax_Tree.Node -> Result Fault α
 
 module Decode:
-  int :: Syntax_Tree.Node -> Result Fault Input = λnode.
+  int :: Decoder Int := λnode.
+    fmap Int.of_float (float node)
+
+  float :: Decoder Float := λnode.
     deconstruct node into
-      Syntax_Tree.Literal (Syntax_Tree.Number n) -> Return (Int.of_float n)
+      Syntax_Tree.Leaf (Syntax_Tree.Number n) -> pure n
     | otherwise -> Fault Expected_Number
+
+  text :: Decoder Text := λnode.
+    deconstruct node into
+      Syntax_Tree.Leaf (Syntax_Tree.String s) -> pure s
+    | otherwise -> Fault Expected_Text
+
+  array :: ∀α. Decoder α -> Decoder (List α) := λdecode node.
+    deconstruct node into
+      Syntax_Tree.Branch (Syntax_Tree.Array elements) ->
+        traverse decode elements
+    | otherwise -> Fault Expected_Array
+
+  (* Thoth makes some wrapper instead of the assoc list.  *)
+  opaque Field_Map ::= Make_Field_Map Syntax_Tree.Object_Fields
+
+  module Field_Map:
+    at :: Text -> Field_Map -> Perhaps Syntax_Tree.Node :=
+      λname (Make_Field_Map fields). Syntax_Tree.Object_Fields.at name fields
+
+  field :: ∀α. Text -> Decoder α -> Field_Map -> Result Fault α :=
+    λname decode fields.
+      deconstruct Field_Map.at name fields into
+        This node -> decode node
+      | Nope -> Fault (Expected_Field name)
+
+  object :: ∀α. (Field_Map -> Result Fault α) -> Decoder α := λdecode node.
+    deconstruct node into
+      Syntax_Tree.Branch (Syntax_Tree.Object fields) ->
+        decode (Make_Field_Map fields)
+    | otherwise -> Fault Expected_Object
+
 
 decode_text :: ∀α. Decodes α |- Text -> Result Fault α := λjson.
   let* tree = parse json in
