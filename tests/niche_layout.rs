@@ -1,0 +1,46 @@
+use std::{fs, path::PathBuf};
+
+use lukas::compiler::{Backend, Compiler};
+
+#[test]
+fn perhaps_uses_zero_niche_and_nested_perhaps_falls_back_to_a_tag() {
+    let output = std::env::temp_dir().join("lukas_niche_layout.c");
+    Compiler {
+        library_path: PathBuf::from("ladies/stdlib"),
+        source_path: PathBuf::from("ladies/lang/13_flat_sum_arrays"),
+        backend: Backend::Native,
+        output_file: Some(output.clone()),
+    }
+    .compiler_main()
+    .expect("native code generation");
+
+    let generated = fs::read_to_string(output).expect("generated C source");
+
+    // Perhaps Int: [-2, Nope-tag, This-tag, niche-offset, payload-leaf].
+    assert!(
+        generated.contains("(int64_t[]){-2, 0, 1, 0, 1, 0}, 6"),
+        "Perhaps Int did not use its one-word zero niche"
+    );
+    // Perhaps Pair has the same niche encoding but retains Pair's two flat words.
+    assert!(
+        generated.contains("(int64_t[]){-2, 0, 1, 0, 1, 2, 0, 0}, 8"),
+        "Perhaps Pair did not remain payload-width"
+    );
+    // The inner Perhaps has consumed zero, so the outer Perhaps must retain a tag.
+    assert!(
+        generated.contains("(int64_t[]){-1, 1, 2, 0, 1, -2, 0, 1, 0, 1, 0}, 11"),
+        "nested Perhaps did not preserve Nope versus This Nope"
+    );
+    // A record already flattened by canonical codegen (nested Perhaps + Pair +
+    // Text) remains exactly its five-word payload width under the outer Perhaps.
+    assert!(
+        generated.contains("(int64_t[]){-2, 0, 1, 0, 1, 5, 0, 0, 0, 0, 0}, 11"),
+        "the niche was not propagated through a wider record payload"
+    );
+    // Occupied has three constructor arguments. Its first is itself niche-encoded,
+    // so zero is valid there; selection must continue and use the Text at offset 1.
+    assert!(
+        generated.contains("(int64_t[]){-2, 0, 1, 1, 3, -2, 0, 1, 0, 1, 0, 0, 2, 0, 0}, 15"),
+        "niche search stopped before the later eligible payload field"
+    );
+}
