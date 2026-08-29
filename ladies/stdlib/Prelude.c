@@ -7,7 +7,21 @@
 // escape-hatch tag so the collector keeps tracing them.
 #include <limits.h>
 #include <float.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "gc.h"
+
+FOREIGN_DECL(Value, Root_Prelude_raw_omg_wtf_bbq,
+              Value, function, Value, file, Value, row, Value, column, Value, message, {
+    fprintf(stderr, "%.*s:%lld:%lld in %.*s:\n",
+            (int)slice_len(file), (const char *)slice_ptr(file),
+            (long long)as_int(row), (long long)as_int(column),
+            (int)slice_len(function), (const char *)slice_ptr(function));
+    fwrite(slice_ptr(message), 1, slice_len(message), stderr);
+    fputc('\n', stderr);
+    fflush(stderr);
+    abort();
+})
 
 // ------------------------------------------------------------------- Int
 // `Int.of_char` and `Float.of_int` are now compiler builtins (see runtime.h

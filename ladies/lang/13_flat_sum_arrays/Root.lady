@@ -1,5 +1,6 @@
 use Stdlib.
 use Stdlib.Data.
+use Stdlib.Data.Array.
 
 (* Array whose ELEMENT type is a flat, non-recursive sum (`Perhaps Int`).          *)
 (*                                                                                  *)
@@ -7,9 +8,10 @@ use Stdlib.Data.
 (* (tuple/record) already flattens this way, its shape discovered at runtime from   *)
 (* element 0. A SUM element cannot: element 0 reveals only one variant, so the       *)
 (* runtime would keep every element a boxed pointer. Instead codegen emits the       *)
-(* element's shape from its TYPE -- a sum node [tag, widest-variant payload,          *)
-(* zero-padding] -- so each slot here is [tag, payload] inline and the per-element    *)
-(* `This` box is gone. `Array.get` reverses the packing, boxing the active variant    *)
+(* element's shape from its TYPE. Perhaps consumes the invalid zero Value as Nope,    *)
+(* so each slot here is only the payload width: This x is x itself and the             *)
+(* per-element `This` box and tag are gone. `Array.get` reverses the packing, boxing   *)
+(* the active variant                                                                  *)
 (* back out, so callers still see ordinary `This`/`Nope` values.                      *)
 (*                                                                                    *)
 (* This test pins the round-trip: build a mixed This/Nope array, then read every       *)
@@ -45,6 +47,39 @@ pair_value :: Perhaps Pair -> Int := λcell.
     This pair -> pair.X + pair.Y
   | Nope -> 0
 
+render_layer :: Perhaps (Perhaps Int) -> Text := λcell.
+  deconstruct cell into
+    Nope          -> "Nope"
+  | This Nope     -> "This Nope"
+  | This (This x) -> "This (This `x`)"
+
+layered_values :: Array (Perhaps (Perhaps Int)) :=
+  [ Nope; This Nope; This (This 9) ]
+
+Complex ::= { Maybe :: Perhaps Int; Pair :: Pair; Title :: Text }
+
+complex_values :: Array (Perhaps Complex) :=
+  [ Nope
+    This { Maybe := Nope; Pair := { X := 4; Y := 5 }; Title := "deep" }
+  ]
+
+Slot ::= Vacant | Occupied (Perhaps Int) Text Pair
+
+slot_values :: Array Slot :=
+  [ Vacant
+    Occupied Nope "cargo" { X := 6; Y := 7 }
+  ]
+
+render_complex :: Perhaps Complex -> Text := λvalue.
+  deconstruct value into
+    Nope -> "empty"
+  | This complex -> "`complex.Title`:`complex.Pair.X + complex.Pair.Y`"
+
+render_slot :: Slot -> Text := λslot.
+  deconstruct slot into
+    Vacant -> "vacant"
+  | Occupied maybe label pair -> "`label`:`pair.X + pair.Y`:`deconstruct maybe into Nope -> 0 | This x -> x`"
+
 start :: Int -> Unit := λ_.
   print_endline "##TC"
   let arr =
@@ -61,7 +96,7 @@ start :: Int -> Unit := λ_.
   (* The sum payload is itself a two-word flat record. This exercises recursive *)
   (* type-driven shapes for literals and Memory_Layout-backed generation.       *)
   let nested = [ This { X := 3; Y := 4 }; Nope; This { X := 8; Y := 9 } ] in
-  let generated = Mutable_Array.generate 3 pair_cell in
+  let generated = unsafe_run_IO (Mutable_Array.generate 3 pair_cell) in
   let old = unsafe_run_IO (Mutable_Array.put_unchecked generated 1 (This { X := 20; Y := 22 })) in
   let now = unsafe_run_IO (Mutable_Array.get_unchecked generated 1) in
   let nested_first = deconstruct Array.get nested 0 into This x -> pair_value x | Nope -> 0 in
@@ -69,3 +104,15 @@ start :: Int -> Unit := λ_.
   let nested_last = deconstruct Array.get nested 2 into This x -> pair_value x | Nope -> 0 in
   print_endline "nested: first=`nested_first` middle=`nested_middle` last=`nested_last`"
   print_endline "generated: old=`pair_value old` current=`pair_value now`"
+
+  (* The inner Perhaps consumes the zero niche. The outer Perhaps therefore    *)
+  (* falls back to an explicit tag, keeping Nope and This Nope distinguishable. *)
+  let layered = layered_values in
+  let first = deconstruct Array.get layered 0 into This x -> render_layer x | Nope -> "oob" in
+  let second = deconstruct Array.get layered 1 into This x -> render_layer x | Nope -> "oob" in
+  let third = deconstruct Array.get layered 2 into This x -> render_layer x | Nope -> "oob" in
+  print_endline "layered: `first`; `second`; `third`"
+
+  let complex = deconstruct Array.get complex_values 1 into This x -> render_complex x | Nope -> "oob" in
+  let slot = deconstruct Array.get slot_values 1 into This x -> render_slot x | Nope -> "oob" in
+  print_endline "elaborate: `complex`; `slot`"

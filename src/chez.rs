@@ -32,6 +32,51 @@ pub enum ChezError {
 
 pub type Result<A> = result::Result<A, ChezError>;
 
+fn emit_record_update_level(
+    update: &ast::RecordUpdate<Erased, Identifier>,
+    prefix: &[usize],
+    base: &str,
+    code: &mut CodeBuffer,
+) -> Result<()> {
+    let depth = prefix.len();
+    let arity = if depth == 0 {
+        update.field_order.len()
+    } else {
+        update
+            .fields
+            .iter()
+            .find(|field| field.indices.starts_with(prefix))
+            .and_then(|field| field.arities.get(depth))
+            .copied()
+            .expect("typed dotted record update arity")
+    };
+    write!(code, "(vector")?;
+    for index in 0..arity {
+        let mut path = prefix.to_vec();
+        path.push(index);
+        if let Some((override_index, _)) = update
+            .fields
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.indices == path)
+        {
+            write!(code, " record-update-{override_index}")?;
+        } else if update
+            .fields
+            .iter()
+            .any(|field| field.indices.starts_with(&path))
+        {
+            let nested = format!("(vector-ref {base} {index})");
+            write!(code, " ")?;
+            emit_record_update_level(update, &path, &nested, code)?;
+        } else {
+            write!(code, " (vector-ref {base} {index})")?;
+        }
+    }
+    write!(code, ")")?;
+    Ok(())
+}
+
 impl phase::SymbolTable<Types> {
     pub fn emit_scheme_code(
         &self,
@@ -293,6 +338,20 @@ impl phase::Expr<Erased> {
                     el.emit(code)?;
                 }
                 write!(code, ")")?
+            }
+
+            ast::Expr::RecordUpdate(_, the) => {
+                write!(code, "(let* ([record-update-base ")?;
+                the.base.emit(code)?;
+                write!(code, "]")?;
+                for (index, field) in the.fields.iter().enumerate() {
+                    write!(code, " [record-update-{index} ")?;
+                    field.value.emit(code)?;
+                    write!(code, "]")?;
+                }
+                write!(code, ") ")?;
+                emit_record_update_level(the, &[], "record-update-base", code)?;
+                write!(code, ")")?;
             }
 
             ast::Expr::Inject(_, the) => {

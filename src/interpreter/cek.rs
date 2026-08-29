@@ -274,6 +274,20 @@ enum AndThen {
         k: Box<AndThen>,
     },
 
+    EvalRecordUpdateBase {
+        fields: Rc<Vec<ast::RecordUpdateField<Erased, namer::Identifier>>>,
+        environment: Env,
+        k: Box<AndThen>,
+    },
+
+    EvalRecordUpdateField {
+        fields: Rc<Vec<ast::RecordUpdateField<Erased, namer::Identifier>>>,
+        result: Val,
+        next: usize,
+        environment: Env,
+        k: Box<AndThen>,
+    },
+
     EvalConstructor {
         input: Rc<Vec<Tree>>,
         output: Vec<Val>,
@@ -532,6 +546,61 @@ fn and_then(value: Val, k: AndThen) -> Suspension {
             }
         }
 
+        AndThen::EvalRecordUpdateBase {
+            fields,
+            environment,
+            k,
+        } => {
+            let Val::Product(values) = value else {
+                return Suspension::Diverged(RuntimeError::ExpectedMatch);
+            };
+            if fields.is_empty() {
+                Suspension::return_and(Val::Product(values), *k)
+            } else {
+                Suspension::Suspend(Suspended::Eval {
+                    expression: Rc::clone(&fields[0].value),
+                    environment: environment.shared(),
+                    k: AndThen::EvalRecordUpdateField {
+                        fields,
+                        result: Val::Product(values),
+                        next: 0,
+                        environment,
+                        k,
+                    },
+                })
+            }
+        }
+
+        AndThen::EvalRecordUpdateField {
+            fields,
+            mut result,
+            next,
+            environment,
+            k,
+        } => {
+            assert!(super::apply_record_update(
+                &mut result,
+                &fields[next].indices,
+                value
+            ));
+            let next = next + 1;
+            if next == fields.len() {
+                Suspension::return_and(result, *k)
+            } else {
+                Suspension::Suspend(Suspended::Eval {
+                    expression: Rc::clone(&fields[next].value),
+                    environment: environment.shared(),
+                    k: AndThen::EvalRecordUpdateField {
+                        fields,
+                        result,
+                        next,
+                        environment,
+                        k,
+                    },
+                })
+            }
+        }
+
         AndThen::EvalConstructor {
             input,
             mut output,
@@ -780,6 +849,16 @@ impl Expr {
                 AndThen::EvalRecordField {
                     input: Rc::new(the.fields.clone()),
                     output: Vec::with_capacity(the.fields.len()),
+                    environment,
+                    k: k.into(),
+                },
+            ),
+
+            Self::RecordUpdate(_, the) => Suspension::eval_and(
+                &the.base,
+                environment.shared(),
+                AndThen::EvalRecordUpdateBase {
+                    fields: Rc::new(the.fields.clone()),
                     environment,
                     k: k.into(),
                 },

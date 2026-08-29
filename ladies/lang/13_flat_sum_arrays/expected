@@ -2,3 +2,5 @@ cells: This 10; Nope; This 30; Nope; This 50;
 sum: 90
 nested: first=7 middle=0 last=17
 generated: old=0 current=42
+layered: Nope; This Nope; This (This 9)
+elaborate: deep:9; cargo:13:0

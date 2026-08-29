@@ -17,6 +17,20 @@ pub mod cek;
 pub type Expr = ast::Expr<Erased, namer::Identifier>;
 pub type Tree = Rc<Expr>;
 
+pub(super) fn apply_record_update(value: &mut Val, indices: &[usize], replacement: Val) -> bool {
+    let Some((&index, rest)) = indices.split_first() else {
+        *value = replacement;
+        return true;
+    };
+    let Val::Product(fields) = value else {
+        return false;
+    };
+    let Some(field) = fields.get_mut(index) else {
+        return false;
+    };
+    apply_record_update(field, rest, replacement)
+}
+
 // Erasing the annotation is not really done for a good reason here
 impl Expr {
     pub fn reduce(self: &Tree, env: &Environment) -> Interpretation {
@@ -84,6 +98,22 @@ impl Expr {
                     .map(|(_, e)| e.reduce(env))
                     .collect::<Interpretation<_>>()?,
             )),
+
+            Self::RecordUpdate(_, the) => {
+                let Val::Product(values) = the.base.reduce(env)? else {
+                    return Err(RuntimeError::ExpectedMatch);
+                };
+                let mut result = Val::Product(values);
+                for field in &the.fields {
+                    let replacement = field.value.reduce(env)?;
+                    assert!(apply_record_update(
+                        &mut result,
+                        &field.indices,
+                        replacement
+                    ));
+                }
+                Ok(result)
+            }
 
             Self::Tuple(_, the) => Ok(Val::Product(
                 the.elements

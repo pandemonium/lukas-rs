@@ -1,0 +1,167 @@
+use Stdlib.Data.Vector.
+use Stdlib.Data.List.
+use Stdlib.IO.
+use Stdlib.Control.
+
+(* A deliberately violent integration benchmark for the growable mutable Vector.
+ *
+ * The workload crosses twenty capacity doublings, repeatedly walks a million
+ * nested records through the checked API, punches every live slot with `set`,
+ * pops and refills a quarter of the allocation, probes both bounds, then forces
+ * the occupied packed prefix through `to_list`. Every phase validates its result;
+ * this is intended to expose logical-length, growth-copy, niche-layout, ordering,
+ * stale-cell, and IO-loop regressions rather than merely produce a timing number.
+ *)
+
+Point ::= { X :: Int; Y :: Int }
+
+Particle ::=
+  { Identity :: Int
+    Location :: Point
+    Weight   :: Int
+    Epoch    :: Int
+  }
+
+module Violence:
+  element_count :: Int := 1048576
+  removed_count :: Int := 262144
+  modulus       :: Int := 1000000007
+
+  particle :: Int -> Int -> Particle := λepoch index.
+    let position =
+      { X := (index * 17 + epoch * 101) % modulus
+        Y := (index * 31 + epoch * 211) % modulus
+      }
+    in
+    { Identity := index
+      Location := position
+      Weight := (index * 43 + epoch * 307) % modulus
+      Epoch := epoch
+    }
+
+  score :: Particle -> Int := λp.
+    (p.Identity + p.Location.X + p.Location.Y + p.Weight + p.Epoch) % modulus
+
+  agrees :: Particle -> Particle -> Bool := λactual expected.
+    actual.Identity = expected.Identity and actual.Location.X = expected.Location.X and actual.Location.Y = expected.Location.Y and actual.Weight = expected.Weight and actual.Epoch = expected.Epoch
+
+  expect :: Bool -> Text -> IO Unit := λcondition message.
+    if condition then pure () else omg_wtf_bbq message
+
+  expect_length :: ∀α. Text -> Int -> Vector α -> IO Unit := λphase expected vector.
+    let* actual = Vector.length vector in
+    expect (actual = expected)
+      "`phase`: expected length `expected`, found `actual`"
+
+  push_epoch :: Int -> Int -> Int -> Vector Particle -> IO Unit :=
+    λepoch index end vector.
+      if index < end then
+        let* _ = Vector.push (particle epoch index) vector in
+        push_epoch epoch (index + 1) end vector
+      else pure ()
+
+  overwrite_epoch :: Int -> Int -> Int -> Vector Particle -> IO Unit :=
+    λepoch index end vector.
+      if index < end then
+        let* written = Vector.set index (particle epoch index) vector in
+        deconstruct written into
+          This _ -> overwrite_epoch epoch (index + 1) end vector
+        | Nope -> omg_wtf_bbq "set rejected live index `index` while overwriting epoch `epoch`"
+      else pure ()
+
+  verify_range :: (Int -> Int) -> Int -> Int -> Int -> Vector Particle -> IO Int :=
+    λepoch_at index end checksum vector.
+      if index < end then
+        let* found = Vector.get index vector in
+        deconstruct found into
+          This actual ->
+            let epoch = epoch_at index in
+            let expected = particle epoch index in
+            if agrees actual expected then
+              verify_range epoch_at (index + 1) end
+                ((checksum + score actual) % modulus) vector
+            else omg_wtf_bbq "get mismatch at index `index`: expected epoch `epoch`, identity `expected.Identity`; found epoch `actual.Epoch`, identity `actual.Identity`"
+        | Nope -> omg_wtf_bbq "get returned Nope for live index `index`"
+      else pure checksum
+
+  pop_epoch :: Int -> Int -> Int -> Vector Particle -> IO Int :=
+    λepoch next_index remaining vector.
+      if remaining > 0 then
+        let* popped = Vector.pop vector in
+        deconstruct popped into
+          This actual ->
+            let expected = particle epoch next_index in
+            if agrees actual expected then
+              pop_epoch epoch (next_index - 1) (remaining - 1) vector
+            else omg_wtf_bbq "pop mismatch at index `next_index`: expected epoch `epoch`, found epoch `actual.Epoch`"
+        | Nope -> omg_wtf_bbq "pop returned Nope with `remaining` live removals remaining"
+      else pure next_index
+
+  verify_list :: (Int -> Int) -> Int -> List Particle -> Int -> (Int, Int) :=
+    λepoch_at index particles checksum.
+      deconstruct particles into
+        Nil -> (index, checksum)
+      | Cons actual tail ->
+          let epoch = epoch_at index in
+          let expected = particle epoch index in
+          if agrees actual expected then
+            verify_list epoch_at (index + 1) tail
+              ((checksum + score actual) % modulus)
+          else omg_wtf_bbq "to_list mismatch at index `index`: expected epoch `epoch`, found epoch `actual.Epoch`"
+
+  expect_missing :: ∀α. Text -> Perhaps α -> IO Unit := λlabel found.
+    deconstruct found into
+      Nope -> pure ()
+    | This _ -> omg_wtf_bbq "bounds probe `label` unexpectedly found an element"
+
+main :: IO Unit :=
+  (* Start at capacity zero: the first push must establish storage, after which the fill *)
+  (* crosses every power-of-two growth boundary through one million elements.            *)
+  let* vector = Vector.empty in
+  let* _ = Violence.expect_length "fresh" 0 vector in
+
+  let* _ = Violence.push_epoch 0 0 Violence.element_count vector in
+  let* _ = Violence.expect_length "initial fill" Violence.element_count vector in
+  let* grown_capacity = Vector.capacity vector in
+  let* _ = Violence.expect (grown_capacity >= Violence.element_count) "capacity `grown_capacity` is below length `Violence.element_count`" in
+
+  (* Rewrite every live element. This repeatedly reads the stable cell handle and writes *)
+  (* a nested record into the packed Perhaps payload.                                    *)
+  let* _ = Violence.overwrite_epoch 1 0 Violence.element_count vector in
+  let* checksum_after_set = Violence.verify_range (λ_. 1) 0 Violence.element_count 0 vector in
+
+  (* Remove the high quarter and validate strict LIFO order and clearing of live slots. *)
+  let survivors = Violence.element_count - Violence.removed_count in
+  let* next_index = Violence.pop_epoch 1 (Violence.element_count - 1) Violence.removed_count vector in
+  let* _ = Violence.expect (next_index = survivors - 1) "pop ended at index `next_index`, expected `survivors - 1`" in
+  let* _ = Violence.expect_length "after pop storm" survivors vector in
+
+  (* Refill the vacated quarter with a distinguishable generation. A correct Vector reuses *)
+  (* its retained capacity without growth and without disturbing the surviving prefix.    *)
+  let* capacity_before_refill = Vector.capacity vector in
+  let* _ = Violence.push_epoch 2 survivors Violence.element_count vector in
+  let* capacity_after_refill = Vector.capacity vector in
+  let* _ = Violence.expect (capacity_before_refill = capacity_after_refill) "refill grew capacity from `capacity_before_refill` to `capacity_after_refill`" in
+  let* _ = Violence.expect_length "after refill" Violence.element_count vector in
+
+  let epoch_at = λindex. if index < survivors then 1 else 2 in
+  let* checksum_after_refill = Violence.verify_range epoch_at 0 Violence.element_count 0 vector in
+
+  (* Both rejected indices must stay rejected after all mutation and growth. *)
+  let* below = Vector.get (0 - 1) vector in
+  let* _ = Violence.expect_missing "negative" below in
+  let* above = Vector.get Violence.element_count vector in
+  let* _ = Violence.expect_missing "length" above in
+
+  (* This is intentionally expensive: it forces every occupied niche payload into a List, *)
+  (* checks order and content again, and retains the whole resulting list until validation. *)
+  let* particles = Vector.to_list vector in
+  let list_count, list_checksum = Violence.verify_list epoch_at 0 particles 0 in
+  let* _ = Violence.expect (list_count = Violence.element_count) "to_list produced `list_count` elements, expected `Violence.element_count`" in
+  let* _ = Violence.expect (list_checksum = checksum_after_refill) "to_list checksum `list_checksum` disagrees with indexed checksum `checksum_after_refill`" in
+
+  output "vector-violence PASS: elements=`Violence.element_count` capacity=`capacity_after_refill` set-sum=`checksum_after_set` final-sum=`checksum_after_refill` list-sum=`list_checksum`"
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  unsafe_run_IO main

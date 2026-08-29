@@ -218,7 +218,9 @@ impl Compiler {
             for symbol in compilation_unit.terms(evaluation_order.iter()) {
                 let value = Rc::new(symbol.body.erase_annotation())
                     .interpret(Env::from_globals(globals.clone()))
-                    .expect("successful static init");
+                    .unwrap_or_else(|error| {
+                        panic!("static initialization of {} failed: {error:?}", symbol.name)
+                    });
 
                 globals.define(symbol.name.clone(), value);
             }
@@ -250,7 +252,8 @@ impl Compiler {
 
             let program = crate::profile::time("type checker: total", || {
                 resolved_symbols.elaborate_compilation_unit()
-            })?;
+            })?
+            .stamp_enclosing_terms();
 
             if std::env::var("DUMP_C").is_ok() {
                 // Dependency-resolvable order lives on the pre-closure table;
@@ -309,14 +312,13 @@ impl Compiler {
                         .into_iter()
                         .cloned()
                         .collect::<Vec<_>>();
-                    // Default path: a single `simplify()`. With `MARM_DEFOREST_IO` set, the first
-                    // `simplify()` inlines `unsafe_run_IO` into its force marker (leaving the
-                    // recursive IO loop un-inlined behind the leak guard); `deforest_io()`
-                    // strictifies that loop in place; the second `simplify()` finishes the
-                    // straight-line cancellation the strict worker exposes. Gated so the default
-                    // path stays byte-identical (no second simplify pass when the flag is off).
+                    // The first pass exposes `unsafe_run_IO` as a force marker. Force-local
+                    // worker/wrapper conversion then opens the concrete computation beneath that
+                    // marker without changing any top-level IO value, and the second pass removes
+                    // the now-adjacent beta/case plumbing. Set `MARM_DEFOREST_IO=0` to retain the
+                    // boxed path for diagnosis and A/B measurements.
                     let program = crate::profile::time("codegen: simplify", || program.simplify());
-                    let program = if std::env::var_os("MARM_DEFOREST_IO").is_some() {
+                    let program = if crate::simplify::deforest_io_on() {
                         program.deforest_io().simplify()
                     } else {
                         program

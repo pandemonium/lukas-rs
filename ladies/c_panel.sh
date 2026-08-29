@@ -15,6 +15,12 @@
 #   [COMPILE-ERR] the front end emitted no C, or the C compiler rejected it
 #   [CRASH]       mc panicked, or the program crashed / timed out
 #   [no-output]   no ##TC output and no error
+#
+# PERFORMANCE TODO: make panel execution two-phase. For N independent cases,
+# compile all N concurrently and wait for the compilation batch to finish; only
+# then run/check the resulting programs (sequentially or concurrently). Cases do
+# not currently share mutable state, so execution may also be parallel. Do not
+# retain this script's compile-one/run-one serialization when reworking it.
 set -u
 
 PANEL="${1:?usage: c_panel.sh <panel-name>}"

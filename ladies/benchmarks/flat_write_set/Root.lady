@@ -14,7 +14,7 @@ module Bench:
       loop table (n - 1)
 
 start := λ_.
-  let table = Mutable_Array.generate Bench.cap (λ_. { x := 0; y := 0 }) in
+  let table = unsafe_run_IO (Mutable_Array.generate Bench.cap (λ_. { x := 0; y := 0 })) in
   let _ = Bench.loop table 50000000 in
   let pair = unsafe_run_IO (Mutable_Array.get_unchecked table 1) in
   print_endline "write-set `pair.x + pair.y`"

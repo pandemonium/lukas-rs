@@ -27,9 +27,10 @@
 // relocated.
 //
 // Two generations: objects are born young; survivors of a minor collection are
-// tenured old. Marmelade values are immutable, so references only run
-// young->old -- a minor collection ignores the old generation entirely (no
-// write barrier, no remembered set). A major sweeps both.
+// tenured old. Most Marmelade values are immutable. Mutable buffers and flat
+// arrays use a write barrier and remembered set for old->young references, so a
+// minor collection scans those containers while otherwise ignoring the old
+// generation. A major sweeps both.
 //
 // Allocation is slab-based. Small objects (<= SMALL_MAX bytes, header included)
 // are carved from 64 KiB-aligned slabs into fixed-size slots by size class;
@@ -235,26 +236,30 @@ static void large_push(GcHeader *h) {
 static size_t gc_young_bytes = 0;      // young allocation since the last minor GC
 static size_t gc_old_bytes = 0;        // live bytes tenured in the old generation
 
-// Generational write barrier for the one mutable object, `Buffer`. `Buffer` is the
-// only value whose heap pointer field mutates (`b->bytes = nbody` on growth / range
-// reset). Once the handle has tenured (old), that store is an old->young edge, and a
-// minor collection skips the old gen (no remembered set) -- so it would free the live
-// young `bytes` body. We remember every old buffer whose `bytes` is re-pointed and
-// re-trace it as an extra root on each minor, keeping the young body live until it
-// tenures. Dead buffers are pruned at the next major. (Buffer is the only mutable
-// object, so this tiny set is the whole barrier -- see notes/gc-design.md §6.2.)
-static uintptr_t *gc_rem = NULL; // body pointers of old buffers with a mutated `bytes`
+// Generational write barrier for mutable heap objects. Buffers mutate their raw
+// `bytes` child and flat arrays mutate Value leaves. Once such a container has
+// tenured, a store may create an old->young edge which a minor collection would
+// otherwise miss. Remember the old container and trace its children explicitly
+// on each minor; dead entries are pruned by the next major collection.
+static uintptr_t *gc_rem = NULL; // body pointers of old mutated containers
 static size_t gc_rem_len = 0, gc_rem_cap = 0;
 
-static void gc_remember_buffer(void *buffer_body) {
-    if (!HEADER(buffer_body)->old) return; // young handle: a minor traces it anyway
+static void gc_remember_object(void *body) {
+    if (!HEADER(body)->old) return; // young container: a minor traces it anyway
     for (size_t i = 0; i < gc_rem_len; i++)
-        if (gc_rem[i] == (uintptr_t)buffer_body) return; // already remembered
+        if (gc_rem[i] == (uintptr_t)body) return; // already remembered
     if (gc_rem_len == gc_rem_cap) {
         gc_rem_cap = gc_rem_cap ? gc_rem_cap * 2 : 16;
         gc_rem = realloc(gc_rem, gc_rem_cap * sizeof *gc_rem);
     }
-    gc_rem[gc_rem_len++] = (uintptr_t)buffer_body;
+    gc_rem[gc_rem_len++] = (uintptr_t)body;
+}
+
+static void gc_prune_remembered(void) {
+    size_t kept = 0;
+    for (size_t i = 0; i < gc_rem_len; i++)
+        if (is_object(gc_rem[i])) gc_rem[kept++] = gc_rem[i];
+    gc_rem_len = kept;
 }
 static size_t gc_nursery = 256u << 20; // trigger a minor GC once the nursery fills.
 // 256 MiB (was 16 MiB): high-churn workloads (e.g. the binary_codec benchmark)
@@ -543,29 +548,39 @@ static void gc_run(bool major) {
     scan_words(&regs, (char *)&regs + sizeof regs);
     scan_words(stack_top, gc_stack_bottom);
 
-    // Write-barrier roots: old buffers whose `bytes` was re-pointed at a young body.
-    // A minor skips the old gen, so trace their (possibly young) bytes explicitly to
-    // keep it live. A major traces the old gen anyway, so this is minor-only.
-    if (!major)
-        for (size_t i = 0; i < gc_rem_len; i++)
-            mark_obj(((Buffer *)gc_rem[i])->bytes);
+    // Write-barrier roots. A minor skips each old container itself, so trace its
+    // mutable children directly and enqueue any young objects they reference.
+    if (!major) {
+        for (size_t i = 0; i < gc_rem_len; i++) {
+            void *body = (void *)gc_rem[i];
+            GcHeader *h = HEADER(body);
+            if (h->kind == OBJ_BUFFER) {
+                mark_obj(((Buffer *)body)->bytes);
+            } else if (h->kind == OBJ_TUPLE) {
+                Tuple *t = body;
+                size_t len = h->body / sizeof(Value);
+                for (size_t j = 0; j < len; j++) mark_value(t->elems[j]);
+            }
+        }
+    }
 
     gc_trace();
 
     if (gc_immix) {
         ix_reclaim(); // mark-region: free empty lines/keep occupied ones, no per-object free
+        // Reclaim clears dead object-start bits. Drop their remembered entries
+        // before the next collection tries to inspect the container kind.
+        gc_prune_remembered();
     } else if (major) {
         // Full sweep of both generations. Survivors keep their generation; the dead
         // are freed. Bitmap-walk the small objects, list-walk the large ones.
         size_t young_live = 0, old_live = 0;
         sweep_small(true, &young_live, &old_live);
         sweep_large(true, &young_live, &old_live);
-        // Prune buffers this major freed from the remembered set: their old->young
-        // edge is gone. `is_object` is false once free_object cleared the slot's bit.
-        size_t kept = 0;
-        for (size_t i = 0; i < gc_rem_len; i++)
-            if (is_object(gc_rem[i])) gc_rem[kept++] = gc_rem[i];
-        gc_rem_len = kept;
+        // Prune containers this major freed from the remembered set: their
+        // old->young edge is gone. `is_object` is false once free_object cleared
+        // the slot's bit.
+        gc_prune_remembered();
         gc_young_bytes = young_live;
         gc_old_bytes = old_live;
         size_t twice = gc_old_bytes * 2;
@@ -1070,6 +1085,13 @@ Value mk_tuple_uninit(size_t len) {
 // by codegen from the element TYPE (via a shaped array), never by element-0
 // discovery (`build_shape`), which cannot see a sum's other variants.
 #define SHAPE_SUM (-1)
+// A two-constructor sum with one nullary constructor and one unary payload
+// constructor can consume a proven zero niche in the payload. Encoding:
+// `[SHAPE_NICHE_SUM, niche_tag, payload_tag, niche_word_offset,
+//   payload_field_count, payload_field_shapes...]`.
+// It occupies exactly the payload width: the nullary value is all zeroes and the
+// payload value is representation-transparent.
+#define SHAPE_NICHE_SUM (-2)
 
 // Number of int64 entries the shape node at `i` spans (pre-order). A variant node
 // `[m, ...]` shares the product/leaf span logic (span of `[0]` and of an empty
@@ -1081,6 +1103,7 @@ static size_t shape_span(const int64_t *shape, size_t i) {
         for (int64_t k = 0; k < node; k++) { size_t s = shape_span(shape, c); c += s; span += s; }
         return span;
     }
+    if (node == SHAPE_NICHE_SUM) return 4 + shape_span(shape, i + 4);
     int64_t nv = shape[i + 2]; // sum: [SHAPE_SUM, pad, nvariants] then each variant node
     size_t span = 3, c = i + 3;
     for (int64_t k = 0; k < nv; k++) { size_t s = shape_span(shape, c); c += s; span += s; }
@@ -1114,6 +1137,8 @@ static size_t build_shape(Value v, int64_t *shape, size_t *slen, int depth, bool
     return 1;
 }
 
+static size_t shape_leaves(const int64_t *shape, size_t *i);
+
 // Pack `v`'s leaves into `dest` in shape order (advancing both cursors). A sum
 // node writes [tag, active variant's leaves, zero-padding to the union payload];
 // the padding keeps the blind even/odd tracer correct (0 is skipped -- DD3).
@@ -1128,6 +1153,26 @@ static void flatten(Value v, const int64_t *shape, size_t *si, Value *dest, size
         (*si)++;
         Tuple *t = as_tuple(v);
         for (int64_t i = 0; i < node; i++) flatten(t->elems[i], shape, si, dest, di);
+        return;
+    }
+    if (node == SHAPE_NICHE_SUM) {
+        size_t node_i = *si;
+        uint64_t tag = data_tag(v);
+        uint64_t niche_tag = (uint64_t)shape[node_i + 1];
+        uint64_t payload_tag = (uint64_t)shape[node_i + 2];
+        size_t payload_i = node_i + 4;
+        size_t end_i = node_i + shape_span(shape, node_i);
+        if (tag == niche_tag) {
+            size_t cursor = payload_i;
+            size_t words = shape_leaves(shape, &cursor);
+            for (size_t i = 0; i < words; i++) dest[(*di)++] = (Value){0};
+        } else {
+            int64_t fields = shape[payload_i++];
+            if (tag != payload_tag || data_len(v) != (size_t)fields) match_fail();
+            for (int64_t i = 0; i < fields; i++)
+                flatten(data_field(v, (size_t)i), shape, &payload_i, dest, di);
+        }
+        *si = end_i;
         return;
     }
     // sum: `v` is a Data (tag in the header, fields inline).
@@ -1165,6 +1210,29 @@ static Value unflatten(const int64_t *shape, size_t *si, const Value *src, size_
             Value child = unflatten(shape, si, src, sri);
             as_tuple(out)->elems[i] = child; // re-read: `out` may have survived a GC
         }
+        return out;
+    }
+    if (node == SHAPE_NICHE_SUM) {
+        size_t node_i = *si;
+        uint64_t niche_tag = (uint64_t)shape[node_i + 1];
+        uint64_t payload_tag = (uint64_t)shape[node_i + 2];
+        size_t niche_offset = (size_t)shape[node_i + 3];
+        size_t payload_i = node_i + 4;
+        size_t cursor = payload_i;
+        size_t words = shape_leaves(shape, &cursor);
+        size_t payload0 = *sri;
+        Value out;
+        if (src[payload0 + niche_offset].w == 0) {
+            out = mk_data_inline(VInt((int64_t)niche_tag), 0, NULL);
+        } else {
+            int64_t field_count = shape[payload_i++];
+            Value fields[FLAT_MAX_FIELDS];
+            for (int64_t i = 0; i < field_count; i++)
+                fields[i] = unflatten(shape, &payload_i, src, sri);
+            out = mk_data_inline(VInt((int64_t)payload_tag), (size_t)field_count, fields);
+        }
+        *sri = payload0 + words;
+        *si = node_i + shape_span(shape, node_i);
         return out;
     }
     // sum: read the tag word, rebuild the active variant's boxed Data. The fields
@@ -1233,6 +1301,7 @@ void flat_array_set(Value arr, size_t i, Value elt) {
     Value *slot = &t->elems[flat_elem_base(arr) + i * stride];
     size_t si = 0, di = 0;
     flatten(elt, shape, &si, slot, &di);
+    gc_remember_object(t);
 }
 
 // Read element `i` back out as a canonical (nested) value. `arr` is a live root
@@ -1246,6 +1315,21 @@ Value flat_array_get(Value arr, size_t i) {
     return unflatten(shape, &si, as_tuple(arr)->elems, &sri);
 }
 
+// Decode only the sole field of a top-level niche-sum payload. This is the
+// representation-level counterpart of matching `This x` when the caller has
+// already established the occupied-slot invariant: a leaf payload is returned
+// directly, while a product payload rebuilds only that product -- never `This`.
+Value flat_array_get_niche_payload_unchecked(Value arr, size_t i) {
+    int64_t shape[FLAT_MAX_SHAPE];
+    size_t slen = read_shape(arr, shape);
+    if (slen < 6 || shape[0] != SHAPE_NICHE_SUM || shape[4] != 1) match_fail();
+
+    size_t stride = (size_t)as_int(as_tuple(arr)->elems[1]);
+    size_t source_i = flat_elem_base(arr) + i * stride;
+    size_t shape_i = 5; // niche header (4), payload field count (1), then field 0
+    return unflatten(shape, &shape_i, as_tuple(arr)->elems, &source_i);
+}
+
 Value flat_array_get_word(Value arr, size_t i, size_t word_offset) {
     Tuple *t = as_tuple(arr);
     size_t stride = (size_t)as_int(t->elems[1]);
@@ -1256,6 +1340,7 @@ void flat_array_set_word(Value arr, size_t i, size_t word_offset, Value value) {
     Tuple *t = as_tuple(arr);
     size_t stride = (size_t)as_int(t->elems[1]);
     t->elems[flat_elem_base(arr) + i * stride + word_offset] = value;
+    gc_remember_object(t);
 }
 
 // Store element `i`, returning the previous element boxed out. The box-out runs
@@ -1264,6 +1349,81 @@ Value flat_array_put(Value arr, size_t i, Value elt) {
     Value prev = flat_array_get(arr, i);
     flat_array_set(arr, i, elt);
     return prev;
+}
+
+// Copy packed elements directly between arrays. The language-level element type
+// guarantees equal layouts; keep a runtime check here because a mismatched stride
+// would otherwise turn a type/layout bug into heap corruption. `memmove` also makes
+// copying within one array well-defined for overlapping ranges.
+void flat_array_copy(Value source, size_t source_index, Value target,
+                     size_t target_index, size_t count) {
+    Tuple *src = as_tuple(source);
+    Tuple *dst = as_tuple(target);
+    size_t src_stride = (size_t)as_int(src->elems[1]);
+    size_t dst_stride = (size_t)as_int(dst->elems[1]);
+    size_t src_slen = (size_t)as_int(src->elems[2]);
+    size_t dst_slen = (size_t)as_int(dst->elems[2]);
+
+    if (src_stride != dst_stride || src_slen != dst_slen ||
+        memcmp(&src->elems[3], &dst->elems[3], src_slen * sizeof(Value)) != 0) {
+        fprintf(stderr, "flat_array_copy: incompatible element layouts\n");
+        abort();
+    }
+
+    Value *src_words = &src->elems[flat_elem_base(source) + source_index * src_stride];
+    Value *dst_words = &dst->elems[flat_elem_base(target) + target_index * dst_stride];
+    memmove(dst_words, src_words, count * src_stride * sizeof(Value));
+    if (count != 0) gc_remember_object(dst);
+}
+
+// Grow without boxing the old prefix or invoking a generator for every slot.
+// The allocation is already zeroed for the tracer. Consequently an all-zero
+// packed fill (notably Nope in a niche-layout Perhaps) needs no suffix writes.
+Value flat_array_grow_with(Value source, size_t new_count, Value fill) {
+    Tuple *src = as_tuple(source);
+    size_t old_count = flat_array_count(source);
+    if (new_count < old_count) {
+        fprintf(stderr, "flat_array_grow_with: new length is smaller than source\n");
+        abort();
+    }
+
+    size_t stride = (size_t)as_int(src->elems[1]);
+    int64_t shape[FLAT_MAX_SHAPE];
+    size_t slen = read_shape(source, shape);
+    Value target = mk_flat_array(new_count, stride, shape, slen);
+
+    Tuple *dst = as_tuple(target); // the collector is non-moving
+    size_t src_base = flat_elem_base(source);
+    size_t dst_base = flat_elem_base(target);
+    memmove(&dst->elems[dst_base], &src->elems[src_base],
+            old_count * stride * sizeof(Value));
+
+    if (new_count > old_count) {
+        Value *packed_fill = &dst->elems[dst_base + old_count * stride];
+        size_t si = 0, di = 0;
+        flatten(fill, shape, &si, packed_fill, &di);
+
+        bool all_zero = true;
+        for (size_t word = 0; word < stride; word++)
+            all_zero &= packed_fill[word].w == 0;
+
+        if (!all_zero) {
+            // Double the initialized suffix each time. This copies the same
+            // number of words as a slot loop but makes only O(log n) memcpy calls.
+            size_t filled = 1;
+            size_t suffix_count = new_count - old_count;
+            while (filled < suffix_count) {
+                size_t chunk = filled < suffix_count - filled
+                    ? filled : suffix_count - filled;
+                memcpy(packed_fill + filled * stride, packed_fill,
+                       chunk * stride * sizeof(Value));
+                filled += chunk;
+            }
+        }
+    }
+
+    if (new_count != 0) gc_remember_object(dst);
+    return target;
 }
 
 // Build a flat array from `n` already-evaluated element values (a readonly
@@ -1298,6 +1458,10 @@ static size_t shape_leaves(const int64_t *shape, size_t *i) {
         size_t sum = 0;
         for (int64_t k = 0; k < node; k++) sum += shape_leaves(shape, i);
         return sum;
+    }
+    if (node == SHAPE_NICHE_SUM) {
+        *i += 4;
+        return shape_leaves(shape, i);
     }
     size_t pad = (size_t)shape[*i + 1];
     *i += shape_span(shape, *i);
@@ -1433,7 +1597,7 @@ Value flat_from_enumerator(int64_t length, Value enumeration, Value next) {
 Value mk_data_inline(Value tag_imm, size_t payload_words, const Value *src) {
     Data *d = gc_new(sizeof(Data) + payload_words * sizeof(Value), OBJ_DATA);
     HEADER(d)->ctag = (uint8_t)as_int(tag_imm);
-    memcpy(d->fields, src, payload_words * sizeof(Value));
+    if (payload_words) memcpy(d->fields, src, payload_words * sizeof(Value));
     return VObject(d);
 }
 
@@ -1589,7 +1753,7 @@ void buffer_put_u8(Value bv, uint8_t byte) {
         memcpy(nbody, b->bytes, b->len);
         b->bytes = nbody;
         b->cap = ncap;
-        gc_remember_buffer(b); // old handle -> young body: record for the minor barrier
+        gc_remember_object(b); // old handle -> young body: record for the minor barrier
     }
     ((uint8_t *)b->bytes)[b->len++] = byte;
 }
@@ -1647,7 +1811,7 @@ Value buffer_move(Value bv) {
     b->bytes = fresh;
     b->len = 0;
     b->cap = 16;
-    gc_remember_buffer(b); // old handle -> young body: record for the minor barrier
+    gc_remember_object(b); // old handle -> young body: record for the minor barrier
     return mk_slice(body, 0, len);
 }
 
@@ -1826,7 +1990,7 @@ Value buffer_move_range(Value bv, size_t off, size_t n) {
     b->bytes = fresh;
     b->len = 0;
     b->cap = 16;
-    gc_remember_buffer(b); // old handle -> young body: record for the minor barrier
+    gc_remember_object(b); // old handle -> young body: record for the minor barrier
     return result_return(mk_slice(body, off, n));
 }
 

@@ -1,0 +1,83 @@
+use Stdlib.
+
+Point ::=
+  { X :: Int
+    Y :: Int
+  }
+
+Address ::=
+  { City :: Text
+    PostalCode :: Int
+  }
+
+Person ::=
+  { Name :: Text
+    Address :: Address
+  }
+
+Conference ::=
+  { Speaker :: Person
+    Host :: Person
+  }
+
+Box ::= ∀α.
+  { Payload :: α
+    Count :: Int
+  }
+
+point :: Int -> Int -> Point := λx y. { X := x; Y := y }
+
+replace_payload :: ∀α. Box α -> α -> Box α := λbox payload.
+  { box: Payload := payload }
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+
+  let original = point 3 4 in
+
+  let inline = { original: X := 10 } in
+  print_endline "original=`original.X`,`original.Y` inline=`inline.X`,`inline.Y`"
+
+  let layout =
+    { original:
+        Y := 40
+    }
+  in
+  print_endline "layout=`layout.X`,`layout.Y`"
+
+  let swapped =
+    { original:
+        X := original.Y
+        Y := original.X
+    }
+  in
+  print_endline "swapped=`swapped.X`,`swapped.Y`"
+
+  let replaced = { original: X := 30; Y := 40 } in
+  print_endline "replaced=`replaced.X`,`replaced.Y`"
+
+  let computed = { point 7 8: Y := 90 } in
+  print_endline "computed=`computed.X`,`computed.Y`"
+
+  let conference =
+    { Speaker := { Name := "Ada"
+          Address := { City := "London"; PostalCode := 10 }
+        }
+      Host := { Name := "Grace"
+          Address := { City := "New York"; PostalCode := 20 }
+        }
+    }
+  in
+  let relocated =
+    { conference:
+        Speaker.Address.City := conference.Host.Address.City
+        Speaker.Address.PostalCode := 30
+        Host.Address.City := "Stockholm"
+    }
+  in
+  print_endline "Originally, `conference.Speaker.Name` spoke in `conference.Speaker.Address.City`, hosted by `conference.Host.Name` in `conference.Host.Address.City`."
+  print_endline "Now `relocated.Speaker.Name` speaks in `relocated.Speaker.Address.City` (`relocated.Speaker.Address.PostalCode`), while `relocated.Host.Name` hosts from `relocated.Host.Address.City`."
+
+  let boxed = { Payload := 5; Count := 7 } in
+  let boxed2 = replace_payload boxed 42 in
+  print_endline "generic=`boxed.Payload`,`boxed.Count` -> `boxed2.Payload`,`boxed2.Count`"

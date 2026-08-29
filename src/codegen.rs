@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{
     ast::{
-        BUILTIN_MODULE_NAME, Binding, Literal, ProductElement, STDLIB_MODULE_NAME, Segment,
+        self, BUILTIN_MODULE_NAME, Binding, Literal, ProductElement, STDLIB_MODULE_NAME, Segment,
         TypeExpression,
         namer::{QualifiedName, TypeDefinition},
         pattern::Pattern,
@@ -50,6 +50,12 @@ fn direct_write_enabled() -> bool {
 enum RuntimeShape {
     Leaf,
     Product(Vec<RuntimeShape>),
+    NicheSum {
+        niche_tag: usize,
+        payload_tag: usize,
+        niche_offset: usize,
+        payload_fields: Vec<RuntimeShape>,
+    },
     Sum {
         payload_words: usize,
         variants: Vec<Vec<RuntimeShape>>,
@@ -61,6 +67,9 @@ impl RuntimeShape {
         match self {
             Self::Leaf => 1,
             Self::Product(fields) => fields.iter().map(Self::stored_words).sum(),
+            Self::NicheSum { payload_fields, .. } => {
+                payload_fields.iter().map(Self::stored_words).sum()
+            }
             Self::Sum { payload_words, .. } => 1 + payload_words,
         }
     }
@@ -71,6 +80,23 @@ impl RuntimeShape {
             Self::Product(fields) => {
                 out.push(fields.len() as i64);
                 for field in fields {
+                    field.encode(out);
+                }
+            }
+            Self::NicheSum {
+                niche_tag,
+                payload_tag,
+                niche_offset,
+                payload_fields,
+            } => {
+                out.extend([
+                    -2,
+                    *niche_tag as i64,
+                    *payload_tag as i64,
+                    *niche_offset as i64,
+                ]);
+                out.push(payload_fields.len() as i64);
+                for field in payload_fields {
                     field.encode(out);
                 }
             }
@@ -86,6 +112,26 @@ impl RuntimeShape {
                     }
                 }
             }
+        }
+    }
+
+    fn zero_niche(&self) -> Option<usize> {
+        match self {
+            Self::Leaf => Some(0),
+            Self::Product(fields) => {
+                let mut offset = 0;
+                for field in fields {
+                    if let Some(inner) = field.zero_niche() {
+                        return Some(offset + inner);
+                    }
+                    offset += field.stored_words();
+                }
+                None
+            }
+            // The zero pattern is the nullary value, hence is already valid.
+            Self::NicheSum { .. } => None,
+            // A tagged sum stores VInt(tag) in its first word; raw zero is invalid.
+            Self::Sum { .. } => Some(0),
         }
     }
 }
@@ -452,6 +498,27 @@ fn raw_array_get_arguments(expr: &Expr) -> Option<(&Expr, &Expr)> {
         .then_some((arguments[0], arguments[1]))
 }
 
+fn raw_array_set_arguments(expr: &Expr) -> Option<(&Expr, &Expr, &Expr)> {
+    let mut head = strip_ascription(expr);
+    let mut arguments = Vec::new();
+    while let Expr::Apply(_, application) = head {
+        arguments.push(application.argument.as_ref());
+        head = strip_ascription(&application.function);
+    }
+    arguments.reverse();
+    if arguments.len() != 3 {
+        return None;
+    }
+    let name = match head {
+        Expr::Variable(_, Identifier::Global(name)) => name.as_ref(),
+        Expr::InvokeBridge(_, bridge) => &bridge.qualified_name,
+        _ => return None,
+    };
+    surface_name(name)
+        .ends_with("Stdlib_Data_Array_Mutable_Array_raw_set_unchecked")
+        .then_some((arguments[0], arguments[1], arguments[2]))
+}
+
 fn projection_root_and_selectors(
     projection: &phase::Projection<Closed>,
 ) -> (&Expr, Vec<ProductElement>) {
@@ -696,10 +763,11 @@ impl lambda_lift::Program {
             Expr::Constant(_, the) => write!(code, "{}", self.compile_constant(the)),
             Expr::RecursiveLambda(_, _the) => panic!("lambdas are lifted"),
             Expr::Lambda(_, _the) => panic!("lambdas are lifted"),
-            Expr::Apply(_, the) => self.compile_apply(the, code),
+            Expr::Apply(a, the) => self.compile_apply(a, the, code),
             Expr::Let(_, the) => self.compile_let(the, code),
             Expr::Tuple(_, the) => self.compile_tuple(&the.elements, code),
             Expr::Record(a, the) => self.compile_record(a, the, code),
+            Expr::RecordUpdate(a, the) => self.compile_record_update(a, the, code),
             Expr::Inject(_, the) => self.compile_inject(the, code),
             Expr::Array(a, the) => self.compile_array(a, &the.elements, code),
             Expr::Project(a, the) => self.compile_projection(a, the, code),
@@ -795,7 +863,7 @@ impl lambda_lift::Program {
         (encoded.len() <= FLAT_MAX_SHAPE).then_some(encoded)
     }
 
-    fn runtime_shape(&self, ty: &Type, on_path: &mut Vec<QualifiedName>) -> ShapeResult {
+    fn runtime_shape(&self, ty: &Type, on_path: &mut Vec<Type>) -> ShapeResult {
         match ty {
             Type::Tuple(tuple) => {
                 let children = tuple
@@ -822,11 +890,47 @@ impl lambda_lift::Program {
                 };
                 self.runtime_named_shape(name, &arguments, on_path)
             }
+            Type::Coproduct(coproduct) => {
+                let constructors = coproduct.constructors().collect::<Vec<_>>();
+                let Some(max_tag) = constructors
+                    .iter()
+                    .filter_map(|(name, _)| self.constructor_tags.get(name).copied())
+                    .max()
+                else {
+                    return ShapeResult {
+                        shape: RuntimeShape::Leaf,
+                        reaches_enclosing_type: false,
+                    };
+                };
+                let mut variants = Vec::new();
+                variants.resize_with(max_tag as usize + 1, || None);
+                for (name, fields) in constructors {
+                    let Some(&tag) = self.constructor_tags.get(name) else {
+                        return ShapeResult {
+                            shape: RuntimeShape::Leaf,
+                            reaches_enclosing_type: false,
+                        };
+                    };
+                    variants[tag as usize] = Some(
+                        fields
+                            .iter()
+                            .map(|field| self.runtime_shape(field, on_path))
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                if variants.iter().any(Option::is_none) {
+                    ShapeResult {
+                        shape: RuntimeShape::Leaf,
+                        reaches_enclosing_type: false,
+                    }
+                } else {
+                    self.runtime_sum_shape(variants.into_iter().map(Option::unwrap).collect())
+                }
+            }
             Type::Variable(..)
             | Type::Base(..)
             | Type::Arrow { .. }
             | Type::Record(..)
-            | Type::Coproduct(..)
             | Type::Array(..) => ShapeResult {
                 shape: RuntimeShape::Leaf,
                 reaches_enclosing_type: false,
@@ -834,13 +938,73 @@ impl lambda_lift::Program {
         }
     }
 
+    fn runtime_sum_shape(&self, variants: Vec<Vec<ShapeResult>>) -> ShapeResult {
+        let recursive = variants
+            .iter()
+            .flatten()
+            .any(|field| field.reaches_enclosing_type);
+        let too_many_fields = variants
+            .iter()
+            .any(|variant| variant.len() > FLAT_MAX_FIELDS);
+        if recursive || too_many_fields {
+            return ShapeResult {
+                shape: RuntimeShape::Leaf,
+                reaches_enclosing_type: false,
+            };
+        }
+        let variants = variants
+            .into_iter()
+            .map(|variant| variant.into_iter().map(|field| field.shape).collect())
+            .collect::<Vec<Vec<_>>>();
+        if variants.len() == 2 {
+            let niche_tag = variants.iter().position(Vec::is_empty);
+            let payload_tag = variants.iter().position(|variant| !variant.is_empty());
+            if let (Some(niche_tag), Some(payload_tag)) = (niche_tag, payload_tag) {
+                if niche_tag != payload_tag {
+                    let payload_fields = variants[payload_tag].clone();
+                    let payload_shape = RuntimeShape::Product(payload_fields.clone());
+                    if let Some(niche_offset) = payload_shape.zero_niche() {
+                        return ShapeResult {
+                            shape: RuntimeShape::NicheSum {
+                                niche_tag,
+                                payload_tag,
+                                niche_offset,
+                                payload_fields,
+                            },
+                            reaches_enclosing_type: false,
+                        };
+                    }
+                }
+            }
+        }
+        let payload_words = variants
+            .iter()
+            .map(|variant| variant.iter().map(RuntimeShape::stored_words).sum())
+            .max()
+            .unwrap_or(0);
+        ShapeResult {
+            shape: RuntimeShape::Sum {
+                payload_words,
+                variants,
+            },
+            reaches_enclosing_type: false,
+        }
+    }
+
     fn runtime_named_shape(
         &self,
         name: &QualifiedName,
         arguments: &[Type],
-        on_path: &mut Vec<QualifiedName>,
+        on_path: &mut Vec<Type>,
     ) -> ShapeResult {
-        if on_path.contains(name) {
+        let instantiated = arguments.iter().cloned().fold(
+            Type::Constructor(name.clone()),
+            |constructor, argument| Type::Apply {
+                constructor: Box::new(constructor),
+                argument: Box::new(argument),
+            },
+        );
+        if on_path.contains(&instantiated) {
             return ShapeResult {
                 shape: RuntimeShape::Leaf,
                 reaches_enclosing_type: true,
@@ -870,9 +1034,26 @@ impl lambda_lift::Program {
             .map(|(parameter, argument)| (parameter.name.clone(), argument.clone()))
             .collect::<HashMap<_, _>>();
 
-        on_path.push(name.clone());
+        on_path.push(instantiated.clone());
         let result = match definition {
             TypeDefinition::Record(record) => {
+                // `compile_record` itself splats a record whenever any nested
+                // field is wider than one word. A shaped array must describe
+                // that canonical value as the already-flat tuple it actually is;
+                // otherwise `flatten` would try to descend into an intermediate
+                // tuple that was deliberately never allocated.
+                if let Some(widths) = self.flat_widths(&instantiated) {
+                    if widths.iter().any(|width| *width > 1) {
+                        return ShapeResult {
+                            shape: RuntimeShape::Product(
+                                (0..widths.iter().sum())
+                                    .map(|_| RuntimeShape::Leaf)
+                                    .collect(),
+                            ),
+                            reaches_enclosing_type: false,
+                        };
+                    }
+                }
                 let mut fields = record.fields.iter().collect::<Vec<_>>();
                 fields.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
                 let children = fields
@@ -949,6 +1130,37 @@ impl lambda_lift::Program {
                             .into_iter()
                             .map(|variant| variant.into_iter().map(|field| field.shape).collect())
                             .collect::<Vec<Vec<_>>>();
+                        let niche = if variants.len() == 2 {
+                            let niche_tag = variants.iter().position(Vec::is_empty);
+                            let payload_tag =
+                                variants.iter().position(|variant| !variant.is_empty());
+                            match (niche_tag, payload_tag) {
+                                (Some(niche_tag), Some(payload_tag))
+                                    if niche_tag != payload_tag =>
+                                {
+                                    let payload_fields = variants[payload_tag].clone();
+                                    let payload_shape =
+                                        RuntimeShape::Product(payload_fields.clone());
+                                    payload_shape.zero_niche().map(|niche_offset| {
+                                        RuntimeShape::NicheSum {
+                                            niche_tag,
+                                            payload_tag,
+                                            niche_offset,
+                                            payload_fields,
+                                        }
+                                    })
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(shape) = niche {
+                            return ShapeResult {
+                                shape,
+                                reaches_enclosing_type: false,
+                            };
+                        }
                         let payload_words = variants
                             .iter()
                             .map(|variant| variant.iter().map(RuntimeShape::stored_words).sum())
@@ -980,7 +1192,7 @@ impl lambda_lift::Program {
         &self,
         expression: &TypeExpression<A, QualifiedName>,
         bindings: &HashMap<crate::parser::Identifier, Type>,
-        on_path: &mut Vec<QualifiedName>,
+        on_path: &mut Vec<Type>,
     ) -> ShapeResult {
         let Some(ty) = instantiate_type_expression(expression, bindings) else {
             return ShapeResult {
@@ -1081,6 +1293,9 @@ impl lambda_lift::Program {
     fn flat_widths(&self, ty: &Type) -> Option<Vec<usize>> {
         match ty {
             Type::Constructor(name) => self.record_layouts.get(name).cloned(),
+            Type::Apply { .. } => {
+                applied_type(ty).and_then(|(name, _)| self.record_layouts.get(&name).cloned())
+            }
             Type::Tuple(tuple) => Some(tuple.0.iter().map(|t| self.flat_width(t)).collect()),
             _ => None,
         }
@@ -1295,6 +1510,30 @@ impl lambda_lift::Program {
         (leaves.len() == 1 + payload_words).then_some(leaves)
     }
 
+    fn niche_constructor_shape_leaves(
+        &self,
+        constructor: &QualifiedName,
+        arguments: &[&Expr],
+        niche_tag: usize,
+        payload_tag: usize,
+        payload_fields: &[RuntimeShape],
+        prelude: &mut Vec<String>,
+    ) -> Option<Vec<String>> {
+        let tag = self.constructor_tag(constructor) as usize;
+        if tag == niche_tag && arguments.is_empty() {
+            let words = payload_fields.iter().map(RuntimeShape::stored_words).sum();
+            return Some(vec!["((Value){0})".to_string(); words]);
+        }
+        if tag == payload_tag && arguments.len() == payload_fields.len() {
+            let mut leaves = Vec::new();
+            for (argument, shape) in arguments.iter().zip(payload_fields) {
+                leaves.extend(self.literal_shape_leaves(argument, shape, prelude)?);
+            }
+            return Some(leaves);
+        }
+        None
+    }
+
     fn canonical_product_leaves(path: &str, shape: &RuntimeShape, out: &mut Vec<String>) {
         match shape {
             RuntimeShape::Leaf => out.push(path.to_string()),
@@ -1306,7 +1545,7 @@ impl lambda_lift::Program {
             // A dynamically-tagged canonical sum needs variant-dependent traversal.
             // Known constructor applications are handled by
             // `constructor_shape_leaves`; other sums keep the runtime fallback.
-            RuntimeShape::Sum { .. } => {}
+            RuntimeShape::Sum { .. } | RuntimeShape::NicheSum { .. } => {}
         }
     }
 
@@ -1338,6 +1577,25 @@ impl lambda_lift::Program {
             }
             (
                 Expr::Inject(_, inject),
+                RuntimeShape::NicheSum {
+                    niche_tag,
+                    payload_tag,
+                    payload_fields,
+                    ..
+                },
+            ) => {
+                let arguments = inject.arguments.iter().map(|a| &**a).collect::<Vec<_>>();
+                self.niche_constructor_shape_leaves(
+                    &inject.constructor,
+                    &arguments,
+                    *niche_tag,
+                    *payload_tag,
+                    payload_fields,
+                    prelude,
+                )
+            }
+            (
+                Expr::Inject(_, inject),
                 RuntimeShape::Sum {
                     payload_words,
                     variants,
@@ -1349,6 +1607,34 @@ impl lambda_lift::Program {
                     &arguments,
                     *payload_words,
                     variants,
+                    prelude,
+                )
+            }
+            (
+                application @ Expr::Apply(..),
+                RuntimeShape::NicheSum {
+                    niche_tag,
+                    payload_tag,
+                    payload_fields,
+                    ..
+                },
+            ) => {
+                let mut arguments = Vec::new();
+                let mut head = application;
+                while let Expr::Apply(_, inner) = head {
+                    arguments.push(&*inner.argument);
+                    head = &inner.function;
+                }
+                arguments.reverse();
+                let Expr::Variable(_, Identifier::Global(constructor)) = head else {
+                    return None;
+                };
+                self.niche_constructor_shape_leaves(
+                    constructor,
+                    &arguments,
+                    *niche_tag,
+                    *payload_tag,
+                    payload_fields,
                     prelude,
                 )
             }
@@ -1377,6 +1663,22 @@ impl lambda_lift::Program {
                     prelude,
                 )
             }
+            (
+                Expr::Variable(_, Identifier::Global(constructor)),
+                RuntimeShape::NicheSum {
+                    niche_tag,
+                    payload_tag,
+                    payload_fields,
+                    ..
+                },
+            ) => self.niche_constructor_shape_leaves(
+                constructor,
+                &[],
+                *niche_tag,
+                *payload_tag,
+                payload_fields,
+                prelude,
+            ),
             (
                 Expr::Variable(_, Identifier::Global(constructor)),
                 RuntimeShape::Sum {
@@ -1421,8 +1723,14 @@ impl lambda_lift::Program {
         // The base is not a flat projection. A record value is always a flat object,
         // so offset into it; a standalone TUPLE is boxed (only a tuple *inlined in a
         // record* is flat, and that is the reach-through case above) -- leave it.
+        // `flat_widths` above already proved this is a nominal record. Generic
+        // records appear as `Type::Apply` (`Entry α β`), while monomorphic records
+        // appear as `Type::Constructor`. Both use the same flattened object
+        // representation and must therefore use the same offset/copy-out path.
         match base_type {
-            Type::Constructor(_) => Some((self.compile_to_string(&projection.base), offset, width)),
+            Type::Constructor(_) | Type::Apply { .. } => {
+                Some((self.compile_to_string(&projection.base), offset, width))
+            }
             _ => None,
         }
     }
@@ -1704,21 +2012,40 @@ impl lambda_lift::Program {
                     return matches!(constructor.arguments.as_slice(), [argument]
                         if self.array_pattern_supported(argument, shape));
                 }
-                let RuntimeShape::Sum { variants, .. } = shape else {
-                    return false;
-                };
                 let Some(tag) = self.constructor_tags.get(name.as_ref()) else {
                     return false;
                 };
-                let Some(fields) = variants.get(*tag as usize) else {
-                    return false;
-                };
-                constructor.arguments.len() == fields.len()
-                    && constructor
-                        .arguments
-                        .iter()
-                        .zip(fields)
-                        .all(|(pattern, shape)| self.array_pattern_supported(pattern, shape))
+                match shape {
+                    RuntimeShape::Sum { variants, .. } => {
+                        let Some(fields) = variants.get(*tag as usize) else {
+                            return false;
+                        };
+                        constructor.arguments.len() == fields.len()
+                            && constructor
+                                .arguments
+                                .iter()
+                                .zip(fields)
+                                .all(|(pattern, shape)| {
+                                    self.array_pattern_supported(pattern, shape)
+                                })
+                    }
+                    RuntimeShape::NicheSum {
+                        niche_tag,
+                        payload_tag,
+                        payload_fields,
+                        ..
+                    } => {
+                        (*tag as usize == *niche_tag && constructor.arguments.is_empty())
+                            || (*tag as usize == *payload_tag
+                                && constructor.arguments.len() == payload_fields.len()
+                                && constructor.arguments.iter().zip(payload_fields).all(
+                                    |(argument, field)| {
+                                        self.array_pattern_supported(argument, field)
+                                    },
+                                ))
+                    }
+                    _ => false,
+                }
             }
             _ => false,
         }
@@ -1801,10 +2128,45 @@ impl lambda_lift::Program {
                         argument, array, index, offset, shape, tests, binds,
                     );
                 }
-                let RuntimeShape::Sum { variants, .. } = shape else {
+                let Some(&tag) = self.constructor_tags.get(name.as_ref()) else {
                     return false;
                 };
-                let Some(&tag) = self.constructor_tags.get(name.as_ref()) else {
+                if let RuntimeShape::NicheSum {
+                    niche_tag,
+                    payload_tag,
+                    niche_offset,
+                    payload_fields,
+                } = shape
+                {
+                    if tag as usize == *niche_tag && constructor.arguments.is_empty() {
+                        tests.push(format!("{}.w == 0", word(offset + niche_offset)));
+                        return true;
+                    }
+                    if tag as usize == *payload_tag {
+                        if constructor.arguments.len() != payload_fields.len() {
+                            return false;
+                        }
+                        tests.push(format!("{}.w != 0", word(offset + niche_offset)));
+                        let mut field_offset = offset;
+                        for (argument, field) in constructor.arguments.iter().zip(payload_fields) {
+                            if !self.collect_array_pattern(
+                                argument,
+                                array,
+                                index,
+                                field_offset,
+                                field,
+                                tests,
+                                binds,
+                            ) {
+                                return false;
+                            }
+                            field_offset += field.stored_words();
+                        }
+                        return true;
+                    }
+                    return false;
+                }
+                let RuntimeShape::Sum { variants, .. } = shape else {
                     return false;
                 };
                 let Some(fields) = variants.get(tag as usize) else {
@@ -2154,6 +2516,117 @@ impl lambda_lift::Program {
         write!(code, ")")
     }
 
+    fn compile_record_update(
+        &self,
+        _annotation: &CaptureInfo,
+        update: &ast::RecordUpdate<CaptureInfo, Identifier>,
+        code: &mut CodeBuffer,
+    ) -> fmt::Result {
+        let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+        write!(code, "({{ Value _rub{id} = ")?;
+        self.compile_expr(&update.base, code)?;
+        write!(code, "; ")?;
+
+        let mut replacements = Vec::with_capacity(update.fields.len());
+        for (field_index, field) in update.fields.iter().enumerate() {
+            let temp = format!("_ru{id}_{field_index}");
+            write!(code, "Value {temp} = ")?;
+            self.compile_expr(&field.value, code)?;
+            write!(code, "; ")?;
+            replacements.push(temp);
+        }
+
+        // Closure conversion may replace the update expression's annotation
+        // while preserving the base expression's concrete nominal record type.
+        let root_type = &update.base.annotation().type_info.inferred_type;
+        let widths = self
+            .flat_widths(root_type)
+            .unwrap_or_else(|| panic!("record update base layout: {root_type:?}"));
+        let total: usize = widths.iter().sum();
+        let base_leaves = (0..total)
+            .map(|offset| format!("proj(_rub{id}, {offset})"))
+            .collect();
+        let leaves = self.record_update_leaves(update, &[], root_type, base_leaves, &replacements);
+        write!(code, "mk_tuple({total}")?;
+        for leaf in leaves {
+            write!(code, ", {leaf}")?;
+        }
+        write!(code, "); }})")
+    }
+
+    fn canonical_update_leaves(&self, value: &str, ty: &Type, width: usize) -> Vec<String> {
+        if width == 1 {
+            return vec![value.to_string()];
+        }
+        if self.sum_layout(ty).is_some() {
+            let mut leaves = vec![format!("VInt(data_tag({value}))")];
+            for index in 0..width - 1 {
+                leaves.push(format!("(({index}) < data_len({value}) ? data_field({value}, {index}) : ((Value){{0}}))"));
+            }
+            leaves
+        } else {
+            (0..width)
+                .map(|index| format!("proj({value}, {index})"))
+                .collect()
+        }
+    }
+
+    fn record_update_leaves(
+        &self,
+        update: &ast::RecordUpdate<CaptureInfo, Identifier>,
+        prefix: &[usize],
+        ty: &Type,
+        mut base_leaves: Vec<String>,
+        replacements: &[String],
+    ) -> Vec<String> {
+        let widths = self.flat_widths(ty).expect("dotted update record layout");
+        let total: usize = widths.iter().sum();
+        if base_leaves.len() == 1 && total > 1 {
+            let base = &base_leaves[0];
+            base_leaves = (0..total)
+                .map(|index| format!("proj({base}, {index})"))
+                .collect();
+        }
+        let mut result = Vec::with_capacity(total);
+        let mut offset = 0;
+        for (index, width) in widths.into_iter().enumerate() {
+            let mut path = prefix.to_vec();
+            path.push(index);
+            let field_type = self
+                .runtime_projection_field(ty, &ProductElement::Ordinal(index))
+                .expect("typed dotted update field")
+                .0;
+            if let Some((replacement_index, _)) = update
+                .fields
+                .iter()
+                .enumerate()
+                .find(|(_, field)| field.indices == path)
+            {
+                result.extend(self.canonical_update_leaves(
+                    &replacements[replacement_index],
+                    &field_type,
+                    width,
+                ));
+            } else if update
+                .fields
+                .iter()
+                .any(|field| field.indices.starts_with(&path))
+            {
+                result.extend(self.record_update_leaves(
+                    update,
+                    &path,
+                    &field_type,
+                    base_leaves[offset..offset + width].to_vec(),
+                    replacements,
+                ));
+            } else {
+                result.extend(base_leaves[offset..offset + width].iter().cloned());
+            }
+            offset += width;
+        }
+        result
+    }
+
     fn compile_projection(
         &self,
         annotation: &CaptureInfo,
@@ -2434,7 +2907,12 @@ impl lambda_lift::Program {
     // no indirection. Everything else is the uniform `apply(closure, argument)`;
     // since a builtin's value is still a curried closure, partial application
     // and higher-order use fall through to this path unchanged.
-    fn compile_apply(&self, the: &phase::Apply<Closed>, code: &mut CodeBuffer) -> fmt::Result {
+    fn compile_apply(
+        &self,
+        annotation: &CaptureInfo,
+        the: &phase::Apply<Closed>,
+        code: &mut CodeBuffer,
+    ) -> fmt::Result {
         // Flatten the application spine into (head, args-in-order).
         let mut args: Vec<&Expr> = vec![&the.argument];
         let mut head: &Expr = &the.function;
@@ -2443,6 +2921,36 @@ impl lambda_lift::Program {
             head = &inner.function;
         }
         args.reverse();
+
+        // `omg_wtf_bbq` deliberately keeps the ordinary surface type `Text -> a`.
+        // Its private foreign worker has extra diagnostic parameters; inject them
+        // here, after all transformations, from metadata carried by the call node.
+        if args.len() == 1
+            && let Expr::Variable(_, Identifier::Global(name)) = head
+            && (surface_name(name).ends_with("Root_Prelude_raw_omg_wtf_bbq")
+                || surface_name(name).ends_with("Root_Prelude_omg_wtf_bbq"))
+        {
+            let info = &annotation.type_info;
+            let function = info
+                .enclosing_term
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            let file = crate::source_map::path_of(info.parse_info.file)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            write!(
+                code,
+                "{}_worker({}, {}, VInt({}), VInt({}), ",
+                "Root_Prelude_raw_omg_wtf_bbq",
+                self.compile_constant(&Literal::Text(function)),
+                self.compile_constant(&Literal::Text(file)),
+                info.parse_info.location.row,
+                info.parse_info.location.column,
+            )?;
+            self.compile_expr(args[0], code)?;
+            return write!(code, ")");
+        }
 
         // A saturated write-only packed-array primitive whose replacement is a
         // structural literal can write its already-evaluated leaves straight into
@@ -2752,6 +3260,228 @@ impl lambda_lift::Program {
 
     // `let l = bound in body` is a GCC statement expression: bind a local, then
     // yield the body's value. Only `Local` binders occur here (see closed.rs).
+    fn same_place_operand(left: &Expr, right: &Expr) -> bool {
+        match (strip_ascription(left), strip_ascription(right)) {
+            (Expr::Variable(_, left), Expr::Variable(_, right)) => match (left, right) {
+                (Identifier::Local(left), Identifier::Local(right)) => left.0 == right.0,
+                (Identifier::Captured(left), Identifier::Captured(right)) => {
+                    left.index() == right.index()
+                }
+                (Identifier::SelfRef, Identifier::SelfRef) => true,
+                (Identifier::Global(left), Identifier::Global(right)) => left == right,
+                _ => false,
+            },
+            (Expr::Constant(_, Literal::Int(left)), Expr::Constant(_, Literal::Int(right))) => {
+                left == right
+            }
+            (Expr::Constant(_, Literal::Bool(left)), Expr::Constant(_, Literal::Bool(right))) => {
+                left == right
+            }
+            (Expr::Constant(_, Literal::Unit), Expr::Constant(_, Literal::Unit)) => true,
+            (Expr::Project(_, left), Expr::Project(_, right)) => {
+                matches!(
+                    (&left.select, &right.select),
+                    (ProductElement::Ordinal(left), ProductElement::Ordinal(right)) if left == right
+                ) && Self::same_place_operand(&left.base, &right.base)
+            }
+            _ => false,
+        }
+    }
+
+    fn record_update_from_local<'a>(
+        expression: &'a Expr,
+        source_level: usize,
+    ) -> Option<(&'a ast::RecordUpdate<CaptureInfo, Identifier>, usize)> {
+        match strip_ascription(expression) {
+            Expr::RecordUpdate(_, update) if matches!(strip_ascription(&update.base), Expr::Variable(_, Identifier::Local(LexicalLevel(level))) if *level == source_level) => {
+                Some((update, source_level))
+            }
+            Expr::Let(_, binding) if matches!(strip_ascription(&binding.bound), Expr::Variable(_, Identifier::Local(LexicalLevel(level))) if *level == source_level) =>
+            {
+                let Identifier::Local(LexicalLevel(alias)) = binding.binder else {
+                    return None;
+                };
+                Self::record_update_from_local(&binding.body, alias)
+            }
+            _ => None,
+        }
+    }
+
+    fn same_place_update<'a>(
+        &self,
+        body: &'a Expr,
+        source_level: usize,
+        read_array: &Expr,
+        read_index: &Expr,
+    ) -> Option<(&'a ast::RecordUpdate<CaptureInfo, Identifier>, usize)> {
+        let Expr::Let(_, binding) = strip_ascription(body) else {
+            return None;
+        };
+        let Identifier::Local(LexicalLevel(updated_level)) = binding.binder else {
+            return None;
+        };
+        let (update, update_level) = Self::record_update_from_local(&binding.bound, source_level)?;
+        let (write_array, write_index, replacement) = raw_array_set_arguments(&binding.body)?;
+        let writes_updated = matches!(
+            strip_ascription(replacement),
+            Expr::Variable(_, Identifier::Local(LexicalLevel(level))) if *level == updated_level
+        );
+        (writes_updated
+            && Self::same_place_operand(read_array, write_array)
+            && Self::same_place_operand(read_index, write_index))
+        .then_some((update, update_level))
+    }
+
+    fn record_path_leaf_offset(&self, root: &Type, indices: &[usize]) -> Option<usize> {
+        let mut current = root.clone();
+        let mut offset = 0;
+        for index in indices {
+            let (next, field_offset) = self.runtime_projection_field_at_fixed_offset(
+                &current,
+                &ProductElement::Ordinal(*index),
+            )?;
+            offset += field_offset;
+            current = next;
+        }
+        matches!(
+            self.runtime_shape(&current, &mut Vec::new()).shape,
+            RuntimeShape::Leaf
+        )
+        .then_some(offset)
+    }
+
+    /// Resolve a projection only when every field preceding the selected field
+    /// has a statically fixed width. This is deliberately less restrictive than
+    /// requiring the whole record to be ground: `{ Length :: Int; Storage :: F a }`
+    /// has a fixed offset for `Length` even though the later `Storage` mentions `a`.
+    /// Conversely, a field after a naked type parameter remains ineligible because
+    /// a caller's layout dictionary may make that parameter wider than one word.
+    fn runtime_projection_field_at_fixed_offset(
+        &self,
+        base_type: &Type,
+        selector: &ProductElement,
+    ) -> Option<(Type, usize)> {
+        if let Type::Tuple(tuple) = base_type {
+            let ProductElement::Ordinal(index) = selector else {
+                return None;
+            };
+            let selected = tuple.elements().get(*index)?.clone();
+            let mut offset = 0;
+            for field in &tuple.elements()[..*index] {
+                if !field.variables().is_empty() {
+                    return None;
+                }
+                offset += self
+                    .runtime_shape(field, &mut Vec::new())
+                    .shape
+                    .stored_words();
+            }
+            return Some((selected, offset));
+        }
+
+        let (name, arguments) = match base_type {
+            Type::Constructor(name) => (name, Vec::new()),
+            Type::Apply { .. } => applied_type(base_type)?,
+            _ => return None,
+        };
+        let TypeDefinition::Record(record) = self.type_definitions.get(name)? else {
+            return None;
+        };
+        let bindings = record
+            .type_parameters
+            .iter()
+            .zip(arguments)
+            .map(|(parameter, argument)| (parameter.name.clone(), argument))
+            .collect::<HashMap<_, _>>();
+        let mut fields = record.fields.iter().collect::<Vec<_>>();
+        fields.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+        let index = match selector {
+            ProductElement::Ordinal(index) => *index,
+            ProductElement::Name(name) => fields.iter().position(|field| &field.name == name)?,
+        };
+        let selected =
+            instantiate_type_expression(&fields.get(index)?.type_signature.body, &bindings)?;
+        let mut offset = 0;
+        for field in &fields[..index] {
+            let ty = instantiate_type_expression(&field.type_signature.body, &bindings)?;
+            if !ty.variables().is_empty() {
+                return None;
+            }
+            offset += self
+                .runtime_shape(&ty, &mut Vec::new())
+                .shape
+                .stored_words();
+        }
+        Some((selected, offset))
+    }
+
+    fn compile_same_place_record_update(
+        &self,
+        level: usize,
+        array: &Expr,
+        index: &Expr,
+        element_type: Type,
+        update: &ast::RecordUpdate<CaptureInfo, Identifier>,
+        code: &mut CodeBuffer,
+    ) -> Option<fmt::Result> {
+        let update_type = &update.base.annotation().type_info.inferred_type;
+        let (element_type, offsets) =
+            [element_type, update_type.clone()]
+                .into_iter()
+                .find_map(|candidate| {
+                    let offsets = update
+                        .fields
+                        .iter()
+                        .map(|field| self.record_path_leaf_offset(&candidate, &field.indices))
+                        .collect::<Option<Vec<_>>>()?;
+                    Some((candidate, offsets))
+                })?;
+
+        let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+        let array_local = format!("_pa{id}");
+        let index_local = format!("_pi{id}");
+        let result = (|| {
+            write!(code, "({{ Value {array_local} = ")?;
+            self.compile_expr(array, code)?;
+            write!(code, "; Value {index_local} = ")?;
+            self.compile_expr(index, code)?;
+            write!(code, "; ")?;
+
+            let previous = ARRAY_ELEMENT_PLACES.with(|places| {
+                places.borrow_mut().insert(
+                    level,
+                    ArrayElementPlace {
+                        array: array_local.clone(),
+                        index: index_local.clone(),
+                        element_type,
+                    },
+                )
+            });
+            for (field_index, field) in update.fields.iter().enumerate() {
+                write!(code, "Value _pv{id}_{field_index} = ")?;
+                self.compile_expr(&field.value, code)?;
+                write!(code, "; ")?;
+            }
+            ARRAY_ELEMENT_PLACES.with(|places| {
+                let mut places = places.borrow_mut();
+                if let Some(previous) = previous {
+                    places.insert(level, previous);
+                } else {
+                    places.remove(&level);
+                }
+            });
+
+            for (field_index, offset) in offsets.iter().enumerate() {
+                write!(
+                    code,
+                    "flat_array_set_word({array_local}, (size_t)as_int({index_local}), {offset}, _pv{id}_{field_index}); "
+                )?;
+            }
+            write!(code, "VUnit(); }})")
+        })();
+        Some(result)
+    }
+
     fn compile_let(
         &self,
         Binding {
@@ -2781,6 +3511,18 @@ impl lambda_lift::Program {
             } else {
                 source_type.clone()
             };
+            if let Some((update, update_level)) = self.same_place_update(body, *level, array, index)
+                && let Some(result) = self.compile_same_place_record_update(
+                    update_level,
+                    array,
+                    index,
+                    element_type.clone(),
+                    update,
+                    code,
+                )
+            {
+                return result;
+            }
             // Register a provisional place while checking the body: pattern
             // eligibility itself resolves local-rooted deconstruct scrutinees
             // through this map.  Restore an outer entry before emitting code.
@@ -2928,6 +3670,25 @@ impl lambda_lift::Program {
                     } else {
                         source_type.clone()
                     };
+                    if let Some((update, update_level)) =
+                        self.same_place_update(&the.body, *level, array, index)
+                        && update.fields.iter().all(|field| {
+                            self.record_path_leaf_offset(&element_type, &field.indices)
+                                .is_some()
+                        })
+                    {
+                        write!(code, "return ")?;
+                        self.compile_same_place_record_update(
+                            update_level,
+                            array,
+                            index,
+                            element_type.clone(),
+                            update,
+                            code,
+                        )
+                        .expect("prevalidated same-place record update")?;
+                        return write!(code, ";");
+                    }
                     let previous = ARRAY_ELEMENT_PLACES.with(|places| {
                         places.borrow_mut().insert(
                             *level,

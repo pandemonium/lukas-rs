@@ -2,7 +2,6 @@ use Stdlib.
 use Stdlib.Data.Tree.
 use Stdlib.Data.Hash_Table.
 use Stdlib.Control.
-use Stdlib.Control.State.
 use Stdlib.Random.
 use Stdlib.IO.
 
@@ -138,11 +137,6 @@ process_file_bytes :: Bytes -> IO (List (Text, Aggregate_Stats)) := λfile_bytes
     let* _ = loop 0 in
     let* table_data = Stats.Cheeky_Map.to_list table
     in pure table_data
-
-(* Direct-style parser: instead of a `State_T Bytes` monad that threads (and reslices)
-   the remaining bytes -- allocating a bind closure + a (value, bytes) pair per step --
-   we thread a single `Int` cursor over the FIXED source. No monad, no reslicing: just
-   an index, exactly the `loop i` shape used elsewhere (FNV1a.hash, Cheeky_Map.to_list). *)
 
 (* First index at or after `i` whose byte equals `delim`. *)
 scan_to :: Bytes -> Int -> Int -> Int := λsource i delim.

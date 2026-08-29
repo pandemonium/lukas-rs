@@ -1,0 +1,39 @@
+use Stdlib.
+use Stdlib.Data.Array.
+
+Entry ::= { Label :: Text; Value :: Int }
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+
+  (* Distinct arrays: copy three packed records without boxing their fields. *)
+  let source = unsafe_run_IO (Mutable_Array.generate 4 (λi.
+    { Label := "source-`i`"; Value := 10 + i }))
+  in
+  let target = unsafe_run_IO (Mutable_Array.generate 6 (λi.
+    { Label := "empty-`i`"; Value := 0 }
+  )) in
+  let _ = unsafe_run_IO (Mutable_Array.copy_unchecked source 1 target 2 3) in
+  let copied0 = unsafe_run_IO (Mutable_Array.get_unchecked target 2) in
+  let copied1 = unsafe_run_IO (Mutable_Array.get_unchecked target 3) in
+  let copied2 = unsafe_run_IO (Mutable_Array.get_unchecked target 4) in
+  print_endline "records: `copied0.Label`=`copied0.Value`, `copied1.Label`=`copied1.Value`, `copied2.Label`=`copied2.Value`"
+
+  (* A type-driven niche sum has a different packed shape, and copies directly. *)
+  let options = unsafe_run_IO (Mutable_Array.generate 3 (λi.
+    if eq i 1 then This 42 else Nope
+  )) in
+  let option_target = unsafe_run_IO (Mutable_Array.generate 3 (λ_. Nope)) in
+  let _ = unsafe_run_IO (Mutable_Array.copy_unchecked options 0 option_target 0 3) in
+  let copied_option = unsafe_run_IO (Mutable_Array.get_unchecked option_target 1) in
+  print_endline "niche: `perhaps 0 (λn. n) copied_option`"
+
+  (* One array: the ranges overlap, so this distinguishes memmove from memcpy. *)
+  let overlapping = unsafe_run_IO (Mutable_Array.generate 5 (λi. i)) in
+  let _ = unsafe_run_IO (Mutable_Array.copy_unchecked overlapping 0 overlapping 1 4) in
+  let a = unsafe_run_IO (Mutable_Array.get_unchecked overlapping 0) in
+  let b = unsafe_run_IO (Mutable_Array.get_unchecked overlapping 1) in
+  let c = unsafe_run_IO (Mutable_Array.get_unchecked overlapping 2) in
+  let d = unsafe_run_IO (Mutable_Array.get_unchecked overlapping 3) in
+  let e = unsafe_run_IO (Mutable_Array.get_unchecked overlapping 4) in
+  print_endline "overlap: `a`,`b`,`c`,`d`,`e`"

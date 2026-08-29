@@ -197,9 +197,11 @@ impl LexicalAnalyzer {
 
         match terminator {
             // A plain `"..."` literal (no interpolation), or an unterminated one at EOF.
-            Some('"') => {
-                self.emit_text(content, TokenKind::Literal(Literal::Text(image)), &remains[1..])
-            }
+            Some('"') => self.emit_text(
+                content,
+                TokenKind::Literal(Literal::Text(image)),
+                &remains[1..],
+            ),
             None => self.emit_text(content, TokenKind::Literal(Literal::Text(image)), remains),
 
             // An interpolation splice: emit the leading text, tokenize the `` `expr` ``,

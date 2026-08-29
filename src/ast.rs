@@ -387,6 +387,7 @@ pub enum Expr<A, Id> {
     Let(A, Binding<A, Id>),
     Tuple(A, Tuple<A, Id>),
     Record(A, Record<A, Id>),
+    RecordUpdate(A, RecordUpdate<A, Id>),
     Inject(A, Injection<A, Id>),
     Array(A, Array<A, Id>),
     Project(A, Projection<A, Id>),
@@ -409,6 +410,7 @@ impl<A, Id> Expr<A, Id> {
             | Self::Apply(a, ..)
             | Self::Let(a, ..)
             | Self::Record(a, ..)
+            | Self::RecordUpdate(a, ..)
             | Self::Tuple(a, ..)
             | Self::Inject(a, ..)
             | Self::Array(a, ..)
@@ -494,6 +496,24 @@ impl<A, Id> Expr<A, Id> {
                 a,
                 Record {
                     fields: the.fields.into_iter().map(|(k, v)| (k, go(v, f))).collect(),
+                },
+            ),
+
+            Expr::RecordUpdate(a, the) => Expr::RecordUpdate(
+                a,
+                RecordUpdate {
+                    base: go(the.base, f),
+                    fields: the
+                        .fields
+                        .into_iter()
+                        .map(|field| RecordUpdateField {
+                            path: field.path,
+                            indices: field.indices,
+                            arities: field.arities,
+                            value: go(field.value, f),
+                        })
+                        .collect(),
+                    field_order: the.field_order,
                 },
             ),
 
@@ -607,6 +627,25 @@ pub struct IfThenElse<A, Id> {
 #[derive(Debug, Clone)]
 pub struct Record<A, Id> {
     pub fields: Vec<(parser::Identifier, Tree<A, Id>)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordUpdate<A, Id> {
+    pub base: Tree<A, Id>,
+    pub fields: Vec<RecordUpdateField<A, Id>>,
+    /// Canonical field order, filled by the typer once the nominal record type
+    /// of the base is known. Empty in parsed and named trees.
+    pub field_order: Vec<parser::Identifier>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordUpdateField<A, Id> {
+    pub path: Vec<parser::Identifier>,
+    /// Positional selector and containing-record arity for every path segment;
+    /// populated by the typer and empty in parsed/named trees.
+    pub indices: Vec<usize>,
+    pub arities: Vec<usize>,
+    pub value: Tree<A, Id>,
 }
 
 impl<A, Id> Record<A, Id> {
@@ -762,6 +801,22 @@ where
             Self::Apply(_, x) => write!(f, "({} {})", x.function, x.argument),
             Self::Let(_, x) => write!(f, "let {} = {} in {}", x.binder, x.bound, x.body),
             Self::Record(_, x) => write!(f, "{x}"),
+            Self::RecordUpdate(_, x) => {
+                write!(f, "{{ {}: ", x.base)?;
+                for (i, field) in x.fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, "; ")?;
+                    }
+                    for (j, name) in field.path.iter().enumerate() {
+                        if j > 0 {
+                            write!(f, ".")?;
+                        }
+                        write!(f, "{name}")?;
+                    }
+                    write!(f, " := {}", field.value)?;
+                }
+                write!(f, " }}")
+            }
             Self::Tuple(_, x) => write!(f, "{x}"),
             Self::Inject(_, x) => {
                 write!(

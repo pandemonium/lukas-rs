@@ -174,6 +174,23 @@ impl<A> namer::SymbolTable<A, namer::QualifiedName, namer::Identifier> {
     }
 }
 
+impl phase::SymbolTable<Types> {
+    /// Preserve the source-level owner of every expression for runtime diagnostics.
+    pub fn stamp_enclosing_terms(mut self) -> Self {
+        for symbol in self.symbols.values_mut() {
+            if let namer::Symbol::Term(term) = symbol {
+                let owner = term.name.clone();
+                term.body = term.body.map_annotation(&|info| {
+                    let mut info = info.clone();
+                    info.enclosing_term = Some(owner.clone());
+                    info
+                });
+            }
+        }
+        self
+    }
+}
+
 impl phase::TypeSignature<Named> {
     fn desugar_constraints(&mut self) {
         for c in mem::take(&mut self.constraints).into_iter().rev() {
@@ -1952,6 +1969,7 @@ fn elaborate_constraint_method_placeholders(
                 TypeInfo {
                     parse_info: type_info.parse_info,
                     inferred_type: ty.unwrap().underlying.clone().into(),
+                    enclosing_term: type_info.enclosing_term,
                 },
                 //TypeInfo {
                 //    parse_info: type_info.parse_info,
@@ -1979,6 +1997,7 @@ fn dictionary_arrow(annotation: &TypeInfo, dictionary_type: &Type) -> TypeInfo {
             domain: Box::new(dictionary_type.clone()),
             codomain: Box::new(annotation.inferred_type.clone()),
         },
+        enclosing_term: annotation.enclosing_term.clone(),
     }
 }
 
@@ -2397,6 +2416,9 @@ pub type Typing<A = Typed> = Result<A, Located<TypeError>>;
 pub struct TypeInfo {
     pub parse_info: ParseInfo,
     pub inferred_type: Type,
+    /// Surface declaration containing this expression. Stamped after elaboration so
+    /// diagnostics survive simplification, closure conversion, and lambda lifting.
+    pub enclosing_term: Option<QualifiedName>,
 }
 
 impl TypeInfo {
@@ -2404,6 +2426,7 @@ impl TypeInfo {
         Self {
             parse_info,
             inferred_type,
+            enclosing_term: None,
         }
     }
 
@@ -2411,6 +2434,7 @@ impl TypeInfo {
         Self {
             parse_info: self.parse_info,
             inferred_type: self.inferred_type.apply(subs),
+            enclosing_term: self.enclosing_term.clone(),
         }
     }
 }
@@ -4525,6 +4549,102 @@ impl TypingContext {
     }
 
     #[instrument]
+    fn infer_record_update(
+        &mut self,
+        pi: ParseInfo,
+        update: &ast::RecordUpdate<ParseInfo, namer::Identifier>,
+    ) -> Typing {
+        let typed_base = self.infer_expr(&update.base)?;
+        let mut substitutions = typed_base.substitutions;
+        let mut constraints = typed_base.constraints;
+        let base_type = typed_base
+            .tree
+            .type_info()
+            .inferred_type
+            .apply(&substitutions);
+        let normalized = self
+            .expand_type_constructor(pi, &base_type)?
+            .unwrap_or_else(|| TypeStructure::Monotype(base_type.clone()));
+        let TypeStructure::PolyRecord(record_type) = normalized else {
+            return Err(TypeError::Disappointed {
+                expected: base_type,
+                from: namer::Expr::RecordUpdate(pi, update.clone()),
+            }
+            .at(pi));
+        };
+
+        let mut seen: Vec<Vec<parser::Identifier>> = Vec::new();
+        let mut typed_fields = Vec::with_capacity(update.fields.len());
+        for field in &update.fields {
+            let conflicts = seen.iter().any(|previous| {
+                previous == &field.path
+                    || previous.starts_with(&field.path)
+                    || field.path.starts_with(previous)
+            });
+            if field.path.is_empty() || conflicts {
+                return Err(TypeError::BadRecordLiteral {
+                    missing: Vec::new(),
+                    superfluous: field.path.last().cloned().into_iter().collect(),
+                }
+                .at(pi));
+            }
+            seen.push(field.path.clone());
+
+            let mut current = base_type.clone();
+            let mut indices = Vec::with_capacity(field.path.len());
+            let mut arities = Vec::with_capacity(field.path.len());
+            for name in &field.path {
+                let structure = self
+                    .expand_type_constructor(pi, &current.apply(&substitutions))?
+                    .unwrap_or_else(|| TypeStructure::Monotype(current.apply(&substitutions)));
+                let TypeStructure::PolyRecord(record) = structure else {
+                    return Err(TypeError::BadRecordLiteral {
+                        missing: Vec::new(),
+                        superfluous: vec![name.clone()],
+                    }
+                    .at(pi));
+                };
+                let Some((index, scheme)) = record.field_info(name) else {
+                    return Err(TypeError::BadRecordLiteral {
+                        missing: Vec::new(),
+                        superfluous: vec![name.clone()],
+                    }
+                    .at(pi));
+                };
+                indices.push(index);
+                arities.push(record.len());
+                current = scheme.instantiate().underlying;
+            }
+
+            let typed = self.check_expr(&current.apply(&substitutions), &field.value)?;
+            substitutions = substitutions.compose(&typed.substitutions);
+            constraints = constraints
+                .apply(&substitutions)
+                .union(typed.constraints.apply(&substitutions));
+            typed_fields.push(ast::RecordUpdateField {
+                path: field.path.clone(),
+                indices,
+                arities,
+                value: typed.tree.into(),
+            });
+        }
+
+        let result_type = base_type.apply(&substitutions);
+        Ok(Typed::computed(
+            substitutions,
+            constraints,
+            Expr::RecordUpdate(
+                pi.with_inferred_type(result_type),
+                ast::RecordUpdate {
+                    base: typed_base.tree.into(),
+                    fields: typed_fields,
+                    field_order: record_type.fields().map(|(name, _)| name.clone()).collect(),
+                },
+            ),
+        ))
+    }
+
+    #[instrument]
     fn check_tuple(
         &mut self,
         pi: ParseInfo,
@@ -4643,13 +4763,21 @@ impl TypingContext {
             }
 
             UntypedExpr::Apply(pi, ast::Apply { function, argument }) => {
-                //                self.infer_apply_with_arg_check(*pi, function, argument)
-                self.infer_apply(*pi, function, argument)
+                if let UntypedExpr::Apply(_, inner) = &**function
+                    && let UntypedExpr::Variable(_, Identifier::Free(name)) = &*inner.function
+                    && matches!(name.member().as_str(), "bind" | "fmap")
+                {
+                    self.infer_reverse_binary_apply(*pi, &inner.function, &inner.argument, argument)
+                } else {
+                    self.infer_apply(*pi, function, argument)
+                }
             }
 
             UntypedExpr::Let(pi, binding) => self.infer_binding(*pi, binding),
 
             UntypedExpr::Record(pi, record) => self.infer_record(*pi, record),
+
+            UntypedExpr::RecordUpdate(pi, update) => self.infer_record_update(*pi, update),
 
             UntypedExpr::Tuple(pi, tuple) => self.infer_tuple(*pi, tuple),
 
@@ -4711,6 +4839,7 @@ impl TypingContext {
                     type_signature: ascription.type_signature.map_annotation(&|pi| TypeInfo {
                         parse_info: *pi,
                         inferred_type: ascribed_type.underlying.clone(),
+                        enclosing_term: None,
                     }),
                 },
             ),
@@ -5718,6 +5847,88 @@ impl TypingContext {
         }
     }
 
+    /// Infer a curried binary combinator whose second argument determines the type
+    /// expected by its first. Desugared `let*`/`let+` have precisely this shape:
+    /// `bind (lambda x. body) action`. Inferring the lambda first leaves `x` as an
+    /// unconstrained metavariable, which makes an otherwise concrete `x.Field`
+    /// spuriously ambiguous. Infer `action`, unify it with argument two, then check
+    /// the continuation against the now-refined argument-one type.
+    fn infer_reverse_binary_apply(
+        &mut self,
+        pi: ParseInfo,
+        function: &phase::Expr<Named>,
+        first: &phase::Expr<Named>,
+        second: &phase::Expr<Named>,
+    ) -> Typing {
+        let function = self.infer_expr(function)?;
+        let mut substitutions = function.substitutions.clone();
+        let mut ctx = self.apply(&substitutions);
+        let second = ctx.infer_expr(second)?;
+        substitutions = substitutions.compose(&second.substitutions);
+
+        let function_type = function
+            .tree
+            .type_info()
+            .inferred_type
+            .apply(&substitutions);
+        let Type::Arrow {
+            domain: first_domain,
+            codomain,
+        } = function_type
+        else {
+            unreachable!("bind/fmap are functions")
+        };
+        let Type::Arrow {
+            domain: second_domain,
+            codomain: result,
+        } = *codomain
+        else {
+            unreachable!("bind/fmap are curried binary functions")
+        };
+
+        let second_unification = second_domain
+            .apply(&substitutions)
+            .unified_with(
+                &second.tree.type_info().inferred_type.apply(&substitutions),
+                &ctx.types,
+            )
+            .map_err(|e| e.at(pi))?;
+        substitutions = substitutions.compose(&second_unification);
+        ctx = self.apply(&substitutions);
+
+        let first = ctx.check_expr(&first_domain.apply(&substitutions), first)?;
+        substitutions = substitutions.compose(&first.substitutions);
+        let constraints = function
+            .constraints
+            .apply(&substitutions)
+            .union(first.constraints.apply(&substitutions))
+            .union(second.constraints.apply(&substitutions));
+
+        let inner_type = Type::Arrow {
+            domain: second_domain,
+            codomain: result.clone(),
+        }
+        .apply(&substitutions);
+        let inner = Expr::Apply(
+            pi.with_inferred_type(inner_type),
+            Apply {
+                function: function.tree.apply(&substitutions).into(),
+                argument: first.tree.apply(&substitutions).into(),
+            },
+        );
+        Ok(Typed::computed(
+            substitutions.clone(),
+            constraints,
+            Expr::Apply(
+                pi.with_inferred_type(result.apply(&substitutions)),
+                Apply {
+                    function: inner.into(),
+                    argument: second.tree.apply(&substitutions).into(),
+                },
+            ),
+        ))
+    }
+
     #[instrument]
     fn infer_apply(
         &mut self,
@@ -6062,6 +6273,7 @@ impl ParseInfo {
         TypeInfo {
             parse_info: self,
             inferred_type,
+            enclosing_term: None,
         }
     }
 }
@@ -6292,6 +6504,7 @@ impl fmt::Display for TypeInfo {
         let Self {
             parse_info,
             inferred_type,
+            ..
         } = self;
         write!(f, "{{{parse_info}:{inferred_type}}}")
     }

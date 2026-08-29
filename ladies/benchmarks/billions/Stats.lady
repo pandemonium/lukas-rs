@@ -1,3 +1,5 @@
+use Stdlib.Data.Array.
+
 Cheeky_Map ::= ∀α β.
   { Buckets :: Mutable_Array (Entry α β)
   }
@@ -22,7 +24,7 @@ positive_mod :: Int -> Int -> Int := λn modulus.
 module Cheeky_Map:
   make_default :: ∀α β. Default α + Default β |- Int -> IO (Cheeky_Map α β) :=
     λcapacity.
-      let bucket_store = Mutable_Array.generate capacity (λ_. default_value) in
+      let* bucket_store = Mutable_Array.generate capacity (λ_. default_value) in
       pure { Buckets := bucket_store }
 
   modify :: ∀α β. Eq α + Hashable α + Semigroup β |- α -> β -> Cheeky_Map α β -> IO Unit :=

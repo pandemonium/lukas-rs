@@ -1411,9 +1411,44 @@ impl<'a> Parser<'a> {
         self.strip_layout()?;
         let position = *self.peek()?.location();
 
+        // `{ base: Field := value }` is a record update.  A construction still
+        // starts with the field label immediately followed by `:=`.
+        let is_construction = matches!(
+            self.remains(),
+            [
+                Token {
+                    kind: TokenKind::Identifier(_),
+                    ..
+                },
+                Token {
+                    kind: TokenKind::Assign,
+                    ..
+                },
+                ..
+            ]
+        );
+        let base = if is_construction || self.peek()?.kind == TokenKind::RightBrace {
+            None
+        } else {
+            let base = self.parse_expression(0)?;
+            self.expect(TokenKind::Colon)?;
+            self.strip_layout()?;
+            Some(base)
+        };
+
         let mut fields = vec![];
         while self.peek()?.kind != TokenKind::RightBrace {
-            fields.push(self.parse_field_init()?);
+            if base.is_some() {
+                fields.push(self.parse_record_update_field()?);
+            } else {
+                let (name, value) = self.parse_field_init()?;
+                fields.push(ast::RecordUpdateField {
+                    path: vec![name],
+                    indices: Vec::new(),
+                    arities: Vec::new(),
+                    value,
+                });
+            }
             self.strip_layout()?;
             if self.peek()?.kind == TokenKind::Semicolon {
                 self.consume()?;
@@ -1423,10 +1458,50 @@ impl<'a> Parser<'a> {
 
         self.expect(TokenKind::RightBrace)?;
 
-        Ok(Expr::Record(
-            ParseInfo::from_position(position),
-            Record::from_fields(&fields),
-        ))
+        let info = ParseInfo::from_position(position);
+        Ok(match base {
+            Some(base) => Expr::RecordUpdate(
+                info,
+                ast::RecordUpdate {
+                    base: base.into(),
+                    fields,
+                    field_order: Vec::new(),
+                },
+            ),
+            None => Expr::Record(
+                info,
+                Record::from_fields(
+                    &fields
+                        .into_iter()
+                        .map(|field| {
+                            (
+                                field.path.into_iter().next().expect("construction field"),
+                                field.value,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+        })
+    }
+
+    fn parse_record_update_field(
+        &mut self,
+    ) -> Result<ast::RecordUpdateField<ParseInfo, IdentifierPattern<ParseInfo>>> {
+        let (_, first) = self.identifier()?;
+        let mut path = vec![Identifier::from_str(&first)];
+        while self.peek()?.kind == TokenKind::Period {
+            self.consume()?;
+            let (_, field) = self.identifier()?;
+            path.push(Identifier::from_str(&field));
+        }
+        self.expect(TokenKind::Assign)?;
+        Ok(ast::RecordUpdateField {
+            path,
+            indices: Vec::new(),
+            arities: Vec::new(),
+            value: self.parse_expression(0)?.into(),
+        })
     }
 
     fn parse_array(&mut self) -> Result<Expr> {
@@ -2808,6 +2883,27 @@ mod tests {
             declarations[0].to_string(),
             "type Wrapper ::= Make_Wrapper(Namespace.Member)"
         );
+    }
+
+    #[test]
+    fn parses_record_update_with_semicolon_or_layout_fields() {
+        let source = r#"
+f := λr. { r: x := 10; y := 20 }
+g := λr.
+  { r:
+      x := 30
+      nested.y := 40
+  }
+"#;
+        let characters = source.chars().collect::<Vec<_>>();
+        let mut lexer = LexicalAnalyzer::default();
+        let tokens = lexer.tokenize(&characters);
+        let mut parser = Parser::from_tokens(tokens);
+
+        let declarations = parser.parse_declaration_list().unwrap();
+        assert_eq!(declarations.len(), 2);
+        assert!(declarations[0].to_string().contains(": x :="));
+        assert!(declarations[1].to_string().contains("nested.y := 40"));
     }
 }
 

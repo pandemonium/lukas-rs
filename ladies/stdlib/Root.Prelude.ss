@@ -1,0 +1,15 @@
+;; Foreign implementation for top-level declarations in Prelude.lady.
+(define Root-Prelude-raw_omg_wtf_bbq
+  (lambda (function file row column message)
+    (display file (current-error-port))
+    (display ":" (current-error-port))
+    (display row (current-error-port))
+    (display ":" (current-error-port))
+    (display column (current-error-port))
+    (display " in " (current-error-port))
+    (display function (current-error-port))
+    (display ":" (current-error-port))
+    (newline (current-error-port))
+    (display message (current-error-port))
+    (newline (current-error-port))
+    (exit 1)))

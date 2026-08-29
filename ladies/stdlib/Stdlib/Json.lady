@@ -35,7 +35,7 @@ module Syntax_Tree:
     from_reversed :: Int -> List (Text, Node) -> Object_Fields := λsize fields.
       let enumerator =
         Indexed_Enumerator.reversed (List.indexed_sized size fields)
-      in Make_Object_Fields (Mutable_Array.from_enumerator enumerator)
+      in Make_Object_Fields (unsafe_run_IO (Mutable_Array.from_enumerator enumerator))
 
     empty :: Object_Fields := from_reversed 0 List.empty
 
@@ -140,7 +140,6 @@ module Decode:
       Syntax_Tree.Branch (Syntax_Tree.Object fields) ->
         decode (Make_Field_Map fields)
     | otherwise -> Fault Expected_Object
-
 
 decode_text :: ∀α. Decodes α |- Text -> Result Fault α := λjson.
   let* tree = parse json in

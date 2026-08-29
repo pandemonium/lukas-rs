@@ -1,0 +1,288 @@
+use Stdlib.Data.Array.
+use Stdlib.Data.Cell.
+
+opaque Vector ::= ∀α.
+  Make_Vector_State (Mutable_Cell (Vector_State α))
+
+opaque Vector_State ::= ∀α.
+  { Storage :: Mutable_Array (Perhaps α)
+    Length  :: Int
+  }
+
+module Vector_State:
+  make :: ∀α. Int -> IO (Vector_State α) := λcapacity.
+    let* storage = Mutable_Array.generate capacity (λ_. Nope) in
+    pure { Storage := storage; Length := 0 }
+
+  push_unchecked :: ∀α. α -> Vector_State α -> IO Unit := λa state.
+    set_unchecked state.Length a state
+
+  get_unchecked :: ∀α. Int -> Vector_State α -> IO (Perhaps α) := λindex state.
+    Mutable_Array.get_unchecked state.Storage index
+
+  set_unchecked :: ∀α. Int -> α -> Vector_State α -> IO Unit := λindex a state.
+    Mutable_Array.set_unchecked state.Storage index (This a)
+
+  unset_last_unchecked :: ∀α. Vector_State α -> IO Unit := λstate.
+    Mutable_Array.set_unchecked state.Storage (state.Length - 1) Nope
+
+  increment_length :: ∀α. Vector_State α -> Vector_State α :=
+    λstate. { state: Length := 1 + state.Length }
+
+  decrement_length :: ∀α. Vector_State α -> Vector_State α :=
+    λstate. { state: Length := state.Length - 1 }
+
+  capacity :: ∀α. Vector_State α -> Int :=
+    λstate. Mutable_Array.length state.Storage
+
+  extend_from :: ∀α. Vector_State α -> IO (Vector_State α) := λsource.
+    let source_length = Mutable_Array.length source.Storage in
+    let new_length = if source_length = 0 then 1 else 2 * source_length in
+    let* new_storage = Mutable_Array.grow_with Nope new_length source.Storage in
+    pure { Storage := new_storage; Length := source.Length }
+
+  modify_unchecked :: ∀α. Int -> (α -> α) -> Vector_State α -> IO Unit := λindex f state.
+    Mutable_Array.modify_at state.Storage index (fmap f)
+
+  clear_range :: ∀α. Int -> Int -> Vector_State α -> IO Unit := λstart end state.
+    Mutable_Array.fill_range state.Storage start (end - start) Nope
+
+  copy_unchecked :: ∀α. Vector_State α -> Int -> Vector_State α -> Int -> Int -> IO Unit :=
+    λsource source_index target target_index count.
+      Mutable_Array.copy_unchecked source.Storage source_index target.Storage target_index count
+
+
+module Vector:
+  get_vector_state :: ∀α. Vector α -> IO (Vector_State α) :=
+    λ(Make_Vector_State cell). Mutable_Cell.get cell
+
+  put_vector_state :: ∀α. Vector_State α -> Vector α -> IO Unit :=
+    λnew_state (Make_Vector_State cell). Mutable_Cell.set new_state cell
+
+  modify_vector_state :: ∀α. (Vector_State α -> Vector_State α) -> Vector α -> IO Unit :=
+    λf (Make_Vector_State cell). Mutable_Cell.modify f cell
+
+  empty :: ∀α. IO (Vector α) := with_capacity 0
+
+  is_empty :: ∀α. Vector α -> IO Bool := λv.
+    fmap (λlength. length = 0) (length v)
+
+  with_capacity :: ∀α. Int -> IO (Vector α) := λcapacity.
+    let* state = Vector_State.make capacity in
+    let* cell = Mutable_Cell.make state in
+    pure (Make_Vector_State cell)
+
+  capacity :: ∀α. Vector α -> IO Int := λvec.
+    let* state = get_vector_state vec in
+    pure (Vector_State.capacity state)
+
+  length :: ∀α. Vector α -> IO Int := λvec.
+    let* state = get_vector_state vec in
+    pure state.Length
+
+  push :: ∀α. α -> Vector α -> IO Unit := λa (Make_Vector_State cell).
+    let* state = Mutable_Cell.get cell in
+    let capacity = Vector_State.capacity state in
+
+    if state.Length < capacity then
+      let* _ = Vector_State.push_unchecked a state in
+      Mutable_Cell.modify Vector_State.increment_length cell
+    else
+      let* new_state = Vector_State.extend_from state in
+      let* _ = Mutable_Cell.set new_state cell in
+      let* _ = Vector_State.push_unchecked a new_state in
+      Mutable_Cell.modify Vector_State.increment_length cell
+
+  (* This should be an unchecked operation. *)
+  pop :: ∀α. Vector α -> IO (Perhaps α) := λ(Make_Vector_State cell).
+    let* state = Mutable_Cell.get cell in
+    if state.Length = 0 then pure Nope
+    else
+      let* element = Vector_State.get_unchecked (state.Length - 1) state in
+      let* _ = Vector_State.unset_last_unchecked state in
+      let* _ = Mutable_Cell.modify Vector_State.decrement_length cell in
+      pure element
+
+  get :: ∀α. Int -> Vector α -> IO (Perhaps α) := λindex vec.
+    let* length = length vec in
+    if index >= 0 and index < length then
+      let* state = get_vector_state vec in
+      Vector_State.get_unchecked index state
+    else pure Nope
+
+  set :: ∀α. Int -> α -> Vector α -> IO (Perhaps Unit) := λindex a vec.
+    let* state = get_vector_state vec in
+    if index >= 0 and index < state.Length then
+      let* _ = Vector_State.set_unchecked index a state in
+      pure (This ())
+    else pure Nope
+
+  to_list :: ∀α. Vector α -> IO (List α) := λvec.
+    let* state = get_vector_state vec in
+    let loop = λindex acc.
+      if index >= 0 then
+        let element = Mutable_Array.unsafe_get_unchecked state.Storage index in
+        deconstruct element into
+          This element -> loop (index - 1) (Cons element acc)
+        | Nope -> omg_wtf_bbq "Index `index` is out of bounds in Mutable_Array of length `state.Length`"
+      else acc
+    in IO.suspend (λ_. loop (state.Length - 1) List.empty)
+
+  modify_at :: ∀α. Int -> (α -> α) -> Vector α -> IO (Perhaps Unit) := λindex f vec.
+    let* state = get_vector_state vec in
+    if index >= 0 and index < state.Length then
+      let* _ = Vector_State.modify_unchecked index f state in
+      pure (This ())
+    else pure Nope
+
+  reserve :: ∀α. Int -> Vector α -> IO Unit := λadditional vec.
+    if additional >= 0 then
+      let* state = get_vector_state vec in
+      let required = state.Length + additional in
+
+      if required <= Vector_State.capacity state then
+        pure ()
+      else
+        let capacity = Vector_State.capacity state in
+
+        let starting_capacity =
+          if capacity = 0 then 1 else capacity
+        in
+
+        let next_capacity = λcapacity required.
+          if capacity >= required then capacity
+          else next_capacity (2 * capacity) required
+        in
+
+        let new_capacity = next_capacity starting_capacity required in
+        let* new_storage = Mutable_Array.grow_with Nope new_capacity state.Storage in
+        put_vector_state { Storage := new_storage; Length := state.Length } vec
+    else
+      omg_wtf_bbq "Vector.reserve: negative additional capacity"
+
+  reserve_exact :: ∀α. Int -> Vector α -> IO Unit := λadditional vec.
+    if additional >= 0 then
+      let* state = get_vector_state vec in
+      let required = state.Length + additional in
+
+      if required <= Vector_State.capacity state then
+        pure ()
+      else
+        let* new_storage = Mutable_Array.grow_with Nope required state.Storage in
+        put_vector_state { Storage := new_storage; Length := state.Length } vec
+    else
+      omg_wtf_bbq "Vector.reserve_exact: negative additional capacity"
+
+  clear :: ∀α. Vector α -> IO Unit :=
+    truncate 0
+
+  truncate :: ∀α. Int -> Vector α -> IO Unit := λtruncate_by vec.
+    let* state = get_vector_state vec in
+    if truncate_by >= 0 then
+      if truncate_by < state.Length then
+        let* _ = Vector_State.clear_range truncate_by (state.Length - 1) state in
+        put_vector_state { state: Length := truncate_by } vec
+      else
+        pure ()
+    else
+      omg_wtf_bbq "bad truncate parameter `truncate_by`"
+
+  extend :: ∀α. List α -> Vector α -> IO Unit := λextension vec.
+    let loop = λxs.
+      deconstruct xs into
+        Nil -> pure ()
+      | Cons x tail ->
+          let* _ = push x vec in
+          loop tail
+    in loop extension
+
+  append :: ∀α. Vector α -> Vector α -> IO Unit := λappendage vec.
+    let* appendage_length = length appendage in
+    let* _ = reserve appendage_length vec in
+    let* source = get_vector_state appendage in
+    let* target = get_vector_state vec in
+    let* _ = Vector_State.copy_unchecked source 0 target target.Length appendage_length in
+    put_vector_state { target: Length := appendage_length + target.Length } vec
+
+  from_list :: ∀α. List α -> IO (Vector α) := λlist.
+    let* vec = empty in
+    let* _ = extend list vec in
+    pure vec
+
+  get_unchecked :: ∀α. Int -> Vector α -> IO α := λindex vec.
+    let* state = get_vector_state vec in
+    let* element = Vector_State.get_unchecked index state in
+    deconstruct element into
+      This element -> pure element
+    | Nope -> omg_wtf_bbq "index `index` is out of bounds in vector of length `state.Length`"
+
+  set_unchecked :: ∀α. Int -> α -> Vector α -> IO Unit := λindex a vec.
+    let* state = get_vector_state vec in
+    Vector_State.set_unchecked index a state
+
+  first :: ∀α. Vector α -> IO (Perhaps α) :=
+    get 0
+
+  last :: ∀α. Vector α -> IO (Perhaps α) := λvec.
+    let* length = length vec in
+    get (length - 1) vec
+
+  swap :: ∀α. Int -> Int -> Vector α -> IO (Perhaps Unit) := λsource target vec.
+    let* source_element = get source vec in
+    let* target_element = get target vec in
+    let the_swap = λ(p, q).
+      let* _ = set_unchecked target p vec in
+      set_unchecked source q vec
+    in
+    traverse the_swap (Perhaps.zip source_element target_element)
+
+  swap_remove :: ∀α. Int -> Vector α -> IO (Perhaps α) := λindex vec.
+    let* length = length vec in
+    let* swapped = swap index (length - 1) vec in
+
+    if Perhaps.is_this swapped then
+      pop vec
+    else
+      pure Nope
+
+  insert :: ∀α. Int -> α -> Vector α -> IO (Perhaps Unit) :=
+    λ_ _ _. omg_wtf_bbq "Vector.insert is not implemented"
+
+  remove :: ∀α. Int -> Vector α -> IO (Perhaps α) :=
+    λ_ _. omg_wtf_bbq "Vector.remove is not implemented"
+
+  retain :: ∀α. (α -> Bool) -> Vector α -> IO Unit :=
+    λ_ _. omg_wtf_bbq "Vector.retain is not implemented"
+
+  reverse :: ∀α. Vector α -> IO Unit :=
+    λ_. omg_wtf_bbq "Vector.reverse is not implemented"
+
+  shrink_to_fit :: ∀α. Vector α -> IO Unit :=
+    λ_. omg_wtf_bbq "Vector.shrink_to_fit is not implemented"
+
+  contains :: ∀α. Eq α |- α -> Vector α -> IO Bool :=
+    λ_ _. omg_wtf_bbq "Vector.contains is not implemented"
+
+  find :: ∀α. (α -> Bool) -> Vector α -> IO (Perhaps α) :=
+    λ_ _. omg_wtf_bbq "Vector.find is not implemented"
+
+  position :: ∀α. (α -> Bool) -> Vector α -> IO (Perhaps Int) :=
+    λ_ _. omg_wtf_bbq "Vector.position is not implemented"
+
+  map :: ∀α β. (α -> β) -> Vector α -> IO (Vector β) :=
+    λ_ _. omg_wtf_bbq "Vector.map is not implemented"
+
+  filter :: ∀α. (α -> Bool) -> Vector α -> IO (Vector α) :=
+    λ_ _. omg_wtf_bbq "Vector.filter is not implemented"
+
+  sort :: ∀α. Ord α |- Vector α -> IO Unit :=
+    λ_. omg_wtf_bbq "Vector.sort is not implemented"
+
+  deduplicate :: ∀α. Eq α |- Vector α -> IO Unit :=
+    λ_. omg_wtf_bbq "Vector.deduplicate is not implemented"
+
+  for_each :: ∀α. (α -> IO Unit) -> Vector α -> IO Unit :=
+    λ_ _. omg_wtf_bbq "Vector.for_each is not implemented"
+
+  fold_io :: ∀α β. (β -> α -> IO β) -> β -> Vector α -> IO β :=
+    λ_ _ _. omg_wtf_bbq "Vector.fold_io is not implemented"

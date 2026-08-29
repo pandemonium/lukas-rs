@@ -202,6 +202,23 @@ impl phase::Expr<Parsed> {
                         .collect(),
                 },
             ),
+            ast::Expr::RecordUpdate(a, the) => Expr::RecordUpdate(
+                a,
+                ast::RecordUpdate {
+                    base: Self::recurse(the.base),
+                    fields: the
+                        .fields
+                        .into_iter()
+                        .map(|field| ast::RecordUpdateField {
+                            path: field.path,
+                            indices: field.indices,
+                            arities: field.arities,
+                            value: Self::recurse(field.value),
+                        })
+                        .collect(),
+                    field_order: the.field_order,
+                },
+            ),
             ast::Expr::Inject(a, the) => Expr::Inject(
                 a,
                 Injection {

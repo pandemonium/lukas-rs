@@ -99,7 +99,7 @@ run_case :: ∀α β. Eq β |- Text -> Int -> (Int -> α) -> (Int -> β) -> Hash
 
 (* Re-inserting a key returns the OLD value and updates the map to the NEW one. *)
 overwrite_case :: IO Unit :=
-  let table = Hash_Table.make 8 (Simple_Hasher.make 6) in
+  let* table = Hash_Table.make 8 (Simple_Hasher.make 6) in
   let* _   = Hash_Table.insert 42 100 table in
   let* old = Hash_Table.insert 42 200 table in
   let* now = Hash_Table.lookup 42 table in
@@ -127,19 +127,19 @@ mutable_cell_case :: IO Unit :=
 (* Every table starts at capacity 8. These sizes are large enough to make the generic *)
 (* layout-specialized path measurable while remaining suitable for the full panel.    *)
 main :: IO Unit :=
-  let t1 = Hash_Table.make 8 (Simple_Hasher.make 1) in
+  let* t1 = Hash_Table.make 8 (Simple_Hasher.make 1) in
   let* _ = run_case "Int   / default" 50000 (λi. i)                            (λi. i * 7 + 1) t1 in
 
-  let t2 = Hash_Table.make 8 (Simple_Hasher.make 2) in
+  let* t2 = Hash_Table.make 8 (Simple_Hasher.make 2) in
   let* _ = run_case "Text  / default" 50000 (λi. "key-`i`")                    (λi. i * 3)     t2 in
 
-  let t3 = Hash_Table.make 8 (Simple_Hasher.make 3) in
+  let* t3 = Hash_Table.make 8 (Simple_Hasher.make 3) in
   let* _ = run_case "Coord / default" 40000 (λi. { X := i % 200; Y := i / 200 }) (λi. i)         t3 in
 
-  let t4 = Hash_Table.make 8 (My_Hasher.make 4) in
+  let* t4 = Hash_Table.make 8 (My_Hasher.make 4) in
   let* _ = run_case "Int   / custom " 50000 (λi. i)                            (λi. i * 7 + 1) t4 in
 
-  let t5 = Hash_Table.make 8 (My_Hasher.make 5) in
+  let* t5 = Hash_Table.make 8 (My_Hasher.make 5) in
   let* _ = run_case "Coord / custom " 40000 (λi. { X := i % 200; Y := i / 200 }) (λi. i)         t5 in
 
   let* _ = overwrite_case in

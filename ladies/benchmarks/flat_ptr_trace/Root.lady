@@ -22,7 +22,7 @@ module Churn:
     else 0
 
 start := λ_.
-  let table = Mutable_Array.generate 1000 (λi. { n := i; label := "row-`i`" }) in
+  let table = unsafe_run_IO (Mutable_Array.generate 1000 (λi. { n := i; label := "row-`i`" })) in
   let _ = Churn.burn 2000000 in
   let got = unsafe_run_IO (Mutable_Array.get_unchecked table 777) in
   deconstruct got into

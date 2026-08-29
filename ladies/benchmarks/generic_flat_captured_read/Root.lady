@@ -47,7 +47,7 @@ repeat :: (Int -> Int -> Int) -> Captured_State Int Int -> Int -> Int -> Int :=
         ((acc + Generic.sum score state 10000) % Generic.modulus)
 
 start := λ_.
-  let entries = Mutable_Array.generate 1048576 make_entry in
+  let entries = unsafe_run_IO (Mutable_Array.generate 1048576 make_entry) in
   let state = { Captured_Entries := entries } in
   let score = λkey value. key + value in
   print_endline "generic-captured-read `repeat score state 5000 0`"

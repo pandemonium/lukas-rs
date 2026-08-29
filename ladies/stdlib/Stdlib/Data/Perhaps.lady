@@ -77,3 +77,7 @@ map :: ∀α β. (α -> β) -> Perhaps α -> Perhaps β :=
 
 bind :: ∀α β. (α -> Perhaps β) -> Perhaps α -> Perhaps β :=
   λf. perhaps Nope f
+
+zip :: ∀α β. Perhaps α -> Perhaps β -> Perhaps (α, β) :=
+  let tuple = λa b. a, b in
+  liftA2 tuple

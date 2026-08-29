@@ -26,6 +26,8 @@ its result lines.
 | 07 | `07_modules` | `module M:` grouping, qualified access `M.f` (incl. self-qualified refs) | `27` / `6` |
 | 08 | `08_interpolation` | string interpolation `` "`expr`" `` (renders each segment via a `Display` instance in scope) | `Hello Ada, you are 36, and next year you will be 37.` |
 | 09 | `09_pattern_matching` | `deconstruct` in depth: list-prefix matching (`Cons a (Cons b _)`), deep constructor nesting (`Branch (Leaf _) (Leaf _)`), tree recursion, record patterns with literal fields, **bare nullary constructors in record fields** (first/middle/adjacent positions, and nested under `Cons`), record patterns nested under `Cons`, multiple scrutinees, wildcards | ⚠ **`COMPILE-ERR`** (see coverage-checker note) |
+| 14 | `14_record_updates` | pure record updates (`{ base: Field := value }`), compact/layout forms, multiple fields, old-value swap semantics, computed bases, nested updates, base immutability, polymorphic records | eight update-result lines |
+| 15 | `15_mutable_record_updates` | ordinary `Mutable_Array.modify_at` fused through a pure three-level dotted record update into a same-place leaf load/store | updated sensor reading with unchanged neighbouring fields |
 
 > **No workarounds.** These programs are written in their natural form, *not* bent
 > around compiler bugs. As a result `09` currently fails to compile — it exercises a

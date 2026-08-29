@@ -36,6 +36,23 @@ where
                 Expr::Apply(a, node) => Expr::Apply(f(a), node.map_annotation(&f)),
                 Expr::Let(a, node) => Expr::Let(f(a), node.map_annotation(&f)),
                 Expr::Record(a, node) => Expr::Record(f(a), node.map_annotation(&f)),
+                Expr::RecordUpdate(a, node) => Expr::RecordUpdate(
+                    f(a),
+                    RecordUpdate {
+                        base: node.base.map_annotation(&f),
+                        fields: node
+                            .fields
+                            .iter()
+                            .map(|field| RecordUpdateField {
+                                path: field.path.clone(),
+                                indices: field.indices.clone(),
+                                arities: field.arities.clone(),
+                                value: field.value.map_annotation(&f),
+                            })
+                            .collect(),
+                        field_order: node.field_order.clone(),
+                    },
+                ),
                 Expr::Tuple(a, node) => Expr::Tuple(f(a), node.map_annotation(&f)),
                 Expr::Inject(a, node) => Expr::Inject(f(a), node.map_annotation(&f)),
                 Expr::Array(a, node) => Expr::Array(f(a), node.map_annotation(&f)),

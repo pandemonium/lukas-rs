@@ -77,7 +77,10 @@ pub fn snippet(id: FileId, row: u32, column: u32) -> Option<String> {
         return None;
     }
     SOURCES.with_borrow(|sources| {
-        let line = sources.get((n - 1) as usize)?.lines.get((row as usize).checked_sub(1)?)?;
+        let line = sources
+            .get((n - 1) as usize)?
+            .lines
+            .get((row as usize).checked_sub(1)?)?;
         // A fixed-width gutter (`  <row> | `) keeps the caret aligned with the quoted
         // line. The caret sits `column - 1` characters into the line's text.
         let gutter = format!("{row:>6} | ");

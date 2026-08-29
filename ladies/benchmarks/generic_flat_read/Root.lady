@@ -16,7 +16,7 @@ module Generic:
   sum :: ∀α. Memory_Layout (Box α) |- (Int -> Box α) -> Mutable_Array (Box α) -> Int -> Int -> Int :=
     λmake table n acc.
       if n <= 0 then
-        let _ = Mutable_Array.generate 0 make in acc
+        let _ = unsafe_run_IO (Mutable_Array.generate 0 make) in acc
       else
         let index = (n * 189812531) % 1048576 in
         let element = unsafe_run_IO (Mutable_Array.get_unchecked table index) in
@@ -25,5 +25,5 @@ module Generic:
 make_box :: Int -> Box Int := λi. { payload := i; count := i + 1 }
 
 start := λ_.
-  let table = Mutable_Array.generate 1048576 make_box in
+  let table = unsafe_run_IO (Mutable_Array.generate 1048576 make_box) in
   print_endline "generic-read `Generic.sum make_box table 50000000 0`"

@@ -31,7 +31,7 @@ count_ghosts :: Int -> Int -> Int -> Hash_Table Int Int -> IO Int := λi n ghost
 
 main :: IO Unit :=
   let n = 1000000 in
-  let table = Hash_Table.make 8 (Simple_Hasher.make 1) in
+  let* table = Hash_Table.make 8 (Simple_Hasher.make 1) in
   let* _ = insert_n 0 n table in
   let* checksum = sum_present 0 n 0 table in
   let* ghosts = count_ghosts 0 n 0 table in

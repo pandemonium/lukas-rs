@@ -21,5 +21,5 @@ module Bench:
       loop table (n - 1) ((acc + x + y) % modulus)
 
 start := λ_.
-  let table = Mutable_Array.generate Bench.cap (λi. { x := i; y := i + 1 }) in
+  let table = unsafe_run_IO (Mutable_Array.generate Bench.cap (λi. { x := i; y := i + 1 })) in
   print_endline "read-sum `Bench.loop table 50000000 0`"

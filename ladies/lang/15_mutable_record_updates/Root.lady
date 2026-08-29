@@ -1,0 +1,39 @@
+use Stdlib.
+use Stdlib.Data.Array.
+
+Reading ::= { Value :: Int; Confidence :: Int }
+Sensor ::= { Name :: Text; Reading :: Reading }
+Station ::= { Sensor :: Sensor; Sequence :: Int }
+
+increment_reading :: Station -> Station := λstation.
+  { station:
+      Sensor.Name := "station-`station.Sequence`"
+      Sensor.Reading.Value := station.Sensor.Reading.Value + 32
+      Sensor.Reading.Confidence := station.Sensor.Reading.Value
+  }
+
+change_reading :: Mutable_Array Station -> Int -> IO Unit := λstations index.
+  Mutable_Array.modify_at stations index increment_reading
+
+churn :: Int -> Text -> Text := λn latest.
+  if n < 1 then latest else churn (n - 1) "garbage-`n`"
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  let stations =
+    unsafe_run_IO (Mutable_Array.generate 2 (λ_.
+      { Sensor := { Name := "north"
+            Reading := { Value := 10; Confidence := 99 }
+          }
+        Sequence := 7
+      }))
+  in
+  (* Keep the array live across enough allocation to tenure it. With a tiny test *)
+  (* nursery, the fresh Text written below then exercises the remembered set.    *)
+  let before = churn 5000 "" in
+  let target = Text.length before % 2 in
+  let _ = unsafe_run_IO (change_reading stations target) in
+  let after = churn 5000 "" in
+  let observed = if Text.length after > 0 then target else 0 in
+  let station = unsafe_run_IO (Mutable_Array.get_unchecked stations observed) in
+  print_endline "`station.Sensor.Name`: value=`station.Sensor.Reading.Value`, confidence=`station.Sensor.Reading.Confidence`, sequence=`station.Sequence`"

@@ -26,8 +26,8 @@ use std::{
 use crate::{
     ast::{
         Apply, Array, Binding, Deconstruct, Expr, IfThenElse, Injection, Interpolate, Lambda,
-        Literal, ProductElement, Projection, Record, Segment, SelfReferential, Sequence, Tree,
-        Tuple, TypeAscription,
+        Literal, ProductElement, Projection, Record, RecordUpdate, RecordUpdateField, Segment,
+        SelfReferential, Sequence, Tree, Tuple, TypeAscription,
         namer::{Identifier, QualifiedName, Symbol, TermSymbol},
         pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern},
     },
@@ -261,6 +261,11 @@ fn build_inlinables(
 
     let budget = inline_budget();
     let inlinable = |name: &QualifiedName, body: &phase::Expr<Types>| {
+        // This public wrapper is a compiler-recognised diagnostic boundary. Keeping
+        // the call intact preserves its caller's source annotation for codegen.
+        if name.to_string().ends_with("Prelude.omg_wtf_bbq") {
+            return false;
+        }
         // A nullary constructor's term is `Inject(C, [])` -- a shared, immutable value.
         // `free_variables` counts the constructor name (its tag), so the term looks
         // self-referential and lands in `recursive`; but unfolding it yields another
@@ -632,6 +637,11 @@ pub(crate) fn children<A, Id>(expr: &Expr<A, Id>) -> Vec<&Tree<A, Id>> {
         Expr::Let(_, Binding { bound, body, .. }) => vec![bound, body],
         Expr::Tuple(_, Tuple { elements }) => elements.iter().collect(),
         Expr::Record(_, Record { fields }) => fields.iter().map(|(_, v)| v).collect(),
+        Expr::RecordUpdate(_, update) => {
+            let mut children = vec![&update.base];
+            children.extend(update.fields.iter().map(|field| &field.value));
+            children
+        }
         Expr::Inject(_, Injection { arguments, .. }) => arguments.iter().collect(),
         Expr::Array(_, Array { elements }) => elements.iter().collect(),
         Expr::Project(_, Projection { base, .. }) => vec![base],
@@ -824,6 +834,23 @@ impl Inliner<'_> {
                         .iter()
                         .map(|(k, v)| (k.clone(), go(v, depth)))
                         .collect(),
+                },
+            ),
+            Expr::RecordUpdate(a, update) => Expr::RecordUpdate(
+                a.clone(),
+                RecordUpdate {
+                    base: go(&update.base, depth),
+                    fields: update
+                        .fields
+                        .iter()
+                        .map(|field| RecordUpdateField {
+                            path: field.path.clone(),
+                            indices: field.indices.clone(),
+                            arities: field.arities.clone(),
+                            value: go(&field.value, depth),
+                        })
+                        .collect(),
+                    field_order: update.field_order.clone(),
                 },
             ),
 
@@ -1320,7 +1347,9 @@ where
         Expr::Deconstruct(a, deconstruct)
             if iodeforest_on()
                 && matches!(&*deconstruct.scrutinee, Expr::Deconstruct(..))
-                && clauses_are_small(&deconstruct.match_clauses) =>
+                && (clauses_are_small(&deconstruct.match_clauses)
+                    || matches!(&*deconstruct.scrutinee, Expr::Deconstruct(_, inner)
+                        if inner.match_clauses.len() == 1)) =>
         {
             let Deconstruct {
                 scrutinee,
@@ -1520,6 +1549,23 @@ where
                     .collect(),
             },
         ),
+        Expr::RecordUpdate(a, update) => Expr::RecordUpdate(
+            a.clone(),
+            RecordUpdate {
+                base: go(&update.base, depth),
+                fields: update
+                    .fields
+                    .iter()
+                    .map(|field| RecordUpdateField {
+                        path: field.path.clone(),
+                        indices: field.indices.clone(),
+                        arities: field.arities.clone(),
+                        value: go(&field.value, depth),
+                    })
+                    .collect(),
+                field_order: update.field_order.clone(),
+            },
+        ),
 
         Expr::Inject(
             a,
@@ -1637,10 +1683,27 @@ where
 fn forwardable_effectfully<A>(body: &Expr<A, Identifier>, level: usize) -> bool {
     match body {
         Expr::Deconstruct(_, d) => {
-            eliminated_head(&d.scrutinee, level) && count_level_uses(body, level) == 1
+            elimination_spine_head_is(&d.scrutinee, level) && count_level_uses(body, level) == 1
         }
         Expr::Project(_, p) => {
-            eliminated_head(&p.base, level) && count_level_uses(body, level) == 1
+            elimination_spine_head_is(&p.base, level) && count_level_uses(body, level) == 1
+        }
+        _ => false,
+    }
+}
+
+/// Whether the value eliminated by `tree` is specifically `level`.  This is stricter
+/// than [`eliminated_head`]: that helper answers whether all occurrences are in safe
+/// elimination positions and therefore quite correctly accepts an unrelated variable.
+/// Effectful forwarding, however, must prove that the target binder is the value evaluated
+/// *first*; accepting any variable here can move the target's effect into a later match arm.
+fn elimination_spine_head_is<A>(tree: &Tree<A, Identifier>, level: usize) -> bool {
+    match &**tree {
+        Expr::Variable(_, Identifier::Bound(k)) => *k == level,
+        Expr::Apply(_, Apply { function, .. }) => elimination_spine_head_is(function, level),
+        Expr::Project(_, Projection { base, .. }) => elimination_spine_head_is(base, level),
+        Expr::Deconstruct(_, Deconstruct { scrutinee, .. }) => {
+            elimination_spine_head_is(scrutinee, level)
         }
         _ => false,
     }
@@ -2145,6 +2208,23 @@ where
                 fields: fields.iter().map(|(k, v)| (k.clone(), go(v))).collect(),
             },
         ),
+        Expr::RecordUpdate(a, update) => Expr::RecordUpdate(
+            a.clone(),
+            RecordUpdate {
+                base: go(&update.base),
+                fields: update
+                    .fields
+                    .iter()
+                    .map(|field| RecordUpdateField {
+                        path: field.path.clone(),
+                        indices: field.indices.clone(),
+                        arities: field.arities.clone(),
+                        value: go(&field.value),
+                    })
+                    .collect(),
+                field_order: update.field_order.clone(),
+            },
+        ),
 
         Expr::Inject(
             a,
@@ -2311,22 +2391,40 @@ where
 // tail -- inlining `bind` there just makes the C recursion non-tail (a stack overflow) without
 // removing an allocation. See `notes/deforest-io.md`.
 //
-// This pass performs the source-level worker/wrapper the notes describe: at every `run` marker
-// `deconstruct E into Suspend v -> (v ())` it *runs* `E` strictly, pushing the force inward and
-// synthesising a strict α-returning worker for each recursive IO function it reaches. `run` of a
-// `bind` becomes a plain `let`; `run` of a strict self-call stays a tail call; every shape it does
-// not recognise falls back to an unchanged force marker (`force`), so the transform is sound by
-// construction and the later `simplify()` finishes the straight-line cancellation (`get_unchecked`
-// / `Suspend` boxes). Gated `MARM_DEFOREST_IO` (default OFF) until the panel is byte-identical.
+// This pass performs force-local worker/wrapper conversion. At every exact `run` marker
+// `deconstruct E into Suspend v -> (v ())`, it opens the actual typed bodies of small acyclic
+// functions, pushes the force into the resulting concrete `Suspend` program, and synthesises
+// strict α-returning workers for local recursive IO functions whose uses are all run-only. It
+// assigns no semantics to `bind`, `pure`, or any other library name. Top-level definitions are
+// never rewritten: escaping actions and nullary IO CAFs retain their ordinary lazy wrappers.
+// Every shape that cannot be proved safe falls back to an unchanged force marker, and the later
+// `simplify()` finishes the adjacent beta/case cancellation.
 
-fn deforest_io_on() -> bool {
-    std::env::var_os("MARM_DEFOREST_IO").is_some()
+pub(crate) fn deforest_io_on() -> bool {
+    let Some(value) = std::env::var_os("MARM_DEFOREST_IO") else {
+        return true;
+    };
+    value.to_str().is_none_or(|value| {
+        let value = value.trim();
+        !value.is_empty()
+            && !["0", "false", "off", "no"]
+                .iter()
+                .any(|disabled| value.eq_ignore_ascii_case(disabled))
+    })
 }
+
+/// Strict workers are copied only at an actual `run` site and do not participate
+/// in the ordinary inliner's multi-round fixpoint, so they can be somewhat larger
+/// than [`INLINE_BUDGET`] without risking combinatorial expansion.  The bound still
+/// keeps this local-worker implementation from duplicating arbitrarily large API
+/// functions; 512 comfortably admits normal IO drivers containing a local loop
+/// (`billions.process_file_bytes` is 173 nodes after the first simplify pass).
+const STRICT_IO_INLINE_BUDGET: usize = 512;
 
 /// Whether a term's type is IO-returning: peel the parameter arrows, then check the result is the
 /// `IO` type -- a `Suspend`-carrying coproduct, or an application headed by the `Prelude.IO`
-/// constructor. Only such recursive terms are strictification candidates; a pure recursive helper
-/// (e.g. `List.concat`) must never be run-transformed.
+/// constructor. Only such local function values are strict-worker candidates; a pure recursive
+/// helper (e.g. `List.concat`) must never be run-transformed.
 fn returns_io(ty: &Type) -> bool {
     let mut result = ty;
     while let Type::Arrow { codomain, .. } = result {
@@ -2345,6 +2443,13 @@ fn returns_io(ty: &Type) -> bool {
         }
     }
     io_headed(result)
+}
+
+/// A strict worker can replace a locally bound function value `f : A -> IO B` while preserving
+/// an inert lambda at the binding. A nullary action `main : IO B` is a value rather than a worker
+/// candidate: stripping its wrapper would execute it merely by evaluating the binding.
+fn is_io_function(ty: &Type) -> bool {
+    matches!(ty, Type::Arrow { .. }) && returns_io(ty)
 }
 
 /// Strip the `IO` wrapper off a type: `IO α -> α`. `run E : α` where `E : IO α`, so this is the
@@ -2399,11 +2504,159 @@ fn as_run_marker<'a>(
     Some((&deconstruct.scrutinee, clause))
 }
 
-/// Whether an argument is the IO monad dictionary (`Stdlib.IO.witness_…`). Used to confirm a
-/// `Monad$bind$spec` / `Applicative$pure$spec` application is the IO instance before restructuring
-/// it -- a transformer stack (`State`/`ExceptT` over IO) has a different dict and falls back.
-fn is_io_dict(arg: &Tree<TypeInfo, Identifier>) -> bool {
-    matches!(&**arg, Expr::Variable(_, Identifier::Free(qn)) if qn.to_string().contains("IO.witness"))
+/// Recognise the more general force eliminator left after simplifying a mapped
+/// action:
+///
+///     deconstruct E into Suspend thunk -> K (thunk ())
+///
+/// where the thunk binder occurs exactly once.  `K` is ordinary pure Marmelade
+/// expression context (most commonly a data constructor such as `Return`).  We
+/// must keep the strict computation at the `thunk ()` occurrence rather than
+/// hoisting it to the scrutinee, since `K` may contain other computations whose
+/// evaluation order is observable through their eventual IO actions.
+fn as_embedded_run<'a>(
+    expr: &'a Expr<TypeInfo, Identifier>,
+) -> Option<(
+    &'a Tree<TypeInfo, Identifier>,
+    &'a MatchClause<TypeInfo, Identifier>,
+    usize,
+)> {
+    let Expr::Deconstruct(_, deconstruct) = expr else {
+        return None;
+    };
+    if deconstruct.match_clauses.len() != 1 {
+        return None;
+    }
+    let clause = &deconstruct.match_clauses[0];
+    let Pattern::Coproduct(_, cp) = &clause.pattern else {
+        return None;
+    };
+    let Identifier::Free(qn) = &cp.constructor else {
+        return None;
+    };
+    if **qn != crate::typer::suspend_constructor_name() || cp.arguments.len() != 1 {
+        return None;
+    }
+    let Pattern::Bind(_, Identifier::Bound(thunk)) = &cp.arguments[0] else {
+        return None;
+    };
+    if count_level_uses(&clause.consequent, *thunk) != 1 {
+        return None;
+    }
+
+    fn contains_force(e: &Expr<TypeInfo, Identifier>, thunk: usize) -> bool {
+        match e {
+            Expr::Apply(_, Apply { function, .. }) if matches!(&**function, Expr::Variable(_, Identifier::Bound(k)) if *k == thunk) => {
+                true
+            }
+            other => children(other)
+                .into_iter()
+                .any(|child| contains_force(child, thunk)),
+        }
+    }
+    contains_force(&clause.consequent, *thunk).then_some((&deconstruct.scrutinee, clause, *thunk))
+}
+
+/// Whether every occurrence of the local function `target` is consumed in a position
+/// where its resulting `IO` action is immediately run.  Calls in a run position are
+/// inspected by opening the actual typed function body, not by assigning special
+/// meaning to library names such as `bind`: after beta/case reduction, the concrete
+/// `Suspend` construction tells us where demand flows.  A definition-cycle or an
+/// unavailable/large body simply stops the proof and therefore keeps the local wrapper.
+fn local_io_function_is_run_only(
+    e: &Expr<TypeInfo, Identifier>,
+    target: usize,
+    running: bool,
+    depth: usize,
+    definitions: &Inlinables<TypeInfo>,
+    expanding: &mut HashSet<QualifiedName>,
+) -> bool {
+    if let Some((scrutinee, _)) = as_run_marker(e) {
+        return local_io_function_is_run_only(
+            scrutinee,
+            target,
+            true,
+            depth,
+            definitions,
+            expanding,
+        );
+    }
+
+    let check = |expr: &Expr<TypeInfo, Identifier>, running, depth, expanding: &mut HashSet<_>| {
+        local_io_function_is_run_only(expr, target, running, depth, definitions, expanding)
+    };
+    match e {
+        Expr::Variable(_, Identifier::Bound(level)) => *level != target || running,
+        Expr::If(_, ite) => {
+            check(&ite.predicate, false, depth, expanding)
+                && check(&ite.consequent, running, depth, expanding)
+                && check(&ite.alternate, running, depth, expanding)
+        }
+        Expr::Let(_, binding) => {
+            check(&binding.bound, false, depth, expanding)
+                && check(&binding.body, running, depth + 1, expanding)
+        }
+        Expr::Deconstruct(_, deconstruct) => {
+            check(&deconstruct.scrutinee, false, depth, expanding)
+                && deconstruct.match_clauses.iter().all(|clause| {
+                    check(
+                        &clause.consequent,
+                        running,
+                        depth + pattern_binder_count(&clause.pattern),
+                        expanding,
+                    )
+                })
+        }
+        Expr::Apply(..) if running => {
+            let tree = Rc::new(e.clone());
+            let (head, args) = peel_apply_spine(&tree);
+            let ordinary_args = |args: &[Tree<TypeInfo, Identifier>],
+                                 expanding: &mut HashSet<_>| {
+                args.iter().all(|arg| check(arg, false, depth, expanding))
+            };
+            match head {
+                Expr::Variable(_, Identifier::Bound(level)) if *level == target => {
+                    ordinary_args(&args, expanding)
+                }
+                Expr::Variable(_, Identifier::Free(name))
+                    if definitions.contains_key(&**name) && expanding.insert((**name).clone()) =>
+                {
+                    let body = &definitions[&**name];
+                    let instantiated = inline_type_substitutions(
+                        &body.annotation().inferred_type,
+                        &head.annotation().inferred_type,
+                    )
+                    .map_or_else(
+                        || (**body).clone(),
+                        |substitutions| (**body).apply(&substitutions),
+                    );
+                    let relocated = shift(&Rc::new(instantiated), 0, depth);
+                    let opened = simplify_expr(replace_spine_head(e, relocated));
+                    let safe = check(&opened, true, depth, expanding);
+                    expanding.remove(&**name);
+                    safe
+                }
+                Expr::Lambda(_, lambda) => {
+                    ordinary_args(&args, expanding)
+                        && check(&lambda.body, true, depth + 1, expanding)
+                }
+                Expr::RecursiveLambda(_, recursive) => {
+                    ordinary_args(&args, expanding)
+                        && check(&recursive.lambda.body, true, depth + 2, expanding)
+                }
+                _ => children(e)
+                    .into_iter()
+                    .all(|child| check(child, false, depth, expanding)),
+            }
+        }
+        Expr::Lambda(_, lambda) => check(&lambda.body, false, depth + 1, expanding),
+        Expr::RecursiveLambda(_, recursive) => {
+            check(&recursive.lambda.body, false, depth + 2, expanding)
+        }
+        _ => children(e)
+            .into_iter()
+            .all(|child| check(child, false, depth, expanding)),
+    }
 }
 
 /// Rebuild an application spine, replacing only its innermost head and reusing every original
@@ -2425,12 +2678,18 @@ fn replace_spine_head(
 }
 
 struct DeforestCtx<'a> {
-    /// The set `R` of recursive IO terms being strictified in place. A `run` of a call to one of
-    /// these returns the call verbatim (it now yields α directly), and inside a strictified body a
-    /// call to one is likewise left as a direct strict call. `R` is closed so that *every* use of a
-    /// member is a run-position use (see `reachable_strict_set`), which is what makes the in-place
-    /// rewrite sound.
-    in_r: &'a HashSet<QualifiedName>,
+    /// Small, acyclic functions whose lazy wrapper may be opened at a
+    /// particular run site.  These functions themselves stay untouched: a use
+    /// that stores or passes the action still receives the ordinary `IO alpha`
+    /// value.  In a run position we splice a strict copy of the function body,
+    /// which is the local worker half of worker/wrapper and, crucially, is safe
+    /// inside a recursive driver because the `Suspend` closure disappears before
+    /// the driver is closure-converted.
+    strict_inlinables: &'a Inlinables<TypeInfo>,
+
+    /// A canonical exact `Suspend thunk -> thunk ()` clause whose annotations
+    /// are reused when an unrecognised action must retain a force boundary.
+    force_template: &'a MatchClause<TypeInfo, Identifier>,
 }
 
 impl DeforestCtx<'_> {
@@ -2440,26 +2699,49 @@ impl DeforestCtx<'_> {
         &self,
         tree: &Tree<TypeInfo, Identifier>,
         depth: usize,
+        strict: &HashSet<usize>,
     ) -> Tree<TypeInfo, Identifier> {
         if let Some((scrutinee, template)) = as_run_marker(tree) {
-            return Rc::new(self.run(scrutinee, &HashSet::new(), depth, template));
+            return Rc::new(self.run(scrutinee, strict, depth, template));
         }
-        let go = |t: &Tree<TypeInfo, Identifier>, d: usize| self.map_markers(t, d);
+        if let Some((scrutinee, clause, thunk_level)) = as_embedded_run(tree) {
+            // Replace the sole thunk value by `lambda _. run E`, then let the
+            // ordinary beta/let reducer expose `run E` at exactly the original
+            // `thunk ()` position.  The wrapper lambda is a substitution device,
+            // not runtime machinery: the following simplify pass removes it.
+            let strict_value = Rc::new(self.run(scrutinee, strict, depth, self.force_template));
+            let Pattern::Coproduct(_, constructor_pattern) = &clause.pattern else {
+                unreachable!("as_embedded_run accepted a non-coproduct pattern")
+            };
+            let thunk_annotation = constructor_pattern.arguments[0].annotation().clone();
+            let delayed = Rc::new(Expr::Lambda(
+                thunk_annotation,
+                Lambda {
+                    parameter: Identifier::Bound(thunk_level),
+                    body: Rc::new(shift(&strict_value, thunk_level, 1)),
+                },
+            ));
+            let replaced = Rc::new(substitute_value(&clause.consequent, thunk_level, &delayed));
+            return self.map_markers(&replaced, depth, strict);
+        }
+        let go = |t: &Tree<TypeInfo, Identifier>, d: usize| self.map_markers(t, d, strict);
         Rc::new(match &**tree {
             Expr::Variable(..)
             | Expr::InvokeBridge(..)
             | Expr::Constant(..)
             | Expr::MakeClosure(..) => (**tree).clone(),
-            Expr::RecursiveLambda(a, SelfReferential { own_name, lambda }) => Expr::RecursiveLambda(
-                a.clone(),
-                SelfReferential {
-                    own_name: own_name.clone(),
-                    lambda: Lambda {
-                        parameter: lambda.parameter.clone(),
-                        body: go(&lambda.body, depth + 2),
+            Expr::RecursiveLambda(a, SelfReferential { own_name, lambda }) => {
+                Expr::RecursiveLambda(
+                    a.clone(),
+                    SelfReferential {
+                        own_name: own_name.clone(),
+                        lambda: Lambda {
+                            parameter: lambda.parameter.clone(),
+                            body: go(&lambda.body, depth + 2),
+                        },
                     },
-                },
-            ),
+                )
+            }
             Expr::Lambda(a, Lambda { parameter, body }) => Expr::Lambda(
                 a.clone(),
                 Lambda {
@@ -2500,7 +2782,27 @@ impl DeforestCtx<'_> {
             Expr::Record(a, Record { fields }) => Expr::Record(
                 a.clone(),
                 Record {
-                    fields: fields.iter().map(|(k, v)| (k.clone(), go(v, depth))).collect(),
+                    fields: fields
+                        .iter()
+                        .map(|(k, v)| (k.clone(), go(v, depth)))
+                        .collect(),
+                },
+            ),
+            Expr::RecordUpdate(a, update) => Expr::RecordUpdate(
+                a.clone(),
+                RecordUpdate {
+                    base: go(&update.base, depth),
+                    fields: update
+                        .fields
+                        .iter()
+                        .map(|field| RecordUpdateField {
+                            path: field.path.clone(),
+                            indices: field.indices.clone(),
+                            arities: field.arities.clone(),
+                            value: go(&field.value, depth),
+                        })
+                        .collect(),
+                    field_order: update.field_order.clone(),
                 },
             ),
             Expr::Inject(
@@ -2624,7 +2926,7 @@ impl DeforestCtx<'_> {
             ) => Expr::If(
                 a.clone(),
                 IfThenElse {
-                    predicate: self.map_markers(predicate, depth),
+                    predicate: self.map_markers(predicate, depth, strict),
                     consequent: Rc::new(self.run(consequent, strict, depth, template)),
                     alternate: Rc::new(self.run(alternate, strict, depth, template)),
                 },
@@ -2637,15 +2939,48 @@ impl DeforestCtx<'_> {
                     bound,
                     body,
                 },
-            ) => Expr::Let(
-                a.clone(),
-                Binding {
-                    binder: binder.clone(),
-                    operator: *operator,
-                    bound: self.map_markers(bound, depth),
-                    body: Rc::new(self.run(body, strict, depth + 1, template)),
-                },
-            ),
+            ) => {
+                let strict_local = if let Identifier::Bound(level) = binder {
+                    is_io_function(&bound.annotation().inferred_type)
+                        && matches!(&**bound, Expr::Lambda(..) | Expr::RecursiveLambda(..))
+                        && local_io_function_is_run_only(
+                            body,
+                            *level,
+                            true,
+                            depth + 1,
+                            self.strict_inlinables,
+                            &mut HashSet::new(),
+                        )
+                } else {
+                    false
+                };
+                if strict_local {
+                    let Identifier::Bound(level) = binder else {
+                        unreachable!("guarded by strict_local")
+                    };
+                    let mut inner = strict.clone();
+                    inner.insert(*level);
+                    Expr::Let(
+                        a.clone(),
+                        Binding {
+                            binder: binder.clone(),
+                            operator: *operator,
+                            bound: Rc::new(self.strictify_worker(bound, strict, depth, template)),
+                            body: Rc::new(self.run(body, &inner, depth + 1, template)),
+                        },
+                    )
+                } else {
+                    Expr::Let(
+                        a.clone(),
+                        Binding {
+                            binder: binder.clone(),
+                            operator: *operator,
+                            bound: self.map_markers(bound, depth, strict),
+                            body: Rc::new(self.run(body, strict, depth + 1, template)),
+                        },
+                    )
+                }
+            }
             Expr::Deconstruct(
                 a,
                 Deconstruct {
@@ -2655,7 +2990,7 @@ impl DeforestCtx<'_> {
             ) => Expr::Deconstruct(
                 a.clone(),
                 Deconstruct {
-                    scrutinee: self.map_markers(scrutinee, depth),
+                    scrutinee: self.map_markers(scrutinee, depth, strict),
                     match_clauses: match_clauses
                         .iter()
                         .map(|c| MatchClause {
@@ -2671,9 +3006,6 @@ impl DeforestCtx<'_> {
                 },
             ),
             Expr::Apply(..) => self.run_apply(e, strict, depth, template),
-            // A bare reference to a term we are strictifying (e.g. `run main`, where `main : IO Unit`
-            // is a nullary value): it now yields α directly, so running it is just the reference.
-            Expr::Variable(_, Identifier::Free(qn)) if self.in_r.contains(&**qn) => (**e).clone(),
             _ => self.force(e, depth, template),
         }
     }
@@ -2686,7 +3018,7 @@ impl DeforestCtx<'_> {
         depth: usize,
         template: &MatchClause<TypeInfo, Identifier>,
     ) -> Expr<TypeInfo, Identifier> {
-        let (head, args) = peel_apply_spine(e);
+        let (head, _) = peel_apply_spine(e);
         match head {
             // A strict-worker self-call: the head already denotes the α-returning worker and this is
             // a tail position, so keep the spine verbatim (its arguments are pure).
@@ -2703,61 +3035,42 @@ impl DeforestCtx<'_> {
 
             Expr::Variable(_, Identifier::Free(qn)) => {
                 let qn: &QualifiedName = qn;
-                let name = qn.to_string();
-                if name.contains("Applicative$pure$spec")
-                    && args.len() == 2
-                    && is_io_dict(&args[0])
-                {
-                    // run (pure x) = x
-                    (*args[1]).clone()
-                } else if name.contains("Monad$bind$spec")
-                    && args.len() == 3
-                    && is_io_dict(&args[0])
-                {
-                    // run (bind f m) = let p = run m in run (f-body). Only when the continuation is a
-                    // literal lambda (it always is post-desugar); otherwise force conservatively.
-                    if let Expr::Lambda(_, Lambda { parameter, body }) = &*args[1] {
-                        let alpha = TypeInfo {
-                            parse_info: e.annotation().parse_info.clone(),
-                            inferred_type: strip_io(&e.annotation().inferred_type),
-                        };
-                        Expr::Let(
-                            alpha,
-                            Binding {
-                                binder: parameter.clone(),
-                                operator: BindingOperator::Identity,
-                                bound: Rc::new(self.run(&args[2], strict, depth, template)),
-                                body: Rc::new(self.run(body, strict, depth + 1, template)),
-                            },
-                        )
-                    } else {
-                        self.force(e, depth, template)
-                    }
-                } else if name.contains("Functor$fmap$spec")
-                    && args.len() == 3
-                    && is_io_dict(&args[0])
-                {
-                    // run (fmap f m) = f (run m): the mapped function is pure, so run the action and
-                    // apply `f` to the result. `f` is not itself run.
-                    Expr::Apply(
-                        TypeInfo {
-                            parse_info: e.annotation().parse_info.clone(),
-                            inferred_type: strip_io(&e.annotation().inferred_type),
-                        },
-                        Apply {
-                            function: args[1].clone(),
-                            argument: Rc::new(self.run(&args[2], strict, depth, template)),
-                        },
+                if let Some(body) = self.strict_inlinables.get(qn) {
+                    // The ordinary top-level definition remains a lazy IO wrapper
+                    // for value/escaping uses.  At this run site, use a strict copy
+                    // of its (small, acyclic) body.  The following simplify pass
+                    // beta-reduces the parameters and cancels the now-adjacent
+                    // `Suspend` constructor/force marker.  Unlike general inlining
+                    // into loops, this cannot weld an action closure into the
+                    // recursive frame: strictification removes that closure first.
+                    // As with the ordinary inliner, instantiate a polymorphic
+                    // definition from this occurrence and relocate its absolute
+                    // De Bruijn levels beneath the caller's current binders before
+                    // splicing it.  Omitting either step is not merely imprecise:
+                    // a helper used inside a local loop would capture the caller's
+                    // low-numbered binders as its own parameters.
+                    let instantiated = inline_type_substitutions(
+                        &body.annotation().inferred_type,
+                        &head.annotation().inferred_type,
                     )
-                } else if self.in_r.contains(qn) {
-                    // A call to a term we are strictifying in place: it now yields α directly, so the
-                    // application is already the value we want -- keep the spine verbatim (its
-                    // arguments are pure). Its own tail self-calls compile to a direct call to its
-                    // global worker and are loopified.
-                    (**e).clone()
+                    .map_or_else(
+                        || (**body).clone(),
+                        |substitutions| (**body).apply(&substitutions),
+                    );
+                    let relocated = shift(&Rc::new(instantiated), 0, depth);
+                    let worker = self.strictify_worker(&relocated, strict, depth, template);
+                    // Reduce the freshly opened worker before returning it to the
+                    // surrounding recursive driver.  Delaying this to the ordinary
+                    // post-pass simplifier would put the still-boxed intermediate
+                    // under that simplifier's recursive-loop leak guard, precisely
+                    // where it is forbidden to inline effectful plumbing.  Here the
+                    // force has already been pushed into the concrete body, so local
+                    // beta/case cancellation is both safe and necessary.
+                    let reduced = simplify_expr(replace_spine_head(e, worker));
+                    Rc::unwrap_or_clone(self.map_markers(&Rc::new(reduced), depth, strict))
                 } else {
-                    // Any other IO head (a non-recursive combinator like `get_unchecked`, or a
-                    // recursive term we did NOT strictify): force it and let `simplify()` finish.
+                    // A recursive definition cycle, an unavailable body, or a body over the
+                    // strict-inlining budget keeps the ordinary force boundary.
                     self.force(e, depth, template)
                 }
             }
@@ -2821,6 +3134,7 @@ impl DeforestCtx<'_> {
         let alpha = TypeInfo {
             parse_info: e.annotation().parse_info.clone(),
             inferred_type: strip_io(&e.annotation().inferred_type),
+            enclosing_term: e.annotation().enclosing_term.clone(),
         };
         let (Pattern::Coproduct(pann, cp), Expr::Apply(app_ann, ap)) =
             (&template.pattern, &*template.consequent)
@@ -2861,159 +3175,17 @@ impl DeforestCtx<'_> {
 
 /// First `run` marker anywhere in `body`, cloned (its constructor + unit + inner annotations are
 /// the skeleton `force` reuses). `None` if the body has no run site.
-fn find_any_marker(
-    body: &Expr<TypeInfo, Identifier>,
-) -> Option<MatchClause<TypeInfo, Identifier>> {
+fn find_any_marker(body: &Expr<TypeInfo, Identifier>) -> Option<MatchClause<TypeInfo, Identifier>> {
     if let Some((_, clause)) = as_run_marker(body) {
         return Some(clause.clone());
     }
     children(body).into_iter().find_map(|c| find_any_marker(c))
 }
 
-/// The set `R` of recursive terms that may be strictified in place: those every use of which is a
-/// *run-position* use, so nothing observes them lazily. Computed as a greatest fixpoint -- start
-/// with all `candidates`, then drop any that `collect_escaped` finds used off a run path; dropping
-/// a term makes its body no longer run-traversed, which can expose further escaping uses, so
-/// iterate to stability.
-fn reachable_strict_set(
-    terms: &[(&QualifiedName, &Expr<TypeInfo, Identifier>)],
-    candidates: &HashSet<QualifiedName>,
-) -> HashSet<QualifiedName> {
-    // Descend through a term's leading parameter lambdas (its arity) to the body they wrap; these
-    // preserve the run context, so a running term's body is still running under them.
-    fn peel_leading<'a>(
-        mut e: &'a Expr<TypeInfo, Identifier>,
-    ) -> &'a Expr<TypeInfo, Identifier> {
-        loop {
-            e = match e {
-                Expr::RecursiveLambda(_, SelfReferential { lambda, .. }) => &lambda.body,
-                Expr::Lambda(_, Lambda { body, .. }) => body,
-                other => return other,
-            };
-        }
-    }
-
-    let mut r = candidates.clone();
-    loop {
-        let mut escaped = HashSet::new();
-        for (name, body) in terms {
-            let running = r.contains(*name);
-            collect_escaped(peel_leading(body), running, &r, candidates, &mut escaped);
-        }
-        let next: HashSet<QualifiedName> = r.difference(&escaped).cloned().collect();
-        if next.len() == r.len() {
-            return next;
-        }
-        r = next;
-    }
-}
-
-/// Collect candidate names that occur *off* a run path (so strictifying them would change an
-/// observed value). `running` is whether the current position is being forced (an IO tail). A
-/// candidate used as a spine head in a run-position (a run-marker scrutinee, a `bind`'s action or
-/// continuation, or a direct call inside a running body) is *covered*; anything else -- a bare
-/// value use, an argument, a non-running context -- escapes.
-fn collect_escaped(
-    e: &Expr<TypeInfo, Identifier>,
-    running: bool,
-    r: &HashSet<QualifiedName>,
-    candidates: &HashSet<QualifiedName>,
-    out: &mut HashSet<QualifiedName>,
-) {
-    // A run marker forces its scrutinee regardless of the surrounding context.
-    if let Some((scrutinee, _)) = as_run_marker(e) {
-        collect_escaped(scrutinee, true, r, candidates, out);
-        return;
-    }
-    let recurse_all = |running: bool, out: &mut HashSet<QualifiedName>| {
-        for c in children(e) {
-            collect_escaped(c, running, r, candidates, out);
-        }
-    };
-    match e {
-        Expr::Variable(_, Identifier::Free(qn)) => {
-            // A bare (un-applied) candidate value: escapes unless it is itself the whole forced
-            // expression (a nullary run, which `run` keeps verbatim when `qn ∈ R`).
-            if candidates.contains(&**qn) && !(running && r.contains(&**qn)) {
-                out.insert((**qn).clone());
-            }
-        }
-        Expr::If(_, ite) => {
-            collect_escaped(&ite.predicate, false, r, candidates, out);
-            collect_escaped(&ite.consequent, running, r, candidates, out);
-            collect_escaped(&ite.alternate, running, r, candidates, out);
-        }
-        Expr::Let(_, b) => {
-            collect_escaped(&b.bound, false, r, candidates, out);
-            collect_escaped(&b.body, running, r, candidates, out);
-        }
-        Expr::Deconstruct(_, d) => {
-            collect_escaped(&d.scrutinee, false, r, candidates, out);
-            for c in &d.match_clauses {
-                collect_escaped(&c.consequent, running, r, candidates, out);
-            }
-        }
-        Expr::Apply(..) if running => {
-            // Peel the application spine over `&Expr` (no `Rc` handy here).
-            let mut node = e;
-            let mut args: Vec<&Expr<TypeInfo, Identifier>> = Vec::new();
-            while let Expr::Apply(_, ap) = node {
-                args.push(&ap.argument);
-                node = &ap.function;
-            }
-            args.reverse();
-            let head = node;
-            let non_running = |args: &[&Expr<TypeInfo, Identifier>], out: &mut HashSet<_>| {
-                for a in args {
-                    collect_escaped(a, false, r, candidates, out);
-                }
-            };
-            match head {
-                Expr::Variable(_, Identifier::Free(qn)) => {
-                    let name = qn.to_string();
-                    let io_dict = |a: &Expr<TypeInfo, Identifier>| {
-                        matches!(a, Expr::Variable(_, Identifier::Free(d)) if d.to_string().contains("IO.witness"))
-                    };
-                    if name.contains("Monad$bind$spec") && args.len() == 3 && io_dict(args[0]) {
-                        // The action and (lambda) continuation body are both run; the dictionary and
-                        // the lambda wrapper are inert.
-                        collect_escaped(args[2], true, r, candidates, out);
-                        if let Expr::Lambda(_, Lambda { body, .. }) = args[1] {
-                            collect_escaped(body, true, r, candidates, out);
-                        } else {
-                            collect_escaped(args[1], false, r, candidates, out);
-                        }
-                    } else if name.contains("Functor$fmap$spec") && args.len() == 3 && io_dict(args[0])
-                    {
-                        // run (fmap f m): the action `m` is run; the mapped function `f` is a pure
-                        // value applied to the result (not run).
-                        collect_escaped(args[2], true, r, candidates, out);
-                        collect_escaped(args[1], false, r, candidates, out);
-                    } else {
-                        // `pure`, a strict `R` call, a forced combinator: the head is consumed here;
-                        // the arguments are ordinary (non-running) values.
-                        non_running(&args, out);
-                    }
-                }
-                // A self / parameter call: the head is consumed; arguments are non-running.
-                Expr::Variable(_, Identifier::Bound(_)) => non_running(&args, out),
-                // A function value (local recursive `probe`) run in place.
-                Expr::Lambda(..) | Expr::RecursiveLambda(..) => {
-                    collect_escaped(head, true, r, candidates, out);
-                    non_running(&args, out);
-                }
-                _ => recurse_all(false, out),
-            }
-        }
-        // Any other node (or an application in non-running position): its sub-terms are values.
-        _ => recurse_all(false, out),
-    }
-}
-
 impl phase::SymbolTable<Types> {
     /// Strictify recursive IO loops (see the module comment above). Runs on the native pipeline
-    /// after `specialize()` (so `bind`/`pure` are the concrete IO specs and `unsafe_run_IO` is the
-    /// inlined force) and before `simplify()` (which finishes the straight-line cancellation).
+    /// after `specialize()` (so concrete dictionary calls can be opened) and before
+    /// `simplify()` (which finishes the straight-line cancellation).
     pub fn deforest_io(self) -> Self {
         if !deforest_io_on() {
             return self;
@@ -3052,27 +3224,32 @@ impl phase::SymbolTable<Types> {
                 ((*name).clone(), deps)
             })
             .collect();
-        // Candidates: every IO-returning term. Strictifying a recursive loop forces its whole
-        // run-reachable IO neighbourhood to be strictified too -- a strict `process_file_bytes`
-        // must be called by a strict `read_file_data` and `main`, or the `fmap`/`bind` at the
-        // boundary would hand an α where an `IO α` is expected. The no-escaping-use fixpoint below
-        // (`reachable_strict_set`) keeps only terms used *purely* in run position, so this naturally
-        // narrows to the run path (a combinator like `output`, passed as a value to `traverse`,
-        // escapes and stays lazy). `reaches_self`/`dependencies` are retained for the loopify note
-        // only; recursion is no longer a candidate condition.
-        let _ = &dependencies;
-        let candidates: HashSet<QualifiedName> = terms
+        // General simplification deliberately refuses to inline effectful helpers
+        // into recursive bodies: before strictification that can retain one action
+        // closure per iteration.  Keep a separate, tightly bounded set for the
+        // inverse order used here -- first make the helper strict, then inline that
+        // closure-free worker at the run site.  Cyclic functions are excluded so
+        // recursively strictifying an inline body always terminates. A local or
+        // self-bound recursive lambda is self-contained and remains eligible; only
+        // a cycle through global names falls back to ordinary boxed IO.
+        let recursive: HashSet<QualifiedName> = terms
             .iter()
-            .filter(|(_, body)| returns_io(&body.annotation().inferred_type))
-            .map(|(n, _)| (*n).clone())
+            // Only expansion through a *global-name* cycle can make strict
+            // worker inlining recurse indefinitely.  A local `let loop =
+            // RecursiveLambda ...` is self-contained in the copied body and is
+            // precisely what `strictify_worker` knows how to turn into a strict
+            // local loop; excluding a term merely because it contains one would
+            // exclude every useful IO driver (`process_file_bytes`, folds, ...).
+            .filter(|(name, _)| reaches_self(name, &dependencies))
+            .map(|(name, _)| (*name).clone())
             .collect();
-
-        let in_r = reachable_strict_set(&terms, &candidates);
-        if std::env::var_os("DUMP_DEFOREST_R").is_some() {
-            let mut names: Vec<String> = in_r.iter().map(|n| n.to_string()).collect();
-            names.sort();
-            eprintln!("[deforest] R = {names:#?}");
-        }
+        let strict_inlinables: Inlinables<TypeInfo> = terms
+            .iter()
+            .filter(|(name, body)| {
+                !recursive.contains(*name) && within_budget(body, STRICT_IO_INLINE_BUDGET)
+            })
+            .map(|(name, body)| ((*name).clone(), Rc::new((*body).clone())))
+            .collect();
 
         // A `Suspend`-marker skeleton (constructor + unit + inner annotations) reused when a
         // strictified body must fall back to an unchanged force marker. Any marker in the program
@@ -3092,7 +3269,10 @@ impl phase::SymbolTable<Types> {
                 member_visibility,
             };
         };
-        let ctx = DeforestCtx { in_r: &in_r };
+        let ctx = DeforestCtx {
+            strict_inlinables: &strict_inlinables,
+            force_template: &template,
+        };
 
         let symbols = symbols
             .into_iter()
@@ -3103,14 +3283,15 @@ impl phase::SymbolTable<Types> {
                         type_signature,
                         body,
                     }) => {
-                        // A member of `R` is rewritten to strict α-returning form in place (its
-                        // self-calls stay tail calls to its own worker); every other term only has
-                        // its `run` markers rewritten.
-                        let body = if in_r.contains(&name) {
-                            ctx.strictify_worker(&body, &HashSet::new(), 0, &template)
-                        } else {
-                            Rc::unwrap_or_clone(ctx.map_markers(&Rc::new(body), 0))
-                        };
+                        // Definitions always keep their ordinary lazy wrapper. A strict worker is
+                        // copied only beneath an actual force, so a top-level IO value is never
+                        // executed during global initialization and escaping actions retain their
+                        // repeatable thunk semantics.
+                        let body = Rc::unwrap_or_clone(ctx.map_markers(
+                            &Rc::new(body),
+                            0,
+                            &HashSet::new(),
+                        ));
                         Symbol::Term(TermSymbol {
                             name,
                             type_signature,
@@ -3191,6 +3372,70 @@ mod tests {
         simplify_expr(e)
     }
 
+    type TT = Tree<TypeInfo, Identifier>;
+
+    fn ti(ty: Type) -> TypeInfo {
+        TypeInfo::new(crate::parser::ParseInfo::default(), ty)
+    }
+
+    fn io_of(payload: Type) -> Type {
+        Type::Apply {
+            constructor: Type::Constructor(crate::typer::io_type_name()).into(),
+            argument: payload.into(),
+        }
+    }
+
+    fn typed_var(level: usize, ty: Type) -> TT {
+        Rc::new(Expr::Variable(ti(ty), Identifier::Bound(level)))
+    }
+
+    fn typed_free(name: &str, ty: Type) -> TT {
+        Rc::new(Expr::Variable(ti(ty), free_id(name)))
+    }
+
+    fn typed_apply(function: TT, argument: TT, result: Type) -> TT {
+        Rc::new(Expr::Apply(ti(result), Apply { function, argument }))
+    }
+
+    fn suspend_clause(
+        thunk_level: usize,
+        payload: Type,
+        consequent: TT,
+    ) -> MatchClause<TypeInfo, Identifier> {
+        let thunk_type = Type::Arrow {
+            domain: Type::Base(BaseType::Unit).into(),
+            codomain: payload.clone().into(),
+        };
+        MatchClause {
+            pattern: Pattern::Coproduct(
+                ti(io_of(payload)),
+                ConstructorPattern {
+                    constructor: Identifier::Free(crate::typer::suspend_constructor_name().into()),
+                    arguments: vec![Pattern::Bind(
+                        ti(thunk_type),
+                        Identifier::Bound(thunk_level),
+                    )],
+                },
+            ),
+            consequent,
+        }
+    }
+
+    fn forced_thunk(thunk_level: usize, payload: Type) -> TT {
+        let thunk_type = Type::Arrow {
+            domain: Type::Base(BaseType::Unit).into(),
+            codomain: payload.clone().into(),
+        };
+        typed_apply(
+            typed_var(thunk_level, thunk_type),
+            Rc::new(Expr::Constant(
+                ti(Type::Base(BaseType::Unit)),
+                Literal::Unit,
+            )),
+            payload,
+        )
+    }
+
     #[test]
     fn inline_types_instantiate_repeated_variables_consistently() {
         let variable = MetaVariable::fresh();
@@ -3220,6 +3465,129 @@ mod tests {
         };
 
         assert!(inline_type_substitutions(&template, &concrete).is_none());
+    }
+
+    #[test]
+    fn embedded_run_recognises_a_once_forced_thunk_under_a_constructor() {
+        let payload = Type::Base(BaseType::Int);
+        let forced = forced_thunk(0, payload.clone());
+        let wrapped = Rc::new(Expr::Inject(
+            ti(payload.clone()),
+            Injection {
+                constructor: ctor("Return"),
+                arguments: vec![forced],
+            },
+        ));
+        let expr = Expr::Deconstruct(
+            ti(payload.clone()),
+            Deconstruct {
+                scrutinee: typed_free("action", io_of(payload.clone())),
+                match_clauses: vec![suspend_clause(0, payload, wrapped)],
+            },
+        );
+
+        let Some((_, _, thunk)) = as_embedded_run(&expr) else {
+            panic!("expected the mapped force to be recognised")
+        };
+        assert_eq!(thunk, 0);
+    }
+
+    #[test]
+    fn embedded_run_rejects_a_thunk_that_is_forced_twice() {
+        let payload = Type::Base(BaseType::Int);
+        let expr = Expr::Deconstruct(
+            ti(payload.clone()),
+            Deconstruct {
+                scrutinee: typed_free("action", io_of(payload.clone())),
+                match_clauses: vec![suspend_clause(
+                    0,
+                    payload.clone(),
+                    Rc::new(Expr::Tuple(
+                        ti(Type::Tuple(crate::typer::TupleType::from_signature(&[
+                            payload.clone(),
+                            payload.clone(),
+                        ]))),
+                        Tuple {
+                            elements: vec![
+                                forced_thunk(0, payload.clone()),
+                                forced_thunk(0, payload),
+                            ],
+                        },
+                    )),
+                )],
+            },
+        );
+
+        assert!(as_embedded_run(&expr).is_none());
+    }
+
+    #[test]
+    fn local_io_worker_must_be_consumed_only_in_run_positions() {
+        let payload = Type::Base(BaseType::Int);
+        let function_type = Type::Arrow {
+            domain: Type::Base(BaseType::Int).into(),
+            codomain: io_of(payload.clone()).into(),
+        };
+        let call = typed_apply(
+            typed_var(0, function_type.clone()),
+            Rc::new(Expr::Constant(
+                ti(Type::Base(BaseType::Int)),
+                Literal::Int(1),
+            )),
+            io_of(payload.clone()),
+        );
+        let forced = Expr::Deconstruct(
+            ti(payload.clone()),
+            Deconstruct {
+                scrutinee: call,
+                match_clauses: vec![suspend_clause(
+                    1,
+                    payload.clone(),
+                    forced_thunk(1, payload.clone()),
+                )],
+            },
+        );
+        assert!(local_io_function_is_run_only(
+            &forced,
+            0,
+            false,
+            0,
+            &Inlinables::new(),
+            &mut HashSet::new(),
+        ));
+
+        let escaped = Expr::Tuple(
+            ti(Type::Tuple(crate::typer::TupleType::from_signature(&[
+                function_type.clone(),
+                function_type,
+            ]))),
+            Tuple {
+                elements: vec![
+                    typed_var(
+                        0,
+                        Type::Arrow {
+                            domain: Type::Base(BaseType::Int).into(),
+                            codomain: io_of(payload.clone()).into(),
+                        },
+                    ),
+                    typed_var(
+                        0,
+                        Type::Arrow {
+                            domain: Type::Base(BaseType::Int).into(),
+                            codomain: io_of(payload).into(),
+                        },
+                    ),
+                ],
+            },
+        );
+        assert!(!local_io_function_is_run_only(
+            &escaped,
+            0,
+            false,
+            0,
+            &Inlinables::new(),
+            &mut HashSet::new(),
+        ));
     }
 
     // ---- shift ----
@@ -3515,6 +3883,41 @@ mod tests {
                                     elements: vec![var(0), var(1)],
                                 },
                             )),
+                        }],
+                    },
+                )),
+            },
+        );
+
+        assert!(matches!(simplify(e), Expr::Let(..)));
+    }
+
+    #[test]
+    fn effectful_forwarding_does_not_move_a_later_use_into_a_match_arm() {
+        // `#0` is used once, but it is NOT the scrutinee evaluated first.  Forwarding
+        // `(read slot)` into the arm would delay that read until after evaluation of the
+        // unrelated scrutinee (and, in real IO code, past intervening writes).
+        //
+        //   let #0 = (read slot) in deconstruct other { C #1 -> #0 }
+        let e = Expr::Let(
+            (),
+            Binding {
+                binder: Identifier::Bound(0),
+                operator: BindingOperator::Identity,
+                bound: Rc::new(apply(free("read"), free("slot"))),
+                body: Rc::new(Expr::Deconstruct(
+                    (),
+                    Deconstruct {
+                        scrutinee: free("other"),
+                        match_clauses: vec![MatchClause {
+                            pattern: Pattern::Coproduct(
+                                (),
+                                ConstructorPattern {
+                                    constructor: Identifier::Free(Box::new(ctor("C"))),
+                                    arguments: vec![Pattern::Bind((), Identifier::Bound(1))],
+                                },
+                            ),
+                            consequent: var(0),
                         }],
                     },
                 )),

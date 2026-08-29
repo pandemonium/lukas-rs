@@ -444,6 +444,24 @@ impl phase::Expr<Types> {
                 },
             ),
 
+            Self::RecordUpdate(ti, the) => Expr::RecordUpdate(
+                ti.empty_capture(),
+                ast::RecordUpdate {
+                    base: Self::go(the.base, lambda_level, is_recursive, layout),
+                    fields: the
+                        .fields
+                        .into_iter()
+                        .map(|field| ast::RecordUpdateField {
+                            path: field.path,
+                            indices: field.indices,
+                            arities: field.arities,
+                            value: Self::go(field.value, lambda_level, is_recursive, layout),
+                        })
+                        .collect(),
+                    field_order: the.field_order,
+                },
+            ),
+
             Self::Inject(ti, the) => Expr::Inject(
                 ti.empty_capture(),
                 Injection {

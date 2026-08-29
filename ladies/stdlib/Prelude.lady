@@ -251,6 +251,11 @@ module Text:
   (* Byte at index `i`, as Int (Rust `str::as_bytes()[i]`). No char indexing. *)
   get :: Text -> Int -> Int := λ(MkText b). Bytes.get_u8 b
 
+(* Report the compiler-injected call site and supplied message, then terminate *)
+(* abnormally. Since it never returns, its result may inhabit any type.         *)
+foreign raw_omg_wtf_bbq :: ∀α. Text -> Text -> Int -> Int -> Text -> α
+omg_wtf_bbq :: ∀α. Text -> α := λmessage. raw_omg_wtf_bbq "<unknown>" "<unknown>" 0 0 message
+
 (* ----------------------------------------------------------------- Eq / Ord *)
 (* Two more primordial classes, for the same reason as `Display` below: the parser *)
 (* desugars the comparison operators to term-level calls, so their classes must be in *)

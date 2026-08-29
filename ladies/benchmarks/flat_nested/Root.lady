@@ -22,7 +22,7 @@ module Nested:
   sum4 :: ((Int, Int), (Int, Int)) -> Int := λ((a, b), (c, d)). a + b + c + d
 
 start := λ_.
-  let table = Mutable_Array.generate 100000 Nested.mk in
+  let table = unsafe_run_IO (Mutable_Array.generate 100000 Nested.mk) in
   let _ = Churn.burn 2000000 in
   let e = unsafe_run_IO (Mutable_Array.get_unchecked table 54321) in
   (* expect (54321,54322),(54323,54324) -> sum 217290 *)

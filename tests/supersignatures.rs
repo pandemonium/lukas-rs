@@ -199,16 +199,22 @@ start :: Int -> Int := λ_. 0
 #[test]
 fn method_constraint_is_not_a_supersignature() {
     let source = r#"
-use Stdlib.
-
 Box ::= ∀α. MkBox α
 
+signature Identity ::= ∀α.
+  { identity :: α -> α
+  }
+
 signature Squash ::= ∀m : * -> *.
-  { squash :: ∀α. Monoid α |- m α -> α
+  { squash :: ∀α. Identity α |- m α -> α
+  }
+
+witness Identity Int :=
+  { identity := λa. a
   }
 
 witness Squash Box :=
-  { squash := λb. deconstruct b into MkBox a -> mappend a mempty
+  { squash := λb. deconstruct b into MkBox a -> identity a
   }
 
 start :: Int -> Int := λ_. squash (MkBox 5)

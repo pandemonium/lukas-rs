@@ -112,6 +112,13 @@ impl<A> ast::Expr<A, Identifier> {
                 }
             }
 
+            Self::RecordUpdate(_, update) => {
+                update.base.gather_free_variables(free);
+                for field in &update.fields {
+                    field.value.gather_free_variables(free)
+                }
+            }
+
             Self::Interpolate(_, ast::Interpolate(segments)) => {
                 for s in segments {
                     if let ast::Segment::Expression(expr) = s {
@@ -743,9 +750,8 @@ impl phase::SymbolTable<Desugared> {
                     .contains_key(&SymbolName::Term(name_expr.qualified_name()));
                 let names_only_a_module = names_a_module && !denotes_value;
 
-                (!name_expr.projections.is_empty()
-                    || (names_a_real_member && !names_only_a_module))
-                .then_some(name_expr)
+                (!name_expr.projections.is_empty() || (names_a_real_member && !names_only_a_module))
+                    .then_some(name_expr)
             })?;
 
         let qualified_name = resolved.qualified_name();
@@ -1762,6 +1768,26 @@ impl phase::Expr<Desugared> {
             Self::Record(pi, node) => Ok(Expr::Record(
                 *pi,
                 node.resolve(names, symbols, semantic_scope)?,
+            )),
+
+            Self::RecordUpdate(pi, node) => Ok(Expr::RecordUpdate(
+                *pi,
+                ast::RecordUpdate {
+                    base: node.base.resolve(names, symbols, semantic_scope)?.into(),
+                    fields: node
+                        .fields
+                        .iter()
+                        .map(|field| {
+                            Ok(ast::RecordUpdateField {
+                                path: field.path.clone(),
+                                indices: field.indices.clone(),
+                                arities: field.arities.clone(),
+                                value: field.value.resolve(names, symbols, semantic_scope)?.into(),
+                            })
+                        })
+                        .collect::<Naming<Vec<_>>>()?,
+                    field_order: node.field_order.clone(),
+                },
             )),
 
             Self::Tuple(pi, node) => Ok(Expr::Tuple(

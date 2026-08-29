@@ -38,6 +38,6 @@ module Flat:
     else pure count
 
 start := λseed.
-  let set = Mutable_Array.generate Flat.cap (λ_. Flat.empty) in
+  let set = unsafe_run_IO (Mutable_Array.generate Flat.cap (λ_. Flat.empty)) in
   let count = unsafe_run_IO (Flat.fill set 10000000 seed 0) in
   print_endline "distinct `count`"

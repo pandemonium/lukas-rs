@@ -172,8 +172,19 @@ Value flat_from_enumerator_shaped(int64_t length, Value enumeration, Value next,
 Value flat_from_enumerator(int64_t length, Value enumeration, Value next);
 size_t flat_array_count(Value arr);
 Value flat_array_get(Value arr, size_t i);
+// Read field 0 of the payload constructor from a top-level unary niche sum,
+// without rebuilding the enclosing coproduct. The caller guarantees that slot
+// `i` contains the payload constructor and that `i` is in bounds.
+Value flat_array_get_niche_payload_unchecked(Value arr, size_t i);
 void flat_array_set(Value arr, size_t i, Value elt);
 Value flat_array_put(Value arr, size_t i, Value elt);
+// Copy a range of packed elements without boxing them out. Source and target
+// must have the same element layout; ranges may overlap (memmove semantics).
+void flat_array_copy(Value source, size_t source_index, Value target,
+                     size_t target_index, size_t count);
+// Allocate a larger array with the source's exact packed layout, copy every
+// existing element, and initialize the new suffix from one constant value.
+Value flat_array_grow_with(Value source, size_t new_count, Value fill);
 // Read one statically-known leaf directly from packed element storage, without
 // rebuilding the canonical aggregate around it.
 Value flat_array_get_word(Value arr, size_t i, size_t word_offset);

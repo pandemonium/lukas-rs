@@ -33,16 +33,22 @@ FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Array_raw_get, Value, arr, int64_t, i
 FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Mutable_Array_raw_generate_shaped, Value, dict, int64_t, length, Value, mk_element, {
   int64_t *entries = (int64_t *)as_ptr(proj(dict, 0));
   size_t slen = (size_t)entries[0];
-  // An empty shape (slen 0) means the element type carries no flat sum: keep the
-  // original element-0 discovery, so a product/scalar element flattens as before.
-  if (slen == 0) return flat_generate(length, mk_element);
+  // A shape with no sum node needs no type-directed packing. Concrete record
+  // codegen may already have flattened its value, so recursively applying the
+  // record shape here would flatten it twice. Element-0 discovery handles these
+  // scalar/product layouts and agrees with their emitted representation.
+  bool has_sum = false;
+  for (size_t i = 1; i <= slen; i++) has_sum |= entries[i] < 0;
+  if (!has_sum) return flat_generate(length, mk_element);
   return flat_generate_shaped(length, mk_element, entries + 1, slen);
 })
 
 FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Mutable_Array_raw_from_enumerator_shaped, Value, dict, int64_t, length, Value, enumeration, Value, next, {
   int64_t *entries = (int64_t *)as_ptr(proj(dict, 0));
   size_t slen = (size_t)entries[0];
-  if (slen == 0)
+  bool has_sum = false;
+  for (size_t i = 1; i <= slen; i++) has_sum |= entries[i] < 0;
+  if (!has_sum)
     return flat_from_enumerator(length, enumeration, next);
   return flat_from_enumerator_shaped(length, enumeration, next,
                                      entries + 1, slen);
@@ -72,6 +78,10 @@ FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Mutable_Array_raw_get_unchecked, Valu
   return flat_array_get(arr, (size_t)index);
 })
 
+FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Mutable_Array_raw_get_niche_payload_unchecked, Value, arr, int64_t, index, {
+  return flat_array_get_niche_payload_unchecked(arr, (size_t)index);
+})
+
 FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Mutable_Array_raw_put_unchecked, Value, arr, int64_t, index, Value, elt, {
   return flat_array_put(arr, (size_t)index, elt);
 })
@@ -81,4 +91,18 @@ FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Mutable_Array_raw_put_unchecked, Valu
 FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Mutable_Array_raw_set_unchecked, Value, arr, int64_t, index, Value, elt, {
   flat_array_set(arr, (size_t)index, elt);
   return VUnit();
+})
+
+FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Mutable_Array_raw_copy_unchecked,
+             Value, source, int64_t, source_index,
+             Value, target, int64_t, target_index, int64_t, count, {
+  flat_array_copy(source, (size_t)source_index,
+                  target, (size_t)target_index, (size_t)count);
+  return VUnit();
+})
+
+FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Mutable_Array_raw_grow_with,
+             Value, source, int64_t, new_length, Value, fill, {
+  if (new_length < 0) match_fail();
+  return flat_array_grow_with(source, (size_t)new_length, fill);
 })
