@@ -258,6 +258,17 @@ fn build_inlinables(
         .filter(|(name, body)| reaches_self(name, &dependencies) || contains_recursion(body))
         .map(|(name, _)| (*name).clone())
         .collect();
+    if std::env::var_os("DUMP_INLINE_EXCLUSION").is_some() {
+        let budget = inline_budget();
+        for (name, body) in &terms {
+            eprintln!(
+                "[inline?] {name}  recursive={} within_budget={} nullary={}",
+                recursive.contains(*name),
+                within_budget(body, budget),
+                is_nullary_injection(body)
+            );
+        }
+    }
 
     let budget = inline_budget();
     let inlinable = |name: &QualifiedName, body: &phase::Expr<Types>| {
@@ -1914,6 +1925,10 @@ where
         }
         Expr::Tuple(_, tuple) => select_tuple_clause(a, scrutinee, tuple, match_clauses),
 
+        // A tuple-valued `if` taken apart by a tuple pattern -- the shape every
+        // multiple-return produces: `let i, w = if neg then 2, x else 1, y`.
+        Expr::If(_, ite) => split_tuple_if(a, ite, match_clauses),
+
         // A constructor referenced as a *value* and then applied -- `Apply(Variable(C), args)`
         // -- is never built as an `Inject` (only a syntactic `C args` is), so it never meets
         // its `deconstruct` and the box never cancels. Fold a *saturated* such application into
@@ -1998,6 +2013,110 @@ where
         }
     }
     None
+}
+
+/// `deconstruct (if p then (x₁..xₙ) else (y₁..yₙ)) into (a₁..aₙ) -> body`
+/// becomes `let a₁ = if p then x₁ else y₁ in … let aₙ = … in body`.
+///
+/// The tuple is built only to be taken apart on the very next line, so this removes the
+/// allocation outright. Case-of-`if` commuting cannot reach this shape: it would copy
+/// `body` into BOTH branches, and `clauses_are_small` rightly forbids that when `body`
+/// is the whole rest of the function -- which is exactly the situation a multiple-return
+/// tuple creates. Splitting per component moves only the components, never the body.
+///
+/// The predicate is duplicated once per component, so it is restricted to a variable or
+/// a constant: free to re-read, and no effect or work can be duplicated. `build_let_chain`
+/// enforces that the pattern binds a contiguous run of De Bruijn levels, so the let-chain
+/// lands on exactly the levels the tuple pattern bound.
+fn split_tuple_if<A>(
+    a: &A,
+    ite: &IfThenElse<A, Identifier>,
+    clauses: &[MatchClause<A, Identifier>],
+) -> Option<Expr<A, Identifier>>
+where
+    A: Clone,
+{
+    let (Expr::Tuple(_, consequent), Expr::Tuple(_, alternate)) =
+        (&*ite.consequent, &*ite.alternate)
+    else {
+        return None;
+    };
+    if consequent.elements.len() != alternate.elements.len() {
+        return None;
+    }
+
+    // A tuple pattern is irrefutable, so the first clause is the one selected.
+    let clause = clauses.first()?;
+    let Pattern::Tuple(_, TuplePattern { elements }) = &clause.pattern else {
+        return None;
+    };
+    if elements.len() != consequent.elements.len() {
+        return None;
+    }
+
+    let split = |predicate: &Tree<A, Identifier>,
+                 patterns: &[Pattern<A, Identifier>],
+                 body: &Tree<A, Identifier>| {
+        let components = consequent
+            .elements
+            .iter()
+            .zip(alternate.elements.iter())
+            .map(|(then_branch, else_branch)| {
+                Rc::new(Expr::If(
+                    a.clone(),
+                    IfThenElse {
+                        predicate: predicate.clone(),
+                        consequent: then_branch.clone(),
+                        alternate: else_branch.clone(),
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        build_let_chain(a, &components, patterns, body)
+    };
+
+    // An atom predicate is free to re-read, so use it directly and introduce no binder.
+    if matches!(
+        &*ite.predicate,
+        Expr::Variable(..) | Expr::Constant(..) | Expr::InvokeBridge(..)
+    ) {
+        return split(&ite.predicate, elements, &clause.consequent);
+    }
+
+    // Otherwise bind the predicate once and split against that. This is not merely a
+    // guard-dodge: evaluating `p` a single time is what the original `if` did, so an
+    // effectful or expensive predicate is preserved exactly -- whereas duplicating it
+    // per component would re-run it. `let value, consumed = if <byte read> then …` is
+    // the case that matters, and it is the common one: a multiple return whose choice
+    // is made by a real test rather than a variable already in hand.
+    //
+    // The new binder takes the level the tuple pattern's FIRST binder had; the pattern's
+    // binders and the body therefore move up by one (`shift_id`/`shift` from that level,
+    // the same idiom as the let-float rule above). The branch components sit at the
+    // scrutinee's depth and can only mention binders OUTSIDE the pattern, so they are
+    // unaffected by a shift starting at it.
+    let base = pattern_min_level(&clause.pattern)?;
+    let shifted_patterns = elements
+        .iter()
+        .map(|p| walk_pattern(p, &|id| shift_id(id, base, 1)))
+        .collect::<Vec<_>>();
+    let shifted_body = Rc::new(shift(&clause.consequent, base, 1));
+
+    let bound_predicate = Rc::new(Expr::Variable(
+        ite.predicate.annotation().clone(),
+        Identifier::Bound(base),
+    ));
+    let inner = split(&bound_predicate, &shifted_patterns, &shifted_body)?;
+
+    Some(Expr::Let(
+        a.clone(),
+        Binding {
+            binder: Identifier::Bound(base),
+            operator: BindingOperator::Identity,
+            bound: ite.predicate.clone(),
+            body: Rc::new(inner),
+        },
+    ))
 }
 
 fn select_tuple_clause<A>(

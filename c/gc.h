@@ -321,6 +321,9 @@ static inline Value prim_text_eq(Value a, Value b) {
 bool text_to_cstr(Value slice, char *buf,
                   size_t cap); // NUL-terminate into buf; false if too big
 Value slice_sub(Value slice, size_t offset, size_t len);
+// First index of `byte` at or after `from`, else -1 (memchr; `from` past the end
+// finds nothing rather than faulting).
+int64_t slice_position(Value slice, int64_t from, int64_t byte);
 
 uint16_t slice_get_u16_le(Value slice, size_t off);
 uint32_t slice_get_u32_le(Value slice, size_t off);

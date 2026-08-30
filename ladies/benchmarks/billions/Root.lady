@@ -160,13 +160,13 @@ parse_temperature :: Bytes -> Int -> (Int, Int) := λsource start.
       else
         (10 * whole + (Bytes.get_u8 source (start + index) - Int.of_char '0')) * 10 + (Bytes.get_u8 source (start + index + 2) - Int.of_char '0'), index + 4
     in
-      ((if neg then 0 - value else value), start + consumed)
+      ((if neg then -value else value), start + consumed)
 
 parse_row :: Bytes -> Int -> (Bytes, Int, Int) := λsource i.
   let semicolon = scan_to source i (Int.of_char ';') in
   let city_bytes = Bytes.slice source i (semicolon - i) in
   let temperature, next = parse_temperature source (semicolon + 1) in
-  (city_bytes, temperature, next)
+  city_bytes, temperature, next
 
 main :: IO Unit :=
   let* collated = read_file_data "ladies/benchmarks/billions/city-temperatures.txt" in

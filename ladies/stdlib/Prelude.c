@@ -67,6 +67,11 @@ FOREIGN_DECL(Value, Root_Prelude_Bytes_raw_sub, Value, s, int64_t, off, int64_t,
 FOREIGN_DECL(int64_t, Root_Prelude_Bytes_raw_get_u8, Value, s, int64_t, i, {
     return (int64_t)slice_get_u8(s, (size_t)i);
 })
+// `memchr`: first `byte` at or after `from`, else -1. Word-at-a-time and vectorised,
+// where the equivalent Marmelade loop reads one byte per iteration. Bounded, so a
+// `from` past the end finds nothing instead of walking off the mapping.
+FOREIGN_DECL(int64_t, Root_Prelude_Bytes_raw_position, Value, s, int64_t, from,
+             int64_t, byte, { return slice_position(s, from, byte); })
 #define TYPED_READ(SUFFIX)                                                             \
     FOREIGN_DECL(int64_t, Root_Prelude_Bytes_raw_get_##SUFFIX, Value, s, int64_t, off, {\
         return (int64_t)slice_get_##SUFFIX(s, (size_t)off);                            \

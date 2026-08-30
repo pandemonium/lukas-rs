@@ -138,7 +138,18 @@ module Buffer:
   (* Independent copy of the buffer's bytes. *)
   copy :: Buffer -> IO Bytes := λ(Buffer b). Suspend (λ_. Bytes (raw_copy b))
 
+(* What can be searched for in a `Bytes`, dispatched on the pattern's TYPE -- the same
+   idea as Rust's `Pattern` trait behind `str::find`. `Bytes.position bs ';'` selects the
+   `Int` witness and runs `memchr`; `Bytes.position bs is_digit` selects the arrow
+   witness and runs the per-byte loop. Keeping these as separate witnesses rather than
+   one predicate function means the fast path is chosen by the type, so it cannot
+   silently stop firing the way a `λb. b = c` rewrite rule would. *)
+signature Byte_Pattern ::= ∀π.
+  { find_bytes :: π -> Bytes -> Int -> Perhaps Int
+  }
+
 module Bytes:
+  foreign raw_position   :: Raw_Bytes -> Int -> Int -> Int
   foreign raw_slice_len  :: Raw_Bytes -> Int
   foreign raw_sub        :: Raw_Bytes -> Int -> Int -> Raw_Bytes
   foreign raw_get_u8     :: Raw_Bytes -> Int -> Int
@@ -200,18 +211,50 @@ module Bytes:
       else Bytes.slice bytes offset (i - offset)
     in loop offset
 
-  (* First index whose byte satisfies `p`, else Nope. *)
-  position :: Bytes -> (Int -> Bool) -> Perhaps Int := λbytes.
-    position' bytes 0
+  (* A single byte: `memchr`. `raw_position` returns -1 for "absent" (the C
+     convention); the Perhaps lives here so callers never see the sentinel. Inside the
+     module so the private `raw_*` foreigns stay private. *)
+  witness Byte_Pattern Int :=
+    { find_bytes := λbyte (Bytes s) offset.
+        let found = raw_position s offset byte in
+        if found < 0 then Nope else This found
+    }
 
-  (* First index whose byte satisfies `p`, else Nope. *)
-  position' :: Bytes -> Int -> (Int -> Bool) -> Perhaps Int := λ(Bytes s) offset p.
-    let length = raw_slice_len s in
-    let scan = λi.
-      if p (raw_get_u8 s i) then This i
-      else if i + 1 < length then scan (i + 1)
-      else Nope
-    in if length > 0 then scan offset else Nope
+  (* A predicate: one indirect call per byte, unavoidably. *)
+  witness Byte_Pattern (Int -> Bool) :=
+    { find_bytes := λp (Bytes s) offset.
+        let length = raw_slice_len s in
+        let scan = λi.
+          if i < length then
+            if p (raw_get_u8 s i) then This i else scan (i + 1)
+          else Nope
+        in
+          if offset < 0 then Nope else scan offset
+    }
+
+  (* First index matching `pattern` at or after the offset, else Nope.
+
+     The pattern is dispatched on its TYPE, the way Rust's `str::find` takes anything
+     implementing `Pattern`: a single byte (`Int`) uses `memchr`, a predicate
+     (`Int -> Bool`) uses the per-byte loop. One name, and the cost is visible in the
+     argument's type rather than hidden in whether an optimiser recognised
+     `λb. b = c`. *)
+  position :: ∀π. Byte_Pattern π |- Bytes -> π -> Perhaps Int := λbytes pattern.
+    position' bytes 0 pattern
+
+  position' :: ∀π. Byte_Pattern π |- Bytes -> Int -> π -> Perhaps Int :=
+    λbytes offset pattern.
+      find_bytes pattern bytes offset
+
+  (* Split at the first match: (before, after the match). Nope if absent. Allocates
+     two sub-views, so prefer `position'` in a loop that already tracks an offset. *)
+  split_once :: ∀π. Byte_Pattern π |- Bytes -> π -> Perhaps (Bytes, Bytes) :=
+    λbytes pattern.
+      deconstruct position bytes pattern into
+        This i ->
+          let length = Bytes.length bytes in
+          This (slice bytes 0 i, slice bytes (i + 1) (length - i - 1))
+      | Nope -> Nope
 
   get_u8     :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_u8 s i
   get_u16_le :: Bytes -> Int -> Int := λ(Bytes s) i. raw_get_u16_le s i
@@ -230,6 +273,8 @@ module Bytes:
   (* Is the whole view well-formed UTF-8? (C fast path; no allocation.) *)
   is_valid :: Bytes -> Bool := raw_is_valid
 
+(* A single byte: `memchr`. `raw_position` returns -1 for "absent", which is the C
+   convention; the Perhaps lives here so callers never see the sentinel. *)
 (* --------------------------------------------------------------------- Text *)
 (* `opaque`, so `MkText` -- and thus the UTF-8 invariant -- is sealed in this module.    *)
 (* `from_bytes` is the only validating way in; `to_bytes` the only way out. Char/byte ops *)

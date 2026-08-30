@@ -1853,6 +1853,19 @@ bool text_to_cstr(Value sv, char *buf, size_t cap) {
     return true;
 }
 
+// Index of the first `byte` at or after `from`, or -1. This is `memchr`, which scans
+// word-at-a-time and vectorises; the equivalent Marmelade loop reads one byte per
+// iteration through a predicate call. `from` past the end is not an error -- it simply
+// finds nothing, which is what lets the caller drive a parse loop without a separate
+// bounds check on every row.
+int64_t slice_position(Value sv, int64_t from, int64_t byte) {
+    const Slice *s = as_ptr(sv);
+    if (from < 0 || (size_t)from >= s->len) return -1;
+    const uint8_t *hit =
+        memchr(s->base + from, (int)(uint8_t)byte, s->len - (size_t)from);
+    return hit ? (int64_t)(hit - s->base) : -1;
+}
+
 Value slice_sub(Value sv, size_t off, size_t len) {
     Slice *s = as_ptr(sv);
     // The base is already resolved, so a sub-view is just base + off -- no owner
