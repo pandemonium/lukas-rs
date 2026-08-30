@@ -39,7 +39,7 @@ module Cheeky_Map:
           This existing_key ->
             if existing_key = key then
                 let new_entry =
-                  { Entry_Key   := This key
+                  { elt:
                     Entry_Value := mappend elt.Entry_Value new_value
                   }
                 in

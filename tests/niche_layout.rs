@@ -31,10 +31,11 @@ fn perhaps_uses_zero_niche_and_nested_perhaps_falls_back_to_a_tag() {
         generated.contains("(int64_t[]){-1, 1, 2, 0, 1, -2, 0, 1, 0, 1, 0}, 11"),
         "nested Perhaps did not preserve Nope versus This Nope"
     );
-    // A record already flattened by canonical codegen (nested Perhaps + Pair +
-    // Text) remains exactly its five-word payload width under the outer Perhaps.
+    // Once the record is ground, its Perhaps Int field also uses a one-word
+    // niche. Together with Pair's two words and Text's one, the record is four
+    // words wide under the outer Perhaps.
     assert!(
-        generated.contains("(int64_t[]){-2, 0, 1, 0, 1, 5, 0, 0, 0, 0, 0}, 11"),
+        generated.contains("(int64_t[]){-2, 0, 1, 0, 1, 4, 0, 0, 0, 0}, 10"),
         "the niche was not propagated through a wider record payload"
     );
     // Occupied has three constructor arguments. Its first is itself niche-encoded,

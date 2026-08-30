@@ -30,6 +30,7 @@ const MAX_LAYOUT_SPECIALIZATIONS: usize = 64;
 struct LayoutSlot {
     argument: usize,
     template: Type,
+    saturation: usize,
 }
 
 impl phase::SymbolTable<Types> {
@@ -271,6 +272,7 @@ fn leading_layout_slots(
     mut body: &phase::Expr<Types>,
     signatures: &HashSet<QualifiedName>,
 ) -> Vec<LayoutSlot> {
+    let saturation = lambda_arity(body);
     while let Expr::Ascription(_, ascription) = body {
         body = &ascription.ascribed_tree;
     }
@@ -298,6 +300,7 @@ fn leading_layout_slots(
             slots.push(LayoutSlot {
                 argument,
                 template: domain.as_ref().clone(),
+                saturation,
             });
         }
 
@@ -313,6 +316,26 @@ fn leading_layout_slots(
         next = lambda.body.as_ref();
     }
     slots
+}
+
+fn lambda_arity(mut body: &phase::Expr<Types>) -> usize {
+    let mut arity = 0;
+    loop {
+        while let Expr::Ascription(_, ascription) = body {
+            body = &ascription.ascribed_tree;
+        }
+        match body {
+            Expr::RecursiveLambda(_, recursive) => {
+                arity += 1;
+                body = &recursive.lambda.body;
+            }
+            Expr::Lambda(_, lambda) => {
+                arity += 1;
+                body = &lambda.body;
+            }
+            _ => return arity,
+        }
+    }
 }
 
 fn match_type_pattern(
@@ -494,16 +517,18 @@ fn collect_layout_pairs(
 ) {
     if let Some((function, arguments)) = application_spine(body)
         && let Some(slots) = layout_slots.get(function)
-        && let Some(types) = slots
+    {
+        let types = slots
             .iter()
             .map(|slot| {
                 arguments
                     .get(slot.argument)
                     .and_then(|argument| concrete_layout_type(argument))
             })
-            .collect::<Option<Vec<_>>>()
-    {
-        out.push((function.clone(), types));
+            .collect::<Option<Vec<_>>>();
+        if let Some(types) = types {
+            out.push((function.clone(), types));
+        }
     }
     for child in crate::simplify::children(body) {
         collect_layout_pairs(&**child, layout_slots, out);
@@ -524,6 +549,57 @@ fn application_spine<A>(
         Expr::Variable(_, Identifier::Free(function)) => Some((function, arguments)),
         _ => None,
     }
+}
+
+fn application_head_type(body: &phase::Expr<Types>) -> Option<&Type> {
+    let mut head = body;
+    while let Expr::Apply(_, application) = head {
+        head = application.function.as_ref();
+    }
+    match head {
+        Expr::Variable(annotation, Identifier::Free(_)) => Some(&annotation.inferred_type),
+        _ => None,
+    }
+}
+
+fn arrow_arity(mut function: &Type) -> usize {
+    let mut arity = 0;
+    while let Type::Arrow { codomain, .. } = function {
+        arity += 1;
+        function = codomain;
+    }
+    arity
+}
+
+/// Recover the call site's own metavariables from the ground layout argument.
+/// Those variables are fresh instantiations of the callee's scheme and therefore
+/// differ from the variables substituted into the specialized definition.
+fn layout_call_substitutions(
+    body: &phase::Expr<Types>,
+    slots: &[LayoutSlot],
+    arguments: &[&phase::Expr<Types>],
+) -> Option<Substitutions> {
+    let mut function_type = application_head_type(body)?;
+    let source_arity = arrow_arity(function_type);
+    let saturation = slots.first()?.saturation;
+    let constraint_arity = saturation.checked_sub(source_arity)?;
+    let source_arguments = arguments.get(constraint_arity..)?;
+    (source_arguments.len() == source_arity).then_some(())?;
+
+    let mut bindings = HashMap::new();
+    for argument in source_arguments {
+        let Type::Arrow { domain, codomain } = function_type else {
+            return None;
+        };
+        match_type_pattern(&argument.annotation().inferred_type, domain, &mut bindings)?;
+        function_type = codomain;
+    }
+    match_type_pattern(
+        &body.annotation().inferred_type,
+        function_type,
+        &mut bindings,
+    )?;
+    Some(bindings.into_iter().collect::<Vec<_>>().into())
 }
 
 fn replace_application_head(node: phase::Expr<Types>, clone: &QualifiedName) -> phase::Expr<Types> {
@@ -548,8 +624,13 @@ fn rewrite_layout_calls(
     slots: &HashMap<QualifiedName, Vec<LayoutSlot>>,
 ) -> phase::Expr<Types> {
     body.map(&mut |node| {
+        // Wait for a saturated call. `Expr::map` is bottom-up, so rewriting the
+        // first prefix that merely reaches the layout argument would hide the
+        // original callee from the outer applications and leave their result
+        // annotations polymorphic.
         let target = application_spine(&node).and_then(|(function, arguments)| {
             let function_slots = slots.get(function)?;
+            (arguments.len() == function_slots[0].saturation).then_some(())?;
             let types = function_slots
                 .iter()
                 .map(|slot| {
@@ -558,9 +639,16 @@ fn rewrite_layout_calls(
                         .and_then(|argument| concrete_layout_type(argument))
                 })
                 .collect::<Option<Vec<_>>>()?;
-            specs.get(&(function.clone(), types)).cloned()
+            let clone = specs.get(&(function.clone(), types.clone()))?.clone();
+            let Some(substitutions) = layout_call_substitutions(&node, function_slots, &arguments)
+            else {
+                return None;
+            };
+            Some((clone, substitutions))
         });
-        target.map_or(node.clone(), |clone| replace_application_head(node, &clone))
+        target.map_or(node.clone(), |(clone, substitutions)| {
+            replace_application_head(node, &clone).apply(&substitutions)
+        })
     })
 }
 

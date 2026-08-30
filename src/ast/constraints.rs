@@ -290,20 +290,35 @@ impl WitnessEnvironment {
                 .map(|c| self.resolve_witness(c, ctx, assumptions))
                 .collect::<Result<Vec<_>, _>>();
 
-            // Compute some honest type info to insert?
             if let Ok(solution) = solution {
                 //tracing::trace!("solution {solution:?}");
 
-                // surely the witness can contain this.
+                // Annotate the evidence spine with the constraint being discharged
+                // rather than a fresh metavariable. A fresh variable is never unified
+                // with anything, so the dictionary reference reaches the back end
+                // carrying an unresolved type -- and every consumer that instantiates
+                // from an occurrence's type (notably the simplifier's typed inliner)
+                // then has nothing to match against, silently keeping the witness
+                // body's *polymorphic* annotations and lowering it at the type
+                // variable instead of the ground type this query fixed.
+                //
+                // Every node takes the head constraint's type, including the
+                // intermediate applications -- whose fully precise types would be the
+                // partially-applied arrows (`Default b -> Default (Entry a b)`). This
+                // mirrors `discharge_constraints`, which likewise stamps one
+                // `type_info` across the dictionary spine it builds, and the
+                // `memory_layout` marker above. Only the head's type is read
+                // downstream; tighten this if a consumer ever needs the arrows.
                 let pi = ParseInfo::default();
+                let evidence_type = constraint.constraint_type.clone();
                 return Ok(solution.into_iter().fold(
                     Expr::Variable(
-                        pi.with_inferred_type(Type::fresh()),
+                        pi.with_inferred_type(evidence_type.clone()),
                         Identifier::Free(witness.name.clone().into()),
                     ),
                     |f, x| {
                         Expr::Apply(
-                            pi.with_inferred_type(Type::fresh()),
+                            pi.with_inferred_type(evidence_type.clone()),
                             Apply {
                                 function: f.into(),
                                 argument: x.into(),

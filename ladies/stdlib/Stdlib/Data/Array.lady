@@ -42,7 +42,7 @@ module Mutable_Array:
   put :: ∀α. Mutable_Array α -> Int -> α -> IO (Perhaps α) := λ(Mutable array) index element.
     IO.suspend (λ_. raw_put array index element)
 
-  get_unchecked :: ∀α. Mutable_Array α -> Int -> IO α := λ(Mutable array) index.
+  get_unchecked :: ∀α. Memory_Layout α |- Mutable_Array α -> Int -> IO α := λ(Mutable array) index.
     IO.suspend (λ_. raw_get_unchecked array index)
 
   (* Pure escape hatch for implementing a larger atomic IO operation. Callers must *)
@@ -59,7 +59,7 @@ module Mutable_Array:
   put_unchecked :: ∀α. Mutable_Array α -> Int -> α -> IO α := λ(Mutable array) index element.
     IO.suspend (λ_. raw_put_unchecked array index element)
 
-  set_unchecked :: ∀α. Mutable_Array α -> Int -> α -> IO Unit := λ(Mutable array) index element.
+  set_unchecked :: ∀α. Memory_Layout α |- Mutable_Array α -> Int -> α -> IO Unit := λ(Mutable array) index element.
     IO.suspend (λ_. raw_set_unchecked array index element)
 
   (* Copy packed elements without rebuilding their canonical values. Source and *)
@@ -79,7 +79,7 @@ module Mutable_Array:
     let element = f previous in
     pure (raw_put_unchecked array index element)
 
-  modify_at :: ∀α. Mutable_Array α -> Int -> (α -> α) -> IO Unit := λ(Mutable array) index f.
+  modify_at :: ∀α. Memory_Layout α |- Mutable_Array α -> Int -> (α -> α) -> IO Unit := λ(Mutable array) index f.
     IO.suspend (λ_.
       let previous = raw_get_unchecked array index in
       let element = f previous in

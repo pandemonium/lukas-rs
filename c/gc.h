@@ -50,14 +50,18 @@ typedef struct GcHeader {
 #define BODY(h) ((void *)((h) + 1))
 #define HEADER(p) (((GcHeader *)(p)) - 1)
 
-// An immutable byte view: `owner` is a real GC-body pointer (an OBJ_BYTES body
-// or an OBJ_MMAP handle -- so the tracer keeps the backing live) plus an
-// offset/length. Both `Bytes` and the validated `Text` erase to an OBJ_SLICE
-// over this. Exposed here (not gc.c-private) so codegen can emit a string
-// literal as a static .rodata Slice.
+// An immutable byte view. `base` is the RESOLVED read pointer, computed once when
+// the slice is built; reading a byte is then a single load, with no dispatch on how
+// the bytes are owned. Valid because the collector is non-moving. `owner` exists
+// purely so the tracer keeps the backing alive -- an OBJ_BYTES body, an OBJ_MMAP
+// handle, the parent OBJ_SLICE of a sub-view of an inline-owned slice, or NULL when
+// the bytes sit immediately behind this slice's own header (see `mk_textn`). It is
+// never followed to find the bytes. Both `Bytes` and the validated `Text` erase to
+// an OBJ_SLICE over this. Exposed here (not gc.c-private) so codegen can emit a
+// string literal as a static .rodata Slice.
 typedef struct {
   void *owner;
-  size_t offset;
+  const uint8_t *base;
   size_t len;
 } Slice;
 
@@ -279,12 +283,28 @@ Value buffer_copy_range(Value buf, size_t off,
                         size_t n); // -> Result; independent copy of [off,off+n)
 
 Value mk_slice(void *owner, size_t offset, size_t len);
-size_t slice_len(Value slice);
-const uint8_t *
-slice_ptr(Value slice); // direct read pointer to byte 0 (owner must stay live)
+// Build a slice over an ALREADY-resolved read pointer. `owner` is only the
+// liveness link (see the `Slice` comment); `base` must point into whatever it
+// keeps alive.
+Value mk_slice_at(void *owner, const uint8_t *base, size_t len);
+
+// The hot accessors. Each is a single load because the base pointer was resolved
+// once, at construction -- no owner dereference, no kind dispatch, no recursion.
+// They live in the header (not gc.c) so they inline into the generated program and
+// the stdlib companions, which are separate translation units: `Bytes.get_u8` in a
+// scanning loop then folds to `base[i]` at the call site instead of three calls.
+static inline const uint8_t *slice_ptr(Value slice) {
+  return ((const Slice *)as_ptr(slice))->base;
+}
+static inline size_t slice_len(Value slice) {
+  return ((const Slice *)as_ptr(slice))->len;
+}
+static inline uint8_t slice_get_u8(Value slice, size_t i) {
+  return ((const Slice *)as_ptr(slice))->base[i];
+}
+
 bool text_to_cstr(Value slice, char *buf,
                   size_t cap); // NUL-terminate into buf; false if too big
-uint8_t slice_get_u8(Value slice, size_t i);
 Value slice_sub(Value slice, size_t offset, size_t len);
 
 uint16_t slice_get_u16_le(Value slice, size_t off);

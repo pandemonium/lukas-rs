@@ -1862,8 +1862,19 @@ fn discharge_constraints(
             // It is just not as easy as picking #0 too. It could be a plain variable
             tracing::trace!("name {term_id}");
 
+            // A witness global reached here inside an evidence term is ALREADY
+            // saturated: `resolve_witness` built the spine with its premise
+            // dictionaries applied. Re-injecting here would double-apply them. This
+            // used to be masked -- the spine carried `Type::fresh()` annotations, so
+            // the unification below bound a free variable, no use-site constraint ever
+            // matched the evidence map, and injection silently no-opped. Now that the
+            // spine is honestly typed, the guard has to be explicit.
+            let is_saturated_witness = matches!(term_id, Identifier::Free(q)
+                if witnesses.witness_named(q.as_ref()).is_some());
+
             if let Some(type_scheme) = ctx.terms.lookup(&term_id)
                 && !type_scheme.constraints.is_empty()
+                && !is_saturated_witness
             {
                 let use_site_type = type_scheme.instantiate();
 

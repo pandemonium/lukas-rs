@@ -1018,8 +1018,8 @@ Value mk_textn(const char *src, size_t len) {
     // with owner == NULL marking "bytes are inline". (The previous form allocated an
     // OBJ_BYTES body plus a separate OBJ_SLICE header -- two objects per computed string.)
     Slice *s = gc_new(sizeof(Slice) + len, OBJ_SLICE);
-    s->owner = NULL;
-    s->offset = 0;
+    s->owner = NULL; // inline-owned: the bytes are this object's own tail
+    s->base = (const uint8_t *)(s + 1);
     s->len = len;
     memcpy((char *)(s + 1), src, len); // `src` is a malloc/rodata pointer, not GC memory
     return VObject(s);
@@ -1790,14 +1790,27 @@ void buffer_put_slice(Value bv, Value sv) {
     for (size_t i = 0; i < n; i++) buffer_put_u8(bv, slice_get_u8(sv, i));
 }
 
-Value mk_slice(void *owner, size_t offset, size_t len) {
+Value mk_slice_at(void *owner, const uint8_t *base, size_t len) {
     // `owner` is a body pointer; it sits on the stack (conservatively scanned), so
-    // it survives the collection `gc_new` may trigger.
+    // it survives the collection `gc_new` may trigger. `base` is an interior pointer
+    // into whatever `owner` keeps alive -- safe only because the collector never
+    // moves objects.
     Slice *s = gc_new(sizeof(Slice), OBJ_SLICE);
     s->owner = owner;
-    s->offset = offset;
+    s->base = base;
     s->len = len;
     return VObject(s);
+}
+
+// Resolve `owner + offset` to a read pointer ONCE, here, rather than on every byte
+// read. `owner` is an OBJ_BYTES body or an OBJ_MMAP handle; inline-owned slices are
+// built by `mk_textn`, and sub-views by `slice_sub`, both of which know their base
+// directly and call `mk_slice_at`.
+Value mk_slice(void *owner, size_t offset, size_t len) {
+    const uint8_t *base = HEADER(owner)->kind == OBJ_BYTES
+                              ? (const uint8_t *)owner + offset
+                              : ((Mmap *)owner)->region + offset;
+    return mk_slice_at(owner, base, len);
 }
 
 // Hand the buffer's body to a Slice, then reseed the handle with a fresh empty
@@ -1823,23 +1836,11 @@ Value buffer_copy(Value bv) {
     return mk_slice(body, 0, n);
 }
 
-static const uint8_t *slice_base(Slice *s) {
-    // An inline-owned slice (owner == NULL) stores its bytes immediately after the Slice
-    // header -- a single allocation for owned strings (mk_textn), no separate OBJ_BYTES.
-    if (s->owner == NULL) return (const uint8_t *)(s + 1) + s->offset;
-    GcHeader *h = HEADER(s->owner);
-    if (h->kind == OBJ_BYTES) return (const uint8_t *)s->owner + s->offset;
-    // A sub-view of an inline-owned slice borrows that slice as its owner.
-    if (h->kind == OBJ_SLICE) return slice_base((Slice *)s->owner) + s->offset;
-    return ((Mmap *)s->owner)->region + s->offset; // OBJ_MMAP
-}
-
-size_t slice_len(Value sv) { return ((Slice *)as_ptr(sv))->len; }
-
-// Direct read pointer to a slice's first byte (valid until the next allocation may
-// move nothing -- the GC is non-moving -- but the owner must stay reachable). Used by
-// the Text primitives (print/eq/show/concat) to avoid a per-byte `slice_get_u8`.
-const uint8_t *slice_ptr(Value sv) { return slice_base(as_ptr(sv)); }
+// `slice_base`, `slice_len`, `slice_ptr` and `slice_get_u8` are now `static inline`
+// in gc.h -- each is one load off the resolved `base`, so they fold into their callers
+// across translation units. The old form re-derived the address on EVERY byte (load the
+// owner's GcHeader, dispatch on its kind, recurse for a borrowed sub-view), which made
+// `Bytes.get_u8` three calls deep and could not inline at all because of the recursion.
 
 // Copy a Text/Bytes slice into a caller buffer as a NUL-terminated C string, for the C
 // APIs that need one (file paths, strtol). Text is length-prefixed, not NUL-terminated,
@@ -1852,23 +1853,30 @@ bool text_to_cstr(Value sv, char *buf, size_t cap) {
     return true;
 }
 
-uint8_t slice_get_u8(Value sv, size_t i) { return slice_base(as_ptr(sv))[i]; }
-
 Value slice_sub(Value sv, size_t off, size_t len) {
     Slice *s = as_ptr(sv);
-    return mk_slice(s->owner, s->offset + off, len); // shares the owner
+    // The base is already resolved, so a sub-view is just base + off -- no owner
+    // dispatch, and correct for every ownership kind including inline-owned (which
+    // the old `mk_slice(s->owner, ...)` got WRONG: it passed the parent's NULL owner
+    // along, so the sub-view claimed its bytes lived behind its own empty header).
+    //
+    // An inline-owned parent IS the object holding the bytes, so the sub-view must
+    // borrow it as its liveness link or the parent could be collected out from under
+    // it. That link is never followed for addressing.
+    void *owner = s->owner ? s->owner : (void *)s;
+    return mk_slice_at(owner, s->base + off, len);
 }
 
 #define SLICE_GET_LE(NAME, TYPE, N)                                                    \
     TYPE NAME(Value sv, size_t off) {                                                  \
-        const uint8_t *p = slice_base(as_ptr(sv)) + off;                                    \
+        const uint8_t *p = slice_ptr(sv) + off;                                    \
         uint64_t v = 0;                                                                \
         for (size_t k = 0; k < (N); k++) v |= (uint64_t)p[k] << (8 * k);               \
         return (TYPE)v;                                                                \
     }
 #define SLICE_GET_BE(NAME, TYPE, N)                                                    \
     TYPE NAME(Value sv, size_t off) {                                                  \
-        const uint8_t *p = slice_base(as_ptr(sv)) + off;                                    \
+        const uint8_t *p = slice_ptr(sv) + off;                                    \
         uint64_t v = 0;                                                                \
         for (size_t k = 0; k < (N); k++) v = (v << 8) | p[k];                          \
         return (TYPE)v;                                                                \
@@ -1949,7 +1957,7 @@ static bool utf8_is_valid(const uint8_t *b, size_t len) {
 // `STATIC_DATA0` instance -- a `.rodata` value, never a heap allocation.
 Value utf8_from_slice(Value sv) {
     Slice *s = as_ptr(sv);
-    const uint8_t *p = slice_base(s);
+    const uint8_t *p = s->base;
     size_t n = s->len;
     if (!utf8_is_valid(p, n)) return STATIC_DATA0(0);
     // The collector is non-moving and `sv` is a live local on the C stack, so its
@@ -1961,7 +1969,7 @@ Value utf8_from_slice(Value sv) {
 // the validator itself (and as a fast `Text.is_valid` that never copies).
 bool utf8_slice_is_valid(Value sv) {
     Slice *s = as_ptr(sv);
-    return utf8_is_valid(slice_base(s), s->len);
+    return utf8_is_valid(s->base, s->len);
 }
 
 // ----------------------------------------------------------------- memory maps
@@ -2047,7 +2055,7 @@ Value mmap_read(Value mv, size_t off, size_t n) {
 }
 
 // Zero-copy view into a mapped region: a Slice whose owner is the Mmap handle
-// itself (no copy -- `slice_base` reads straight from `region`). Valid only
+// itself (no copy -- the slice's `base` points straight into `region`). Valid only
 // while the mapping is open; reading it after mmap_close faults on the unmapped
 // pages. Returns Result (Fault errno | Return Slice).
 Value mmap_slice(Value mv, size_t off, size_t n) {
@@ -2066,7 +2074,7 @@ int64_t slice_write_file(Value sv, const char *path) {
     Slice *s = as_ptr(sv);
     FILE *f = fopen(path, "wb");
     if (!f) return errno;
-    size_t w = fwrite(slice_base(s), 1, s->len, f);
+    size_t w = fwrite(s->base, 1, s->len, f);
     int err = (w == s->len) ? 0 : -1;
     fclose(f);
     return err;

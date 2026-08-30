@@ -180,7 +180,7 @@ fn mutable_array_deep_update_is_one_load_and_one_store_at_the_leaf_offset() {
 }
 
 #[test]
-fn mutable_array_update_fusion_refuses_different_places_and_aggregate_leaves() {
+fn mutable_array_update_fusion_refuses_different_places_and_scalarizes_aggregate_leaves() {
     let source = r#"
 use Stdlib.
 use Stdlib.Data.Array.
@@ -218,20 +218,133 @@ start :: Int -> Unit := λ_.
     let replace_effect = generated_function(&generated, first_closure_target(replace_wrapper));
     let write_effect = generated_function(&generated, first_closure_target(write_wrapper));
 
-    for effect in [replace_effect, write_effect] {
+    assert!(
+        !write_effect.contains("Value _pa"),
+        "a write to a different index was fused: {write_effect}"
+    );
+    assert_eq!(
+        write_effect.matches("flat_array_set_word").count(),
+        3,
+        "the whole three-word Outer value must be stored at the other index: {write_effect}"
+    );
+
+    assert!(
+        replace_effect.contains("Value _pa"),
+        "the same-place aggregate replacement was not fused: {replace_effect}"
+    );
+    assert_eq!(
+        replace_effect.matches("flat_array_get_word").count(),
+        1,
+        "only old.inner.x should be read: {replace_effect}"
+    );
+    assert_eq!(
+        replace_effect.matches("flat_array_set_word").count(),
+        2,
+        "only the two leaves of inner should be written: {replace_effect}"
+    );
+    for offset in [0, 1] {
         assert!(
-            !effect.contains("Value _pa"),
-            "an update outside the supported same-place scalar case was fused: {effect}"
-        );
-        assert_eq!(
-            effect.matches("flat_array_set_word").count(),
-            3,
-            "the whole three-word Outer value must be stored: {effect}"
+            replace_effect.contains(&format!(", {offset}, _pv")),
+            "missing aggregate leaf store at offset {offset}: {replace_effect}"
         );
     }
     assert!(
-        replace_effect.contains("mk_tuple(3"),
-        "an aggregate replacement must be rebuilt before its whole-value store: {replace_effect}"
+        !replace_effect.contains("mk_tuple"),
+        "the aggregate replacement allocated a temporary tuple: {replace_effect}"
+    );
+}
+
+#[test]
+fn branch_local_update_keeps_a_niche_key_and_nested_record_in_the_array_place() {
+    let source = r#"
+use Stdlib.
+use Stdlib.Data.Array.
+
+Stats ::= { Count :: Int; Max :: Int; Min :: Int; Sum :: Int }
+Entry ::= ∀α. { Entry_Key :: Perhaps α; Entry_Value :: Stats }
+Store ::= ∀α. { Buckets :: Mutable_Array (Entry α) }
+
+combine :: Stats -> Stats -> Stats := λold added.
+  { Count := old.Count + added.Count
+    Max := old.Max + added.Max
+    Min := old.Min + added.Min
+    Sum := old.Sum + added.Sum
+  }
+
+update :: ∀α. Eq α |- α -> Stats -> Store α -> Int -> IO Unit :=
+  λkey added store initial_index.
+    let length = Mutable_Array.length store.Buckets in
+    let loop = λindex.
+      let* old = Mutable_Array.get_unchecked store.Buckets index in
+      deconstruct old.Entry_Key into
+        This existing ->
+          if existing = key then
+            let changed = { old: Entry_Value := combine old.Entry_Value added } in
+            Mutable_Array.set_unchecked store.Buckets index changed
+          else
+            loop ((index + 1) % length)
+      | Nope ->
+          Mutable_Array.set_unchecked store.Buckets index
+            { Entry_Key := This key; Entry_Value := added }
+    in loop initial_index
+
+start :: Int -> Unit := λ_.
+  let zero = { Count := 0; Max := 0; Min := 0; Sum := 0 } in
+  let one = { Count := 1; Max := 2; Min := 3; Sum := 4 } in
+  let buckets = unsafe_run_IO (Mutable_Array.generate 4 (λ_. { Entry_Key := Nope; Entry_Value := zero })) in
+  let store = { Buckets := buckets } in
+  let _ = unsafe_run_IO (update "alpha" one store 0) in
+  unsafe_run_IO (update "alpha" one store 0)
+"#;
+    let mut compiler = compiler_for("branch_local_niche_update", source);
+    let output = compiler.source_path.join("branch_local_niche_update.c");
+    compiler.output_file = Some(output.clone());
+    compiler.compiler_main().expect("native code generation");
+    let generated = fs::read_to_string(output).expect("generated C source");
+
+    assert!(
+        generated.contains("{6, 5, 0, 0, 0, 0, 0}"),
+        "Entry Text was not represented as one niche key plus four inline Stats words"
+    );
+
+    let hot_function = generated
+        .split("\nValue ")
+        .find(|function| {
+            function.contains("Value _pv")
+                && function.contains(", 1, _pv")
+                && function.contains(", 2, _pv")
+                && function.contains(", 3, _pv")
+                && function.contains(", 4, _pv")
+        })
+        .expect("no four-leaf same-place update was generated");
+    let update_start = hot_function.find("Value _pa").unwrap();
+    let update_end = hot_function[update_start..]
+        .find("VUnit();")
+        .map(|end| update_start + end + "VUnit();".len())
+        .unwrap();
+    let occupied_update = &hot_function[update_start..update_end];
+
+    assert!(
+        hot_function.contains(".w != 0"),
+        "the Perhaps key was not tested through its zero niche: {hot_function}"
+    );
+    assert!(
+        !hot_function.contains("raw_get_unchecked_worker"),
+        "the complete Entry was reconstructed by an array read: {hot_function}"
+    );
+    assert_eq!(
+        occupied_update.matches("flat_array_get_word").count(),
+        4,
+        "the occupied update should read exactly the four Stats leaves: {occupied_update}"
+    );
+    assert_eq!(
+        occupied_update.matches("flat_array_set_word").count(),
+        4,
+        "the occupied update should write exactly the four Stats leaves: {occupied_update}"
+    );
+    assert!(
+        !occupied_update.contains(", 0, _pv") && !occupied_update.contains("mk_tuple"),
+        "the occupied update rewrote the key or rebuilt an aggregate: {occupied_update}"
     );
 }
 

@@ -997,8 +997,36 @@ fn inline_type_substitutions(template: &Type, concrete: &Type) -> Option<Substit
         }
     }
 
+    fn arrow_arity(mut function: &Type) -> usize {
+        let mut arity = 0;
+        while let Type::Arrow { codomain, .. } = function {
+            arity += 1;
+            function = codomain;
+        }
+        arity
+    }
+
     let mut bindings = HashMap::new();
-    match_pattern(template, concrete, &mut bindings)?;
+    if match_pattern(template, concrete, &mut bindings).is_some() {
+        return Some(bindings.into_iter().collect::<Vec<_>>().into());
+    }
+
+    // A constrained definition (`Memory_Layout a |- Mutable_Array a -> ...`) carries a
+    // leading dictionary arrow per premise, but the occurrence being unfolded records
+    // only the source type. Matching those two directly fails on the very first domain
+    // -- and the silent fallback then inlines the body with its *polymorphic*
+    // annotations, so codegen lowers it at the type variable instead of the ground type
+    // the call site fixed. Peel exactly the premise prefix and match the source types.
+    let premises = arrow_arity(template).checked_sub(arrow_arity(concrete))?;
+    let mut source = template;
+    for _ in 0..premises {
+        let Type::Arrow { codomain, .. } = source else {
+            return None;
+        };
+        source = codomain;
+    }
+    let mut bindings = HashMap::new();
+    match_pattern(source, concrete, &mut bindings)?;
     Some(bindings.into_iter().collect::<Vec<_>>().into())
 }
 
