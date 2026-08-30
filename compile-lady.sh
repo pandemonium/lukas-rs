@@ -114,7 +114,10 @@ case "$BACKEND" in
     BIN="$SOURCE_PATH/$NAME"
     C_SOURCE_LIST="$BUILD_DIR/native-c-sources.txt"
     CC=${CC:-clang}
-    CFLAGS=${CFLAGS:--O2}
+    # `-flto` by default: it buys real time on the byte-access path, and it turns
+    # latent "raw word sitting in a Value slot" bugs into loud failures instead of
+    # letting them ride on whether the word happens to be odd. Override with CFLAGS.
+    CFLAGS=${CFLAGS:--O2 -flto}
 
     command -v "$CC" >/dev/null 2>&1 \
       || die "C compiler not found: $CC"

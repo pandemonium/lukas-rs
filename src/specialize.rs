@@ -119,6 +119,11 @@ impl phase::SymbolTable<Types> {
         }
         pairs.sort();
         pairs.dedup();
+        if std::env::var_os("DUMP_SPECIALIZE").is_some() {
+            for (f, w) in &pairs {
+                eprintln!("[spec-pair] {f}  <-  {w}  (dict level {})", dict_levels[f]);
+            }
+        }
 
         // Mint (or reuse) a clone per (f, w) under a deterministic name.
         let mut specs: HashMap<(QualifiedName, QualifiedName), QualifiedName> = HashMap::new();
@@ -472,7 +477,11 @@ fn collect_pairs<A>(
         if let (Expr::Variable(_, Identifier::Free(f)), Expr::Variable(_, Identifier::Free(w))) =
             (&*app.function, &*app.argument)
         {
-            if dict_levels.contains_key(f.as_ref()) && witnesses.contains(w.as_ref()) {
+            if dict_levels.contains_key(f.as_ref())
+                && witnesses.contains(w.as_ref())
+                && std::env::var_os("MARM_NO_SELECTOR_SPEC")
+                    .map_or(true, |_| !f.member().as_str().contains('$'))
+            {
                 out.push((f.as_ref().clone(), w.as_ref().clone()));
             }
         }
@@ -673,7 +682,12 @@ fn rewrite_calls<A: Clone>(
                 Some((fa, clone)) => Expr::Apply(
                     a,
                     Apply {
-                        function: Rc::new(Expr::Variable(fa, Identifier::Free(Box::new(clone)))),
+                        function: Rc::new(Expr::Variable(fa, Identifier::Free(Box::new({
+                            if std::env::var_os("DUMP_SPECIALIZE").is_some() {
+                                eprintln!("[spec-redirect] -> {clone}");
+                            }
+                            clone
+                        })))),
                         argument: app.argument,
                     },
                 ),

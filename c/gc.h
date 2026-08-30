@@ -5,6 +5,7 @@
 #define MARMELADE_GC_H
 
 #include "runtime.h"
+#include <string.h> // memcmp, for the inline Text comparison below
 
 // Heap-object kind (selects a body's layout + tracing). Exposed here -- not
 // gc.c-private -- so the emitted code can build static text descriptors for
@@ -301,6 +302,20 @@ static inline size_t slice_len(Value slice) {
 }
 static inline uint8_t slice_get_u8(Value slice, size_t i) {
   return ((const Slice *)as_ptr(slice))->base[i];
+}
+
+// Monomorphic `=` on Text. `val_eq` is the polymorphic fallback: it must first
+// decide what it was handed, which costs two dependent loads into the operands'
+// object headers just to confirm a kind codegen already knew statically. When both
+// sides of `=` are Text, codegen emits this instead -- Text is always an OBJ_SLICE
+// (OBJ_TEXT is a legacy enum value nothing constructs), so the length check and the
+// byte compare can happen directly. Worth having as its own prim because a hash
+// table's probe runs it once per lookup.
+static inline Value prim_text_eq(Value a, Value b) {
+  const Slice *x = (const Slice *)as_ptr(a);
+  const Slice *y = (const Slice *)as_ptr(b);
+  return VBool(x->len == y->len &&
+               (x->base == y->base || memcmp(x->base, y->base, x->len) == 0));
 }
 
 bool text_to_cstr(Value slice, char *buf,

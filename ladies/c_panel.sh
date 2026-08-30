@@ -60,7 +60,16 @@ for dir in "$ROOT_DIR"/ladies/"$PANEL"/*/; do
     done
 
     # shellcheck disable=SC2086 # $foreign_cs is an intentional list of paths.
-    if ! clang -std=c11 -I"$C_DIR" -o "$work/prog" \
+    # `-flto` deliberately: cross-TU inlining is worth real time on the byte-access
+    # path, but the reason it is ON HERE is that it CATCHES BUGS. The runtime reads
+    # some words as `Value`s without proof (element-zero shape discovery in
+    # `build_shape` decides pointer-ness from the low bit alone), so a raw word in a
+    # Value slot is only safe while it happens to be odd. Without LTO those stay
+    # latent for months; with it they fail loudly in the panel. If a case here starts
+    # crashing under LTO, suspect the program's own layout/dictionary handling before
+    # suspecting the optimiser -- that is exactly how the `Default`-dictionary swap
+    # was found.
+    if ! clang -std=c11 -I"$C_DIR" -flto -o "$work/prog" \
         "$C_DIR/runtime.c" "$C_DIR/gc.c" $foreign_cs "$work/program.c" \
         2>"$work/cc.err"; then
       status="COMPILE-ERR"

@@ -343,6 +343,19 @@ fn builtin_prim(head: &Expr) -> Option<(&'static str, usize)> {
 // applied at a primitive (leaf) type -- the `Display` witnesses for compound types
 // recurse through `display`, never calling `prim_show` on a tuple/constructor -- so a
 // non-leaf here is a compiler invariant break.
+// `Text` reaches codegen two ways: the legacy builtin base type, and the stdlib DU
+// `opaque Text ::= Text Bytes` that string literals now elaborate to. Both erase to
+// the same OBJ_SLICE, so both are eligible for the monomorphic prims.
+//
+// The DU arm compares against `stdlib_text_type()` -- the compiler's one sanctioned
+// reference to `Root.Prelude.Text` -- NOT against the bare member name. Matching
+// `name.member == "Text"` would also accept any user type that happens to be called
+// `Text` in any module, and `prim_text_eq` would then read a value that is not a
+// Slice as one.
+fn is_text_type(ty: &Type) -> bool {
+    matches!(ty, Type::Base(BaseType::Text)) || *ty == crate::typer::stdlib_text_type()
+}
+
 fn show_prim(arg: &Expr) -> &'static str {
     match &arg.annotation().type_info.inferred_type {
         Type::Base(BaseType::Int) => "prim_show_int",
@@ -3390,10 +3403,13 @@ impl lambda_lift::Program {
                     // The arithmetic/ordering/logical prims are monomorphised on the
                     // operands' static type: a Float operand routes to the boxed-double
                     // prim, an Int operand routes `and`/`or`/`xor` to their bitwise
-                    // variant; everything else keeps the int/generic prim.
-                    match &args[0].annotation().type_info.inferred_type {
+                    // variant, a Text operand routes `=` to the direct slice compare;
+                    // everything else keeps the int/generic prim.
+                    let operand = &args[0].annotation().type_info.inferred_type;
+                    match operand {
                         Type::Base(BaseType::Float) => float_prim(prim).unwrap_or(prim),
                         Type::Base(BaseType::Int) => bitwise_prim(prim).unwrap_or(prim),
+                        _ if prim == "prim_eq" && is_text_type(operand) => "prim_text_eq",
                         _otherwise => prim,
                     }
                 };

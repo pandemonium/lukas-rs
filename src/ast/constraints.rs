@@ -11,7 +11,7 @@ use crate::{
     parser::ParseInfo,
     phase,
     typer::{
-        Constraint, RecordShape, Substitutions, Type, TypeEnvironment, TypeError, TypeStructure,
+        Constraint, RecordShape, Substitutions, TypeEnvironment, TypeError, TypeStructure,
         Types, Typing, TypingContext, display_list,
     },
 };
@@ -53,6 +53,12 @@ impl Witness {
         witness: phase::TypeSignature<Named>,
         ctx: &TypingContext,
     ) -> Typing<Self> {
+        // `premises` order IS the dictionary argument order: `resolve_witness` folds
+        // the evidence spine over it, and the witness body binds its dictionary
+        // parameters in the registered scheme's `ConstraintSet` order. Both sides must
+        // therefore use that one order -- taking the premises in *declaration* order
+        // instead would introduce a second, competing convention that disagrees
+        // whenever a witness is written `C b + C a`.
         let witness_signature = witness.type_scheme(&HashMap::default(), ctx)?;
         let witness_type = witness_signature.instantiate();
 

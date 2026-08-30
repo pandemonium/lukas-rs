@@ -1884,7 +1884,19 @@ fn discharge_constraints(
                     .underlying
                     .unified_with(&type_info.inferred_type, &ctx.types)
                     .expect("expr.typed");
-                let use_site_constraints = use_site_type.constraints.apply(&use_site_subst);
+                // Substitute each constraint but KEEP the scheme's own order. Going
+                // through `ConstraintSet::apply` would re-collect into a `BTreeSet`,
+                // re-sorting by the now-GROUND types -- and the fold below turns this
+                // order into the dictionary ARGUMENT order, while the callee bound its
+                // dictionary PARAMETERS against the un-grounded constraints. For two
+                // premises of the same class (`Default a + Default b`) the class name
+                // cannot break the tie, so grounding can reverse them and the two
+                // dictionaries get swapped at the call site.
+                let use_site_constraints = use_site_type
+                    .constraints
+                    .iter()
+                    .map(|c| c.apply(&use_site_subst))
+                    .collect::<Vec<_>>();
 
                 let is_injection_site = use_site_constraints
                     .iter()
