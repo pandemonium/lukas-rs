@@ -1464,6 +1464,30 @@ fn elaborate_term_constraints(
 ) -> Result<ast::Expr<TypeInfo, Identifier>, TypeError> {
     tracing::trace!("{symbol_name} given {given} wanted {constraints} tree {tree}");
 
+    if std::env::var_os("DUMP_WANTED").is_some_and(|f| {
+        symbol_name
+            .to_string()
+            .contains(&f.to_string_lossy().to_string())
+    }) {
+        eprintln!(
+            "[wanted] {symbol_name}  body type {}",
+            tree.type_info().inferred_type
+        );
+        for c in given.iter() {
+            eprintln!(
+                "    given  {c}  ground={}",
+                c.constraint_type.variables().is_empty()
+            );
+        }
+        for c in constraints.iter() {
+            eprintln!(
+                "    wanted {c}  ground={} parametric={}",
+                c.constraint_type.variables().is_empty(),
+                c.is_parametric()
+            );
+        }
+    }
+
     Ok(resolve_constraints(
         symbol_name,
         tree,
@@ -2563,6 +2587,17 @@ pub struct ConstraintSet(BTreeSet<Constraint>);
 impl ConstraintSet {
     fn _len(&self) -> usize {
         self.0.len()
+    }
+
+    /// The constraints of `self` that `other` does not already carry.
+    fn difference(&self, other: &ConstraintSet) -> ConstraintSet {
+        ConstraintSet(
+            self.0
+                .iter()
+                .filter(|c| !other.0.contains(*c))
+                .cloned()
+                .collect(),
+        )
     }
 
     fn _contains(&self, constraint: &Constraint) -> bool {
@@ -6070,13 +6105,43 @@ impl TypingContext {
         let mut ctx1 = self.apply(&typed_bound.substitutions);
 
         let bound_type = typed_bound.as_constrained_type().generalize(&ctx1);
-        let retained_constraints = typed_bound.constraints.clone();
-        let bound_scheme =
-            if retained_constraints.is_empty() || is_generalizable_value(binding.bound.as_ref()) {
-                bound_type.underlying
-            } else {
-                TypeScheme::from_constant(bound_type.underlying.underlying)
-            };
+        // A constrained local binding stays MONOMORPHIC. Generalisation quantifies the
+        // type but does not abstract the DICTIONARY -- the scheme would carry
+        // `Applicative m` while the bound lambda is still `λi. λacc. …` with no dictionary
+        // parameter and no use site supplying one, leaving the body's evidence reference
+        // dangling (it then resolves to whatever local shares that level). Keeping it
+        // monomorphic lets the metavariable stay shared, so the use site's unification
+        // grounds it (`m := IO`) and the constraint resolves to a real witness. This is the
+        // monomorphism restriction, forced here by the absence of dictionary abstraction
+        // for local bindings.
+        let generalizes = typed_bound.constraints.is_empty()
+            || (is_generalizable_value(binding.bound.as_ref())
+                && bound_type.underlying.constraints.is_empty());
+        // A constraint that generalisation moved INTO the binding's scheme is discharged
+        // afresh at each use site, where the instantiated variable unifies with the
+        // actual type. Propagating the definition's copy outward as well leaks the
+        // binding's OWN metavariable into the enclosing term, where it appears nowhere in
+        // that term's type -- an ambiguous residual. Being variable-headed it is then
+        // misclassified as parametric and becomes a leading dictionary parameter that the
+        // enclosing term's registered scheme does not mention, so callers never pass one:
+        // the body reads its dictionary out of whatever argument does arrive.
+        //
+        // That is how `let loop = λi acc. … pure acc in let* c = loop 0 0 …` silently
+        // dropped its continuation (`pure` projected out of the `IO` suspension's Unit),
+        // or segfaulted outright at higher arity. Constraints generalisation did NOT take
+        // (they mention variables bound outside) still have to be retained here.
+        let retained_constraints = if generalizes {
+            typed_bound
+                .constraints
+                .difference(&bound_type.underlying.constraints)
+        } else {
+            typed_bound.constraints.clone()
+        };
+        let bound_scheme = if generalizes {
+            bound_type.underlying
+        } else {
+            TypeScheme::from_constant(bound_type.underlying.underlying)
+        };
 
         let expected = expected_type.apply(&typed_bound.substitutions);
         ctx1.bind_term_and_then(binding.binder.clone(), bound_scheme, |ctx| {
@@ -6143,17 +6208,38 @@ impl TypingContext {
         let mut ctx1 = self.apply(&typed_bound.substitutions);
 
         let bound_type = typed_bound.as_constrained_type().generalize(&ctx1);
-        let retained_constraints = typed_bound.constraints.clone();
-        let bound_scheme =
-            if retained_constraints.is_empty() || is_generalizable_value(binding.bound.as_ref()) {
-                bound_type.underlying
-            } else {
-                // Expansive constrained bindings remain monomorphic. Their result type
-                // and wanted constraints therefore share metavariables with the body,
-                // allowing later uses to ground the evidence instead of creating stale,
-                // independently-generalized dictionary parameters.
-                TypeScheme::from_constant(bound_type.underlying.underlying)
-            };
+        // A constrained local binding stays MONOMORPHIC. Generalisation quantifies the
+        // type but does not abstract the DICTIONARY -- the scheme would carry
+        // `Applicative m` while the bound lambda is still `λi. λacc. …` with no dictionary
+        // parameter and no use site supplying one, leaving the body's evidence reference
+        // dangling (it then resolves to whatever local shares that level). Keeping it
+        // monomorphic lets the metavariable stay shared, so the use site's unification
+        // grounds it (`m := IO`) and the constraint resolves to a real witness. This is the
+        // monomorphism restriction, forced here by the absence of dictionary abstraction
+        // for local bindings.
+        let generalizes = typed_bound.constraints.is_empty()
+            || (is_generalizable_value(binding.bound.as_ref())
+                && bound_type.underlying.constraints.is_empty());
+        // See `check_binding`: a constraint generalisation moved into the binding's own
+        // scheme must NOT also be propagated outward, or the binding's metavariable leaks
+        // into the enclosing term as an ambiguous residual and becomes a phantom
+        // dictionary parameter.
+        let retained_constraints = if generalizes {
+            typed_bound
+                .constraints
+                .difference(&bound_type.underlying.constraints)
+        } else {
+            typed_bound.constraints.clone()
+        };
+        let bound_scheme = if generalizes {
+            bound_type.underlying
+        } else {
+            // Expansive constrained bindings remain monomorphic. Their result type
+            // and wanted constraints therefore share metavariables with the body,
+            // allowing later uses to ground the evidence instead of creating stale,
+            // independently-generalized dictionary parameters.
+            TypeScheme::from_constant(bound_type.underlying.underlying)
+        };
 
         ctx1.bind_term_and_then(binding.binder.clone(), bound_scheme, |ctx| {
             let typed_body = ctx.infer_expr(&binding.body)?;

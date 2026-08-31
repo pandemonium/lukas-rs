@@ -287,6 +287,8 @@ module Text:
       then This (MkText bytes)
       else Nope
 
+  unsafe_from_bytes :: Bytes -> Text := MkText
+
   (* Share the underlying bytes back out (free -- the wrapper erases). *)
   to_bytes :: Text -> Bytes := λ(MkText b). b
 

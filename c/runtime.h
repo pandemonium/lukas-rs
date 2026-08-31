@@ -140,34 +140,42 @@ static inline const char *as_text(Value v)  { return (const char *)(uintptr_t)v.
 // allocation) entirely. The `builtin_*` closure values below remain for partial
 // application and higher-order use (e.g. passing `+` to a fold).
 bool val_eq(Value a, Value b);
-// Arithmetic is untag -> compute -> retag. Int is 63-bit, so overflow wraps
-// (OCaml-style, no check); the codec's fields fit, full-width lands in Stage 2.
-static inline Value prim_add(Value a, Value b) { return VInt(as_int(a) + as_int(b)); }
-static inline Value prim_sub(Value a, Value b) { return VInt(as_int(a) - as_int(b)); }
-static inline Value prim_mul(Value a, Value b) { return VInt(as_int(a) * as_int(b)); }
+// Int is the odd word `2n + 1`. Addition, subtraction, ordering, bitwise operations,
+// and negation are closed over that encoding, so do them directly instead of
+// repeatedly shifting out and restoring the tag. Unsigned word arithmetic also
+// gives the specified 63-bit wraparound without relying on signed-overflow UB.
+static inline Value prim_add(Value a, Value b) { return (Value){a.w + b.w - IMM_TAG}; }
+static inline Value prim_sub(Value a, Value b) { return (Value){a.w - b.w + IMM_TAG}; }
+static inline Value prim_mul(Value a, Value b) {
+    return (Value){(a.w - IMM_TAG) * (uint64_t)as_int(b) + IMM_TAG};
+}
 static inline Value prim_div(Value a, Value b) { return VInt(as_int(a) / as_int(b)); }
 static inline Value prim_mod(Value a, Value b) { return VInt(as_int(a) % as_int(b)); }
-static inline Value prim_lt(Value a, Value b) { return VBool(as_int(a) < as_int(b)); }
-static inline Value prim_gt(Value a, Value b) { return VBool(as_int(a) > as_int(b)); }
-static inline Value prim_le(Value a, Value b) { return VBool(as_int(a) <= as_int(b)); }
-static inline Value prim_ge(Value a, Value b) { return VBool(as_int(a) >= as_int(b)); }
+static inline Value prim_lt(Value a, Value b) { return VBool((int64_t)a.w < (int64_t)b.w); }
+static inline Value prim_gt(Value a, Value b) { return VBool((int64_t)a.w > (int64_t)b.w); }
+static inline Value prim_le(Value a, Value b) { return VBool((int64_t)a.w <= (int64_t)b.w); }
+static inline Value prim_ge(Value a, Value b) { return VBool((int64_t)a.w >= (int64_t)b.w); }
 static inline Value prim_eq(Value a, Value b) { return VBool(val_eq(a, b)); }
+// Monomorphic equality for immediate primitive leaves. Codegen uses this when
+// the operand type is statically Int/Bool/Char/Unit; higher-order or unresolved
+// equality retains `prim_eq` and its generic Text/Float dispatch.
+static inline Value prim_word_eq(Value a, Value b) { return VBool(a.w == b.w); }
 // `and`/`or`/`xor` are logical on Bool (these) and bitwise on Int (the `prim_b*`
 // forms below); codegen picks between them on the operands' static type, exactly as
 // it picks the Float arithmetic prims.
-static inline Value prim_and(Value a, Value b) { return VBool(as_bool(a) && as_bool(b)); }
-static inline Value prim_or(Value a, Value b) { return VBool(as_bool(a) || as_bool(b)); }
-static inline Value prim_xor(Value a, Value b) { return VBool(as_bool(a) != as_bool(b)); }
-static inline Value prim_band(Value a, Value b) { return VInt(as_int(a) & as_int(b)); }
-static inline Value prim_bor(Value a, Value b)  { return VInt(as_int(a) | as_int(b)); }
-static inline Value prim_bxor(Value a, Value b) { return VInt(as_int(a) ^ as_int(b)); }
+static inline Value prim_and(Value a, Value b) { return (Value){a.w & b.w}; }
+static inline Value prim_or(Value a, Value b) { return (Value){a.w | b.w}; }
+static inline Value prim_xor(Value a, Value b) { return (Value){(a.w ^ b.w) | IMM_TAG}; }
+static inline Value prim_band(Value a, Value b) { return (Value){a.w & b.w}; }
+static inline Value prim_bor(Value a, Value b)  { return (Value){a.w | b.w}; }
+static inline Value prim_bxor(Value a, Value b) { return (Value){(a.w ^ b.w) | IMM_TAG}; }
 // Unary `not`: logical complement on Bool, bitwise complement on Int (codegen picks
 // `prim_bnot` when the operand's static type is Int).
-static inline Value prim_not(Value a)  { return VBool(!as_bool(a)); }
-static inline Value prim_bnot(Value a) { return VInt(~as_int(a)); }
+static inline Value prim_not(Value a)  { return (Value){a.w ^ 2u}; }
+static inline Value prim_bnot(Value a) { return (Value){~a.w | IMM_TAG}; }
 // Unary minus: arithmetic negation. `prim_neg` is Int; codegen picks `prim_fneg`
 // (defined with the Float prims below) when the operand's static type is Float.
-static inline Value prim_neg(Value a) { return VInt(-as_int(a)); }
+static inline Value prim_neg(Value a) { return (Value){2u - a.w}; }
 // Widening coercions. `Char -> Int` is a no-op: a Char and its code point share the
 // immediate encoding (`VChar('0')` is bit-identical to `VInt(48)`), so this compiles
 // away. `Int -> Float` boxes (Float is a heap OBJ_FLOAT), so it does real work.
@@ -176,7 +184,7 @@ static inline Value prim_float_of_int(Value a) { return VFloat((double)as_int(a)
 static inline Value prim_int_of_float(Value a) { return VInt((int64_t)as_float(a)); }
 // `Int -> Char` (`Char.of_byte`): total, masks to the low byte. Char and Int share the
 // immediate encoding, so this is just the masked int re-tagged as itself.
-static inline Value prim_char_of_byte(Value a) { return VInt(as_int(a) & 0xFF); }
+static inline Value prim_char_of_byte(Value a) { return (Value){a.w & 0x1FFu}; }
 // Float arithmetic: unbox -> compute -> rebox. Codegen picks these (over the `prim_*`
 // int forms) when the operands' static type is Float. Each result is a fresh heap box.
 // `prim_fmod` is C `fmod` (IEEE remainder toward zero), matching the interpreter's `%`.

@@ -682,12 +682,15 @@ fn rewrite_calls<A: Clone>(
                 Some((fa, clone)) => Expr::Apply(
                     a,
                     Apply {
-                        function: Rc::new(Expr::Variable(fa, Identifier::Free(Box::new({
-                            if std::env::var_os("DUMP_SPECIALIZE").is_some() {
-                                eprintln!("[spec-redirect] -> {clone}");
-                            }
-                            clone
-                        })))),
+                        function: Rc::new(Expr::Variable(
+                            fa,
+                            Identifier::Free(Box::new({
+                                if std::env::var_os("DUMP_SPECIALIZE").is_some() {
+                                    eprintln!("[spec-redirect] -> {clone}");
+                                }
+                                clone
+                            })),
+                        )),
                         argument: app.argument,
                     },
                 ),

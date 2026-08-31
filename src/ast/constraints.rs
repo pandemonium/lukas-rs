@@ -11,8 +11,8 @@ use crate::{
     parser::ParseInfo,
     phase,
     typer::{
-        Constraint, RecordShape, Substitutions, TypeEnvironment, TypeError, TypeStructure,
-        Types, Typing, TypingContext, display_list,
+        Constraint, RecordShape, Substitutions, TypeEnvironment, TypeError, TypeStructure, Types,
+        Typing, TypingContext, display_list,
     },
 };
 

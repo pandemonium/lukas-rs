@@ -194,6 +194,10 @@ Value flat_array_grow_with(Value source, size_t new_count, Value fill);
 // rebuilding the canonical aggregate around it.
 Value flat_array_get_word(Value arr, size_t i, size_t word_offset);
 void flat_array_set_word(Value arr, size_t i, size_t word_offset, Value value);
+// Store a compiler-proven immediate/null word. Such a value cannot create a
+// heap edge, so no generational write barrier is required.
+void flat_array_set_word_immediate(Value arr, size_t i, size_t word_offset,
+                                   Value value);
 
 // Box a double on the heap (OBJ_FLOAT leaf). A 64-bit IEEE-754 value cannot
 // share the word with the immediate tag bit, so every computed Float is a heap

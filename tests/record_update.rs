@@ -288,6 +288,12 @@ update :: ∀α. Eq α |- α -> Stats -> Store α -> Int -> IO Unit :=
             { Entry_Key := This key; Entry_Value := added }
     in loop initial_index
 
+rename_entry :: Entry Text -> Entry Text := λold.
+  { old: Entry_Key := This "beta" }
+
+rename :: Mutable_Array (Entry Text) -> IO Unit := λbuckets.
+  Mutable_Array.modify_at buckets 0 rename_entry
+
 start :: Int -> Unit := λ_.
   let zero = { Count := 0; Max := 0; Min := 0; Sum := 0 } in
   let one = { Count := 1; Max := 2; Min := 3; Sum := 4 } in
@@ -342,9 +348,27 @@ start :: Int -> Unit := λ_.
         4,
         "the occupied update should write exactly the four Stats leaves: {occupied_update}"
     );
+    assert_eq!(
+        occupied_update
+            .matches("flat_array_set_word_immediate")
+            .count(),
+        4,
+        "immediate Stats leaves should not enter the GC remembered set: {occupied_update}"
+    );
     assert!(
         !occupied_update.contains(", 0, _pv") && !occupied_update.contains("mk_tuple"),
         "the occupied update rewrote the key or rebuilt an aggregate: {occupied_update}"
+    );
+
+    let rename_wrapper = generated_function(&generated, "Root_rename_worker");
+    let rename_effect = generated_function(&generated, first_closure_target(rename_wrapper));
+    assert!(
+        rename_effect.contains("flat_array_set_word(") && rename_effect.contains(", 0, _pv"),
+        "the pointer-bearing Perhaps Text field must retain its write barrier: {rename_effect}"
+    );
+    assert!(
+        !rename_effect.contains("flat_array_set_word_immediate"),
+        "the pointer-bearing Perhaps Text field used the immediate-only setter: {rename_effect}"
     );
 }
 

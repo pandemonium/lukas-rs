@@ -150,12 +150,30 @@ struct ArrayElementPlace {
     source_index: Expr,
 }
 
+#[derive(Clone)]
+struct FlatValuePlace {
+    words: Vec<String>,
+}
+
+#[derive(Clone)]
+struct CapturePlace {
+    offset: usize,
+    width: usize,
+    ty: Type,
+}
+
 thread_local! {
     /// Lexical locals whose value is represented by a packed array element rather
     /// than an eagerly rebuilt canonical object. Entries are scoped by
     /// `compile_let`; code generation itself is single-threaded.
     static ARRAY_ELEMENT_PLACES: RefCell<HashMap<usize, ArrayElementPlace>> =
         RefCell::new(HashMap::new());
+    /// Record-valued locals split into their canonical words. A whole-value use
+    /// rebuilds the record; projections and other flat consumers read the words.
+    static FLAT_VALUE_PLACES: RefCell<HashMap<usize, FlatValuePlace>> =
+        RefCell::new(HashMap::new());
+    /// Logical closure capture index -> physical range in the flat capture array.
+    static CAPTURE_PLACES: RefCell<Vec<CapturePlace>> = RefCell::new(Vec::new());
 }
 
 pub struct Codegen;
@@ -605,7 +623,17 @@ impl lambda_lift::Program {
         }
         writeln!(out)?;
 
+        // A single-stage closure that is BUILT AND IMMEDIATELY APPLIED needs no heap
+        // environment: its captures can be ordinary arguments. The lifted body is already
+        // a `for(;;)` loop -- the closure was never the control flow, only the parameter
+        // block -- so this removes one allocation per entry to such a loop.
+        //
+        // Deliberately done HERE, in codegen, rather than as a source-to-source pass:
+        // rewriting the loop's captures into parameters before the flat-array analyses
+        // run makes them lose track of the element and materialise it, which cost far
+        // more than the closure saved. By this point those analyses have already run.
         for LiftedFunction { name, code, .. } in &self.functions {
+            CAPTURE_PLACES.with(|places| *places.borrow_mut() = self.capture_places(name));
             tracing::trace!("generate_code: {name}");
             writeln!(out, "Value {}(Value self, Value l0) {{", c_name(name))?;
             writeln!(out, "  (void)self; (void)l0;")?;
@@ -629,6 +657,7 @@ impl lambda_lift::Program {
         // Uncurried workers: an N-ary function whose parameters are the flat frame
         // `l0..l{N-1}`. No `self` -- these are closure-free, so their bodies carry
         // no captures. `compile_apply` calls them directly at saturated call sites.
+        CAPTURE_PLACES.with(|places| places.borrow_mut().clear());
         for Worker { name, params, body } in &self.workers {
             let signature = (0..*params)
                 .map(|i| format!("Value l{i}"))
@@ -661,6 +690,7 @@ impl lambda_lift::Program {
         // captures); the flattened parameters arrive in `args[0..arity]`, which we
         // name `l0..l{arity-1}` to match the frame the flattened body expects.
         for ChainWorker { head, arity, body } in &self.chain_workers {
+            CAPTURE_PLACES.with(|places| *places.borrow_mut() = self.capture_places(head));
             writeln!(
                 out,
                 "Value {}_uworker(Value self, Value *args) {{",
@@ -684,6 +714,7 @@ impl lambda_lift::Program {
             }
         }
 
+        CAPTURE_PLACES.with(|places| places.borrow_mut().clear());
         writeln!(out, "void startup(void) {{")?;
         // Foreign closures init first: their `__init` builders are self-contained
         // (they build a closure or compute a C-side constant and never read a user
@@ -951,6 +982,107 @@ impl lambda_lift::Program {
                 reaches_enclosing_type: false,
             },
         }
+    }
+
+    /// Whether every word of `ty`'s packed-array representation is an immediate
+    /// (or the zero niche). A store of such a word cannot create an old-to-young
+    /// heap edge and therefore needs no generational write barrier.
+    fn packed_type_is_immediate(&self, ty: &Type) -> bool {
+        self.packed_type_is_immediate_on_path(ty, &mut Vec::new())
+    }
+
+    fn packed_type_is_immediate_on_path(&self, ty: &Type, on_path: &mut Vec<Type>) -> bool {
+        match ty {
+            Type::Base(BaseType::Int | BaseType::Bool | BaseType::Unit | BaseType::Char) => true,
+            Type::Tuple(tuple) => tuple
+                .elements()
+                .iter()
+                .all(|element| self.packed_type_is_immediate_on_path(element, on_path)),
+            Type::Constructor(name) => self.packed_named_type_is_immediate(name, &[], on_path),
+            Type::Apply { .. } => applied_type(ty).is_some_and(|(name, arguments)| {
+                self.packed_named_type_is_immediate(name, &arguments, on_path)
+            }),
+            // Float is boxed; Text/Array/arrows and unresolved structural or
+            // polymorphic types may contain pointers. Stay conservative.
+            Type::Variable(..)
+            | Type::Base(..)
+            | Type::Arrow { .. }
+            | Type::Record(..)
+            | Type::Coproduct(..)
+            | Type::Array(..) => false,
+        }
+    }
+
+    fn packed_named_type_is_immediate(
+        &self,
+        name: &QualifiedName,
+        arguments: &[Type],
+        on_path: &mut Vec<Type>,
+    ) -> bool {
+        let instantiated = arguments.iter().cloned().fold(
+            Type::Constructor(name.clone()),
+            |constructor, argument| Type::Apply {
+                constructor: Box::new(constructor),
+                argument: Box::new(argument),
+            },
+        );
+        if on_path.contains(&instantiated) {
+            return false;
+        }
+        let Some(definition) = self.type_definitions.get(name) else {
+            return false;
+        };
+        if let TypeDefinition::BaseType(base_type) = definition {
+            return matches!(
+                base_type,
+                BaseType::Int | BaseType::Bool | BaseType::Unit | BaseType::Char
+            );
+        }
+        let parameters = match definition {
+            TypeDefinition::Record(record) => &record.type_parameters,
+            TypeDefinition::Coproduct(coproduct) => &coproduct.type_parameters,
+            TypeDefinition::Alias(alias) => &alias.type_parameters,
+            TypeDefinition::Signature(..) => return false,
+            TypeDefinition::BaseType(..) => unreachable!("handled above"),
+        };
+        let bindings = parameters
+            .iter()
+            .zip(arguments)
+            .map(|(parameter, argument)| (parameter.name.clone(), argument.clone()))
+            .collect::<HashMap<_, _>>();
+
+        on_path.push(instantiated.clone());
+        let result = match definition {
+            TypeDefinition::Record(record) => record.fields.iter().all(|field| {
+                instantiate_type_expression(&field.type_signature.body, &bindings).is_some_and(
+                    |field_type| self.packed_type_is_immediate_on_path(&field_type, on_path),
+                )
+            }),
+            TypeDefinition::Coproduct(coproduct) => {
+                let newtype = matches!(coproduct.constructors.as_slice(), [only]
+                    if only.signature.len() == 1);
+                let packed_inline = newtype
+                    || !matches!(
+                        self.runtime_shape(&instantiated, &mut Vec::new()).shape,
+                        RuntimeShape::Leaf
+                    );
+                packed_inline
+                    && coproduct.constructors.iter().all(|constructor| {
+                        constructor.signature.iter().all(|field| {
+                            instantiate_type_expression(field, &bindings).is_some_and(
+                                |field_type| {
+                                    self.packed_type_is_immediate_on_path(&field_type, on_path)
+                                },
+                            )
+                        })
+                    })
+            }
+            TypeDefinition::Alias(alias) => instantiate_type_expression(&alias.body, &bindings)
+                .is_some_and(|aliased| self.packed_type_is_immediate_on_path(&aliased, on_path)),
+            TypeDefinition::Signature(..) | TypeDefinition::BaseType(..) => false,
+        };
+        on_path.pop();
+        result
     }
 
     fn runtime_sum_shape(&self, variants: Vec<Vec<ShapeResult>>) -> ShapeResult {
@@ -1309,6 +1441,77 @@ impl lambda_lift::Program {
         self.flat_widths_on_path(ty, &mut Vec::new())
     }
 
+    /// Records wider than one word travel through compiler-generated locals and
+    /// closure environments as their canonical flat words. Other values retain
+    /// the ordinary one-`Value` representation.
+    fn flat_record_width(&self, ty: &Type) -> usize {
+        if self.flat_records_enabled()
+            && ty.variables().is_empty()
+            && matches!(ty, Type::Constructor(_) | Type::Apply { .. })
+            && let Some(widths) = self.flat_widths(ty)
+        {
+            let width = widths.iter().sum();
+            if (2..=FLAT_INLINE_CAP).contains(&width) {
+                return width;
+            }
+        }
+        1
+    }
+
+    fn capture_places(&self, lifted_name: &QualifiedName) -> Vec<CapturePlace> {
+        let Some(function) = self
+            .functions
+            .iter()
+            .find(|function| &function.name == lifted_name)
+        else {
+            return Vec::new();
+        };
+        let mut offset = 0;
+        function
+            .capture_info
+            .captured_types()
+            .iter()
+            .map(|info| {
+                let width = self.flat_record_width(&info.inferred_type);
+                let place = CapturePlace {
+                    offset,
+                    width,
+                    ty: info.inferred_type.clone(),
+                };
+                offset += width;
+                place
+            })
+            .collect()
+    }
+
+    fn current_capture_place(index: usize) -> Option<CapturePlace> {
+        CAPTURE_PLACES.with(|places| places.borrow().get(index).cloned())
+    }
+
+    fn flat_words_for(&self, expression: &Expr) -> Option<Vec<String>> {
+        match strip_ascription(expression) {
+            Expr::Variable(_, Identifier::Local(LexicalLevel(level))) => FLAT_VALUE_PLACES
+                .with(|places| places.borrow().get(level).map(|place| place.words.clone())),
+            Expr::Variable(_, Identifier::Captured(capture)) => {
+                let place = Self::current_capture_place(capture.index())?;
+                (place.width > 1).then(|| {
+                    (0..place.width)
+                        .map(|word| format!("env_get(self, {})", place.offset + word))
+                        .collect()
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn tuple_from_words(words: &[String]) -> String {
+        if words.len() <= 4 {
+            format!("mk_tuple{}({})", words.len(), words.join(", "))
+        } else {
+            format!("mk_tuple({}, {})", words.len(), words.join(", "))
+        }
+    }
+
     fn flat_widths_on_path(&self, ty: &Type, on_path: &mut Vec<Type>) -> Option<Vec<usize>> {
         if on_path.contains(ty) {
             return None;
@@ -1499,6 +1702,11 @@ impl lambda_lift::Program {
     // (its `width` words copied out -- the value-semantics copy of a small
     // existing record). Temp bindings accumulate in `prelude`.
     fn flat_leaves(&self, value: &Expr, width: usize, prelude: &mut Vec<String>) -> Vec<String> {
+        if let Some(words) = self.flat_words_for(value)
+            && words.len() == width
+        {
+            return words;
+        }
         if width == 1 {
             let ty = &value.annotation().type_info.inferred_type;
             if ty.variables().is_empty()
@@ -1695,6 +1903,12 @@ impl lambda_lift::Program {
         shape: &RuntimeShape,
         prelude: &mut Vec<String>,
     ) -> Option<Vec<String>> {
+        if matches!(shape, RuntimeShape::Product(_))
+            && let Some(words) = self.flat_words_for(value)
+            && words.len() == shape.stored_words()
+        {
+            return Some(words);
+        }
         match (strip_ascription(value), shape) {
             (_, RuntimeShape::Leaf) => Some(vec![self.compile_to_string(value)]),
             (Expr::Record(_, record), RuntimeShape::Product(fields))
@@ -1705,6 +1919,15 @@ impl lambda_lift::Program {
                     leaves.extend(self.literal_shape_leaves(field, shape, prelude)?);
                 }
                 Some(leaves)
+            }
+            (Expr::Record(annotation, record), RuntimeShape::Product(_)) => {
+                let widths = self.flat_widths(&annotation.type_info.inferred_type)?;
+                (widths.iter().sum::<usize>() == shape.stored_words()).then_some(())?;
+                let mut leaves = Vec::new();
+                for ((_, field), width) in record.fields.iter().zip(widths) {
+                    leaves.extend(self.flat_leaves(field, width, prelude));
+                }
+                (leaves.len() == shape.stored_words()).then_some(leaves)
             }
             (Expr::Tuple(_, tuple), RuntimeShape::Product(fields))
                 if tuple.elements.len() == fields.len() =>
@@ -1838,6 +2061,32 @@ impl lambda_lift::Program {
             }
             _ => None,
         }
+    }
+
+    /// Resolve a projection rooted in a split local or flattened capture to its
+    /// physical words. This is the local/closure counterpart of
+    /// `flat_array_region`.
+    fn flat_value_region(
+        &self,
+        projection: &phase::Projection<Closed>,
+    ) -> Option<(Vec<String>, usize, Type, RuntimeShape)> {
+        let (root, selectors) = projection_root_and_selectors(projection);
+        let words = self.flat_words_for(root)?;
+        let mut current_type = root.annotation().type_info.inferred_type.clone();
+        let mut offset = 0;
+        for selector in &selectors {
+            let (next_type, field_offset) =
+                self.runtime_projection_field(&current_type, selector)?;
+            offset += field_offset;
+            current_type = next_type;
+        }
+        let shape = self.runtime_shape(&current_type, &mut Vec::new()).shape;
+        (offset + shape.stored_words() <= words.len()).then_some((
+            words,
+            offset,
+            current_type,
+            shape,
+        ))
     }
 
     // Resolve a projection into a flat record to `(base, offset, width)`: the C
@@ -2197,9 +2446,23 @@ impl lambda_lift::Program {
                 // `compile_deconstruct`: otherwise the lazy let omits the
                 // canonical local, only for the matcher to decline the direct
                 // path and emit a reference to that missing local.
+                // Plan the clauses exactly as `compile_deconstruct` will. Checking only
+                // the shape was too permissive: a clause `collect_array_pattern` declines
+                // left the matcher on the canonical path while this had already dropped
+                // the canonical local.
                 if matched_type.variables().is_empty()
                     && self
                         .array_match_shape(&deconstruct.match_clauses, &shape)
+                        .filter(|planned| {
+                            self.plan_array_match(
+                                &deconstruct.match_clauses,
+                                "_probe_a",
+                                "_probe_i",
+                                _offset,
+                                planned,
+                            )
+                            .is_some()
+                        })
                         .is_some()
                 {
                     return deconstruct.match_clauses.iter().all(|clause| {
@@ -2218,6 +2481,42 @@ impl lambda_lift::Program {
                 .into_iter()
                 .all(|child| self.local_uses_are_flat_array_leaves(child, level, element_type)),
         }
+    }
+
+    /// Plan the in-place read for every clause, or `None` if ANY clause declines.
+    ///
+    /// This is the single source of truth for "can the matcher read this element
+    /// directly": `compile_deconstruct` uses it to decide whether to take the direct
+    /// path, and `local_uses_are_flat_array_leaves` uses it to decide whether the
+    /// canonical `let` may be elided. They MUST agree -- if the checker is more
+    /// permissive, the `let` is dropped and the matcher then emits a reference to the
+    /// local that is no longer bound.
+    fn plan_array_match(
+        &self,
+        clauses: &[phase::MatchClause<Closed>],
+        array_local: &str,
+        index_local: &str,
+        offset: usize,
+        shape: &RuntimeShape,
+    ) -> Option<Vec<(Vec<String>, Vec<(usize, String)>)>> {
+        let mut plans = Vec::with_capacity(clauses.len());
+        for clause in clauses {
+            let mut tests = Vec::new();
+            let mut binds = Vec::new();
+            if !self.collect_array_pattern(
+                &clause.pattern,
+                array_local,
+                index_local,
+                offset,
+                shape,
+                &mut tests,
+                &mut binds,
+            ) {
+                return None;
+            }
+            plans.push((tests, binds));
+        }
+        Some(plans)
     }
 
     fn array_match_shape(
@@ -2971,6 +3270,24 @@ impl lambda_lift::Program {
         // out a whole inlined sub-aggregate copies it out to a fresh object -- a
         // record/tuple to a tuple, an inlined sum to a boxed constructor.
         if self.flat_records_enabled() {
+            if let Some((words, offset, selected_type, shape)) = self.flat_value_region(the) {
+                if matches!(shape, RuntimeShape::Leaf) {
+                    return write!(code, "{}", words[offset]);
+                }
+                if shape.stored_words() == 1
+                    && let Some(decoded) =
+                        self.decode_one_word_niche(&words[offset], &selected_type)
+                {
+                    return write!(code, "{decoded}");
+                }
+                if matches!(shape, RuntimeShape::Product(_)) {
+                    return write!(
+                        code,
+                        "{}",
+                        Self::tuple_from_words(&words[offset..offset + shape.stored_words()])
+                    );
+                }
+            }
             if direct_array_enabled()
                 && let Some((array, index, offset, selected_type, shape)) =
                     self.flat_array_region(&Expr::Project(annotation.clone(), the.clone()))
@@ -3059,35 +3376,42 @@ impl lambda_lift::Program {
                         .is_empty(),
                 );
             }
-            if let Some(shape) = self.array_match_shape(&the.match_clauses, &fallback_shape) {
-                let array_local = format!("_ma{id}");
-                let index_local = format!("_mi{id}");
+            // Plan EVERY clause before emitting anything. `collect_array_pattern` can
+            // decline a clause even when `array_match_shape` accepted the shape, and this
+            // used to only `debug_assert!` it -- so a release build emitted the direct path
+            // anyway with an empty bind list, and the clause body referenced a local that
+            // the lazy `let` had already elided ("use of undeclared identifier lN").
+            // Declining here restores the canonical path, and
+            // `local_uses_are_flat_array_leaves` runs the same planning so the `let` is
+            // kept whenever we end up needing it.
+            let plan = self
+                .array_match_shape(&the.match_clauses, &fallback_shape)
+                .and_then(|shape| {
+                    let array_local = format!("_ma{id}");
+                    let index_local = format!("_mi{id}");
+                    let plans = self.plan_array_match(
+                        &the.match_clauses,
+                        &array_local,
+                        &index_local,
+                        offset,
+                        &shape,
+                    )?;
+                    Some((array_local, index_local, plans))
+                });
+            if let Some((array_local, index_local, plans)) = plan {
                 write!(
                     code,
                     "({{ Value {array_local} = {array}; Value {index_local} = {index}; "
                 )?;
 
-                for clause in &the.match_clauses {
-                    let mut tests = Vec::new();
-                    let mut binds = Vec::new();
-                    let supported = self.collect_array_pattern(
-                        &clause.pattern,
-                        &array_local,
-                        &index_local,
-                        offset,
-                        &shape,
-                        &mut tests,
-                        &mut binds,
-                    );
-                    debug_assert!(supported);
-
+                for (clause, (tests, binds)) in the.match_clauses.iter().zip(&plans) {
                     if tests.is_empty() {
                         write!(code, "true")?;
                     } else {
                         write!(code, "{}", tests.join(" && "))?;
                     }
                     write!(code, " ? ({{ ")?;
-                    for (level, path) in &binds {
+                    for (level, path) in binds {
                         write!(code, "Value l{level} = {path}; ")?;
                     }
                     self.compile_expr(&clause.consequent, code)?;
@@ -3408,6 +3732,9 @@ impl lambda_lift::Program {
                     let operand = &args[0].annotation().type_info.inferred_type;
                     match operand {
                         Type::Base(BaseType::Float) => float_prim(prim).unwrap_or(prim),
+                        Type::Base(
+                            BaseType::Int | BaseType::Bool | BaseType::Unit | BaseType::Char,
+                        ) if prim == "prim_eq" => "prim_word_eq",
                         Type::Base(BaseType::Int) => bitwise_prim(prim).unwrap_or(prim),
                         _ if prim == "prim_eq" && is_text_type(operand) => "prim_text_eq",
                         _otherwise => prim,
@@ -3441,6 +3768,20 @@ impl lambda_lift::Program {
             }
         }
 
+        // A closure which is constructed only to be called at this very site does not
+        // need a heap lifetime.  Its descriptor and captures can form a closure-shaped
+        // frame on the C stack, and the lifted code (or saturated chain worker) can be
+        // called directly with that frame as `self`.
+        //
+        // Recursive closures are safe too, provided `self` is used exclusively as the
+        // head of a saturated recursive call: every such call finishes before this C
+        // expression returns, so the stack frame is still alive.  A returned, captured,
+        // stored, or otherwise passed-around `self` is rejected by
+        // `self_references_are_calls` and keeps the ordinary heap closure path.
+        if let Some(result) = self.compile_immediate_closure_apply(head, &args, code) {
+            return result;
+        }
+
         // Generic path. A multi-argument application of an unknown head (a curried
         // function *value*, e.g. a parameter passed to a higher-order function)
         // goes through `apply_n`, which dispatches straight to the head's
@@ -3468,6 +3809,257 @@ impl lambda_lift::Program {
         write!(code, ")")
     }
 
+    /// Evaluate a closure's logical captures and return the physical capture
+    /// words. Ground record captures are split according to the lifted frame's
+    /// layout; scalar and polymorphic captures remain one word.
+    fn compile_capture_values(
+        &self,
+        lifted_name: &QualifiedName,
+        elements: &[Rc<Expr>],
+        stem: &str,
+        code: &mut CodeBuffer,
+    ) -> Result<Vec<String>, fmt::Error> {
+        let places = self.capture_places(lifted_name);
+        if places.len() != elements.len() {
+            return Err(fmt::Error);
+        }
+        let mut values = Vec::new();
+        for (capture, (element, place)) in elements.iter().zip(&places).enumerate() {
+            if place.width == 1 {
+                let name = format!("{stem}_{capture}");
+                write!(code, "volatile Value {name} = ")?;
+                self.compile_expr(element, code)?;
+                write!(code, "; ")?;
+                values.push(name);
+                continue;
+            }
+
+            let shape = self.runtime_shape(&place.ty, &mut Vec::new()).shape;
+            let mut prelude = Vec::new();
+            let leaves = self
+                .literal_shape_leaves(element, &shape, &mut prelude)
+                .filter(|leaves| leaves.len() == place.width)
+                .ok_or(fmt::Error)?;
+            for binding in prelude {
+                write!(code, "{binding} ")?;
+            }
+            for (word, leaf) in leaves.into_iter().enumerate() {
+                let name = format!("{stem}_{capture}_{word}");
+                write!(code, "volatile Value {name} = {leaf}; ")?;
+                values.push(name);
+            }
+        }
+        Ok(values)
+    }
+
+    /// Directly call an immediately-applied closure through a stack-resident closure
+    /// frame.  Returns `None` whenever the application is partial/over-saturated or
+    /// `self` could escape the dynamic extent of the call.
+    fn compile_immediate_closure_apply(
+        &self,
+        head: &Expr,
+        args: &[&Expr],
+        code: &mut CodeBuffer,
+    ) -> Option<fmt::Result> {
+        let Expr::MakeClosure(_, closure) = strip_ascription(head) else {
+            return None;
+        };
+        let Expr::Tuple(_, environment) = closure.environment.as_ref() else {
+            return None;
+        };
+
+        // A saturated curried chain has a flattened worker.  Otherwise only an
+        // ordinary one-stage application can directly enter the lifted function.
+        let chain_arity = self.chain_heads.get(&closure.lifted_name).copied();
+        let (body, recursive_arity, direct_worker) = if chain_arity == Some(args.len()) {
+            let worker = self
+                .chain_workers
+                .iter()
+                .find(|worker| worker.head == closure.lifted_name)?;
+            (&worker.body, worker.arity, true)
+        } else if args.len() == 1 {
+            let lifted = self
+                .functions
+                .iter()
+                .find(|function| function.name == closure.lifted_name)?;
+            (&lifted.code, 1, false)
+        } else {
+            return None;
+        };
+
+        if !Self::self_references_are_calls(body, recursive_arity) {
+            return None;
+        }
+
+        let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+        let name = c_name(&closure.lifted_name);
+
+        let (descriptor_worker, descriptor_arity) = match chain_arity {
+            Some(arity) => (format!("{name}_uworker"), arity),
+            None => ("NULL".to_owned(), 1),
+        };
+
+        let result = (|| {
+            write!(code, "({{ ")?;
+            if environment.elements.is_empty() {
+                write!(
+                    code,
+                    "Value _sf{id} = STATIC_CLOSURE0({name}, {descriptor_worker}, {descriptor_arity}); "
+                )?;
+            } else {
+                let capture_values = self.compile_capture_values(
+                    &closure.lifted_name,
+                    &environment.elements,
+                    &format!("_sv{id}"),
+                    code,
+                )?;
+                let captures = capture_values.len();
+
+                // The collector finds live Values by scanning C stack memory.  With
+                // LTO, an ordinary local aggregate could be scalar-replaced into
+                // registers across an allocating argument expression; `volatile`
+                // keeps every capture materialized in the stack frame for the whole
+                // immediate call.
+                write!(
+                    code,
+                    "static const ClosureDesc _sd{id} = {{{name}, {descriptor_worker}, {descriptor_arity}}}; "
+                )?;
+                write!(
+                    code,
+                    "volatile struct {{ const ClosureDesc *desc; Value caps[{captures}]; }} _sc{id} = {{&_sd{id}, {{"
+                )?;
+                for (index, value) in capture_values.iter().enumerate() {
+                    if index > 0 {
+                        write!(code, ", ")?;
+                    }
+                    write!(code, "{value}")?;
+                }
+                write!(code, "}}}}; Value _sf{id} = VObject((void *)&_sc{id}); ")?;
+            }
+
+            // Sequence source arguments explicitly.  Apart from preserving language
+            // evaluation order, the Value locals keep earlier arguments visible to the
+            // conservative stack scanner if a later argument allocates and triggers GC.
+            for (index, argument) in args.iter().enumerate() {
+                write!(code, "Value _sa{id}_{index} = ")?;
+                self.compile_expr(argument, code)?;
+                write!(code, "; ")?;
+            }
+
+            if direct_worker {
+                write!(code, "{name}_uworker(_sf{id}, (Value[]){{")?;
+                for index in 0..args.len() {
+                    if index > 0 {
+                        write!(code, ", ")?;
+                    }
+                    write!(code, "_sa{id}_{index}")?;
+                }
+                write!(code, "}}); }})")
+            } else {
+                write!(code, "{name}(_sf{id}, _sa{id}_0); }})")
+            }
+        })();
+        Some(result)
+    }
+
+    /// True when every reference to a recursive closure's `self` is the head of a
+    /// saturated recursive call.  Such calls cannot make the closure outlive an
+    /// immediate application; every other use (returning it, passing it as data,
+    /// capturing it in another closure, storing it, partial application) is an escape.
+    fn self_references_are_calls(expression: &Expr, arity: usize) -> bool {
+        let expression = strip_ascription(expression);
+        if matches!(expression, Expr::Apply(..)) {
+            let mut arguments = Vec::new();
+            let mut head = expression;
+            while let Expr::Apply(_, application) = strip_ascription(head) {
+                arguments.push(application.argument.as_ref());
+                head = application.function.as_ref();
+            }
+            if matches!(
+                strip_ascription(head),
+                Expr::Variable(_, Identifier::SelfRef)
+            ) {
+                return arguments.len() == arity
+                    && arguments
+                        .iter()
+                        .all(|argument| Self::self_references_are_calls(argument, arity));
+            }
+        }
+
+        match expression {
+            Expr::Variable(_, Identifier::SelfRef) => false,
+            Expr::Variable(..) | Expr::InvokeBridge(..) | Expr::Constant(..) => true,
+            Expr::RecursiveLambda(_, lambda) => {
+                Self::self_references_are_calls(&lambda.lambda.body, arity)
+            }
+            Expr::Lambda(_, lambda) => Self::self_references_are_calls(&lambda.body, arity),
+            Expr::Apply(_, application) => {
+                Self::self_references_are_calls(&application.function, arity)
+                    && Self::self_references_are_calls(&application.argument, arity)
+            }
+            Expr::Let(_, binding) => {
+                Self::self_references_are_calls(&binding.bound, arity)
+                    && Self::self_references_are_calls(&binding.body, arity)
+            }
+            Expr::Tuple(_, tuple) => tuple
+                .elements
+                .iter()
+                .all(|element| Self::self_references_are_calls(element, arity)),
+            Expr::Record(_, record) => record
+                .fields
+                .iter()
+                .all(|(_, field)| Self::self_references_are_calls(field, arity)),
+            Expr::RecordUpdate(_, update) => {
+                Self::self_references_are_calls(&update.base, arity)
+                    && update
+                        .fields
+                        .iter()
+                        .all(|field| Self::self_references_are_calls(&field.value, arity))
+            }
+            Expr::Inject(_, injection) => injection
+                .arguments
+                .iter()
+                .all(|argument| Self::self_references_are_calls(argument, arity)),
+            Expr::Array(_, array) => array
+                .elements
+                .iter()
+                .all(|element| Self::self_references_are_calls(element, arity)),
+            Expr::Project(_, projection) => {
+                Self::self_references_are_calls(&projection.base, arity)
+            }
+            Expr::Sequence(_, sequence) => {
+                Self::self_references_are_calls(&sequence.this, arity)
+                    && Self::self_references_are_calls(&sequence.and_then, arity)
+            }
+            Expr::Deconstruct(_, deconstruct) => {
+                Self::self_references_are_calls(&deconstruct.scrutinee, arity)
+                    && deconstruct
+                        .match_clauses
+                        .iter()
+                        .all(|clause| Self::self_references_are_calls(&clause.consequent, arity))
+            }
+            Expr::If(_, conditional) => {
+                Self::self_references_are_calls(&conditional.predicate, arity)
+                    && Self::self_references_are_calls(&conditional.consequent, arity)
+                    && Self::self_references_are_calls(&conditional.alternate, arity)
+            }
+            Expr::Interpolate(_, interpolation) => {
+                interpolation.0.iter().all(|segment| match segment {
+                    Segment::Literal(..) => true,
+                    Segment::Expression(expression) => {
+                        Self::self_references_are_calls(expression, arity)
+                    }
+                })
+            }
+            Expr::Ascription(_, ascription) => {
+                Self::self_references_are_calls(&ascription.ascribed_tree, arity)
+            }
+            Expr::MakeClosure(_, closure) => {
+                Self::self_references_are_calls(&closure.environment, arity)
+            }
+        }
+    }
+
     // A closure value: the lifted function's code paired with a freshly built
     // environment tuple of its captured values. When the closure is the head of a
     // non-recursive curried chain, it also carries its uncurried worker and arity
@@ -3483,7 +4075,6 @@ impl lambda_lift::Program {
             panic!("closure environment is always a tuple");
         };
         let name = c_name(&the.lifted_name);
-        let n = env.elements.len();
         // The per-function `code`/`worker`/`arity` are identical for every closure of
         // this lifted function, so emit ONE shared static `ClosureDesc`; the heap
         // closure stores just a pointer to it plus the captures (24 B smaller). A
@@ -3495,24 +4086,32 @@ impl lambda_lift::Program {
         };
         // Capture-free: identical + immutable, so a single static instance, no heap
         // allocation at all (mirrors the borrowed-string descriptors).
-        if n == 0 {
+        if env.elements.is_empty() {
             return write!(code, "STATIC_CLOSURE0({name}, {worker}, {arity})");
         }
         // Per-site static descriptor, then a heap {desc, captures}. Statement-expression
         // scoping keeps each site's `__d` local, so `&__d` binds to this site's descriptor
         // even when a captured expression is itself a closure with its own `__d`.
+        let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+        write!(code, "({{ ")?;
+        let capture_values = self.compile_capture_values(
+            &the.lifted_name,
+            &env.elements,
+            &format!("_cv{id}"),
+            code,
+        )?;
+        let n = capture_values.len();
         write!(
             code,
-            "({{ static const ClosureDesc __d = {{{name}, {worker}, {arity}}}; "
+            "static const ClosureDesc __d = {{{name}, {worker}, {arity}}}; "
         )?;
         if n <= 4 {
             write!(code, "mk_closure_d{n}(&__d")?;
         } else {
             write!(code, "mk_closure_dn(&__d, {n}")?;
         }
-        for element in &env.elements {
-            write!(code, ", ")?;
-            self.compile_expr(element, code)?;
+        for value in capture_values {
+            write!(code, ", {value}")?;
         }
         write!(code, "); }})")
     }
@@ -3565,8 +4164,47 @@ impl lambda_lift::Program {
 
     fn compile_var(&self, var: &Identifier) -> String {
         match var {
-            Identifier::Local(LexicalLevel(level)) => format!("l{level}"),
-            Identifier::Captured(capture) => format!("env_get(self, {})", capture.index()),
+            // A local bound to a flat array element may have had its `let` ELIDED in
+            // favour of an (array, index) place, so `l{level}` names nothing. Every
+            // consumer that reads leaves out of the place resolves it itself; this is
+            // the fallback for the ones that genuinely need the value -- rebuild the
+            // canonical element rather than emit a dangling identifier.
+            //
+            // Without this, a path that declines the in-place read (e.g. the multiword
+            // `_flat` projection matcher, whose `flat_place` compiles the base as a plain
+            // local) emitted "use of undeclared identifier lN" and the program did not
+            // compile at all.
+            Identifier::Local(LexicalLevel(level)) => FLAT_VALUE_PLACES
+                .with(|places| places.borrow().get(level).cloned())
+                .map(|place| Self::tuple_from_words(&place.words))
+                .or_else(|| {
+                    ARRAY_ELEMENT_PLACES
+                        .with(|places| places.borrow().get(level).cloned())
+                        .filter(|place| !place.array.is_empty() && !place.index.is_empty())
+                        .map(|place| {
+                            format!(
+                                "flat_array_get({}, (size_t)as_int({}))",
+                                place.array, place.index
+                            )
+                        })
+                })
+                .unwrap_or_else(|| format!("l{level}")),
+            Identifier::Captured(capture) => {
+                let index = capture.index();
+                Self::current_capture_place(index).map_or_else(
+                    || format!("env_get(self, {index})"),
+                    |place| {
+                        if place.width == 1 {
+                            format!("env_get(self, {})", place.offset)
+                        } else {
+                            let words = (0..place.width)
+                                .map(|word| format!("env_get(self, {})", place.offset + word))
+                                .collect::<Vec<_>>();
+                            Self::tuple_from_words(&words)
+                        }
+                    },
+                )
+            }
             Identifier::SelfRef => "self".to_owned(),
             Identifier::Global(qualified_name) => c_name(qualified_name),
         }
@@ -3861,10 +4499,15 @@ impl lambda_lift::Program {
             .fields
             .iter()
             .zip(&regions)
-            .map(|(field, (offset, _, shape))| {
+            .map(|(field, (offset, selected_type, shape))| {
                 let mut prelude = Vec::new();
                 let leaves = self.literal_shape_leaves(&field.value, shape, &mut prelude)?;
-                Some((*offset, prelude, leaves))
+                Some((
+                    *offset,
+                    self.packed_type_is_immediate(selected_type),
+                    prelude,
+                    leaves,
+                ))
             })
             .collect::<Option<Vec<_>>>();
         ARRAY_ELEMENT_PLACES.with(|places| {
@@ -3885,25 +4528,103 @@ impl lambda_lift::Program {
             write!(code, "; ")?;
 
             let mut stores = Vec::new();
-            for (field_index, (offset, prelude, leaves)) in plans.iter().enumerate() {
+            for (field_index, (offset, immediate, prelude, leaves)) in plans.iter().enumerate() {
                 for binding in prelude {
                     write!(code, "{binding} ")?;
                 }
                 for (leaf_index, leaf) in leaves.iter().enumerate() {
                     let temp = format!("_pv{id}_{field_index}_{leaf_index}");
                     write!(code, "Value {temp} = {leaf}; ")?;
-                    stores.push((offset + leaf_index, temp));
+                    stores.push((offset + leaf_index, temp, *immediate));
                 }
             }
-            for (offset, temp) in stores {
+            for (offset, temp, immediate) in stores {
+                let setter = if immediate {
+                    "flat_array_set_word_immediate"
+                } else {
+                    "flat_array_set_word"
+                };
                 write!(
                     code,
-                    "flat_array_set_word({array_local}, (size_t)as_int({index_local}), {offset}, {temp}); "
+                    "{setter}({array_local}, (size_t)as_int({index_local}), {offset}, {temp}); "
                 )?;
             }
             write!(code, "VUnit(); }})")
         })();
         Some(result)
+    }
+
+    fn flat_record_literal<'a>(
+        &self,
+        bound: &'a Expr,
+    ) -> Option<(Vec<(usize, &'a Expr)>, Vec<String>, Vec<String>)> {
+        let mut bindings = Vec::new();
+        let mut value = strip_ascription(bound);
+        while let Expr::Let(_, binding) = value {
+            let Identifier::Local(LexicalLevel(level)) = &binding.binder else {
+                return None;
+            };
+            bindings.push((*level, binding.bound.as_ref()));
+            value = strip_ascription(&binding.body);
+        }
+        if !matches!(value, Expr::Record(..)) {
+            return None;
+        }
+
+        // Let-floating deliberately preserves wrapper annotations, which can
+        // describe an intermediate value. The terminal record node is the
+        // representation being constructed and is therefore authoritative.
+        let ty = &value.annotation().type_info.inferred_type;
+        let width = self.flat_record_width(ty);
+        if width == 1 {
+            return None;
+        }
+        let shape = self.runtime_shape(ty, &mut Vec::new()).shape;
+        let mut prelude = Vec::new();
+        let leaves = self.literal_shape_leaves(value, &shape, &mut prelude)?;
+        (leaves.len() == width).then_some((bindings, prelude, leaves))
+    }
+
+    fn emit_flat_local(
+        &self,
+        id: usize,
+        bindings: &[(usize, &Expr)],
+        prelude: &[String],
+        leaves: &[String],
+        code: &mut CodeBuffer,
+    ) -> fmt::Result {
+        write!(
+            code,
+            "volatile Value _fv{id}[{}] = {{0}}; {{ ",
+            leaves.len()
+        )?;
+        for (level, bound) in bindings {
+            write!(code, "Value l{level} = ")?;
+            self.compile_expr(bound, code)?;
+            write!(code, "; ")?;
+        }
+        for binding in prelude {
+            write!(code, "{binding} ")?;
+        }
+        for (word, leaf) in leaves.iter().enumerate() {
+            write!(code, "_fv{id}[{word}] = {leaf}; ")?;
+        }
+        write!(code, "}} ")
+    }
+
+    fn install_flat_local(level: usize, words: Vec<String>) -> Option<FlatValuePlace> {
+        FLAT_VALUE_PLACES.with(|places| places.borrow_mut().insert(level, FlatValuePlace { words }))
+    }
+
+    fn restore_flat_local(level: usize, previous: Option<FlatValuePlace>) {
+        FLAT_VALUE_PLACES.with(|places| {
+            let mut places = places.borrow_mut();
+            if let Some(previous) = previous {
+                places.insert(level, previous);
+            } else {
+                places.remove(&level);
+            }
+        });
     }
 
     fn compile_let(
@@ -3936,6 +4657,29 @@ impl lambda_lift::Program {
                 result?;
                 return write!(code, "{fused}");
             }
+        }
+
+        if let Some(words) = self.flat_words_for(bound)
+            && words.len() == self.flat_record_width(&bound.annotation().type_info.inferred_type)
+        {
+            let previous = Self::install_flat_local(*level, words);
+            let result = self.compile_expr(body, code);
+            Self::restore_flat_local(*level, previous);
+            return result;
+        }
+
+        if let Some((bindings, prelude, leaves)) = self.flat_record_literal(bound) {
+            let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+            write!(code, "({{ ")?;
+            self.emit_flat_local(id, &bindings, &prelude, &leaves, code)?;
+            let words = (0..leaves.len())
+                .map(|word| format!("_fv{id}[{word}]"))
+                .collect();
+            let previous = Self::install_flat_local(*level, words);
+            let result = self.compile_expr(body, code);
+            Self::restore_flat_local(*level, previous);
+            result?;
+            return write!(code, "; }})");
         }
 
         // Lazy packed-element binding: when every use of the result of an
@@ -4027,6 +4771,7 @@ impl lambda_lift::Program {
                 return write!(code, "; }})");
             }
         }
+
         write!(code, "({{ Value l{level} = ")?;
         self.compile_expr(bound, code)?;
         write!(code, "; ")?;
@@ -4127,6 +4872,26 @@ impl lambda_lift::Program {
                         result?;
                         return write!(code, "return {fused};");
                     }
+                }
+                if let Some(words) = self.flat_words_for(&the.bound)
+                    && words.len()
+                        == self.flat_record_width(&the.bound.annotation().type_info.inferred_type)
+                {
+                    let previous = Self::install_flat_local(*level, words);
+                    let result = self.compile_tail(target, arity, &the.body, code);
+                    Self::restore_flat_local(*level, previous);
+                    return result;
+                }
+                if let Some((bindings, prelude, leaves)) = self.flat_record_literal(&the.bound) {
+                    let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+                    self.emit_flat_local(id, &bindings, &prelude, &leaves, code)?;
+                    let words = (0..leaves.len())
+                        .map(|word| format!("_fv{id}[{word}]"))
+                        .collect();
+                    let previous = Self::install_flat_local(*level, words);
+                    let result = self.compile_tail(target, arity, &the.body, code);
+                    Self::restore_flat_local(*level, previous);
+                    return result;
                 }
                 if direct_array_enabled()
                     && let Some((array, index, source_type)) = self.raw_array_get_source(&the.bound)

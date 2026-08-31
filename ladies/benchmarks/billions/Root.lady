@@ -55,10 +55,10 @@ module FNV1a:
     let length = Bytes.length bytes in
 
     let loop = λi hash_value.
-      if i < length then
-        loop
-          (i + 1)
-          ((hash_value xor Bytes.get_u8 bytes i) * prime)
+      if i + 8 <= length then
+        loop (i + 8) ((hash_value xor Bytes.get_u64_le bytes i) * prime)
+      else if i < length then
+        loop (i + 1) ((hash_value xor Bytes.get_u8 bytes i) * prime)
       else
         hash_value
     in
@@ -124,13 +124,20 @@ process_file_bytes :: Bytes -> IO (List (Text, Aggregate_Stats)) := λfile_bytes
   let loop = λi.
     if i < length then
       let city_bytes, temperature, next = parse_row file_bytes i in
-      deconstruct Text.from_bytes city_bytes into
+      let city = Text.unsafe_from_bytes city_bytes in
+      let aggregate = from (File_Row.make city temperature) in
+      let* _ = Stats.Cheeky_Map.modify city aggregate table in
+      loop next
+
+      (* deconstruct Text.from_bytes city_bytes into
         This city ->
           let aggregate = from (File_Row.make city temperature) in
           let* _ = Stats.Cheeky_Map.modify city aggregate table in
           loop next
       | Nope ->
-          loop next
+          omg_wtf_bbq "Bad UTF8 bytes"
+          loop next *)
+
     else
       pure ()
   in

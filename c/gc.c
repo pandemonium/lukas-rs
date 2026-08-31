@@ -1343,6 +1343,13 @@ void flat_array_set_word(Value arr, size_t i, size_t word_offset, Value value) {
     gc_remember_object(t);
 }
 
+void flat_array_set_word_immediate(Value arr, size_t i, size_t word_offset,
+                                   Value value) {
+    Tuple *t = as_tuple(arr);
+    size_t stride = (size_t)as_int(t->elems[1]);
+    t->elems[flat_elem_base(arr) + i * stride + word_offset] = value;
+}
+
 // Store element `i`, returning the previous element boxed out. The box-out runs
 // before the overwrite; `elt` is a live root on the stack across it.
 Value flat_array_put(Value arr, size_t i, Value elt) {

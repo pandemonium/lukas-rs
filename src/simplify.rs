@@ -46,8 +46,26 @@ use crate::{
 /// 7.15s at 60, and 16.7s (2.5x!) at 50; utf8_get is 2.3x slower at 50. Above 70 the codec C
 /// is byte-identical; raising the budget to 4000 changes NOTHING on any benchmark (the only
 /// remaining un-inlined bodies are recursive, gated by the recursion guard, not by size). So
-/// 100 = the knee + ~30 nodes of margin; there is no perf to win by tuning it either way.
-const INLINE_BUDGET: usize = 100;
+/// 100 was the knee + ~30 nodes of margin for those benchmarks.
+///
+/// RAISED 100 -> 200 (2026-08-30). The note above claimed raising it "changes NOTHING on any
+/// benchmark", the remaining un-inlined bodies being recursive rather than oversized. That is
+/// no longer true: `billions`' `parse_temperature` is non-recursive and gated purely by size,
+/// and inlining it lets its multiple-return tuple meet its destructuring and cancel.
+///
+/// Tune this against ALLOCATION, not wall time. Wall conflates this inliner with clang's, and
+/// the two are not interchangeable -- clang cannot remove a `gc_new`, so only this pass can
+/// cancel a construct/destruct pair. These are HISTORICAL, same-revision A/B figures from the
+/// 2026-08-30 sweep, not totals for the current pipeline (later work reduced `billions` much
+/// further). On wall the sweep looked like noise (7.42/7.23/7.29/7.30/7.40s at
+/// 100/200/300/600/1200); on allocation it had a sharp knee and then a fixpoint:
+///   billions      100: 37086 MB / 1.26 bn objs / 144 GCs
+///                 200: 32966 MB / 1.08 bn objs / 128 GCs
+///                 300, 600, 1200: identical to 200
+///   binary_codec, utf8_get, flat_records: identical at 100/200/400/800 (already saturated)
+/// So 200 is the smallest value reaching the fixpoint. Beyond it there is nothing left to
+/// cancel and the extra body size only costs compile time (mc 7.3 -> 7.5s) and, at 1200, wall.
+const INLINE_BUDGET: usize = 200;
 /// Whether the IO-deforestation reductions (single-use let-forwarding, case-of-case
 /// commuting, saturated-constructor-application folding) are enabled. Default on; set
 /// `MARM_NO_IODEFOREST` to disable, for A/B and regression bisection.
@@ -1925,6 +1943,12 @@ where
         }
         Expr::Tuple(_, tuple) => select_tuple_clause(a, scrutinee, tuple, match_clauses),
 
+        // The record twin of the tuple case: a record LITERAL taken apart by a record
+        // PATTERN. `{ City := c; Temperature := t }` immediately consumed by
+        // `λ({ City: c; Temperature: t }). …` builds the record only to project it back
+        // out on the next line -- the same construct/deconstruct pair, one allocation.
+        Expr::Record(_, record) => select_record_clause(a, scrutinee, record, match_clauses),
+
         // A tuple-valued `if` taken apart by a tuple pattern -- the shape every
         // multiple-return produces: `let i, w = if neg then 2, x else 1, y`.
         Expr::If(_, ite) => split_tuple_if(a, ite, match_clauses),
@@ -2117,6 +2141,47 @@ where
             body: Rc::new(inner),
         },
     ))
+}
+
+/// Cancel a record literal against the record pattern that immediately takes it apart.
+///
+/// The components are ordered by the PATTERN's field order, not the record literal's: the
+/// namer assigns De Bruijn levels walking the pattern, so that is the order
+/// `build_let_chain` needs to see them in for its contiguous-level check to hold.
+///
+/// Requires the pattern to bind every field. A partial pattern would let a field's
+/// expression be dropped, which is only sound if it is pure -- not worth assuming here,
+/// and the shape that matters (a record built purely to be destructured) binds all of them.
+fn select_record_clause<A>(
+    a: &A,
+    scrutinee: &Tree<A, Identifier>,
+    record: &Record<A, Identifier>,
+    clauses: &[MatchClause<A, Identifier>],
+) -> Option<Expr<A, Identifier>>
+where
+    A: Clone,
+{
+    // A record pattern is irrefutable, so the first clause is the one selected.
+    let clause = clauses.first()?;
+    match &clause.pattern {
+        Pattern::Bind(_, Identifier::Bound(level)) => {
+            Some(bind_whole(a, *level, scrutinee, &clause.consequent))
+        }
+        Pattern::Struct(_, StructPattern { fields }) => {
+            if fields.len() != record.fields.len() {
+                return None;
+            }
+            let mut values = Vec::with_capacity(fields.len());
+            let mut patterns = Vec::with_capacity(fields.len());
+            for (name, field_pattern) in fields {
+                let value = record.fields.iter().find(|(n, _)| n == name)?.1.clone();
+                values.push(value);
+                patterns.push(field_pattern.clone());
+            }
+            build_let_chain(a, &values, &patterns, &clause.consequent)
+        }
+        _ => None,
+    }
 }
 
 fn select_tuple_clause<A>(

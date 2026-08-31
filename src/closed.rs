@@ -206,6 +206,12 @@ impl CaptureInfo {
             .empty_capture()
     }
 
+    pub(crate) fn captured_types(&self) -> &[TypeInfo] {
+        self.layout
+            .as_ref()
+            .map_or(&[], |captures| captures.types.as_slice())
+    }
+
     pub fn make_environment_tuple(&self) -> Expr {
         let (elements, element_types) = match &self.layout {
             Some(captures) => (
