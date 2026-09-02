@@ -1,6 +1,7 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
+    hash::{Hash, Hasher},
     marker::PhantomData,
     mem,
     ops::Deref,
@@ -15,8 +16,8 @@ use tracing::instrument;
 
 use crate::{
     ast::{
-        self, Apply, Array, ArrowTypeExpr, Binding, ConstraintExpression, Deconstruct, IfThenElse,
-        Injection, Kind, Lambda, Literal, ProductElement, Projection, Record, Segment,
+        self, Apply, Array, ArrowTypeExpr, Binding, Confinement, ConstraintExpression, Deconstruct,
+        IfThenElse, Injection, Kind, Lambda, Literal, ProductElement, Projection, Record, Segment,
         SelfReferential, Sequence, Tree, Tuple, TupleTypeExpr, TypeAscription, TypeExpression,
         annotation::Annotated,
         constraints::{Witness, WitnessEnvironment},
@@ -206,6 +207,7 @@ impl phase::TypeSignature<Named> {
         self.body = TypeExpression::Arrow(
             annotation,
             ArrowTypeExpr {
+                capture: ast::Confinement::fresh(),
                 domain: argument.into(),
                 codomain: mem::take(&mut self.body).into(),
             },
@@ -240,8 +242,6 @@ impl phase::TypeSignature<Named> {
             })
             .collect::<Vec<_>>();
 
-        let quantifiers = type_params.iter().map(|(_, p)| p.clone()).collect();
-
         let type_param_map = context_type_param_map
             .iter()
             .map(|(p, q)| (p.clone(), q.clone()))
@@ -254,9 +254,35 @@ impl phase::TypeSignature<Named> {
             .map(|c| Constraint::from_constraint_expr(&type_param_map, c, ctx))
             .collect::<Typing<Vec<_>>>()?;
 
+        let underlying = self.body.synthesize_type(&type_param_map, ctx)?;
+        // Capability ascriptions can refine the indexed kind of a quantified
+        // variable. Keep the scheme's binder in lockstep with the occurrence in
+        // the synthesized body; metavariable identity itself remains unchanged.
+        let underlying_variables = underlying.variables();
+        let quantifiers = type_params
+            .iter()
+            .map(|(_, parameter)| {
+                underlying_variables
+                    .iter()
+                    .find(|variable| *variable == parameter)
+                    .cloned()
+                    .unwrap_or_else(|| parameter.clone())
+            })
+            .collect();
+        let context_confinements = context_type_param_map
+            .values()
+            .flat_map(|parameter| parameter.kind().confinement_variables())
+            .collect::<BTreeSet<_>>();
+        let confinement_quantifiers = underlying
+            .confinement_variables()
+            .difference(&context_confinements)
+            .copied()
+            .collect();
+
         Ok(TypeScheme {
             quantifiers,
-            underlying: self.body.synthesize_type(&type_param_map, ctx)?,
+            confinement_quantifiers,
+            underlying,
             constraints: ConstraintSet::from(constraints.as_slice()),
         })
     }
@@ -632,134 +658,238 @@ impl phase::SymbolTable<Named> {
         Ok(witnesses)
     }
 
-    fn infer_alias_kinds(&self) -> Typing<HashMap<QualifiedName, Kind>> {
+    fn infer_type_kinds(&self) -> Typing<HashMap<QualifiedName, Kind>> {
         fn expression_kind(
             table: &phase::SymbolTable<Named>,
             expression: &phase::TypeExpression<Named>,
             parameters: &HashMap<parser::Identifier, Kind>,
-            cache: &mut HashMap<QualifiedName, Kind>,
-            path: &mut Vec<QualifiedName>,
+            kinds: &HashMap<QualifiedName, Kind>,
         ) -> Typing<Kind> {
             match expression {
                 TypeExpression::Constructor(pi, name) => {
-                    let Symbol::Type(symbol) =
-                        table
-                            .symbols
-                            .get(&SymbolName::Type(name.clone()))
-                            .ok_or_else(|| TypeError::UndefinedType(name.clone()).at(*pi))?
+                    let Some(Symbol::Type(_)) = table.symbols.get(&SymbolName::Type(name.clone()))
                     else {
                         return Err(TypeError::UndefinedType(name.clone()).at(*pi));
                     };
-                    if matches!(symbol.definition, TypeDefinition::Alias(_)) {
-                        alias_kind(table, name, cache, path)
-                    } else {
-                        Ok(symbol.kind.clone())
-                    }
+                    kinds
+                        .get(name)
+                        .cloned()
+                        .ok_or_else(|| TypeError::UndefinedType(name.clone()).at(*pi))
                 }
                 TypeExpression::Parameter(pi, parameter) => parameters
                     .get(parameter)
                     .cloned()
                     .ok_or_else(|| TypeError::UnquantifiedTypeParameter(parameter.clone()).at(*pi)),
                 TypeExpression::Apply(pi, application) => {
-                    expression_kind(table, &application.function, parameters, cache, path)?
+                    expression_kind(table, &application.function, parameters, kinds)?
                         .apply(expression_kind(
                             table,
                             &application.argument,
                             parameters,
-                            cache,
-                            path,
+                            kinds,
                         )?)
                         .map_err(|error| error.at(*pi))
                 }
+                TypeExpression::ConfinementAscription(pi, body, required) => {
+                    let kind = expression_kind(table, body, parameters, kinds)?;
+                    let actual = kind.confinement().cloned().ok_or_else(|| {
+                        TypeError::ExpectedMonotypeKind { kind: kind.clone() }.at(*pi)
+                    })?;
+                    let required = Confinement::from(*required);
+                    let substitutions = actual.require(required.clone()).ok_or_else(|| {
+                        TypeError::ConfinementMismatch {
+                            lhs: actual,
+                            rhs: required,
+                        }
+                        .at(*pi)
+                    })?;
+                    Ok(kind.apply_confinement_substitutions(&substitutions))
+                }
                 TypeExpression::Arrow(pi, arrow) => {
                     for component in [&arrow.domain, &arrow.codomain] {
-                        let kind = expression_kind(table, component, parameters, cache, path)?;
-                        if kind != Kind::Star {
+                        let kind = expression_kind(table, component, parameters, kinds)?;
+                        if !kind.is_star() {
                             return Err(TypeError::ExpectedMonotypeKind { kind }.at(*pi));
                         }
                     }
-                    Ok(Kind::Star)
+                    Ok(Kind::Star(arrow.capture.clone()))
                 }
-                TypeExpression::Tuple(pi, tuple) => {
-                    for element in &tuple.0 {
-                        let kind = expression_kind(table, element, parameters, cache, path)?;
-                        if kind != Kind::Star {
-                            return Err(TypeError::ExpectedMonotypeKind { kind }.at(*pi));
-                        }
-                    }
-                    Ok(Kind::Star)
-                }
+                TypeExpression::Tuple(pi, tuple) => Ok(Kind::Star(Confinement::join(
+                    tuple
+                        .0
+                        .iter()
+                        .map(|element| {
+                            let kind = expression_kind(table, element, parameters, kinds)?;
+                            kind.confinement()
+                                .cloned()
+                                .ok_or_else(|| TypeError::ExpectedMonotypeKind { kind }.at(*pi))
+                        })
+                        .collect::<Typing<Vec<_>>>()?,
+                ))),
             }
         }
 
-        fn alias_kind(
+        fn signature_confinement(
             table: &phase::SymbolTable<Named>,
-            name: &QualifiedName,
-            cache: &mut HashMap<QualifiedName, Kind>,
-            path: &mut Vec<QualifiedName>,
-        ) -> Typing<Kind> {
-            if let Some(kind) = cache.get(name) {
-                return Ok(kind.clone());
-            }
-            if let Some(start) = path.iter().position(|candidate| candidate == name) {
-                let mut cycle = path[start..].to_vec();
-                cycle.push(name.clone());
-                return Err(TypeError::CyclicTypeAlias { cycle }.at(ParseInfo::default()));
-            }
-            let Some(Symbol::Type(TypeSymbol {
-                definition: TypeDefinition::Alias(alias),
-                ..
-            })) = table.symbols.get(&SymbolName::Type(name.clone()))
-            else {
-                return Err(TypeError::UndefinedType(name.clone()).at(ParseInfo::default()));
-            };
-            path.push(name.clone());
-            let parameters = alias
-                .type_parameters
-                .iter()
-                .map(|parameter| (parameter.name.clone(), parameter.kind.clone()))
-                .collect::<HashMap<_, _>>();
-            let body_kind = expression_kind(table, &alias.body, &parameters, cache, path)?;
-            let kind = alias
-                .type_parameters
-                .iter()
-                .rfold(body_kind, |result, parameter| {
-                    Kind::Arrow(parameter.kind.clone().into(), result.into())
-                });
-            path.pop();
-            cache.insert(name.clone(), kind.clone());
-            Ok(kind)
+            signature: &phase::TypeSignature<Named>,
+            enclosing_parameters: &HashMap<parser::Identifier, Kind>,
+            kinds: &HashMap<QualifiedName, Kind>,
+        ) -> Typing<Confinement> {
+            let mut parameters = enclosing_parameters.clone();
+            parameters.extend(
+                signature
+                    .universal_quantifiers
+                    .iter()
+                    .map(|parameter| (parameter.name.clone(), parameter.kind.clone())),
+            );
+            let kind = expression_kind(table, &signature.body, &parameters, kinds)?;
+            kind.confinement().cloned().ok_or_else(|| {
+                TypeError::ExpectedMonotypeKind { kind }.at(*signature.body.annotation())
+            })
         }
 
-        let mut aliases = self
+        fn is_fixed(symbol: &TypeSymbol<QualifiedName>) -> bool {
+            matches!(
+                symbol.origin,
+                namer::TypeOrigin::Builtin | namer::TypeOrigin::Foreign
+            ) || matches!(symbol.opacity, namer::Access::Within(_))
+                && matches!(
+                    symbol.kind.result_confinement(),
+                    Some(Confinement::Confined | Confinement::Unconfined)
+                )
+        }
+
+        let mut symbols = self
             .symbols
             .values()
             .filter_map(|symbol| match symbol {
-                Symbol::Type(TypeSymbol {
-                    definition: TypeDefinition::Alias(alias),
-                    ..
-                }) => Some(alias.name.clone()),
+                Symbol::Type(symbol) => Some((symbol.qualified_name(), symbol)),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        aliases.sort();
-        let mut kinds = HashMap::new();
-        for alias in aliases {
-            alias_kind(self, &alias, &mut kinds, &mut Vec::new())?;
+        symbols.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+
+        let mut kinds = symbols
+            .iter()
+            .map(|(name, symbol)| {
+                let kind = if is_fixed(symbol) {
+                    symbol.kind.clone()
+                } else {
+                    symbol.kind.with_result_confinement(Confinement::Unconfined)
+                };
+                (name.clone(), kind)
+            })
+            .collect::<HashMap<_, _>>();
+
+        // Equations are monotone joins over a finite lattice. Starting every
+        // inferred result at unconfined computes the least fixed point, including
+        // mutually recursive declarations.
+        for iteration in 0..=symbols.len() + 1 {
+            let mut changed = false;
+            let previous = kinds.clone();
+
+            for (name, symbol) in &symbols {
+                if is_fixed(symbol) {
+                    continue;
+                }
+
+                let parameters = symbol
+                    .type_parameters()
+                    .iter()
+                    .map(|parameter| (parameter.name.clone(), parameter.kind.clone()))
+                    .collect::<HashMap<_, _>>();
+
+                let next = match &symbol.definition {
+                    TypeDefinition::Record(record) => {
+                        symbol.kind.with_result_confinement(Confinement::join(
+                            record
+                                .fields
+                                .iter()
+                                .map(|field| {
+                                    signature_confinement(
+                                        self,
+                                        &field.type_signature,
+                                        &parameters,
+                                        &previous,
+                                    )
+                                })
+                                .collect::<Typing<Vec<_>>>()?,
+                        ))
+                    }
+                    TypeDefinition::Signature(signature) => {
+                        symbol.kind.with_result_confinement(Confinement::join(
+                            signature
+                                .vtable
+                                .fields
+                                .iter()
+                                .map(|field| {
+                                    signature_confinement(
+                                        self,
+                                        &field.type_signature,
+                                        &parameters,
+                                        &previous,
+                                    )
+                                })
+                                .collect::<Typing<Vec<_>>>()?,
+                        ))
+                    }
+                    TypeDefinition::Coproduct(coproduct) => {
+                        symbol.kind.with_result_confinement(Confinement::join(
+                            coproduct
+                                .constructors
+                                .iter()
+                                .flat_map(|constructor| constructor.signature.iter())
+                                .map(|field| {
+                                    let kind =
+                                        expression_kind(self, field, &parameters, &previous)?;
+                                    kind.confinement().cloned().ok_or_else(|| {
+                                        TypeError::ExpectedMonotypeKind { kind }
+                                            .at(*field.annotation())
+                                    })
+                                })
+                                .collect::<Typing<Vec<_>>>()?,
+                        ))
+                    }
+                    TypeDefinition::Alias(alias) => {
+                        let body_kind = expression_kind(self, &alias.body, &parameters, &previous)?;
+                        symbol.type_parameters().iter().rev().fold(
+                            body_kind,
+                            |codomain, parameter| {
+                                Kind::Arrow(parameter.kind.clone().into(), codomain.into())
+                            },
+                        )
+                    }
+                    TypeDefinition::BaseType(_) => continue,
+                };
+
+                if previous.get(name) != Some(&next) {
+                    kinds.insert(name.clone(), next);
+                    changed = true;
+                }
+            }
+
+            if !changed {
+                return Ok(kinds);
+            }
+            assert!(
+                iteration <= symbols.len(),
+                "confinement kind inference did not converge"
+            );
         }
-        Ok(kinds)
+
+        unreachable!("finite confinement inference loop must converge")
     }
 
     fn elaborate_types(&self) -> Typing<TypingContext> {
         let mut ctx = TypingContext::default();
-        let alias_kinds = self.infer_alias_kinds()?;
+        let inferred_kinds = self.infer_type_kinds()?;
 
         for symbol in self.symbols.iter().filter_map(|(_, sym)| match sym {
             Symbol::Type(symbol) => Some(symbol),
             _ => None,
         }) {
             let mut symbol = symbol.clone();
-            if let Some(kind) = alias_kinds.get(&symbol.qualified_name()) {
+            if let Some(kind) = inferred_kinds.get(&symbol.qualified_name()) {
                 symbol.kind = kind.clone();
             }
             ctx.bind_type(
@@ -1227,6 +1357,31 @@ impl phase::SymbolTable<Named> {
                 let pi = *symbol.body.annotation();
                 declared.reject_if_more_general_than(&inferred, &qualified_name, pi, ctx)?;
 
+                // Surface signatures elide arrow capture indices. Checking the
+                // body solves those indices; retain that solution in the scheme
+                // registered for subsequent users instead of re-generalizing the
+                // unsolved placeholders from the parsed annotation.
+                let capture_solution = declared
+                    .underlying
+                    .unified_with(&inferred, &ctx.types)
+                    .map_err(|e| e.at(pi))?;
+                declared.underlying = declared.underlying.apply(&Substitutions::with_confinements(
+                    capture_solution.confinements.clone(),
+                ));
+                let declared_variables = declared.underlying.variables();
+                declared.quantifiers = declared
+                    .quantifiers
+                    .iter()
+                    .map(|quantifier| {
+                        declared_variables
+                            .iter()
+                            .find(|variable| *variable == quantifier)
+                            .cloned()
+                            .unwrap_or_else(|| quantifier.clone())
+                    })
+                    .collect();
+                declared.confinement_quantifiers = declared.underlying.confinement_variables();
+
                 // `Memory_Layout` evidence is compiler-derived, so a surface
                 // signature need not repeat layout obligations introduced by an
                 // implementation detail such as calling `Hash_Table.lookup`.
@@ -1292,7 +1447,14 @@ impl phase::SymbolTable<Named> {
 
     pub fn elaborate_foreign_terms(&self, ctx: &mut TypingContext) -> Typing<()> {
         for ext in &self.foreign_terms {
-            let type_scheme = ext.type_signature.type_scheme(&HashMap::default(), ctx)?;
+            let mut type_scheme = ext.type_signature.type_scheme(&HashMap::default(), ctx)?;
+            // A foreign symbol itself is a global code pointer, not a closure.
+            // Partial applications may still capture arguments; only the outer
+            // arrow receives this unconditional bottom capability.
+            if let Type::Arrow { capture, .. } = &mut type_scheme.underlying {
+                *capture = Confinement::Unconfined;
+            }
+            type_scheme.confinement_quantifiers = type_scheme.underlying.confinement_variables();
             ctx.bind_free_term(ext.name.clone(), type_scheme);
         }
         Ok(())
@@ -2041,6 +2203,7 @@ fn dictionary_arrow(annotation: &TypeInfo, dictionary_type: &Type) -> TypeInfo {
     TypeInfo {
         parse_info: annotation.parse_info,
         inferred_type: Type::Arrow {
+            capture: Confinement::fresh(),
             domain: Box::new(dictionary_type.clone()),
             codomain: Box::new(annotation.inferred_type.clone()),
         },
@@ -2421,6 +2584,24 @@ pub enum TypeError {
     #[error("kind mismatch: cannot apply type of kind {function} at type of kind {argument}")]
     KindMismatchError { function: Kind, argument: Kind },
 
+    #[error("confinement mismatch: cannot unify {lhs} with {rhs}")]
+    ConfinementMismatch { lhs: Confinement, rhs: Confinement },
+
+    #[error("type `{ty}` is {actual}{path}, but this context requires {required}")]
+    ConfinementRequirement {
+        ty: Type,
+        actual: Confinement,
+        required: Confinement,
+        /// Filled in later by `attribute_confined_capture`; unification itself
+        /// has no type environment to walk.
+        path: ConfinementPath,
+    },
+
+    #[error(
+        "this action captures `{ty}`, which is confined{path}, so the action cannot cross a thread boundary"
+    )]
+    ConfinedCapture { ty: Type, path: ConfinementPath },
+
     #[error(
         "unification error: kind mismatch: cannot unify {lhs}:{lhs_kind} with {rhs}:{rhs_kind}"
     )]
@@ -2513,6 +2694,12 @@ impl Constrained<Type> {
             constraints: ConstraintSet::default(),
             underlying: TypeScheme {
                 quantifiers: quantifiers.iter().cloned().collect(),
+                confinement_quantifiers: self
+                    .underlying
+                    .confinement_variables()
+                    .difference(&ctx.free_confinement_variables())
+                    .copied()
+                    .collect(),
                 underlying: self.underlying.clone(),
                 constraints: ConstraintSet::from(quantified.as_slice()),
             },
@@ -2784,11 +2971,84 @@ impl CoproductType {
 impl Kind {
     pub fn apply(self, at: Kind) -> Result<Self, TypeError> {
         match self {
-            Kind::Arrow(k1, k2) if *k1 == at => Ok(*k2),
+            Kind::Arrow(k1, k2) => {
+                let mut substitutions = BTreeMap::new();
+                if k1.match_argument(&at, &mut substitutions) {
+                    Ok(k2.apply_confinement_substitutions(&substitutions))
+                } else {
+                    Err(TypeError::KindMismatchError {
+                        function: Kind::Arrow(k1, k2),
+                        argument: at,
+                    })
+                }
+            }
             otherwise => Err(TypeError::KindMismatchError {
                 function: otherwise,
                 argument: at,
             }),
+        }
+    }
+}
+
+/// The field/constructor chain from a confined composite down to the leaf that
+/// makes it confined, with that leaf's type. Absent when the type is confined in
+/// itself, in which case naming the type is already the whole explanation.
+#[derive(Debug, Clone, Default)]
+pub struct ConfinementPath(Option<(Vec<String>, Type)>);
+
+impl fmt::Display for ConfinementPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            None => Ok(()),
+            Some((path, leaf)) => write!(f, " because `{}` is `{leaf}`", path.join(".")),
+        }
+    }
+}
+
+/// One lexically captured variable, retained with its source position and type so
+/// a failed capability check can name the capture that caused it rather than
+/// reporting only that the enclosing action failed a constraint.
+#[derive(Debug, Clone)]
+pub struct Capture {
+    parse_info: ParseInfo,
+    ty: Type,
+    confinement: Confinement,
+}
+
+/// The capture index of a lambda, plus the captures it was joined from. Inference
+/// uses `joined` alone; the captures exist only so diagnostics can attribute a
+/// confined index to a specific variable.
+#[derive(Debug, Clone)]
+pub struct CaptureConfinement {
+    joined: Confinement,
+    captures: Vec<Capture>,
+}
+
+impl CaptureConfinement {
+    /// The first capture that is confined, in source order -- the one to blame
+    /// when an action is rejected at a thread boundary.
+    fn confined(&self) -> Option<&Capture> {
+        self.captures
+            .iter()
+            .find(|capture| capture.confinement == Confinement::Confined)
+    }
+
+    /// Explain a failed capture-index check. When a specific capture is confined,
+    /// blame it at its own source position; otherwise fall back to the opaque
+    /// index mismatch, which is all the inference actually knows.
+    fn mismatch(&self, expected: Confinement, pi: ParseInfo) -> Located<TypeError> {
+        match self.confined() {
+            Some(capture) => TypeError::ConfinedCapture {
+                ty: capture.ty.clone(),
+                // No type environment here to walk; the type alone is the blame.
+                path: ConfinementPath::default(),
+            }
+            .at(capture.parse_info),
+            None => TypeError::ConfinementMismatch {
+                lhs: expected,
+                rhs: self.joined.clone(),
+            }
+            .at(pi),
         }
     }
 }
@@ -2798,6 +3058,7 @@ pub enum Type {
     Variable(MetaVariable),
     Base(BaseType),
     Arrow {
+        capture: Confinement,
         domain: Box<Type>,
         codomain: Box<Type>,
     },
@@ -2809,20 +3070,69 @@ pub enum Type {
     Apply {
         constructor: Box<Type>,
         argument: Box<Type>,
+        /// Occurrence-specific capture index for constructors with a hidden
+        /// capability parameter. Currently used by `IO`; ordinary applications
+        /// leave it absent.
+        capture: Option<Confinement>,
     },
 }
 
 impl Type {
+    pub(crate) fn application(constructor: Type, argument: Type) -> Self {
+        let capture = matches!(
+            &constructor,
+            Type::Constructor(name) if *name == io_type_name()
+        )
+        .then(Confinement::fresh);
+        Self::Apply {
+            constructor: constructor.into(),
+            argument: argument.into(),
+            capture,
+        }
+    }
+
     pub fn kind(&self, ctx: &TypeEnvironment) -> Result<Kind, TypeError> {
+        fn inhabited(kind: Kind) -> Result<Confinement, TypeError> {
+            match kind {
+                Kind::Star(confinement) => Ok(confinement),
+                kind => Err(TypeError::ExpectedMonotypeKind { kind }),
+            }
+        }
+
         match self {
             Self::Variable(tp) => Ok(tp.kind().clone()),
-            Self::Base(BaseType::Array) => Ok(Kind::Arrow(Kind::Star.into(), Kind::Star.into())),
-            Self::Base(..) => Ok(Kind::Star),
-            Self::Arrow { .. } => Ok(Kind::Star),
-            Self::Tuple(..) => Ok(Kind::Star),
-            Self::Record(..) => Ok(Kind::Star),
-            Self::Coproduct(..) => Ok(Kind::Star),
-            Self::Array(..) => Ok(Kind::Arrow(Kind::Star.into(), Kind::Star.into())),
+            Self::Base(BaseType::Array) => {
+                let element = Confinement::fresh();
+                Ok(Kind::Arrow(
+                    Kind::Star(element.clone()).into(),
+                    Kind::Star(element).into(),
+                ))
+            }
+            Self::Base(..) => Ok(Kind::unconfined()),
+            Self::Arrow { capture, .. } => Ok(Kind::Star(capture.clone())),
+            Self::Tuple(tuple) => Ok(Kind::Star(Confinement::join(
+                tuple
+                    .elements()
+                    .iter()
+                    .map(|element| element.kind(ctx).and_then(inhabited))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))),
+            Self::Record(record) => Ok(Kind::Star(Confinement::join(
+                record
+                    .0
+                    .iter()
+                    .map(|(_, field)| field.kind(ctx).and_then(inhabited))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))),
+            Self::Coproduct(coproduct) => Ok(Kind::Star(Confinement::join(
+                coproduct
+                    .0
+                    .iter()
+                    .flat_map(|(_, arguments)| arguments)
+                    .map(|argument| argument.kind(ctx).and_then(inhabited))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))),
+            Self::Array(element) => Ok(Kind::Star(inhabited(element.kind(ctx)?)?)),
             Self::Constructor(name) => ctx
                 .lookup(name)
                 .ok_or_else(|| TypeError::UndefinedType(name.clone()))
@@ -2831,7 +3141,12 @@ impl Type {
             Self::Apply {
                 constructor,
                 argument,
+                capture,
             } => {
+                if let Some(capture) = capture {
+                    let result = inhabited(argument.kind(ctx)?)?;
+                    return Ok(Kind::Star(Confinement::join([capture.clone(), result])));
+                }
                 let k1 = constructor.kind(ctx)?;
                 let k2 = argument.kind(ctx)?;
                 //println!("kind: k1 {constructor}; k2 {argument}");
@@ -2859,7 +3174,9 @@ impl Type {
         f(self);
 
         match self {
-            Self::Arrow { domain, codomain } => {
+            Self::Arrow {
+                domain, codomain, ..
+            } => {
                 f(domain);
                 domain.walk(f);
                 f(codomain);
@@ -2886,6 +3203,7 @@ impl Type {
             Self::Apply {
                 constructor,
                 argument,
+                ..
             } => {
                 f(constructor);
                 constructor.walk(f);
@@ -2907,6 +3225,50 @@ impl Type {
         vars
     }
 
+    pub fn confinement_variables(&self) -> BTreeSet<u32> {
+        match self {
+            Self::Variable(variable) => variable.kind().confinement_variables(),
+            Self::Base(_) | Self::Constructor(_) => BTreeSet::new(),
+            Self::Arrow {
+                capture,
+                domain,
+                codomain,
+            } => capture
+                .variables()
+                .into_iter()
+                .chain(domain.confinement_variables())
+                .chain(codomain.confinement_variables())
+                .collect(),
+            Self::Tuple(tuple) => tuple
+                .elements()
+                .iter()
+                .flat_map(Self::confinement_variables)
+                .collect(),
+            Self::Record(record) => record
+                .0
+                .iter()
+                .flat_map(|(_, field)| field.confinement_variables())
+                .collect(),
+            Self::Coproduct(coproduct) => coproduct
+                .0
+                .iter()
+                .flat_map(|(_, arguments)| arguments)
+                .flat_map(Self::confinement_variables)
+                .collect(),
+            Self::Array(element) => element.confinement_variables(),
+            Self::Apply {
+                constructor,
+                argument,
+                capture,
+            } => capture
+                .iter()
+                .flat_map(Confinement::variables)
+                .chain(constructor.confinement_variables())
+                .chain(argument.confinement_variables())
+                .collect(),
+        }
+    }
+
     //    #[instrument]
     pub fn apply(&self, subs: &Substitutions) -> Self {
         //trace!("{self} -- subs {subs}");
@@ -2922,7 +3284,7 @@ impl Type {
                 // the chain to a stable canonical representative instead.
                 let mut current = param.clone();
                 let mut seen = HashSet::<MetaVariable>::default();
-                loop {
+                let resolved = loop {
                     match subs.substitution(&current) {
                         None => break Self::Variable(current),
                         // Identity self-binding: nothing more to resolve.
@@ -2941,12 +3303,23 @@ impl Type {
                         // A non-variable binding: substitute it structurally.
                         Some(t) => break t.clone().apply(subs),
                     }
+                };
+                match resolved {
+                    Self::Variable(variable) => {
+                        Self::Variable(variable.apply_confinements(&subs.confinements))
+                    }
+                    other => other,
                 }
             }
 
             Self::Base(b) => Self::Base(b.clone()),
 
-            Self::Arrow { domain, codomain } => Self::Arrow {
+            Self::Arrow {
+                capture,
+                domain,
+                codomain,
+            } => Self::Arrow {
+                capture: capture.apply(&subs.confinements),
                 domain: domain.apply(subs).into(),
                 codomain: codomain.apply(subs).into(),
             },
@@ -2970,9 +3343,13 @@ impl Type {
             Self::Apply {
                 constructor,
                 argument,
+                capture,
             } => Self::Apply {
                 constructor: constructor.apply(subs).into(),
                 argument: argument.apply(subs).into(),
+                capture: capture
+                    .as_ref()
+                    .map(|capture| capture.apply(&subs.confinements)),
             },
         }
     }
@@ -2993,7 +3370,7 @@ impl Type {
 
         let lhs_kind = self.kind(ctx)?;
         let rhs_kind = rhs.kind(ctx)?;
-        if lhs_kind != rhs_kind {
+        if !lhs_kind.is_compatible_with(&rhs_kind) {
             Err(TypeError::KindMismatch {
                 lhs: self.clone(),
                 lhs_kind,
@@ -3012,25 +3389,60 @@ impl Type {
                         ty: ty.clone(),
                     })
                 } else {
-                    Ok(vec![(p.clone(), ty.clone())].into())
+                    let ty_kind = ty.kind(ctx)?;
+                    let kind_substitutions = match p.kind().unify_confinements(&ty_kind) {
+                        Some(substitutions) => Substitutions::with_confinements(substitutions),
+                        None => {
+                            if let (Kind::Star(required), Kind::Star(actual)) = (p.kind(), &ty_kind)
+                            {
+                                return Err(TypeError::ConfinementRequirement {
+                                    path: ConfinementPath::default(),
+                                    ty: ty.clone(),
+                                    actual: actual.clone(),
+                                    required: required.clone(),
+                                });
+                            }
+                            return Err(TypeError::KindMismatch {
+                                lhs: Self::Variable(p.clone()),
+                                lhs_kind: p.kind().clone(),
+                                rhs: ty.clone(),
+                                rhs_kind: ty_kind,
+                            });
+                        }
+                    };
+                    let type_substitution =
+                        Substitutions::from(vec![(p.clone(), ty.apply(&kind_substitutions))]);
+                    Ok(kind_substitutions.compose(&type_substitution))
                 }
             }
 
             (
                 Self::Arrow {
+                    capture: lhs_capture,
                     domain: lhs_dom,
                     codomain: lhs_codom,
                 },
                 Self::Arrow {
+                    capture: rhs_capture,
                     domain: rhs_dom,
                     codomain: rhs_codom,
                 },
             ) => {
-                let domain = lhs_dom.unified_with(rhs_dom, ctx)?;
+                let captures = lhs_capture
+                    .unify(rhs_capture)
+                    .map(Substitutions::with_confinements)
+                    .ok_or_else(|| TypeError::ConfinementMismatch {
+                        lhs: lhs_capture.clone(),
+                        rhs: rhs_capture.clone(),
+                    })?;
+                let domain = lhs_dom
+                    .apply(&captures)
+                    .unified_with(&rhs_dom.apply(&captures), ctx)?;
+                let substitutions = captures.compose(&domain);
                 let codomain = lhs_codom
-                    .apply(&domain)
-                    .unified_with(&rhs_codom.apply(&domain), ctx)?;
-                Ok(domain.compose(&codomain))
+                    .apply(&substitutions)
+                    .unified_with(&rhs_codom.apply(&substitutions), ctx)?;
+                Ok(substitutions.compose(&codomain))
             }
 
             (Self::Tuple(lhs), Self::Tuple(rhs)) if lhs.arity() == rhs.arity() => {
@@ -3064,13 +3476,28 @@ impl Type {
                 Self::Apply {
                     constructor: lhs_con,
                     argument: lhs_arg,
+                    capture: lhs_capture,
                 },
                 Self::Apply {
                     constructor: rhs_con,
                     argument: rhs_arg,
+                    capture: rhs_capture,
                 },
             ) => {
-                let constructor = lhs_con.unified_with(rhs_con, ctx)?;
+                let captures = match (lhs_capture, rhs_capture) {
+                    (Some(lhs), Some(rhs)) => lhs
+                        .unify(rhs)
+                        .map(Substitutions::with_confinements)
+                        .ok_or_else(|| TypeError::ConfinementMismatch {
+                            lhs: lhs.clone(),
+                            rhs: rhs.clone(),
+                        })?,
+                    _ => Substitutions::default(),
+                };
+                let constructor = lhs_con
+                    .apply(&captures)
+                    .unified_with(&rhs_con.apply(&captures), ctx)?;
+                let constructor = captures.compose(&constructor);
                 let argument = lhs_arg
                     .apply(&constructor)
                     .unified_with(&rhs_arg.apply(&constructor), ctx)?;
@@ -3343,12 +3770,41 @@ impl phase::TypeExpression<Named> {
                 ast::ApplyTypeExpr {
                     function, argument, ..
                 },
-            ) => Ok(Type::Apply {
-                constructor: function.synthesize_type(type_params, ctx)?.into(),
-                argument: argument.synthesize_type(type_params, ctx)?.into(),
-            }),
+            ) => Ok(Type::application(
+                function.synthesize_type(type_params, ctx)?,
+                argument.synthesize_type(type_params, ctx)?,
+            )),
 
-            Self::Arrow(_, ast::ArrowTypeExpr { domain, codomain }) => Ok(Type::Arrow {
+            Self::ConfinementAscription(pi, body, required) => {
+                let body = body.synthesize_type(type_params, ctx)?;
+                let kind = body.kind(&ctx.types).map_err(|error| error.at(*pi))?;
+                let actual = kind.confinement().cloned().ok_or_else(|| {
+                    TypeError::ExpectedMonotypeKind { kind: kind.clone() }.at(*pi)
+                })?;
+                let required = Confinement::from(*required);
+                let substitutions = actual.require(required.clone()).ok_or_else(|| {
+                    TypeError::ConfinementMismatch {
+                        lhs: actual,
+                        rhs: required,
+                    }
+                    .at(*pi)
+                })?;
+                Ok(body.apply(&Substitutions::with_confinements(substitutions)))
+            }
+
+            Self::Arrow(
+                _,
+                ast::ArrowTypeExpr {
+                    capture,
+                    domain,
+                    codomain,
+                },
+            ) => Ok(Type::Arrow {
+                // The surface arrow's index is a template, not a named variable:
+                // every synthesis of a signature/alias occurrence receives an
+                // independent hidden capture metavariable. Capability ascriptions
+                // immediately constrain this fresh index when present.
+                capture: capture.freshen(&mut BTreeMap::new()),
                 domain: domain.synthesize_type(type_params, ctx)?.into(),
                 codomain: codomain.synthesize_type(type_params, ctx)?.into(),
             }),
@@ -3374,6 +3830,10 @@ pub struct TypeConstructorDefinition {
     pub name: namer::QualifiedName,
     pub instantiated_params: HashMap<parser::Identifier, MetaVariable>,
     pub defining_symbol: TypeSymbol<namer::QualifiedName>,
+    /// The hidden, occurrence-specific capture index of `IO`.  Keeping it on
+    /// the instantiated constructor makes the `Suspend` field and the `IO α`
+    /// spine refer to the same index.
+    hidden_capture: Option<Confinement>,
 }
 
 impl TypeConstructorDefinition {
@@ -3385,22 +3845,27 @@ impl TypeConstructorDefinition {
         &self,
         type_parameters: &HashMap<parser::Identifier, MetaVariable>,
     ) -> Type {
-        self.defining_symbol.type_parameters().iter().fold(
+        let mut spine = self.defining_symbol.type_parameters().iter().fold(
             Type::Constructor(self.name.clone()),
-            |constructor, param| Type::Apply {
-                constructor: constructor.into(),
-                argument: Type::Variable(type_parameters[&param.name].clone()).into(),
+            |constructor, param| {
+                Type::application(
+                    constructor,
+                    Type::Variable(type_parameters[&param.name].clone()),
+                )
             },
-        )
+        );
+        if let (Some(hidden_capture), Type::Apply { capture, .. }) =
+            (&self.hidden_capture, &mut spine)
+        {
+            *capture = Some(hidden_capture.clone());
+        }
+        spine
     }
 
     pub fn apply_at(&self, arguments: &[Type]) -> Type {
         arguments.iter().fold(
             Type::Constructor(self.name.clone()),
-            |constructor, argument| Type::Apply {
-                constructor: constructor.into(),
-                argument: argument.clone().into(),
-            },
+            |constructor, argument| Type::application(constructor, argument.clone()),
         )
     }
 
@@ -3500,6 +3965,30 @@ impl TypeStructure {
             Self::PolyRecord(record) => record.materialize_type(),
         }
     }
+
+    fn tie_io_capture(&mut self, capture: Confinement) -> bool {
+        let Self::Monotype(Type::Coproduct(coproduct)) = self else {
+            return false;
+        };
+        let Some((_, signature)) = coproduct
+            .0
+            .iter_mut()
+            .find(|(name, _)| *name == suspend_constructor_name())
+        else {
+            return false;
+        };
+        let [
+            Type::Arrow {
+                capture: thunk_capture,
+                ..
+            },
+        ] = signature.as_mut_slice()
+        else {
+            return false;
+        };
+        *thunk_capture = capture;
+        true
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3524,6 +4013,7 @@ impl TypeConstructor {
                     name: symbol.qualified_name(),
                     instantiated_params: HashMap::default(),
                     defining_symbol: symbol.clone(),
+                    hidden_capture: None,
                 },
                 structure: TypeStructure::Monotype(Type::Base(base_type.clone())),
             })
@@ -3532,6 +4022,8 @@ impl TypeConstructor {
                 name: symbol.qualified_name(),
                 instantiated_params: fresh_type_parameters(symbol),
                 defining_symbol: symbol.clone(),
+                hidden_capture: (symbol.qualified_name() == io_type_name())
+                    .then(Confinement::fresh),
             })
         }
     }
@@ -3617,10 +4109,18 @@ fn from_definition(
     definition: &TypeConstructorDefinition,
     ctx: &TypingContext,
 ) -> Typing<TypeConstructor> {
-    let structure = definition
+    let mut structure = definition
         .defining_symbol
         .definition
         .synthesize_type(&definition.instantiated_params, ctx)?;
+    if let Some(capture) = &definition.hidden_capture
+        && !structure.tie_io_capture(capture.clone())
+    {
+        Err(TypeError::InternalAssertion(
+            "Prelude.IO must have the form `IO ::= ∀α. Suspend (Unit -> α)`".to_owned(),
+        )
+        .at(ParseInfo::default()))?;
+    }
     Ok(TypeConstructor::Elaborated(ElaboratedTypeConstructor {
         definition: definition.clone(),
         structure,
@@ -3665,6 +4165,7 @@ impl TypeDefinition<QualifiedName> {
 #[derive(Debug, Clone)]
 pub struct TypeScheme {
     pub quantifiers: Vec<MetaVariable>,
+    pub confinement_quantifiers: BTreeSet<u32>,
     pub underlying: Type,
     pub constraints: ConstraintSet,
 }
@@ -3675,19 +4176,37 @@ impl TypeScheme {
         for q in &self.quantifiers {
             subst.remove(q);
         }
+        for q in &self.confinement_quantifiers {
+            subst.confinements.remove(q);
+        }
         Self {
             quantifiers: self.quantifiers.clone(),
+            confinement_quantifiers: self.confinement_quantifiers.clone(),
             underlying: self.underlying.apply(&subst),
             constraints: self.constraints.apply(&subst),
         }
     }
 
     fn instantiation_substitutions(&self) -> Substitutions {
-        self.quantifiers
+        let confinements = self
+            .confinement_quantifiers
             .iter()
-            .map(|tp| (tp.clone(), Type::fresh_with_kind(tp.kind().clone())))
-            .collect::<Vec<_>>()
-            .into()
+            .map(|id| (*id, Confinement::fresh()))
+            .collect::<BTreeMap<_, _>>();
+        let types = self
+            .quantifiers
+            .iter()
+            .map(|tp| {
+                (
+                    tp.clone(),
+                    Type::fresh_with_kind(tp.kind().apply_confinement_substitutions(&confinements)),
+                )
+            })
+            .collect::<Vec<_>>();
+        Substitutions {
+            types,
+            confinements,
+        }
     }
 
     /// Reject a declared signature the body cannot actually deliver: instantiate the
@@ -3734,6 +4253,7 @@ impl TypeScheme {
     pub fn from_constant(ty: Type) -> TypeScheme {
         Self {
             quantifiers: vec![],
+            confinement_quantifiers: BTreeSet::new(),
             underlying: ty,
             constraints: ConstraintSet::default(),
         }
@@ -3746,9 +4266,17 @@ impl TypeScheme {
         }
         vars
     }
+
+    pub fn free_confinement_variables(&self) -> BTreeSet<u32> {
+        self.underlying
+            .confinement_variables()
+            .difference(&self.confinement_quantifiers)
+            .copied()
+            .collect()
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone)]
 pub struct MetaVariable(u32, Kind);
 
 static FRESH_TYPE_ID: AtomicU32 = AtomicU32::new(0);
@@ -3765,11 +4293,47 @@ impl MetaVariable {
     pub fn kind(&self) -> &Kind {
         &self.1
     }
+
+    fn apply_confinements(&self, substitutions: &BTreeMap<u32, Confinement>) -> Self {
+        Self(
+            self.0,
+            self.1.apply_confinement_substitutions(substitutions),
+        )
+    }
+}
+
+impl PartialEq for MetaVariable {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for MetaVariable {}
+
+impl Hash for MetaVariable {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state)
+    }
+}
+
+impl PartialOrd for MetaVariable {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MetaVariable {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
 }
 
 //pub struct Substitutions(Vec<(TypeParamter, Type)>);
 #[derive(Debug, Default, Clone)]
-pub struct Substitutions(Vec<(MetaVariable, Type)>);
+pub struct Substitutions {
+    types: Vec<(MetaVariable, Type)>,
+    confinements: BTreeMap<u32, Confinement>,
+}
 
 impl Substitutions {
     pub fn substitution(&self, rhs: &MetaVariable) -> Option<&Type> {
@@ -3789,18 +4353,43 @@ impl Substitutions {
             out.push((param.clone(), ty.clone()));
         }
 
-        Substitutions(out)
+        let confinements = rhs
+            .confinements
+            .iter()
+            .map(|(id, confinement)| (*id, confinement.apply(&self.confinements)))
+            .chain(
+                self.confinements
+                    .iter()
+                    .map(|(id, confinement)| (*id, confinement.clone())),
+            )
+            .collect();
+
+        Substitutions {
+            types: out,
+            confinements,
+        }
+    }
+
+    fn with_confinements(confinements: BTreeMap<u32, Confinement>) -> Self {
+        Self {
+            types: Vec::new(),
+            confinements,
+        }
     }
 
     fn remove(&mut self, param: &MetaVariable) {
-        self.0.retain(|(tp, ..)| param != tp);
+        self.types.retain(|(tp, ..)| param != tp);
+        if let Some(confinement) = param.kind().confinement() {
+            for variable in confinement.variables() {
+                self.confinements.remove(&variable);
+            }
+        }
     }
 }
 
 impl fmt::Display for Substitutions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self(subs) = self;
-        let mut subs = subs.iter();
+        let mut subs = self.types.iter();
         write!(f, "{{")?;
 
         if let Some((p, ty)) = subs.next() {
@@ -3817,7 +4406,10 @@ impl fmt::Display for Substitutions {
 
 impl From<Vec<(MetaVariable, Type)>> for Substitutions {
     fn from(value: Vec<(MetaVariable, Type)>) -> Self {
-        Self(value)
+        Self {
+            types: value,
+            confinements: BTreeMap::new(),
+        }
     }
 }
 
@@ -3825,7 +4417,7 @@ impl Deref for Substitutions {
     type Target = [(MetaVariable, Type)];
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.types
     }
 }
 
@@ -3854,6 +4446,18 @@ impl TermEnvironment {
             .iter()
             .flat_map(|ts| ts.free_variables())
             .chain(self.free.values().flat_map(|ts| ts.free_variables()))
+            .collect()
+    }
+
+    pub fn free_confinement_variables(&self) -> BTreeSet<u32> {
+        self.bound
+            .iter()
+            .flat_map(TypeScheme::free_confinement_variables)
+            .chain(
+                self.free
+                    .values()
+                    .flat_map(TypeScheme::free_confinement_variables),
+            )
             .collect()
     }
 }
@@ -4000,6 +4604,7 @@ impl TypeEnvironment {
         while let Type::Apply {
             constructor,
             argument,
+            ..
         } = application
         {
             arguments.push(argument.as_ref());
@@ -4037,10 +4642,7 @@ impl TypeEnvironment {
         );
         let expanded = arguments[parameter_count..].iter().fold(
             alias.structure.materialize_monotype().apply(&substitutions),
-            |constructor, argument| Type::Apply {
-                constructor: constructor.into(),
-                argument: (*argument).clone().into(),
-            },
+            |constructor, argument| Type::application(constructor, (*argument).clone()),
         );
         let result = self
             .normalize_alias_on_path(&expanded, path)
@@ -4115,14 +4717,14 @@ impl TypingContext {
             .map_err(|error| error.at(pi))?;
         if let Some(normalized) = normalized {
             return if matches!(normalized, Type::Constructor { .. } | Type::Apply { .. }) {
-                self.reduce_applied_constructor(pi, &normalized, &mut vec![])
+                self.reduce_applied_constructor(pi, &normalized, &mut vec![], &mut None)
                     .map(Some)
             } else {
                 Ok(Some(TypeStructure::Monotype(normalized)))
             };
         }
         if let Type::Constructor { .. } | Type::Apply { .. } = ty {
-            self.reduce_applied_constructor(pi, ty, &mut vec![])
+            self.reduce_applied_constructor(pi, ty, &mut vec![], &mut None)
                 .map(Some)
         } else {
             Ok(None)
@@ -4134,6 +4736,7 @@ impl TypingContext {
         pi: ParseInfo,
         applied: &Type,
         arguments: &mut Vec<Type>,
+        application_capture: &mut Option<Confinement>,
     ) -> Typing<TypeStructure> {
         match applied {
             Type::Constructor(name) => {
@@ -4157,7 +4760,7 @@ impl TypingContext {
                 arguments.reverse();
 
                 let definition = constructor.definition();
-                let subs = Substitutions::from(
+                let mut subs = Substitutions::from(
                     definition
                         .defining_symbol
                         .type_parameters()
@@ -4173,15 +4776,32 @@ impl TypingContext {
                         .collect::<Vec<_>>(),
                 );
 
+                if let (Some(hidden), Some(actual)) =
+                    (&definition.hidden_capture, application_capture.as_ref())
+                {
+                    let captures = hidden.unify(actual).ok_or_else(|| {
+                        TypeError::ConfinementMismatch {
+                            lhs: hidden.clone(),
+                            rhs: actual.clone(),
+                        }
+                        .at(pi)
+                    })?;
+                    subs = subs.compose(&Substitutions::with_confinements(captures));
+                }
+
                 Ok(constructor.structure()?.apply(&subs))
             }
 
             Type::Apply {
                 constructor,
                 argument,
+                capture,
             } => {
                 arguments.push(*argument.clone());
-                self.reduce_applied_constructor(pi, constructor, arguments)
+                if let Some(capture) = capture {
+                    *application_capture = Some(capture.clone());
+                }
+                self.reduce_applied_constructor(pi, constructor, arguments, application_capture)
             }
 
             _ => {
@@ -4192,12 +4812,7 @@ impl TypingContext {
                 // down — otherwise `f α` collapses to just `f`, dropping `α` and
                 // mis-binding pattern variables at a truncated (mis-kinded) type.
                 arguments.reverse();
-                let ty = arguments
-                    .drain(..)
-                    .fold(applied.clone(), |constructor, argument| Type::Apply {
-                        constructor: constructor.into(),
-                        argument: argument.into(),
-                    });
+                let ty = arguments.drain(..).fold(applied.clone(), Type::application);
                 Ok(TypeStructure::Monotype(ty))
             }
         }
@@ -4436,7 +5051,12 @@ impl TypingContext {
 
         tracing::trace!("expected {expected_type} tree {:?}", rec.lambda);
 
-        if let TypeStructure::Monotype(Type::Arrow { domain, codomain }) = &normalized_type {
+        if let TypeStructure::Monotype(Type::Arrow {
+            capture,
+            domain,
+            codomain,
+        }) = &normalized_type
+        {
             self.bind_term_and_then(
                 rec.own_name.clone(),
                 TypeScheme::from_constant(expected_type.clone()),
@@ -4447,19 +5067,32 @@ impl TypingContext {
                         |ctx| {
                             let typed_body = ctx.check_expr(codomain, &rec.lambda.body)?;
 
-                            let type_info = pi.with_inferred_type(
-                                expected_type.apply(&typed_body.substitutions).clone(),
-                            );
+                            let body = typed_body.tree.apply(&typed_body.substitutions);
+                            let actual_capture = ctx.lambda_capture_confinement(
+                                &rec.lambda.parameter,
+                                Some(&rec.own_name),
+                                &body,
+                            )?;
+                            let expected_capture =
+                                capture.apply(&typed_body.substitutions.confinements);
+                            let capture_substitutions = expected_capture
+                                .unify(&actual_capture.joined)
+                                .map(Substitutions::with_confinements)
+                                .ok_or_else(|| actual_capture.mismatch(expected_capture, pi))?;
+                            let substitutions =
+                                typed_body.substitutions.compose(&capture_substitutions);
+                            let type_info =
+                                pi.with_inferred_type(expected_type.apply(&substitutions));
                             Ok(Typed::computed(
-                                typed_body.substitutions,
-                                typed_body.constraints,
+                                substitutions.clone(),
+                                typed_body.constraints.apply(&substitutions),
                                 Expr::RecursiveLambda(
                                     type_info,
                                     SelfReferential {
                                         own_name: rec.own_name.clone(),
                                         lambda: Lambda {
                                             parameter: rec.lambda.parameter.clone(),
-                                            body: typed_body.tree.into(),
+                                            body: body.apply(&substitutions).into(),
                                         },
                                     },
                                 ),
@@ -4484,24 +5117,38 @@ impl TypingContext {
             .expand_type_constructor(pi, expected_type)?
             .unwrap_or_else(|| TypeStructure::Monotype(expected_type.clone()));
 
-        if let TypeStructure::Monotype(Type::Arrow { domain, codomain }) = &normalized_type {
+        if let TypeStructure::Monotype(Type::Arrow {
+            capture,
+            domain,
+            codomain,
+        }) = &normalized_type
+        {
             self.bind_term_and_then(
                 lambda.parameter.clone(),
                 TypeScheme::from_constant(*domain.clone()),
                 |ctx| {
                     let body = ctx.check_expr(codomain, &lambda.body)?;
 
-                    ctx.substitute_mut(&body.substitutions);
+                    let typed_body = body.tree.apply(&body.substitutions);
+                    let actual_capture =
+                        ctx.lambda_capture_confinement(&lambda.parameter, None, &typed_body)?;
+                    let expected_capture = capture.apply(&body.substitutions.confinements);
+                    let capture_substitutions = expected_capture
+                        .unify(&actual_capture.joined)
+                        .map(Substitutions::with_confinements)
+                        .ok_or_else(|| actual_capture.mismatch(expected_capture, pi))?;
+                    let substitutions = body.substitutions.compose(&capture_substitutions);
+                    ctx.substitute_mut(&substitutions);
 
-                    let type_info = pi.with_inferred_type(expected_type.apply(&body.substitutions));
+                    let type_info = pi.with_inferred_type(expected_type.apply(&substitutions));
                     Ok(Typed::computed(
-                        body.substitutions,
-                        body.constraints,
+                        substitutions.clone(),
+                        body.constraints.apply(&substitutions),
                         Expr::Lambda(
                             type_info,
                             Lambda {
                                 parameter: lambda.parameter.clone(),
-                                body: body.tree.into(),
+                                body: typed_body.apply(&substitutions).into(),
                             },
                         ),
                     ))
@@ -5508,10 +6155,10 @@ impl TypingContext {
                 Expr::Array(
                     pi.with_inferred_type(
                         //Type::Array(array_element_type.into()),
-                        Type::Apply {
-                            constructor: Type::Constructor(QualifiedName::builtin("Array")).into(),
-                            argument: array_element_type.into(),
-                        },
+                        Type::application(
+                            Type::Constructor(QualifiedName::builtin("Array")),
+                            array_element_type,
+                        ),
                     ),
                     Array { elements },
                 ),
@@ -5807,7 +6454,9 @@ impl TypingContext {
     ) -> Typing {
         let domain = Type::fresh();
         let codomain = Type::fresh();
+        let own_capture = Confinement::fresh();
         let own_ty = Type::Arrow {
+            capture: own_capture.clone(),
             domain: domain.clone().into(),
             codomain: codomain.clone().into(),
         };
@@ -5828,8 +6477,19 @@ impl TypingContext {
                             .map_err(|e| e.at(pi))?;
 
                         let substitutions = typed.substitutions.compose(&s_codomain);
-
                         let tree = typed.tree.apply(&substitutions);
+                        let actual_capture = ctx.lambda_capture_confinement(
+                            &rec_lambda.lambda.parameter,
+                            Some(&rec_lambda.own_name),
+                            &tree,
+                        )?;
+                        let expected_capture = own_capture.apply(&substitutions.confinements);
+                        let capture_substitutions = expected_capture
+                            .unify(&actual_capture.joined)
+                            .map(Substitutions::with_confinements)
+                            .ok_or_else(|| actual_capture.mismatch(expected_capture, pi))?;
+                        let substitutions = substitutions.compose(&capture_substitutions);
+
                         Ok(Typed::computed(
                             substitutions.clone(),
                             typed.constraints.apply(&substitutions),
@@ -5839,7 +6499,7 @@ impl TypingContext {
                                     own_name: rec_lambda.own_name.clone(),
                                     lambda: Lambda {
                                         parameter: rec_lambda.lambda.parameter.clone(),
-                                        body: tree.into(),
+                                        body: tree.apply(&substitutions).into(),
                                     },
                                 },
                             ),
@@ -5865,6 +6525,7 @@ impl TypingContext {
             let domain = Type::fresh();
             let codomain = Type::fresh();
             let unification = Type::Arrow {
+                capture: Confinement::fresh(),
                 domain: domain.into(),
                 codomain: codomain.into(),
             }
@@ -5877,7 +6538,10 @@ impl TypingContext {
         }
 
         let function_type = &function.tree.type_info().inferred_type;
-        if let Type::Arrow { domain, codomain } = &function_type {
+        if let Type::Arrow {
+            domain, codomain, ..
+        } = &function_type
+        {
             let argument = self.check_expr(&domain.apply(&function.substitutions), argument)?;
 
             let substitutions = function.substitutions.compose(&argument.substitutions);
@@ -5932,6 +6596,7 @@ impl TypingContext {
         let Type::Arrow {
             domain: first_domain,
             codomain,
+            ..
         } = function_type
         else {
             unreachable!("bind/fmap are functions")
@@ -5939,6 +6604,7 @@ impl TypingContext {
         let Type::Arrow {
             domain: second_domain,
             codomain: result,
+            ..
         } = *codomain
         else {
             unreachable!("bind/fmap are curried binary functions")
@@ -5963,6 +6629,7 @@ impl TypingContext {
             .union(second.constraints.apply(&substitutions));
 
         let inner_type = Type::Arrow {
+            capture: Confinement::fresh(),
             domain: second_domain,
             codomain: result.clone(),
         }
@@ -6008,6 +6675,7 @@ impl TypingContext {
         let substitutions = function.substitutions.compose(&argument.substitutions);
 
         let expected_ty = Type::Arrow {
+            capture: Confinement::fresh(),
             domain: argument
                 .tree
                 .type_info()
@@ -6023,7 +6691,12 @@ impl TypingContext {
             .inferred_type
             .apply(&substitutions)
             .unified_with(&expected_ty.apply(&substitutions), &self.types)
-            .map_err(|e| e.at(pi))?
+            // Attribution runs only on the error path: rebuilding the typed
+            // argument is not worth doing for every application that succeeds.
+            .map_err(|e| {
+                ctx.attribute_confined_capture(e, &argument.tree.apply(&substitutions))
+                    .at(pi)
+            })?
             .compose(&substitutions);
 
         let apply = Apply {
@@ -6039,6 +6712,231 @@ impl TypingContext {
             constraints,
             Expr::Apply(pi.with_inferred_type(inferred_type), apply),
         ))
+    }
+
+    /// How far `confinement_path` descends before giving up. A diagnostic aid, so
+    /// the bound only needs to cover the nesting a person would want named.
+    const CONFINEMENT_PATH_DEPTH: usize = 8;
+
+    /// Is this type opaque, so that its representation is not the caller's
+    /// business? Descent stops here: the answer to "why is this confined" is the
+    /// abstraction's own name, not the field it happens to wrap.
+    fn is_opaque(&self, ty: &Type) -> bool {
+        let mut head = ty;
+        while let Type::Apply { constructor, .. } = head {
+            head = constructor;
+        }
+        match head {
+            Type::Constructor(name) => self.types.lookup(name).is_some_and(|constructor| {
+                matches!(
+                    constructor.definition().defining_symbol.opacity,
+                    namer::Access::Within(_)
+                )
+            }),
+            _ => false,
+        }
+    }
+
+    /// Explain *why* a composite is confined: the field or constructor chain down
+    /// to the confined leaf, plus that leaf's type. `Workspace` yields
+    /// (`["scratch"]`, `Buffer`). Returns `None` when the type is confined in
+    /// itself, when nothing is visible, or when expansion fails -- callers then
+    /// report the type alone.
+    ///
+    /// Purely a diagnostic aid, so it prefers giving up to being wrong: it bounds
+    /// the descent rather than tracking visited constructors, which keeps a
+    /// recursive type from looping.
+    fn confinement_path(
+        &self,
+        ty: &Type,
+        pi: ParseInfo,
+        fuel: usize,
+    ) -> Option<(Vec<String>, Type)> {
+        if fuel == 0 || self.is_opaque(ty) {
+            return None;
+        }
+        let confined = |ty: &Type| {
+            matches!(
+                ty.kind(&self.types)
+                    .ok()
+                    .as_ref()
+                    .and_then(Kind::confinement),
+                Some(Confinement::Confined)
+            )
+        };
+
+        // Descend through the first confined component. If the component cannot
+        // itself be explained further, it is the leaf we are looking for.
+        let step = |label: String, field: &Type| -> Option<(Vec<String>, Type)> {
+            confined(field).then(|| match self.confinement_path(field, pi, fuel - 1) {
+                Some((rest, leaf)) => (
+                    std::iter::once(label.clone()).chain(rest).collect(),
+                    leaf,
+                ),
+                None => (vec![label], field.clone()),
+            })
+        };
+
+        let structure = match self.expand_type_constructor(pi, ty) {
+            Ok(Some(TypeStructure::Monotype(expanded))) => expanded,
+            // A declared record expands to its field schemes rather than a
+            // structural record type.
+            Ok(Some(TypeStructure::PolyRecord(record))) => {
+                return record.fields().find_map(|(name, scheme)| {
+                    step(name.to_string(), &scheme.underlying)
+                });
+            }
+            _ => return None,
+        };
+
+        match &structure {
+            Type::Record(record) => record
+                .0
+                .iter()
+                .find_map(|(name, field)| step(name.to_string(), field)),
+            Type::Coproduct(coproduct) => {
+                coproduct.0.iter().find_map(|(constructor, arguments)| {
+                    arguments
+                        .iter()
+                        .find_map(|argument| step(constructor.member.to_string(), argument))
+                })
+            }
+            Type::Tuple(tuple) => tuple
+                .0
+                .iter()
+                .enumerate()
+                .find_map(|(index, element)| step(format!("{index}"), element)),
+            Type::Array(element) => step("[]".to_string(), element),
+            _ => None,
+        }
+    }
+
+    /// Turn an opaque capture-index mismatch into one that names the offending
+    /// capture. Unification reports `IO unconfined _` against `IO confined _`
+    /// without knowing *why* the action is confined -- that lives in the lambda
+    /// it is applied to. This is a pure diagnostic pass: it runs only once an
+    /// error has already been produced, and can never change what is accepted.
+    fn attribute_confined_capture(
+        &self,
+        error: TypeError,
+        argument: &phase::Expr<Types>,
+    ) -> TypeError {
+        // A requirement failure already names the offending type; it only lacks
+        // the path explaining why that type is confined.
+        if let TypeError::ConfinementRequirement {
+            ty,
+            actual,
+            required,
+            path: _,
+        } = error
+        {
+            let pi = argument.annotation().parse_info;
+            return TypeError::ConfinementRequirement {
+                path: ConfinementPath(self.confinement_path(
+                    &ty,
+                    pi,
+                    Self::CONFINEMENT_PATH_DEPTH,
+                )),
+                ty,
+                actual,
+                required,
+            };
+        }
+
+        if !matches!(error, TypeError::ConfinementMismatch { .. }) {
+            return error;
+        }
+
+        let mut blamed = None;
+        argument.walk(&mut |expression| {
+            if blamed.is_some() {
+                return;
+            }
+            let (parameter, body, own) = match expression {
+                Expr::Lambda(_, lambda) => (&lambda.parameter, &lambda.body, None),
+                Expr::RecursiveLambda(_, rec) => (
+                    &rec.lambda.parameter,
+                    &rec.lambda.body,
+                    Some(&rec.own_name),
+                ),
+                _ => return,
+            };
+            if let Ok(captures) = self.lambda_capture_confinement(parameter, own, body) {
+                blamed = captures.confined().cloned();
+            }
+        });
+
+        match blamed {
+            Some(capture) => TypeError::ConfinedCapture {
+                path: ConfinementPath(self.confinement_path(
+                    &capture.ty,
+                    capture.parse_info,
+                    Self::CONFINEMENT_PATH_DEPTH,
+                )),
+                ty: capture.ty,
+            },
+            None => error,
+        }
+    }
+
+    fn lambda_capture_confinement(
+        &self,
+        parameter: &namer::Identifier,
+        ignored_capture: Option<&namer::Identifier>,
+        body: &phase::Expr<Types>,
+    ) -> Typing<CaptureConfinement> {
+        let namer::Identifier::Bound(parameter_level) = parameter else {
+            return Err(TypeError::InternalAssertion(
+                "lambda parameter was not a bound identifier".into(),
+            )
+            .at(body.annotation().parse_info));
+        };
+
+        let mut captures = Vec::new();
+        body.walk(&mut |expression| {
+            if let Expr::Variable(type_info, identifier) = &expression {
+                let is_capture = match identifier {
+                    namer::Identifier::Bound(level) => level < parameter_level,
+                    // Closure capture inference is deliberately lexical. Global
+                    // reachability is a separate whole-program dependency check at
+                    // the eventual spawn boundary; treating code/constructor names
+                    // as heap captures here both conflates the two judgments and
+                    // destroys principal capture equations for ordinary functions.
+                    namer::Identifier::Free(_) => false,
+                };
+                if is_capture && ignored_capture != Some(identifier) {
+                    captures.push((type_info.parse_info, type_info.inferred_type.clone()));
+                }
+            }
+        });
+
+        let captures = captures
+            .into_iter()
+            .map(|(parse_info, ty)| {
+                ty.kind(&self.types)
+                    .map_err(|error| error.at(parse_info))
+                    .and_then(|kind| {
+                        kind.confinement().cloned().ok_or_else(|| {
+                            TypeError::ExpectedMonotypeKind { kind }.at(parse_info)
+                        })
+                    })
+                    .map(|confinement| Capture {
+                        parse_info,
+                        ty,
+                        confinement,
+                    })
+            })
+            .collect::<Typing<Vec<_>>>()?;
+
+        Ok(CaptureConfinement {
+            joined: Confinement::join(
+                captures
+                    .iter()
+                    .map(|capture| capture.confinement.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            captures,
+        })
     }
 
     #[instrument]
@@ -6068,12 +6966,14 @@ impl TypingContext {
 
                 substitutions = substitutions.compose(&unify_subs);
 
+                let body = body.apply(&substitutions);
+                let capture = ctx.lambda_capture_confinement(&lambda.parameter, None, &body)?;
+
                 let inferred_type = Type::Arrow {
+                    capture: capture.joined,
                     domain: domain.apply(&substitutions).into(),
                     codomain: codomain.apply(&substitutions).into(),
                 };
-
-                let body = body.apply(&substitutions);
 
                 let constraints = constraints.apply(&substitutions);
 
@@ -6356,6 +7256,10 @@ impl TypingContext {
     fn free_variables(&self) -> HashSet<MetaVariable> {
         self.terms.free_variables()
     }
+
+    fn free_confinement_variables(&self) -> BTreeSet<u32> {
+        self.terms.free_confinement_variables()
+    }
 }
 
 impl Literal {
@@ -6622,8 +7526,29 @@ impl fmt::Display for TypeInfo {
 impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Kind::Star => write!(f, "*"),
+            // Capability indices are normally elided from existing type output.
+            Kind::Star(_) => write!(f, "*"),
             Kind::Arrow(k1, k2) => write!(f, "{k1} -> {k2}"),
+        }
+    }
+}
+
+impl fmt::Display for Confinement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unconfined => write!(f, "unconfined"),
+            Self::Confined => write!(f, "confined"),
+            Self::Variable(id) => write!(f, "κ{id}"),
+            Self::Join(parts) => {
+                let mut parts = parts.iter();
+                if let Some(first) = parts.next() {
+                    write!(f, "{first}")?;
+                    for part in parts {
+                        write!(f, " ⊔ {part}")?;
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -6635,7 +7560,9 @@ impl fmt::Display for Type {
 
             Self::Base(base_type) => write!(f, "{base_type}"),
 
-            Self::Arrow { domain, codomain } => write!(f, "({domain} -> {codomain})"),
+            Self::Arrow {
+                domain, codomain, ..
+            } => write!(f, "({domain} -> {codomain})"),
 
             Self::Tuple(tuple) => {
                 let tuple_rendering = tuple
@@ -6682,6 +7609,7 @@ impl fmt::Display for Type {
             Self::Apply {
                 constructor,
                 argument,
+                ..
             } => write!(f, "{constructor} [ {argument} ]"),
         }
     }
@@ -6808,5 +7736,239 @@ impl fmt::Display for RecordType {
         }
 
         write!(f, " }}")
+    }
+}
+
+#[cfg(test)]
+mod confinement_kind_tests {
+    use super::*;
+    use crate::ast::namer::ConstructorSymbol;
+    use crate::ast::{ApplyTypeExpr, TypeVariable};
+
+    fn name(member: &str) -> QualifiedName {
+        QualifiedName::new(parser::IdentifierPath::new("Test"), member)
+    }
+
+    fn parameter(image: &str, confinement: Confinement) -> TypeVariable {
+        TypeVariable::with_kind(parser::Identifier::from_str(image), Kind::Star(confinement))
+    }
+
+    #[test]
+    fn higher_kinded_confinement_is_a_result_mapping() {
+        let raw_name = name("Raw_Mutable_Array");
+        let list_name = name("List");
+        let mutable_name = name("Mutable_Array");
+        let pi = ParseInfo::default();
+
+        let list_element = Confinement::fresh();
+        let list_parameter = parameter("a", list_element.clone());
+        let list_kind = Kind::Arrow(list_parameter.kind.clone().into(), Kind::star().into());
+        let recursive_list = TypeExpression::Apply(
+            pi,
+            ApplyTypeExpr {
+                function: TypeExpression::Constructor(pi, list_name.clone()).into(),
+                argument: TypeExpression::Parameter(pi, parser::Identifier::from_str("a")).into(),
+                phase: PhantomData,
+            },
+        );
+
+        let mutable_element = Confinement::fresh();
+        let mutable_parameter = parameter("a", mutable_element);
+        let mutable_kind = Kind::Arrow(mutable_parameter.kind.clone().into(), Kind::star().into());
+
+        let mut table: phase::SymbolTable<Named> = Default::default();
+        table.symbols.insert(
+            SymbolName::Type(raw_name.clone()),
+            Symbol::Type(TypeSymbol {
+                definition: TypeDefinition::Coproduct(CoproductSymbol {
+                    name: raw_name.clone(),
+                    type_parameters: vec![],
+                    constructors: vec![],
+                }),
+                origin: namer::TypeOrigin::Foreign,
+                opacity: namer::Access::Within(parser::IdentifierPath::new("Test")),
+                arity: 0,
+                kind: Kind::confined(),
+            }),
+        );
+        table.symbols.insert(
+            SymbolName::Type(list_name.clone()),
+            Symbol::Type(TypeSymbol {
+                definition: TypeDefinition::Coproduct(CoproductSymbol {
+                    name: list_name.clone(),
+                    type_parameters: vec![list_parameter],
+                    constructors: vec![
+                        ConstructorSymbol {
+                            name: name("Empty"),
+                            signature: vec![],
+                        },
+                        ConstructorSymbol {
+                            name: name("Cons"),
+                            signature: vec![
+                                TypeExpression::Parameter(pi, parser::Identifier::from_str("a")),
+                                recursive_list,
+                            ],
+                        },
+                    ],
+                }),
+                origin: namer::TypeOrigin::UserDefined,
+                opacity: namer::Access::Anywhere,
+                arity: 1,
+                kind: list_kind,
+            }),
+        );
+        table.symbols.insert(
+            SymbolName::Type(mutable_name.clone()),
+            Symbol::Type(TypeSymbol {
+                definition: TypeDefinition::Coproduct(CoproductSymbol {
+                    name: mutable_name.clone(),
+                    type_parameters: vec![mutable_parameter],
+                    constructors: vec![ConstructorSymbol {
+                        name: name("Mutable"),
+                        signature: vec![TypeExpression::Constructor(pi, raw_name)],
+                    }],
+                }),
+                origin: namer::TypeOrigin::UserDefined,
+                opacity: namer::Access::Within(parser::IdentifierPath::new("Test")),
+                arity: 1,
+                kind: mutable_kind,
+            }),
+        );
+
+        let kinds = table.infer_type_kinds().unwrap();
+        for confinement in [Confinement::Unconfined, Confinement::Confined] {
+            assert_eq!(
+                kinds[&list_name]
+                    .clone()
+                    .apply(Kind::Star(confinement.clone()))
+                    .unwrap(),
+                Kind::Star(confinement)
+            );
+        }
+        for confinement in [Confinement::Unconfined, Confinement::Confined] {
+            assert_eq!(
+                kinds[&mutable_name]
+                    .clone()
+                    .apply(Kind::Star(confinement))
+                    .unwrap(),
+                Kind::confined()
+            );
+        }
+    }
+
+    #[test]
+    fn unconfined_requirement_distributes_over_a_symbolic_join() {
+        let left = Confinement::fresh();
+        let right = Confinement::fresh();
+        let joined = Confinement::join([left.clone(), right.clone()]);
+
+        let substitutions = joined.require(Confinement::Unconfined).unwrap();
+
+        assert_eq!(left.apply(&substitutions), Confinement::Unconfined);
+        assert_eq!(right.apply(&substitutions), Confinement::Unconfined);
+        assert_eq!(joined.apply(&substitutions), Confinement::Unconfined);
+    }
+
+    #[test]
+    fn lambda_capture_confinement_uses_lexically_outer_bound_values() {
+        let raw_name = name("Raw_Buffer");
+        let raw_symbol = TypeSymbol {
+            definition: TypeDefinition::Coproduct(CoproductSymbol {
+                name: raw_name.clone(),
+                type_parameters: vec![],
+                constructors: vec![],
+            }),
+            origin: namer::TypeOrigin::Foreign,
+            opacity: namer::Access::Within(parser::IdentifierPath::new("Test")),
+            arity: 0,
+            kind: Kind::confined(),
+        };
+        let mut context = TypingContext::default();
+        context
+            .types
+            .bind(raw_name.clone(), TypeConstructor::from_symbol(&raw_symbol));
+        let body = Expr::Variable(
+            TypeInfo::new(ParseInfo::default(), Type::Constructor(raw_name)),
+            Identifier::Bound(0),
+        );
+
+        assert_eq!(
+            context
+                .lambda_capture_confinement(&Identifier::Bound(1), None, &body)
+                .unwrap()
+                .joined,
+            Confinement::Confined
+        );
+        assert_eq!(
+            context
+                .lambda_capture_confinement(&Identifier::Bound(0), None, &body)
+                .unwrap()
+                .joined,
+            Confinement::Unconfined
+        );
+    }
+
+    #[test]
+    fn unconfined_type_ascription_rejects_a_confined_leaf() {
+        let raw_name = name("Raw_Buffer");
+        let raw_symbol = TypeSymbol {
+            definition: TypeDefinition::Coproduct(CoproductSymbol {
+                name: raw_name.clone(),
+                type_parameters: vec![],
+                constructors: vec![],
+            }),
+            origin: namer::TypeOrigin::Foreign,
+            opacity: namer::Access::Within(parser::IdentifierPath::new("Test")),
+            arity: 0,
+            kind: Kind::confined(),
+        };
+        let mut context = TypingContext::default();
+        context
+            .types
+            .bind(raw_name.clone(), TypeConstructor::from_symbol(&raw_symbol));
+        let expression = TypeExpression::ConfinementAscription(
+            ParseInfo::default(),
+            TypeExpression::Constructor(ParseInfo::default(), raw_name).into(),
+            ast::ConfinementModifier::Unconfined,
+        );
+
+        let error = expression
+            .synthesize_type(&HashMap::new(), &context)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cannot unify confined with unconfined"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unconfined_type_variable_cannot_bind_a_confined_type() {
+        let raw_name = name("Raw_Buffer");
+        let raw_symbol = TypeSymbol {
+            definition: TypeDefinition::Coproduct(CoproductSymbol {
+                name: raw_name.clone(),
+                type_parameters: vec![],
+                constructors: vec![],
+            }),
+            origin: namer::TypeOrigin::Foreign,
+            opacity: namer::Access::Within(parser::IdentifierPath::new("Test")),
+            arity: 0,
+            kind: Kind::confined(),
+        };
+        let mut context = TypingContext::default();
+        context
+            .types
+            .bind(raw_name.clone(), TypeConstructor::from_symbol(&raw_symbol));
+
+        let error = Type::fresh_with_kind(Kind::unconfined())
+            .unified_with(&Type::Constructor(raw_name), &context.types)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            error,
+            "type `Test.Raw_Buffer` is confined, but this context requires unconfined"
+        );
     }
 }

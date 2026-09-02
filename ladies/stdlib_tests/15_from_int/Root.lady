@@ -23,6 +23,7 @@ round_trip :: Text -> Int -> Bool := λsource expected.
   perhaps false id (fmap matches parsed)
 
 start := λ_.
+  print_endline "##TC"
   let loop = λi.
     if i >= 0
       then

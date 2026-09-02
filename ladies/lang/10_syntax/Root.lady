@@ -137,6 +137,7 @@ chain :: Perhaps Int :=
 (* Run everything. The body of `start` is itself a layout construct: a sequence *)
 (* of statements separated by newlines at one indentation level. *)
 start :: Int -> Unit := λ_.
+  print_endline "##TC"
   print_endline "`same_line`"                     (* 42 *)
   print_endline "`indented_body`"                 (* 42 *)
   print_endline "`applied_across_lines`"          (* 60 *)

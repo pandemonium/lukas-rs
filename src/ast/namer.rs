@@ -195,6 +195,10 @@ impl TypeExpression<ParseInfo, QualifiedName> {
                 apply.argument.gather_free_variables(free);
             }
 
+            Self::ConfinementAscription(_, body, _) => {
+                body.gather_free_variables(free);
+            }
+
             Self::Arrow(_, arrow) => {
                 arrow.domain.gather_free_variables(free);
                 arrow.codomain.gather_free_variables(free);
@@ -549,19 +553,30 @@ impl RecordDeclarator<ParseInfo> {
         name: &QualifiedName,
         origin: TypeOrigin,
         opacity: Access,
+        result_confinement: ast::Confinement,
     ) -> TypeSymbol<IdentifierPath> {
         TypeSymbol {
             definition: TypeDefinition::Record(self.as_record_symbol(type_parameters, name)),
             origin,
             opacity,
             arity: type_parameters.len(),
-            kind: compute_type_constructor_kind(type_parameters),
+            kind: compute_type_constructor_kind_with_result(
+                type_parameters,
+                Kind::Star(result_confinement),
+            ),
         }
     }
 }
 
 fn compute_type_constructor_kind(type_parameters: &[TypeVariable]) -> Kind {
-    type_parameters.iter().rfold(Kind::Star, |z, tv| {
+    compute_type_constructor_kind_with_result(type_parameters, Kind::star())
+}
+
+fn compute_type_constructor_kind_with_result(
+    type_parameters: &[TypeVariable],
+    result: Kind,
+) -> Kind {
+    type_parameters.iter().rfold(result, |z, tv| {
         Kind::Arrow(tv.kind.clone().into(), z.into())
     })
 }
@@ -574,6 +589,7 @@ impl CoproductDeclarator<ParseInfo> {
         constructors: Vec<ConstructorSymbol<IdentifierPath>>,
         origin: TypeOrigin,
         opacity: Access,
+        result_confinement: ast::Confinement,
     ) -> TypeSymbol<IdentifierPath> {
         TypeSymbol {
             definition: TypeDefinition::Coproduct(CoproductSymbol {
@@ -584,7 +600,10 @@ impl CoproductDeclarator<ParseInfo> {
             origin,
             opacity,
             arity: type_parameters.len(),
-            kind: compute_type_constructor_kind(type_parameters),
+            kind: compute_type_constructor_kind_with_result(
+                type_parameters,
+                Kind::Star(result_confinement),
+            ),
         }
     }
 }
@@ -864,12 +883,20 @@ impl phase::SymbolTable<Parsed> {
             declarator,
             origin,
             opaque,
+            confinement,
         }: ast::TypeDeclaration<ParseInfo>,
     ) {
         {
             self.add_module_type_member(module_path.clone(), name.clone());
 
             let name = QualifiedName::new(module_path.clone(), name.as_str());
+
+            let result_confinement = match confinement {
+                Some(ast::ConfinementModifier::Confined) => ast::Confinement::Confined,
+                Some(ast::ConfinementModifier::Unconfined) => ast::Confinement::Unconfined,
+                None if matches!(origin, TypeOrigin::Foreign) => ast::Confinement::Confined,
+                None => ast::Confinement::fresh(),
+            };
 
             let opacity = if opaque || matches!(origin, TypeOrigin::Foreign) {
                 Access::Within(module_path.clone())
@@ -892,7 +919,13 @@ impl phase::SymbolTable<Parsed> {
                 ast::TypeDeclarator::Record(_, record) => {
                     self.add_type_symbol(
                         name.clone(),
-                        record.as_type_symbol(&type_parameters, &name, origin, opacity),
+                        record.as_type_symbol(
+                            &type_parameters,
+                            &name,
+                            origin,
+                            opacity,
+                            result_confinement,
+                        ),
                     );
                 }
 
@@ -933,6 +966,7 @@ impl phase::SymbolTable<Parsed> {
                             constructors,
                             origin,
                             opacity,
+                            result_confinement,
                         ),
                     );
                 }
@@ -949,7 +983,10 @@ impl phase::SymbolTable<Parsed> {
                             origin,
                             opacity,
                             arity: type_parameters.len(),
-                            kind: compute_type_constructor_kind(&type_parameters),
+                            kind: compute_type_constructor_kind_with_result(
+                                &type_parameters,
+                                Kind::Star(result_confinement),
+                            ),
                         },
                     );
                 }
@@ -1511,6 +1548,11 @@ impl ConstructorSymbol<IdentifierPath> {
                     TypeExpression::Arrow(
                         pi,
                         ArrowTypeExpr {
+                            // Each generated lambda is checked like an ordinary
+                            // curried function. The outer arrow resolves to
+                            // unconfined; inner arrows retain the capabilities of
+                            // constructor arguments captured by partial application.
+                            capture: ast::Confinement::fresh(),
                             domain: lhs.into(),
                             codomain: rhs.into(),
                         },
@@ -1695,9 +1737,18 @@ impl phase::TypeExpression<Desugared> {
                 },
             )),
 
+            Self::ConfinementAscription(a, body, confinement) => {
+                Ok(TypeExpression::ConfinementAscription(
+                    *a,
+                    body.resolve_names(symbols, pi, semantic_scope)?.into(),
+                    *confinement,
+                ))
+            }
+
             Self::Arrow(a, arrow) => Ok(TypeExpression::Arrow(
                 *a,
                 ArrowTypeExpr {
+                    capture: arrow.capture.clone(),
                     domain: arrow
                         .domain
                         .resolve_names(symbols, pi, semantic_scope)?
@@ -2424,7 +2475,7 @@ impl phase::SymbolTable<Desugared> {
                         origin: symbol.origin,
                         opacity: symbol.opacity.clone(),
                         arity: symbol.arity,
-                        kind: Kind::Arrow(Kind::Star.into(), Kind::Star.into()),
+                        kind: Kind::Arrow(Kind::star().into(), Kind::star().into()),
                     },
 
                     TypeDefinition::BaseType(base_type) => TypeSymbol {

@@ -20,9 +20,12 @@ fn comparison_signature() -> TypeScheme {
     let tp = MetaVariable::fresh();
     TypeScheme {
         quantifiers: vec![tp.clone()],
+        confinement_quantifiers: tp.kind().confinement_variables(),
         underlying: Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: Type::Variable(tp.clone()).into(),
             codomain: Type::Arrow {
+                capture: crate::ast::Confinement::Unconfined,
                 domain: Type::Variable(tp).into(),
                 codomain: Type::Base(BaseType::Bool).into(),
             }
@@ -37,9 +40,12 @@ fn artithmetic_signature() -> TypeScheme {
     let tp = MetaVariable::fresh();
     TypeScheme {
         quantifiers: vec![tp.clone()],
+        confinement_quantifiers: tp.kind().confinement_variables(),
         underlying: Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: Type::Variable(tp.clone()).into(),
             codomain: Type::Arrow {
+                capture: crate::ast::Confinement::Unconfined,
                 domain: Type::Variable(tp.clone()).into(),
                 codomain: Type::Variable(tp).into(),
             }
@@ -56,7 +62,9 @@ fn unary_signature() -> TypeScheme {
     let tp = MetaVariable::fresh();
     TypeScheme {
         quantifiers: vec![tp.clone()],
+        confinement_quantifiers: tp.kind().confinement_variables(),
         underlying: Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: Type::Variable(tp.clone()).into(),
             codomain: Type::Variable(tp).into(),
         },
@@ -205,6 +213,7 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
         name: "int_of_char",
         apply: mk_unary_op(int_of_char),
         type_scheme: TypeScheme::from_constant(Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: Type::Base(BaseType::Char).into(),
             codomain: Type::Base(BaseType::Int).into(),
         }),
@@ -214,6 +223,7 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
         name: "float_of_int",
         apply: mk_unary_op(float_of_int),
         type_scheme: TypeScheme::from_constant(Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: Type::Base(BaseType::Int).into(),
             codomain: Type::Base(BaseType::Float).into(),
         }),
@@ -223,6 +233,7 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
         name: "int_of_float",
         apply: mk_unary_op(int_of_float),
         type_scheme: TypeScheme::from_constant(Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: Type::Base(BaseType::Float).into(),
             codomain: Type::Base(BaseType::Int).into(),
         }),
@@ -235,6 +246,7 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
         name: "char_of_byte",
         apply: mk_unary_op(char_of_byte),
         type_scheme: TypeScheme::from_constant(Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: Type::Base(BaseType::Int).into(),
             codomain: Type::Base(BaseType::Char).into(),
         }),
@@ -248,10 +260,14 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
 
             TypeScheme {
                 quantifiers: vec![z.clone()],
+                confinement_quantifiers: z.kind().confinement_variables(),
                 underlying: Type::Arrow {
+                    capture: crate::ast::Confinement::Unconfined,
                     domain: Type::Arrow {
+                        capture: crate::ast::Confinement::Unconfined,
                         domain: Type::Base(BaseType::Char).into(),
                         codomain: Type::Arrow {
+                            capture: crate::ast::Confinement::Unconfined,
                             domain: Type::Variable(z.clone()).into(),
                             codomain: Type::Variable(z.clone()).into(),
                         }
@@ -259,8 +275,10 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
                     }
                     .into(),
                     codomain: Type::Arrow {
+                        capture: crate::ast::Confinement::Unconfined,
                         domain: Type::Variable(z.clone()).into(),
                         codomain: Type::Arrow {
+                            capture: crate::ast::Confinement::Unconfined,
                             domain: stdlib_text_type().into(),
                             codomain: Type::Variable(z).into(),
                         }
@@ -304,14 +322,14 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
             origin: TypeOrigin::Builtin,
             opacity: Access::Anywhere,
             arity: 0,
-            kind: Kind::Star,
+            kind: Kind::unconfined(),
         },
         TypeSymbol {
             definition: TypeDefinition::BaseType(BaseType::Float),
             origin: TypeOrigin::Builtin,
             opacity: Access::Anywhere,
             arity: 0,
-            kind: Kind::Star,
+            kind: Kind::unconfined(),
         },
         // `Text` is no longer a builtin type: it is the stdlib DU
         // `opaque Text ::= Text Bytes` (Stdlib/Text.lady). String literals and
@@ -321,28 +339,34 @@ pub fn import() -> Vec<Symbol<ParseInfo, parser::IdentifierPath, <Parsed as Phas
             origin: TypeOrigin::Builtin,
             opacity: Access::Anywhere,
             arity: 0,
-            kind: Kind::Star,
+            kind: Kind::unconfined(),
         },
         TypeSymbol {
             definition: TypeDefinition::BaseType(BaseType::Unit),
             origin: TypeOrigin::Builtin,
             opacity: Access::Anywhere,
             arity: 0,
-            kind: Kind::Star,
+            kind: Kind::unconfined(),
         },
         TypeSymbol {
             definition: TypeDefinition::BaseType(BaseType::Char),
             origin: TypeOrigin::Builtin,
             opacity: Access::Anywhere,
             arity: 0,
-            kind: Kind::Star,
+            kind: Kind::unconfined(),
         },
         TypeSymbol {
             definition: TypeDefinition::BaseType(BaseType::Array),
             origin: TypeOrigin::Builtin,
             opacity: Access::Anywhere,
             arity: 1,
-            kind: Kind::Arrow(Kind::Star.into(), Kind::Star.into()),
+            kind: {
+                let element = crate::ast::Confinement::fresh();
+                Kind::Arrow(
+                    Kind::Star(element.clone()).into(),
+                    Kind::Star(element).into(),
+                )
+            },
         },
     ];
 

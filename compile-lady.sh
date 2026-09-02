@@ -111,13 +111,13 @@ case "$BACKEND" in
     # Keep generated C beside Root.lady. The leading dot prevents the ordinary
     # "$SOURCE_PATH"/*.c glob below from treating it as a foreign implementation.
     ROOT_C="$SOURCE_PATH/.${NAME}.generated.c"
-    BIN="$SOURCE_PATH/$NAME"
+    # A fixed name, so one .gitignore rule covers every program's binary rather
+    # than one rule per directory name.
+    BIN="$SOURCE_PATH/exe"
     C_SOURCE_LIST="$BUILD_DIR/native-c-sources.txt"
     CC=${CC:-clang}
-    # `-flto` by default: it buys real time on the byte-access path, and it turns
-    # latent "raw word sitting in a Value slot" bugs into loud failures instead of
-    # letting them ride on whether the word happens to be odd. Override with CFLAGS.
-    CFLAGS=${CFLAGS:--O2 -flto}
+    # The one definition of the native flags, shared with the test panel.
+    . "$C_DIR/cflags.sh"
 
     command -v "$CC" >/dev/null 2>&1 \
       || die "C compiler not found: $CC"

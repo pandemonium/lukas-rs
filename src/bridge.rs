@@ -221,6 +221,7 @@ where
 
     fn type_scheme(&self) -> TypeScheme {
         TypeScheme::from_constant(Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: A::ty().into(),
             codomain: R::ty().into(),
         })
@@ -252,8 +253,10 @@ where
 
     fn type_scheme(&self) -> TypeScheme {
         TypeScheme::from_constant(Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: A::ty().into(),
             codomain: Type::Arrow {
+                capture: crate::ast::Confinement::Unconfined,
                 domain: B::ty().into(),
                 codomain: R::ty().into(),
             }
@@ -289,10 +292,13 @@ where
 
     fn type_scheme(&self) -> TypeScheme {
         TypeScheme::from_constant(Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: A::ty().into(),
             codomain: Type::Arrow {
+                capture: crate::ast::Confinement::Unconfined,
                 domain: B::ty().into(),
                 codomain: Type::Arrow {
+                    capture: crate::ast::Confinement::Unconfined,
                     domain: C::ty().into(),
                     codomain: R::ty().into(),
                 }
@@ -324,7 +330,9 @@ where
         let tp = MetaVariable::fresh();
         TypeScheme {
             quantifiers: vec![tp.clone()],
+            confinement_quantifiers: tp.kind().confinement_variables(),
             underlying: Type::Arrow {
+                capture: crate::ast::Confinement::Unconfined,
                 domain: Type::Variable(tp).into(),
                 codomain: R::ty().into(),
             },

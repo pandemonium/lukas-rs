@@ -1,3 +1,4 @@
 start := λ_.
+  print_endline "##TC"
   print_endline "Ints range from `Int.Minimum` to `Int.Maximum`"
   print_endline "Floats range from `Float.Minimum` to `Float.Maximum`"

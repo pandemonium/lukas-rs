@@ -36,4 +36,5 @@ use Stdlib.
 (*        { alpha := 1; beta := 2 }.alpha *)
 
 start :: Int -> Unit := λ_.
+  print_endline "##TC"
   print_endline "11_broken_syntax: constructs that should work but currently do not."

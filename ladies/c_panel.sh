@@ -27,6 +27,9 @@ PANEL="${1:?usage: c_panel.sh <panel-name>}"
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 LIB="$ROOT_DIR/ladies/stdlib"
 C_DIR="$ROOT_DIR/c"
+
+# The one definition of the native flags, shared with compile-lady.sh.
+. "$C_DIR/cflags.sh"
 : "${TIMEOUT:=20}"
 
 cargo build -q --release --bin mc 2>/dev/null || { echo "build failed"; exit 1; }
@@ -69,7 +72,7 @@ for dir in "$ROOT_DIR"/ladies/"$PANEL"/*/; do
     # crashing under LTO, suspect the program's own layout/dictionary handling before
     # suspecting the optimiser -- that is exactly how the `Default`-dictionary swap
     # was found.
-    if ! clang -std=c11 -I"$C_DIR" -flto -o "$work/prog" \
+    if ! clang -std=c11 -I"$C_DIR" $CFLAGS -o "$work/prog" \
         "$C_DIR/runtime.c" "$C_DIR/gc.c" $foreign_cs "$work/program.c" \
         2>"$work/cc.err"; then
       status="COMPILE-ERR"

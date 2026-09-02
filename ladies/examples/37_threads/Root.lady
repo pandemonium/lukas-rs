@@ -1,0 +1,13 @@
+use Stdlib.
+use Stdlib.Threading.
+use Stdlib.IO.
+
+main :: IO Int :=
+  let* buffer = Buffer.new_buffer 3 in
+  let* t = Thread.spawn (pure buffer) in
+  pure 2
+
+start := λ_.
+  print_endline "Hi, threads"
+  let x = unsafe_run_IO main in
+  print_endline "`x`"

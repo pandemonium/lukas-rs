@@ -397,6 +397,13 @@ where
             Self::Constructor(a, id) => TypeExpression::Constructor(f(a), id.clone()),
             Self::Parameter(a, id) => TypeExpression::Parameter(f(a), id.clone()),
             Self::Apply(a, node) => TypeExpression::Apply(f(a), node.map_annotation(f)),
+            Self::ConfinementAscription(a, body, confinement) => {
+                TypeExpression::ConfinementAscription(
+                    f(a),
+                    body.map_annotation(f).into(),
+                    *confinement,
+                )
+            }
             Self::Arrow(a, node) => TypeExpression::Arrow(f(a), node.map_annotation(f)),
             Self::Tuple(a, node) => TypeExpression::Tuple(f(a), node.map_annotation(f)),
         }
@@ -432,6 +439,7 @@ where
         F: Fn(&A) -> B,
     {
         ArrowTypeExpr {
+            capture: self.capture.clone(),
             domain: self.domain.map_annotation(f).into(),
             codomain: self.codomain.map_annotation(f).into(),
         }

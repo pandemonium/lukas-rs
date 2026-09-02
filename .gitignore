@@ -4,3 +4,6 @@ runtime.so
 *.generated.c
 *.dSYM/
 ladies/benchmarks/billions/city-temperatures.txt
+
+# Native executables built beside a program's Root.lady by compile-lady.sh.
+exe

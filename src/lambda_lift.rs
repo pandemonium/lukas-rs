@@ -153,6 +153,7 @@ impl closed::SymbolTable {
             // Polymorphic, applied, and function fields are one word.
             TypeExpression::Parameter(..)
             | TypeExpression::Apply(..)
+            | TypeExpression::ConfinementAscription(..)
             | TypeExpression::Arrow(..) => 1,
         }
     }
@@ -223,6 +224,7 @@ fn applied_head<A>(type_expr: &TypeExpression<A, QualifiedName>) -> Option<&Qual
     match type_expr {
         TypeExpression::Constructor(_, name) => Some(name),
         TypeExpression::Apply(_, apply) => applied_head(&apply.function),
+        TypeExpression::ConfinementAscription(_, body, _) => applied_head(body),
         _ => None,
     }
 }
@@ -237,6 +239,9 @@ fn type_expr_references_path<A>(
     match type_expr {
         TypeExpression::Constructor(_, name) => on_path.contains(name),
         TypeExpression::Parameter(..) => false,
+        TypeExpression::ConfinementAscription(_, body, _) => {
+            type_expr_references_path(body, on_path)
+        }
         TypeExpression::Tuple(_, TupleTypeExpr(elements)) => elements
             .iter()
             .any(|e| type_expr_references_path(e, on_path)),
@@ -249,7 +254,12 @@ fn type_expr_references_path<A>(
             type_expr_references_path(function, on_path)
                 || type_expr_references_path(argument, on_path)
         }
-        TypeExpression::Arrow(_, ArrowTypeExpr { domain, codomain }) => {
+        TypeExpression::Arrow(
+            _,
+            ArrowTypeExpr {
+                domain, codomain, ..
+            },
+        ) => {
             type_expr_references_path(domain, on_path)
                 || type_expr_references_path(codomain, on_path)
         }

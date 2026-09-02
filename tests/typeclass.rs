@@ -56,8 +56,10 @@ signature Eq ::= ∀α.
   { eq :: α -> α -> Bool
   }
 
+(* `=` desugars to `Eq.eq`, so `p = q` here would dispatch through the very     *)
+(* witness being defined. A primitive witness must bottom out in `prim_eq`.      *)
 witness Eq Int :=
-  { eq := λp q. p = q
+  { eq := λp q. prim_eq p q
   }
 
 witness ∀α. Eq α |- Eq (Box α) :=
@@ -91,8 +93,10 @@ signature Eq ::= ∀α.
   { eq :: α -> α -> Bool
   }
 
+(* `=` desugars to `Eq.eq`, so `p = q` here would dispatch through the very     *)
+(* witness being defined. A primitive witness must bottom out in `prim_eq`.      *)
 witness Eq Int :=
-  { eq := λp q. p = q
+  { eq := λp q. prim_eq p q
   }
 
 witness ∀α. Eq α |- Eq (List α) :=

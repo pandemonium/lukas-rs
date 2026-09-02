@@ -6,6 +6,10 @@ pub struct LexicalAnalyzer {
     indentation_level: u32,
     indentation: Vec<u32>,
     paren_marks: Vec<usize>,
+    /// Where a line began, when that line began with a comment. The offside
+    /// decision is owed to the next real token, and is judged here rather than at
+    /// the comment's end. See `scan_whitespace`.
+    pending_layout_at: Option<SourceLocation>,
     output: Vec<Token>,
 }
 
@@ -284,6 +288,11 @@ impl LexicalAnalyzer {
     }
 
     fn emit<'a>(&mut self, length: u32, token_type: TokenKind, remains: &'a [char]) -> &'a [char] {
+        // A token abutting a comment's `*)` never re-enters `scan_whitespace`, so
+        // settle anything that comment still owes.
+        if let Some(at) = self.layout_position(self.location) {
+            self.settle_layout(at);
+        }
         self.output.push(Token {
             kind: token_type,
             position: self.location,
@@ -306,6 +315,13 @@ impl LexicalAnalyzer {
         // comment that starts left of the enclosing block (e.g. at column 1 between two
         // indented statements) would emit a spurious dedent.
         if let ['(', '*', ..] = remains {
+            // A comment decides no layout by itself. But if it *starts* a line, the
+            // line's offside column is where the comment begins -- so remember it and
+            // let the next real token settle the decision. Chained comments keep the
+            // first one's column.
+            if next_location.is_below(&self.location) {
+                self.pending_layout_at.get_or_insert(next_location);
+            }
             self.location = next_location;
         } else {
             self.update_location(next_location);
@@ -328,19 +344,39 @@ impl LexicalAnalyzer {
     }
 
     fn update_location(&mut self, next: SourceLocation) {
-        if next.is_below(&self.location) {
-            if next.is_left_of(self.indentation_level) {
-                self.dedent_and_emit(next);
-                // Yes?
-                //                self.emit_layout(next, Layout::Newline);
-            } else if next.is_right_of(self.indentation_level) {
-                self.indent_and_emit(next);
-            } else {
-                self.emit_layout(next, Layout::Newline);
-            }
+        if let Some(at) = self.layout_position(next) {
+            self.settle_layout(at);
         }
 
         self.location = next;
+    }
+
+    /// Where the offside decision for the token at `next` should be judged, if one is
+    /// due at all.
+    ///
+    /// `self.location` is where the last comment ended, so a further line break means
+    /// that comment sat alone on its line: it decides nothing, and the token's own line
+    /// decides instead. Otherwise the comment runs into the token, the two share a
+    /// logical line, and that line began at the comment -- however many lines the
+    /// comment itself spanned.
+    fn layout_position(&mut self, next: SourceLocation) -> Option<SourceLocation> {
+        match self.pending_layout_at.take() {
+            _ if next.is_below(&self.location) => Some(next),
+            Some(at) => Some(at),
+            None => None,
+        }
+    }
+
+    /// Emit the layout implied by a line break, judged at `at` -- the column of the
+    /// real token that follows it.
+    fn settle_layout(&mut self, at: SourceLocation) {
+        if at.is_left_of(self.indentation_level) {
+            self.dedent_and_emit(at);
+        } else if at.is_right_of(self.indentation_level) {
+            self.indent_and_emit(at);
+        } else {
+            self.emit_layout(at, Layout::Newline);
+        }
     }
 
     fn dedent_and_emit(&mut self, next: SourceLocation) {
@@ -478,6 +514,7 @@ impl Default for LexicalAnalyzer {
             indentation_level: location.column,
             indentation: Vec::default(),
             paren_marks: Vec::default(),
+            pending_layout_at: None,
             output: Vec::default(), // This could actually be something a lot bigger.
         }
     }
@@ -783,6 +820,8 @@ pub enum Keyword {
     Witness,
     Foreign,
     Opaque,
+    Confined,
+    Unconfined,
 }
 
 impl Keyword {
@@ -811,6 +850,8 @@ impl Keyword {
             "witness" => Some(Self::Witness),
             "foreign" => Some(Self::Foreign),
             "opaque" => Some(Self::Opaque),
+            "confined" => Some(Self::Confined),
+            "unconfined" => Some(Self::Unconfined),
             _otherwise => None,
         }
     }
@@ -1022,6 +1063,8 @@ impl fmt::Display for Keyword {
             Self::Witness => write!(f, "Witness"),
             Self::Foreign => write!(f, "Foreign"),
             Self::Opaque => write!(f, "Opaque"),
+            Self::Confined => write!(f, "Confined"),
+            Self::Unconfined => write!(f, "Unconfined"),
         }
     }
 }
@@ -1095,3 +1138,4 @@ mod tests {
         assert_eq!(positions, vec![1, 6]);
     }
 }
+

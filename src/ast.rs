@@ -1,4 +1,11 @@
-use std::{cmp::Ordering, fmt, marker::PhantomData, rc::Rc};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    marker::PhantomData,
+    rc::Rc,
+    sync::atomic::{AtomicU32, Ordering as AtomicOrdering},
+};
 
 use crate::{
     ast::{
@@ -156,6 +163,22 @@ pub struct TypeDeclaration<A> {
     pub declarator: TypeDeclarator<A>,
     pub origin: TypeOrigin,
     pub opaque: bool,
+    pub confinement: Option<ConfinementModifier>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum ConfinementModifier {
+    Confined,
+    Unconfined,
+}
+
+impl fmt::Display for ConfinementModifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Confined => write!(f, "confined"),
+            Self::Unconfined => write!(f, "unconfined"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -181,11 +204,345 @@ impl TypeVariable {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
-    #[default]
-    Star,
+    Star(Confinement),
     Arrow(Box<Kind>, Box<Kind>),
+}
+
+impl Default for Kind {
+    fn default() -> Self {
+        Self::Star(Confinement::fresh())
+    }
+}
+
+impl Kind {
+    pub fn star() -> Self {
+        Self::default()
+    }
+
+    pub fn unconfined() -> Self {
+        Self::Star(Confinement::Unconfined)
+    }
+
+    pub fn confined() -> Self {
+        Self::Star(Confinement::Confined)
+    }
+
+    pub fn is_star(&self) -> bool {
+        matches!(self, Self::Star(_))
+    }
+
+    pub fn confinement(&self) -> Option<&Confinement> {
+        match self {
+            Self::Star(confinement) => Some(confinement),
+            Self::Arrow(..) => None,
+        }
+    }
+
+    pub fn result_confinement(&self) -> Option<&Confinement> {
+        match self {
+            Self::Star(confinement) => Some(confinement),
+            Self::Arrow(_, codomain) => codomain.result_confinement(),
+        }
+    }
+
+    pub fn with_result_confinement(&self, result: Confinement) -> Self {
+        match self {
+            Self::Star(_) => Self::Star(result),
+            Self::Arrow(domain, codomain) => Self::Arrow(
+                domain.clone(),
+                codomain.with_result_confinement(result).into(),
+            ),
+        }
+    }
+
+    pub fn apply_confinement_substitutions(
+        &self,
+        substitutions: &BTreeMap<u32, Confinement>,
+    ) -> Self {
+        match self {
+            Self::Star(confinement) => Self::Star(confinement.apply(substitutions)),
+            Self::Arrow(domain, codomain) => Self::Arrow(
+                domain.apply_confinement_substitutions(substitutions).into(),
+                codomain
+                    .apply_confinement_substitutions(substitutions)
+                    .into(),
+            ),
+        }
+    }
+
+    /// Match a constructor-kind pattern against an argument kind. Capability
+    /// variables in the pattern are local binders for this kind application.
+    pub fn match_argument(
+        &self,
+        actual: &Self,
+        substitutions: &mut BTreeMap<u32, Confinement>,
+    ) -> bool {
+        match (self, actual) {
+            (Self::Star(expected), Self::Star(actual)) => {
+                expected.bind_pattern(actual, substitutions)
+            }
+            (Self::Arrow(expected_a, expected_b), Self::Arrow(actual_a, actual_b)) => {
+                expected_a.match_argument(actual_a, substitutions)
+                    && expected_b.match_argument(actual_b, substitutions)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn is_compatible_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            // Confinement is an index on inhabited types, not part of their
+            // runtime shape identity. Type unification reconciles the shapes;
+            // capability constraints are checked at capability ascriptions.
+            (Self::Star(_), Self::Star(_)) => true,
+            (Self::Arrow(lhs_a, lhs_b), Self::Arrow(rhs_a, rhs_b)) => {
+                lhs_a.is_compatible_with(rhs_a) && lhs_b.is_compatible_with(rhs_b)
+            }
+            _ => false,
+        }
+    }
+
+    /// Unify only the hidden confinement indices while requiring the ordinary
+    /// kind-arrow shape to match. Type metavariables use this when they are bound
+    /// to a concrete type, so a capability ascription such as `*unconfined`
+    /// cannot silently accept a confined argument.
+    pub fn unify_confinements(&self, other: &Self) -> Option<BTreeMap<u32, Confinement>> {
+        fn merge(
+            lhs: BTreeMap<u32, Confinement>,
+            rhs: BTreeMap<u32, Confinement>,
+        ) -> Option<BTreeMap<u32, Confinement>> {
+            let mut combined = lhs;
+            for (id, value) in rhs {
+                if let Some(existing) = combined.get(&id).cloned() {
+                    let reconciliation = existing.unify(&value)?;
+                    for value in combined.values_mut() {
+                        *value = value.apply(&reconciliation);
+                    }
+                    combined.extend(reconciliation);
+                } else {
+                    combined.insert(id, value);
+                }
+            }
+            Some(combined)
+        }
+
+        match (self, other) {
+            (Self::Star(lhs), Self::Star(rhs)) => lhs.unify(rhs),
+            (Self::Arrow(lhs_domain, lhs_codomain), Self::Arrow(rhs_domain, rhs_codomain)) => {
+                let domain = lhs_domain.unify_confinements(rhs_domain)?;
+                let lhs_codomain = lhs_codomain.apply_confinement_substitutions(&domain);
+                let rhs_codomain = rhs_codomain.apply_confinement_substitutions(&domain);
+                merge(domain, lhs_codomain.unify_confinements(&rhs_codomain)?)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn freshen_confinement_variables(&self, fresh: &mut BTreeMap<u32, Confinement>) -> Self {
+        match self {
+            Self::Star(confinement) => Self::Star(confinement.freshen(fresh)),
+            Self::Arrow(domain, codomain) => Self::Arrow(
+                domain.freshen_confinement_variables(fresh).into(),
+                codomain.freshen_confinement_variables(fresh).into(),
+            ),
+        }
+    }
+
+    pub fn confinement_variables(&self) -> BTreeSet<u32> {
+        match self {
+            Self::Star(confinement) => confinement.variables(),
+            Self::Arrow(domain, codomain) => domain
+                .confinement_variables()
+                .into_iter()
+                .chain(codomain.confinement_variables())
+                .collect(),
+        }
+    }
+}
+
+/// The hidden index on an inhabited kind. `Join` is the two-point lattice join:
+/// one confined component taints the complete applied type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Confinement {
+    Unconfined,
+    Confined,
+    Variable(u32),
+    Join(BTreeSet<Confinement>),
+}
+
+impl From<ConfinementModifier> for Confinement {
+    fn from(value: ConfinementModifier) -> Self {
+        match value {
+            ConfinementModifier::Confined => Self::Confined,
+            ConfinementModifier::Unconfined => Self::Unconfined,
+        }
+    }
+}
+
+static FRESH_CONFINEMENT_ID: AtomicU32 = AtomicU32::new(0);
+
+impl Confinement {
+    pub fn fresh() -> Self {
+        Self::Variable(FRESH_CONFINEMENT_ID.fetch_add(1, AtomicOrdering::SeqCst))
+    }
+
+    pub fn join<I>(parts: I) -> Self
+    where
+        I: IntoIterator<Item = Self>,
+    {
+        let mut joined = BTreeSet::new();
+        for part in parts {
+            match part {
+                Self::Unconfined => {}
+                Self::Confined => return Self::Confined,
+                Self::Join(nested) => joined.extend(nested),
+                variable => {
+                    joined.insert(variable);
+                }
+            }
+        }
+        match joined.len() {
+            0 => Self::Unconfined,
+            1 => joined.into_iter().next().unwrap(),
+            _ => Self::Join(joined),
+        }
+    }
+
+    pub fn apply(&self, substitutions: &BTreeMap<u32, Self>) -> Self {
+        match self {
+            Self::Variable(id) => substitutions
+                .get(id)
+                .map(|replacement| replacement.apply(substitutions))
+                .unwrap_or_else(|| self.clone()),
+            Self::Join(parts) => Self::join(parts.iter().map(|part| part.apply(substitutions))),
+            _ => self.clone(),
+        }
+    }
+
+    pub fn variables(&self) -> BTreeSet<u32> {
+        match self {
+            Self::Variable(id) => BTreeSet::from([*id]),
+            Self::Join(parts) => parts
+                .iter()
+                .flat_map(Self::variables)
+                .collect::<BTreeSet<_>>(),
+            _ => BTreeSet::new(),
+        }
+    }
+
+    pub fn freshen(&self, fresh: &mut BTreeMap<u32, Self>) -> Self {
+        match self {
+            Self::Variable(id) => fresh.entry(*id).or_insert_with(Self::fresh).clone(),
+            Self::Join(parts) => Self::join(parts.iter().map(|part| part.freshen(fresh))),
+            _ => self.clone(),
+        }
+    }
+
+    pub fn unify(&self, other: &Self) -> Option<BTreeMap<u32, Self>> {
+        fn go(
+            lhs: Confinement,
+            rhs: Confinement,
+            substitutions: &mut BTreeMap<u32, Confinement>,
+        ) -> bool {
+            let lhs = lhs.apply(substitutions);
+            let rhs = rhs.apply(substitutions);
+            if lhs == rhs {
+                return true;
+            }
+            match (lhs, rhs) {
+                (Confinement::Join(lhs), Confinement::Join(rhs)) => {
+                    let common = lhs.intersection(&rhs).cloned().collect::<BTreeSet<_>>();
+                    if common.is_empty() {
+                        // Independently instantiated copies of the same symbolic
+                        // join have disjoint variable ids. Pairing their normalized
+                        // operands yields a deterministic alpha-renaming unifier.
+                        return lhs.len() == rhs.len()
+                            && lhs
+                                .into_iter()
+                                .zip(rhs)
+                                .all(|(lhs, rhs)| go(lhs, rhs, substitutions));
+                    }
+                    let lhs = Confinement::join(lhs.difference(&common).cloned());
+                    let rhs = Confinement::join(rhs.difference(&common).cloned());
+                    go(lhs, rhs, substitutions)
+                }
+                (Confinement::Variable(id), Confinement::Join(parts))
+                | (Confinement::Join(parts), Confinement::Variable(id))
+                    if parts.contains(&Confinement::Variable(id)) =>
+                {
+                    // κ = κ ⊔ rest. Capability inference chooses the least
+                    // solution, so every additional component is bottom.
+                    let rest = Confinement::join(
+                        parts
+                            .into_iter()
+                            .filter(|part| *part != Confinement::Variable(id)),
+                    );
+                    let Some(required) = rest.require(Confinement::Unconfined) else {
+                        return false;
+                    };
+                    for (id, value) in required {
+                        substitutions.insert(id, value);
+                    }
+                    true
+                }
+                (Confinement::Variable(id), value) | (value, Confinement::Variable(id))
+                    if !value.variables().contains(&id) =>
+                {
+                    substitutions.insert(id, value);
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        let mut substitutions = BTreeMap::new();
+        go(self.clone(), other.clone(), &mut substitutions).then_some(substitutions)
+    }
+
+    /// Solve an exact capability ascription. The bottom requirement distributes
+    /// through joins: `κ1 ⊔ κ2 = unconfined` implies both operands are
+    /// unconfined. The corresponding confined equation is disjunctive, so a join
+    /// of unresolved variables is deliberately rejected rather than guessed.
+    pub fn require(&self, required: Self) -> Option<BTreeMap<u32, Self>> {
+        fn require_unconfined(
+            actual: Confinement,
+            substitutions: &mut BTreeMap<u32, Confinement>,
+        ) -> bool {
+            match actual.apply(substitutions) {
+                Confinement::Unconfined => true,
+                Confinement::Confined => false,
+                Confinement::Variable(id) => {
+                    substitutions.insert(id, Confinement::Unconfined);
+                    true
+                }
+                Confinement::Join(parts) => parts
+                    .into_iter()
+                    .all(|part| require_unconfined(part, substitutions)),
+            }
+        }
+
+        if required == Self::Unconfined {
+            let mut substitutions = BTreeMap::new();
+            require_unconfined(self.clone(), &mut substitutions).then_some(substitutions)
+        } else {
+            self.unify(&required)
+        }
+    }
+
+    fn bind_pattern(&self, actual: &Self, substitutions: &mut BTreeMap<u32, Self>) -> bool {
+        match self.apply(substitutions) {
+            Self::Variable(id) => {
+                let actual = actual.apply(substitutions);
+                if actual != Self::Variable(id) {
+                    substitutions.insert(id, actual);
+                }
+                true
+            }
+            expected => expected == actual.apply(substitutions),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -292,6 +649,7 @@ pub enum TypeExpression<A, TypeId> {
     Constructor(A, TypeId),
     Parameter(A, parser::Identifier),
     Apply(A, ApplyTypeExpr<A, TypeId>),
+    ConfinementAscription(A, Box<TypeExpression<A, TypeId>>, ConfinementModifier),
     Arrow(A, ArrowTypeExpr<A, TypeId>),
     Tuple(A, TupleTypeExpr<A, TypeId>),
 }
@@ -311,6 +669,7 @@ impl<A, TypeId> TypeExpression<A, TypeId> {
             Self::Constructor(a, _)
             | Self::Parameter(a, _)
             | Self::Apply(a, _)
+            | Self::ConfinementAscription(a, _, _)
             | Self::Arrow(a, _)
             | Self::Tuple(a, _) => a,
         }
@@ -343,9 +702,20 @@ impl<A, TypeId> TypeExpression<A, TypeId> {
                     phase: PhantomData,
                 },
             ),
-            Self::Arrow(a, ArrowTypeExpr { domain, codomain }) => TypeExpression::Arrow(
+            Self::ConfinementAscription(a, body, confinement) => {
+                TypeExpression::ConfinementAscription(a, body.map_name(f).into(), confinement)
+            }
+            Self::Arrow(
                 a,
                 ArrowTypeExpr {
+                    capture,
+                    domain,
+                    codomain,
+                },
+            ) => TypeExpression::Arrow(
+                a,
+                ArrowTypeExpr {
+                    capture,
                     domain: domain.map_name(f).into(),
                     codomain: codomain.map_name(f).into(),
                 },
@@ -370,6 +740,8 @@ pub struct ApplyTypeExpr<A, TypeId> {
 
 #[derive(Debug, Clone)]
 pub struct ArrowTypeExpr<A, TypeId> {
+    /// Hidden confinement index of the function value's closure environment.
+    pub capture: Confinement,
     pub domain: Box<TypeExpression<A, TypeId>>,
     pub codomain: Box<TypeExpression<A, TypeId>>,
 }
@@ -429,6 +801,69 @@ impl<A, Id> Expr<A, Id> {
         Self: Annotated<A, Erased, Id, Output = Expr<Erased, Id>>,
     {
         self.map_annotation(&|_| Erased)
+    }
+
+    /// Visit an expression tree by reference without rebuilding it. This is the
+    /// read-only counterpart to `map`; analyses such as closure-capture inference
+    /// should not clone a complete nested lambda body merely to inspect it.
+    pub fn walk<F>(&self, visitor: &mut F)
+    where
+        F: FnMut(&Expr<A, Id>),
+    {
+        visitor(self);
+        let mut walk_tree = |tree: &Tree<A, Id>| tree.as_ref().walk(visitor);
+        match self {
+            Self::RecursiveLambda(_, recursive) => walk_tree(&recursive.lambda.body),
+            Self::Lambda(_, lambda) => walk_tree(&lambda.body),
+            Self::Apply(_, apply) => {
+                walk_tree(&apply.function);
+                walk_tree(&apply.argument);
+            }
+            Self::Let(_, binding) => {
+                walk_tree(&binding.bound);
+                walk_tree(&binding.body);
+            }
+            Self::Tuple(_, tuple) => tuple.elements.iter().for_each(&mut walk_tree),
+            Self::Record(_, record) => record.fields.iter().for_each(|(_, value)| walk_tree(value)),
+            Self::RecordUpdate(_, update) => {
+                walk_tree(&update.base);
+                update
+                    .fields
+                    .iter()
+                    .for_each(|field| walk_tree(&field.value));
+            }
+            Self::Inject(_, injection) => injection.arguments.iter().for_each(&mut walk_tree),
+            Self::Array(_, array) => array.elements.iter().for_each(&mut walk_tree),
+            Self::Project(_, projection) => walk_tree(&projection.base),
+            Self::Sequence(_, sequence) => {
+                walk_tree(&sequence.this);
+                walk_tree(&sequence.and_then);
+            }
+            Self::Deconstruct(_, deconstruct) => {
+                walk_tree(&deconstruct.scrutinee);
+                deconstruct
+                    .match_clauses
+                    .iter()
+                    .for_each(|clause| walk_tree(&clause.consequent));
+            }
+            Self::If(_, conditional) => {
+                walk_tree(&conditional.predicate);
+                walk_tree(&conditional.consequent);
+                walk_tree(&conditional.alternate);
+            }
+            Self::Interpolate(_, Interpolate(segments)) => {
+                segments.iter().for_each(|segment| {
+                    if let Segment::Expression(expression) = segment {
+                        walk_tree(expression);
+                    }
+                });
+            }
+            Self::Ascription(_, ascription) => walk_tree(&ascription.ascribed_tree),
+            Self::Variable(..)
+            | Self::InvokeBridge(..)
+            | Self::Constant(..)
+            | Self::MakeClosure(..) => {}
+        }
     }
 
     pub fn map<F>(self, f: &mut F) -> Expr<A, Id>
@@ -1160,7 +1595,14 @@ impl<A> fmt::Display for TypeDeclaration<A> {
             declarator,
             origin,
             opaque,
+            confinement,
         } = self;
+        if let Some(confinement) = confinement {
+            match confinement {
+                ConfinementModifier::Confined => write!(f, "confined ")?,
+                ConfinementModifier::Unconfined => write!(f, "unconfined ")?,
+            }
+        }
         if matches!(origin, TypeOrigin::Foreign) {
             return write!(f, "foreign {name}");
         }
@@ -1306,7 +1748,16 @@ where
                 },
             ) => write!(f, "({function} {argument})"),
 
-            Self::Arrow(_, ArrowTypeExpr { domain, codomain }) => {
+            Self::ConfinementAscription(_, body, confinement) => {
+                write!(f, "({body}) : {confinement}")
+            }
+
+            Self::Arrow(
+                _,
+                ArrowTypeExpr {
+                    domain, codomain, ..
+                },
+            ) => {
                 write!(f, "({domain} -> {codomain})")
             }
 

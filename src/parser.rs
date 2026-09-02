@@ -5,12 +5,13 @@ use thiserror::Error;
 
 use crate::{
     ast::{
-        self, Apply, ApplyTypeExpr, Array, ArrowTypeExpr, Binding, ConstraintExpression,
-        Declaration, Deconstruct, FieldDeclarator, ForeignDeclaration, IdentifierPattern,
-        IfThenElse, Interpolate, Kind, Lambda, ModuleDeclaration, ModuleDeclarator, Projection,
-        Record, SelfReferential, Sequence, SignatureDeclaration, Tree, Tuple, TupleTypeExpr,
-        TypeAscription, TypeDeclaration, TypeDeclarator, TypeExpression, TypeSignature,
-        TypeVariable, UseDeclaration, ValueDeclaration, ValueDeclarator, WitnessDeclaration,
+        self, Apply, ApplyTypeExpr, Array, ArrowTypeExpr, Binding, ConfinementModifier,
+        ConstraintExpression, Declaration, Deconstruct, FieldDeclarator, ForeignDeclaration,
+        IdentifierPattern, IfThenElse, Interpolate, Kind, Lambda, ModuleDeclaration,
+        ModuleDeclarator, Projection, Record, SelfReferential, Sequence, SignatureDeclaration,
+        Tree, Tuple, TupleTypeExpr, TypeAscription, TypeDeclaration, TypeDeclarator,
+        TypeExpression, TypeSignature, TypeVariable, UseDeclaration, ValueDeclaration,
+        ValueDeclarator, WitnessDeclaration,
         namer::{QualifiedName, TypeOrigin},
         pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern},
     },
@@ -195,6 +196,9 @@ pub enum ParseError {
     #[error("expected a type constructor (Capitalized name.)")]
     ExpectedTypeConstructor,
 
+    #[error("{position}: confinement modifiers apply to foreign types, not foreign terms")]
+    ConfinementModifierOnForeignTerm { position: SourceLocation },
+
     #[error(
         "{position}: unexpected input; the parser stopped here with tokens left over.\n\
          A declaration above likely failed to parse, or the layout desynced (a stray \
@@ -265,6 +269,7 @@ impl phase::Interpolate<Parsed> {
 
 enum TypeExprOperator {
     Apply,
+    ConfinementAscription,
     Arrow,
     Tuple,
 }
@@ -272,7 +277,8 @@ enum TypeExprOperator {
 impl TypeExprOperator {
     fn precedence(&self) -> usize {
         match self {
-            Self::Apply => 3,
+            Self::Apply => 4,
+            Self::ConfinementAscription => 3,
             Self::Arrow => 2,
             Self::Tuple => 1,
         }
@@ -488,6 +494,8 @@ impl<'a> Parser<'a> {
                             // recognised as the next declaration, so the list stops
                             // early and the enclosing block reports "expected <Ded>".
                             | Keyword::Opaque
+                            | Keyword::Confined
+                            | Keyword::Unconfined
                     ),
                     ..
                 },
@@ -500,6 +508,43 @@ impl<'a> Parser<'a> {
         let _t = self.trace();
 
         match self.remains() {
+            [
+                modifier,
+                opaque,
+                Token {
+                    kind: TokenKind::Identifier(name),
+                    position,
+                },
+                Token {
+                    kind: TokenKind::TypeAssign,
+                    ..
+                },
+                ..,
+            ] if matches!(
+                modifier.kind,
+                TokenKind::Keyword(Keyword::Confined | Keyword::Unconfined)
+            ) && opaque.is_keyword(Keyword::Opaque) =>
+            {
+                let confinement = if modifier.is_keyword(Keyword::Confined) {
+                    ConfinementModifier::Confined
+                } else {
+                    ConfinementModifier::Unconfined
+                };
+                self.advance(4);
+
+                Ok(Declaration::Type(
+                    ParseInfo::from_position(*position),
+                    TypeDeclaration {
+                        name: Identifier::from_str(name),
+                        type_parameters: self.parse_forall_clause()?,
+                        declarator: self.parse_block(|parser| parser.parse_type_declarator())?,
+                        origin: TypeOrigin::UserDefined,
+                        opaque: true,
+                        confinement: Some(confinement),
+                    },
+                ))
+            }
+
             [
                 t,
                 Token {
@@ -526,6 +571,7 @@ impl<'a> Parser<'a> {
                         ),
                         origin: TypeOrigin::UserDefined,
                         opaque: false,
+                        confinement: None,
                     },
                 ))
             }
@@ -608,6 +654,7 @@ impl<'a> Parser<'a> {
                         declarator: self.parse_block(|parser| parser.parse_type_declarator())?,
                         origin: TypeOrigin::UserDefined,
                         opaque: false,
+                        confinement: None,
                     },
                 ))
             }
@@ -635,6 +682,7 @@ impl<'a> Parser<'a> {
                         declarator: self.parse_block(|parser| parser.parse_type_declarator())?,
                         origin: TypeOrigin::UserDefined,
                         opaque: true,
+                        confinement: None,
                     },
                 ))
             }
@@ -812,9 +860,46 @@ impl<'a> Parser<'a> {
                             ),
                             origin: TypeOrigin::Foreign,
                             opaque: false,
+                            confinement: None,
                         },
                     ))
                 }
+            }
+
+            [modifier, foreign, ..]
+                if matches!(
+                    modifier.kind,
+                    TokenKind::Keyword(Keyword::Confined | Keyword::Unconfined)
+                ) && foreign.is_keyword(Keyword::Foreign) =>
+            {
+                let confinement = if modifier.is_keyword(Keyword::Confined) {
+                    ConfinementModifier::Confined
+                } else {
+                    ConfinementModifier::Unconfined
+                };
+                self.advance(2);
+                let (pos, id) = self.identifier()?;
+                if matches!(self.peek()?.kind, TokenKind::TypeAscribe) {
+                    return Err(ParseError::ConfinementModifierOnForeignTerm {
+                        position: modifier.position,
+                    });
+                }
+                Ok(Declaration::Type(
+                    ParseInfo::from_position(pos),
+                    TypeDeclaration {
+                        name: Identifier::from_str(&id),
+                        type_parameters: Vec::new(),
+                        declarator: TypeDeclarator::Coproduct(
+                            ParseInfo::from_position(pos),
+                            CoproductDeclarator {
+                                constructors: Vec::new(),
+                            },
+                        ),
+                        origin: TypeOrigin::Foreign,
+                        opaque: false,
+                        confinement: Some(confinement),
+                    },
+                ))
             }
 
             otherwise => panic!("{otherwise:?}"),
@@ -936,7 +1021,7 @@ impl<'a> Parser<'a> {
                 // *
                 self.advance(1);
 
-                Ok(Kind::Star)
+                Ok(Kind::star())
             }
 
             otherwise => panic!("{otherwise:?}"),
@@ -958,7 +1043,7 @@ impl<'a> Parser<'a> {
             ] => {
                 // -> *
                 self.advance(2);
-                self.parse_kind_spec_infix(Kind::Arrow(prefix.into(), Kind::Star.into()))
+                self.parse_kind_spec_infix(Kind::Arrow(prefix.into(), Kind::star().into()))
             }
 
             [
@@ -1154,6 +1239,18 @@ impl<'a> Parser<'a> {
 
             [
                 Token {
+                    kind: TokenKind::Colon,
+                    ..
+                },
+                Token {
+                    kind: TokenKind::Keyword(Keyword::Confined | Keyword::Unconfined),
+                    ..
+                },
+                ..,
+            ] => Some(TypeExprOperator::ConfinementAscription),
+
+            [
+                Token {
                     kind: TokenKind::Comma,
                     ..
                 },
@@ -1226,9 +1323,27 @@ impl<'a> Parser<'a> {
                     TypeExpression::Arrow(
                         ParseInfo::from_position(position),
                         ArrowTypeExpr {
+                            capture: ast::Confinement::fresh(),
                             domain: lhs.into(),
                             codomain: rhs.into(),
                         },
+                    ),
+                    context_precedence,
+                )
+            }
+
+            TypeExprOperator::ConfinementAscription => {
+                let position = self.consume()?.position;
+                let confinement = match self.consume()?.kind {
+                    TokenKind::Keyword(Keyword::Confined) => ConfinementModifier::Confined,
+                    TokenKind::Keyword(Keyword::Unconfined) => ConfinementModifier::Unconfined,
+                    _ => unreachable!("peek_type_expr_operator validated the capability keyword"),
+                };
+                self.parse_type_expr_infix(
+                    TypeExpression::ConfinementAscription(
+                        ParseInfo::from_position(position),
+                        lhs.into(),
+                        confinement,
                     ),
                     context_precedence,
                 )
@@ -1901,6 +2016,8 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Module),
             TokenKind::Keyword(Keyword::Witness),
             TokenKind::Keyword(Keyword::Foreign),
+            TokenKind::Keyword(Keyword::Confined),
+            TokenKind::Keyword(Keyword::Unconfined),
             TokenKind::Keyword(Keyword::Use),
             TokenKind::End,
         ];
@@ -2445,16 +2562,23 @@ impl<'a> Parser<'a> {
 
         self.expect(TokenKind::Keyword(Keyword::Into))?;
 
-        // Annoying
-        if self.peek()?.is_indent() {
+        // The clauses of one `deconstruct` all align their patterns at this column.
+        // Prefer the opening `Indent`, which the lexer puts at the column the clause's
+        // *line* began -- a leading comment (`(* why *) Cons x xs -> ...`) shifts the
+        // first pattern token right without moving the clause. Falling back to the
+        // token is for an unindented single-line `deconstruct`, and either way it is
+        // taken from a token rather than the parsed pattern's annotation, since a tuple
+        // pattern is annotated at its comma, not its start (`Cons x xs, Cons y ys`
+        // would otherwise anchor on the comma).
+        let opening = self.peek()?;
+        let indent_column = opening.is_indent().then_some(opening.location().column);
+        if indent_column.is_some() {
             self.advance(1);
         }
-
-        // The clauses of one `deconstruct` all align their patterns at this column --
-        // the first token of the first clause's pattern. Taken from the token rather
-        // than the parsed pattern's annotation, since a tuple pattern is annotated at
-        // its comma, not its start (`Cons x xs, Cons y ys` would anchor on the comma).
-        let clause_column = self.peek()?.location().column;
+        let clause_column = match indent_column {
+            Some(column) => column,
+            None => self.peek()?.location().column,
+        };
 
         let mut match_clauses = vec![self.parse_match_clause()?];
 
@@ -2883,6 +3007,55 @@ mod tests {
             declarations[0].to_string(),
             "type Wrapper ::= Make_Wrapper(Namespace.Member)"
         );
+    }
+
+    #[test]
+    fn parses_confinement_modifiers_on_representation_types() {
+        let source = "confined foreign Raw_Buffer\nunconfined foreign Raw_Bytes\nunconfined opaque Locked ::= Locked Raw_Buffer\n";
+        let characters = source.chars().collect::<Vec<_>>();
+        let mut lexer = LexicalAnalyzer::default();
+        let tokens = lexer.tokenize(&characters);
+        let mut parser = Parser::from_tokens(tokens);
+
+        let declarations = parser.parse_declaration_list().unwrap();
+        let modifiers = declarations
+            .iter()
+            .map(|declaration| match declaration {
+                Declaration::Type(_, declaration) => declaration.confinement,
+                _ => panic!("expected type declaration"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            modifiers,
+            vec![
+                Some(ConfinementModifier::Confined),
+                Some(ConfinementModifier::Unconfined),
+                Some(ConfinementModifier::Unconfined),
+            ]
+        );
+    }
+
+    #[test]
+    fn confinement_ascription_binds_tighter_than_type_arrow() {
+        let source = "spawn :: ∀a. (IO a) : unconfined -> IO a := spawn_impl\n";
+        let characters = source.chars().collect::<Vec<_>>();
+        let mut lexer = LexicalAnalyzer::default();
+        let tokens = lexer.tokenize(&characters);
+        let mut parser = Parser::from_tokens(tokens);
+
+        let declarations = parser.parse_declaration_list().unwrap();
+        let Declaration::Value(_, declaration) = &declarations[0] else {
+            panic!("expected value declaration");
+        };
+        let signature = declaration.declarator.type_signature.as_ref().unwrap();
+        let TypeExpression::Arrow(_, arrow) = &signature.body else {
+            panic!("expected outer function arrow");
+        };
+        assert!(matches!(
+            arrow.domain.as_ref(),
+            TypeExpression::ConfinementAscription(_, _, ConfinementModifier::Unconfined)
+        ));
     }
 
     #[test]

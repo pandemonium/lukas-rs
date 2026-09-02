@@ -988,10 +988,12 @@ fn inline_type_substitutions(template: &Type, concrete: &Type) -> Option<Substit
                 Type::Apply {
                     constructor: tc,
                     argument: ta,
+                    ..
                 },
                 Type::Apply {
                     constructor: cc,
                     argument: ca,
+                    ..
                 },
             ) => {
                 match_pattern(tc, cc, bindings)?;
@@ -1001,10 +1003,12 @@ fn inline_type_substitutions(template: &Type, concrete: &Type) -> Option<Substit
                 Type::Arrow {
                     domain: td,
                     codomain: tc,
+                    ..
                 },
                 Type::Arrow {
                     domain: cd,
                     codomain: cc,
+                    ..
                 },
             ) => {
                 match_pattern(td, cd, bindings)?;
@@ -2719,7 +2723,9 @@ fn as_run_marker<'a>(
 /// Recognise the more general force eliminator left after simplifying a mapped
 /// action:
 ///
-///     deconstruct E into Suspend thunk -> K (thunk ())
+/// ```text
+/// deconstruct E into Suspend thunk -> K (thunk ())
+/// ```
 ///
 /// where the thunk binder occurs exactly once.  `K` is ordinary pure Marmelade
 /// expression context (most commonly a data constructor such as `Return`).  We
@@ -3591,10 +3597,7 @@ mod tests {
     }
 
     fn io_of(payload: Type) -> Type {
-        Type::Apply {
-            constructor: Type::Constructor(crate::typer::io_type_name()).into(),
-            argument: payload.into(),
-        }
+        Type::application(Type::Constructor(crate::typer::io_type_name()), payload)
     }
 
     fn typed_var(level: usize, ty: Type) -> TT {
@@ -3615,6 +3618,7 @@ mod tests {
         consequent: TT,
     ) -> MatchClause<TypeInfo, Identifier> {
         let thunk_type = Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: Type::Base(BaseType::Unit).into(),
             codomain: payload.clone().into(),
         };
@@ -3635,6 +3639,7 @@ mod tests {
 
     fn forced_thunk(thunk_level: usize, payload: Type) -> TT {
         let thunk_type = Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: Type::Base(BaseType::Unit).into(),
             codomain: payload.clone().into(),
         };
@@ -3652,10 +3657,12 @@ mod tests {
     fn inline_types_instantiate_repeated_variables_consistently() {
         let variable = MetaVariable::fresh();
         let template = Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: Type::Variable(variable.clone()).into(),
             codomain: Type::Array(Type::Variable(variable).into()).into(),
         };
         let concrete = Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: Type::Base(BaseType::Int).into(),
             codomain: Type::Array(Type::Base(BaseType::Int).into()).into(),
         };
@@ -3668,10 +3675,12 @@ mod tests {
     fn inline_types_reject_inconsistent_repeated_variables() {
         let variable = MetaVariable::fresh();
         let template = Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: Type::Variable(variable.clone()).into(),
             codomain: Type::Variable(variable).into(),
         };
         let concrete = Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: Type::Base(BaseType::Int).into(),
             codomain: Type::Base(BaseType::Bool).into(),
         };
@@ -3737,6 +3746,7 @@ mod tests {
     fn local_io_worker_must_be_consumed_only_in_run_positions() {
         let payload = Type::Base(BaseType::Int);
         let function_type = Type::Arrow {
+            capture: crate::ast::Confinement::Unconfined,
             domain: Type::Base(BaseType::Int).into(),
             codomain: io_of(payload.clone()).into(),
         };
@@ -3778,6 +3788,7 @@ mod tests {
                     typed_var(
                         0,
                         Type::Arrow {
+                            capture: crate::ast::Confinement::Unconfined,
                             domain: Type::Base(BaseType::Int).into(),
                             codomain: io_of(payload.clone()).into(),
                         },
@@ -3785,6 +3796,7 @@ mod tests {
                     typed_var(
                         0,
                         Type::Arrow {
+                            capture: crate::ast::Confinement::Unconfined,
                             domain: Type::Base(BaseType::Int).into(),
                             codomain: io_of(payload).into(),
                         },

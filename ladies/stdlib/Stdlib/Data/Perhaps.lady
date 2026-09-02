@@ -54,8 +54,14 @@ witness Traversable Perhaps :=
   { traverse := λf. perhaps (pure Nope) (compose (fmap This) f)
   }
 
+(* `p = q` here would mean `Eq (Perhaps α)` -- this very witness -- so it must  *)
+(* deconstruct first and compare the payloads through the `Eq α` premise.       *)
 witness ∀α. Eq α |- Eq (Perhaps α) :=
-  { eq := λp q. p = q
+  { eq := λp q.
+      deconstruct p, q into
+        This a, This b -> a = b
+      | Nope,   Nope   -> true
+      | otherwise      -> false
   }
 
 empty :: ∀α. Perhaps α := Nope

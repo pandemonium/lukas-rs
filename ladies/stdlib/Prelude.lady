@@ -98,9 +98,9 @@ IO ::= ∀α. Suspend (Unit -> α)
 (* the `Bytes` and `Buffer` submodules can name/construct them. The unsafe `raw_*`       *)
 (* foreigns are grouped under their submodule below and stay private to it.             *)
 foreign Raw_Buffer
-foreign Raw_Bytes
+unconfined foreign Raw_Bytes
 
-opaque Buffer ::= Buffer Raw_Buffer         (* mutable, growable: the write side *)
+confined opaque Buffer ::= Buffer Raw_Buffer         (* mutable, growable: the write side *)
 opaque Bytes  ::= Bytes Raw_Bytes           (* immutable view:  the read side *)
 opaque Text   ::= MkText Bytes              (* validated UTF-8 view over Bytes. Couldn't this be `Text`? *)
 

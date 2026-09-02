@@ -1,0 +1,11 @@
+opaque Read_Write_Lock ::= Make_Rw_Lock Int
+
+opaque Thread ::= ∀α. Make_Thread_Handle α
+
+module Thread:
+  spawn :: ∀α. (IO α) : unconfined -> IO (Thread α) := λinit.
+    let* x = init in
+    pure (Make_Thread_Handle x)
+
+  join :: ∀α. Thread α -> IO α := λthread.
+    omg_wtf_bbq "Thread.join is not implemented"

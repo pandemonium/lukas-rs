@@ -9,6 +9,10 @@
 set -u
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+
+# The one definition of the native flags, shared with compile-lady.sh. `-g` is
+# added below: a benchmark wants symbols for profiling.
+. "$ROOT/c/cflags.sh"
 LIB="${LADY_LIBRARY:-$ROOT/ladies/stdlib}"
 NAME="${1:-binary_codec}"
 SRC="$ROOT/ladies/benchmarks/$NAME"
@@ -20,7 +24,7 @@ cargo run --release -q --manifest-path "$ROOT/Cargo.toml" --bin mc -- \
 # link the program + runtime + every stdlib companion (foreign bindings)
 companions="$(find "$LIB" -name '*.c' 2>/dev/null)"
 # shellcheck disable=SC2086
-clang -std=c11 -I"$ROOT/c" -O2 -g -flto -o "$W/bench" \
+clang -std=c11 -I"$ROOT/c" $CFLAGS -g -o "$W/bench" \
     "$ROOT/c/runtime.c" "$ROOT/c/gc.c" $companions "$W/prog.c" || exit 1
 
 if [ "${SAMPLE:-0}" = "1" ]; then

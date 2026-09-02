@@ -49,6 +49,11 @@ fn direct_write_enabled() -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RuntimeShape {
     Leaf,
+    /// One stored word that may legitimately be zero, because a niche sum was
+    /// spliced into this position and spells its nullary constructor as zero.
+    /// Encodes identically to `Leaf`: the distinction exists only so `zero_niche`
+    /// does not offer this word to an enclosing sum.
+    ZeroableLeaf,
     Product(Vec<RuntimeShape>),
     NicheSum {
         niche_tag: usize,
@@ -65,7 +70,7 @@ enum RuntimeShape {
 impl RuntimeShape {
     fn stored_words(&self) -> usize {
         match self {
-            Self::Leaf => 1,
+            Self::Leaf | Self::ZeroableLeaf => 1,
             Self::Product(fields) => fields.iter().map(Self::stored_words).sum(),
             Self::NicheSum { payload_fields, .. } => {
                 payload_fields.iter().map(Self::stored_words).sum()
@@ -76,7 +81,7 @@ impl RuntimeShape {
 
     fn encode(&self, out: &mut Vec<i64>) {
         match self {
-            Self::Leaf => out.push(0),
+            Self::Leaf | Self::ZeroableLeaf => out.push(0),
             Self::Product(fields) => {
                 out.push(fields.len() as i64);
                 for field in fields {
@@ -115,9 +120,35 @@ impl RuntimeShape {
         }
     }
 
+    /// Splice this shape into one entry per stored word, the way `compile_record`
+    /// splices the value itself. A single-word niche sum is kept whole: reducing it
+    /// to a leaf would claim its word can never be zero, when zero is exactly how
+    /// that word spells the nullary constructor. An enclosing sum consulting
+    /// `zero_niche` would then pick that word to host its own niche and read every
+    /// nullary field as its own nullary.
+    fn splat_words(self, out: &mut Vec<Self>) {
+        match self {
+            Self::Product(fields) => {
+                for field in fields {
+                    field.splat_words(out);
+                }
+            }
+            // The splat has already encoded a niche sum into raw words, so the
+            // shape must describe them as leaves -- `flatten` would otherwise read
+            // a `Data` that is not there. Every word it occupies may be zero,
+            // though, since that is how it spells its nullary constructor.
+            niche @ Self::NicheSum { .. } => {
+                out.extend(std::iter::repeat_n(Self::ZeroableLeaf, niche.stored_words()));
+            }
+            one_word if one_word.stored_words() == 1 => out.push(one_word),
+            wide => out.extend(std::iter::repeat_n(Self::Leaf, wide.stored_words())),
+        }
+    }
+
     fn zero_niche(&self) -> Option<usize> {
         match self {
             Self::Leaf => Some(0),
+            Self::ZeroableLeaf => None,
             Self::Product(fields) => {
                 let mut offset = 0;
                 for field in fields {
@@ -434,6 +465,7 @@ fn array_element_type(ty: &Type) -> Option<&Type> {
         Type::Apply {
             constructor,
             argument,
+            ..
         } if matches!(constructor.as_ref(), Type::Constructor(name) if *name == QualifiedName::builtin("Array")) => {
             Some(argument)
         }
@@ -446,6 +478,7 @@ fn mutable_array_element_type(ty: &Type) -> Option<&Type> {
         Type::Apply {
             constructor,
             argument,
+            ..
         } if matches!(constructor.as_ref(), Type::Constructor(name)
             if surface_name(name).ends_with("Stdlib_Data_Array_Mutable_Array")) =>
         {
@@ -462,6 +495,7 @@ fn applied_type(ty: &Type) -> Option<(&QualifiedName, Vec<Type>)> {
     while let Type::Apply {
         constructor,
         argument,
+        ..
     } = head
     {
         arguments.push((**argument).clone());
@@ -483,11 +517,15 @@ fn instantiate_type_expression<A>(
     match expression {
         TypeExpression::Constructor(_, name) => Some(Type::Constructor(name.clone())),
         TypeExpression::Parameter(_, parameter) => bindings.get(parameter).cloned(),
-        TypeExpression::Apply(_, application) => Some(Type::Apply {
-            constructor: instantiate_type_expression(&application.function, bindings)?.into(),
-            argument: instantiate_type_expression(&application.argument, bindings)?.into(),
-        }),
+        TypeExpression::Apply(_, application) => Some(Type::application(
+            instantiate_type_expression(&application.function, bindings)?,
+            instantiate_type_expression(&application.argument, bindings)?,
+        )),
+        TypeExpression::ConfinementAscription(_, body, _) => {
+            instantiate_type_expression(body, bindings)
+        }
         TypeExpression::Arrow(_, arrow) => Some(Type::Arrow {
+            capture: arrow.capture.clone(),
             domain: instantiate_type_expression(&arrow.domain, bindings)?.into(),
             codomain: instantiate_type_expression(&arrow.codomain, bindings)?.into(),
         }),
@@ -1019,13 +1057,10 @@ impl lambda_lift::Program {
         arguments: &[Type],
         on_path: &mut Vec<Type>,
     ) -> bool {
-        let instantiated = arguments.iter().cloned().fold(
-            Type::Constructor(name.clone()),
-            |constructor, argument| Type::Apply {
-                constructor: Box::new(constructor),
-                argument: Box::new(argument),
-            },
-        );
+        let instantiated = arguments
+            .iter()
+            .cloned()
+            .fold(Type::Constructor(name.clone()), Type::application);
         if on_path.contains(&instantiated) {
             return false;
         }
@@ -1144,13 +1179,10 @@ impl lambda_lift::Program {
         arguments: &[Type],
         on_path: &mut Vec<Type>,
     ) -> ShapeResult {
-        let instantiated = arguments.iter().cloned().fold(
-            Type::Constructor(name.clone()),
-            |constructor, argument| Type::Apply {
-                constructor: Box::new(constructor),
-                argument: Box::new(argument),
-            },
-        );
+        let instantiated = arguments
+            .iter()
+            .cloned()
+            .fold(Type::Constructor(name.clone()), Type::application);
         if on_path.contains(&instantiated) {
             return ShapeResult {
                 shape: RuntimeShape::Leaf,
@@ -1184,23 +1216,6 @@ impl lambda_lift::Program {
         on_path.push(instantiated.clone());
         let result = match definition {
             TypeDefinition::Record(record) => {
-                // `compile_record` itself splats a record whenever any nested
-                // field is wider than one word. A shaped array must describe
-                // that canonical value as the already-flat tuple it actually is;
-                // otherwise `flatten` would try to descend into an intermediate
-                // tuple that was deliberately never allocated.
-                if let Some(widths) = self.flat_widths(&instantiated) {
-                    if widths.iter().any(|width| *width > 1) {
-                        return ShapeResult {
-                            shape: RuntimeShape::Product(
-                                (0..widths.iter().sum())
-                                    .map(|_| RuntimeShape::Leaf)
-                                    .collect(),
-                            ),
-                            reaches_enclosing_type: false,
-                        };
-                    }
-                }
                 let mut fields = record.fields.iter().collect::<Vec<_>>();
                 fields.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
                 let children = fields
@@ -1213,13 +1228,33 @@ impl lambda_lift::Program {
                         )
                     })
                     .collect::<Vec<_>>();
+                let reaches_enclosing_type =
+                    children.iter().any(|child| child.reaches_enclosing_type);
+                let children = children
+                    .into_iter()
+                    .map(|child| child.shape)
+                    .collect::<Vec<_>>();
+
+                // `compile_record` itself splats a record whenever any nested field
+                // is wider than one word. A shaped array must then describe that
+                // canonical value as the already-flat tuple it actually is;
+                // otherwise `flatten` would try to descend into an intermediate
+                // tuple that was deliberately never allocated.
+                let splatted = self
+                    .flat_widths(&instantiated)
+                    .is_some_and(|widths| widths.iter().any(|width| *width > 1));
+
                 ShapeResult {
-                    reaches_enclosing_type: children
-                        .iter()
-                        .any(|child| child.reaches_enclosing_type),
-                    shape: RuntimeShape::Product(
-                        children.into_iter().map(|child| child.shape).collect(),
-                    ),
+                    reaches_enclosing_type,
+                    shape: RuntimeShape::Product(if splatted {
+                        let mut words = Vec::new();
+                        for child in children {
+                            child.splat_words(&mut words);
+                        }
+                        words
+                    } else {
+                        children
+                    }),
                 }
             }
             TypeDefinition::Coproduct(coproduct) => {
@@ -1884,7 +1919,8 @@ impl lambda_lift::Program {
 
     fn canonical_product_leaves(path: &str, shape: &RuntimeShape, out: &mut Vec<String>) {
         match shape {
-            RuntimeShape::Leaf => out.push(path.to_string()),
+            // A zeroable leaf is a leaf to everything but niche selection.
+            RuntimeShape::Leaf | RuntimeShape::ZeroableLeaf => out.push(path.to_string()),
             RuntimeShape::Product(fields) => {
                 for (index, field) in fields.iter().enumerate() {
                     Self::canonical_product_leaves(&format!("proj({path}, {index})"), field, out);

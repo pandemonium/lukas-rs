@@ -361,10 +361,12 @@ fn match_type_pattern(
             Type::Apply {
                 constructor: tc,
                 argument: ta,
+                ..
             },
             Type::Apply {
                 constructor: cc,
                 argument: ca,
+                ..
             },
         ) => {
             match_type_pattern(tc, cc, bindings)?;
@@ -374,10 +376,12 @@ fn match_type_pattern(
             Type::Arrow {
                 domain: td,
                 codomain: tc,
+                ..
             },
             Type::Arrow {
                 domain: cd,
                 codomain: cc,
+                ..
             },
         ) => {
             match_type_pattern(td, cd, bindings)?;
@@ -597,7 +601,10 @@ fn layout_call_substitutions(
 
     let mut bindings = HashMap::new();
     for argument in source_arguments {
-        let Type::Arrow { domain, codomain } = function_type else {
+        let Type::Arrow {
+            domain, codomain, ..
+        } = function_type
+        else {
             return None;
         };
         match_type_pattern(&argument.annotation().inferred_type, domain, &mut bindings)?;

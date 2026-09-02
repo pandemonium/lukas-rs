@@ -26,8 +26,14 @@ FOREIGN_DECL(Value, Root_Prelude_raw_omg_wtf_bbq,
 // ------------------------------------------------------------------- Int
 // `Int.of_char` and `Float.of_int` are now compiler builtins (see runtime.h
 // prim_int_of_char / prim_float_of_int), not foreigns -- no companion needed.
-FOREIGN_DECL(int64_t, Root_Prelude_Int_raw_max_of_int, { return INT_MAX; })
-FOREIGN_DECL(int64_t, Root_Prelude_Int_raw_min_of_int, { return INT_MIN; })
+// An `Int` is an immediate: `(payload << 1) | 1`, decoded by an arithmetic shift
+// (`as_int`, c/runtime.h). That leaves 63 signed bits, so the range is +/-2^62 --
+// NOT C's `int`, whose 32-bit limits these used to report.
+#define MARM_INT_MAX (((int64_t)1 << 62) - 1)
+#define MARM_INT_MIN (-((int64_t)1 << 62))
+
+FOREIGN_DECL(int64_t, Root_Prelude_Int_raw_max_of_int, { return MARM_INT_MAX; })
+FOREIGN_DECL(int64_t, Root_Prelude_Int_raw_min_of_int, { return MARM_INT_MIN; })
 
 FOREIGN_DECL(Value, Root_Prelude_Float_raw_max_of_float, { return VFloat(DBL_MAX); })
 FOREIGN_DECL(Value, Root_Prelude_Float_raw_min_of_float, { return VFloat(DBL_MIN); })

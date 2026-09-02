@@ -10,4 +10,5 @@ main :: IO Unit :=
   IO.output "The value is: `value`"
 
 start := λ_.
+  print_endline "##TC"
   IO.unsafe_run_IO main

@@ -37,6 +37,7 @@ module Ref:
 (* Build the effect as a value, then run it once. Three reads of the SAME `r`        *)
 (* produce 1, 42, 142 -- proof that `read` is effectful, not a pure projection.      *)
 start := λ_.
+  print_endline "##TC"
   let program =
     let* r = Ref.new 1 in
     let* a = Ref.read r in
