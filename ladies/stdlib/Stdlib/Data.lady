@@ -5,4 +5,5 @@ module Tree.
 module Array.
 module Cell.
 module Hash_Table.
+module Ring_Buffer.
 module Vector.

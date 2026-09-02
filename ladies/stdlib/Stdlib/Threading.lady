@@ -1,11 +1,234 @@
+use Stdlib.
+use Stdlib.IO.
+use Stdlib.Data.Ring_Buffer.
+use Stdlib.Control.Enumerator.
+
 opaque Read_Write_Lock ::= Make_Rw_Lock Int
 
-opaque Thread ::= ∀α. Make_Thread_Handle α
+(* The handle is the sidecar's `MarmThread *` as an integer. It is opaque, so no *)
+(* caller can fabricate or copy one, and `join` frees it exactly once.           *)
+opaque Thread ::= ∀α. Make_Thread_Handle Int
+
+(* A shared cursor over N units of work. Opaque: the handle is a C pointer, and
+   handing out or copying one would let two pools drain the same queue.
+
+   `unconfined` is the whole point of this type -- every worker in a pool holds the
+   same queue at the same time, which is exactly what the structural rule exists to
+   stop. The override is honest here: the only shared state behind the handle is one
+   `_Atomic long long`, advanced with a single fetch-add, and each index it returns
+   goes to exactly one worker. There is nothing else to race on. *)
+unconfined opaque Work_Queue ::= Make_Work_Queue Int
+
+module Work_Queue:
+  foreign raw_new  :: Int -> Int
+  foreign raw_next :: Int -> Int
+  foreign raw_free :: Int -> Unit
+
+  new :: Int -> IO Work_Queue :=
+    λunits. IO.suspend (λ_. Make_Work_Queue (raw_new units))
+
+  (* The next unclaimed index, or a negative number once the queue is drained. *)
+  next :: Work_Queue -> IO Int :=
+    λ(Make_Work_Queue handle). IO.suspend (λ_. raw_next handle)
+
+  free :: Work_Queue -> IO Unit :=
+    λ(Make_Work_Queue handle). IO.suspend (λ_. raw_free handle)
 
 module Thread:
-  spawn :: ∀α. (IO α) : unconfined -> IO (Thread α) := λinit.
-    let* x = init in
-    pure (Make_Thread_Handle x)
+  foreign raw_spawn :: ∀α. (Unit -> α) -> Int
+  foreign raw_join  :: ∀α. Int -> α
 
-  join :: ∀α. Thread α -> IO α := λthread.
-    omg_wtf_bbq "Thread.join is not implemented"
+  spawn :: ∀α. (IO α) : unconfined -> IO (Thread α) :=
+    λ(Suspend thunk). IO.suspend (λ_. Make_Thread_Handle (raw_spawn thunk))
+
+  join :: ∀α. Thread α -> IO α :=
+    λ(Make_Thread_Handle handle). IO.suspend (λ_. raw_join handle)
+
+  spawn_all :: ∀α β. ((α -> β) : unconfined) -> ((List α) : unconfined) -> IO (List (Thread β)) :=
+    λf. traverse (λx. Thread.spawn (IO.suspend (λ_. f x)))
+
+  join_all :: ∀β. List (Thread β) -> IO (List β) :=
+    traverse Thread.join
+
+  par_map :: ∀α β. ((α -> β) : unconfined) -> ((List α) : unconfined) -> IO (List β) := λf xs.
+    let* handles = spawn_all f xs in
+    join_all handles
+
+  par_fold_map :: ∀α β. Monoid β |- ((α -> β) : unconfined) -> ((List α) : unconfined) -> IO β :=
+    λf xs. fmap mconcat (par_map f xs)
+
+  (* Fork/join over an unfold, with a bounded window of threads in flight.
+
+     The source is pulled one element at a time through `next`, so it is generated
+     lazily and never materialised.
+     Results are folded with the Monoid AS THEY ARRIVE, so neither the elements nor
+     the handles are ever all in memory: at most `window` of each.
+
+     Joining early does not serialise anything, as long as the thread joined is not
+     the one just spawned. This joins the OLDEST in flight, which by then has had
+     `window - 1` spawns worth of time to run, and immediately spawns another in its
+     place -- so `window` threads stay busy throughout. It is also strictly better
+     than collecting every handle first when the results are large and the algebra
+     reduces, which is the 1BRC shape: a table per chunk, merged pairwise, where
+     holding all N tables at once is the thing you cannot afford.
+
+     The window is a `Ring_Buffer`, not a `List` used as a queue: one allocation of
+     `window` slots instead of a cell per spawn, and O(1) at both ends instead of an
+     O(window) append at the tail.
+
+     Order is preserved -- oldest joined first -- so a non-commutative Monoid is
+     still combined left to right.
+
+     The source is any `Enumerator`: a `List`, a `Ring_Buffer`, or an ad-hoc
+     coalgebra wrapped in `Unfold` -- see `par_unfold` below.
+
+     The worker is `α -> IO β`, not `α -> β`. Almost anything worth handing to a
+     thread is already effectful -- the 1BRC chunk worker builds a hash table -- and a
+     pure signature forces every such caller to reach for `unsafe_run_IO`, which is
+     both a lie about the function and the one construct this interface should never
+     make anyone write. `spawn` wants an `IO β` anyway, so this hands its argument
+     straight through instead of re-wrapping it.
+
+     The ACCUMULATOR and the ELEMENT are different types on purpose. A thread returns
+     a `β` -- whatever crosses `join`, so it must be unconfined -- while the fold
+     builds a `γ`, which never leaves this thread and so may be confined and mutable.
+     That asymmetry is what lets 1BRC absorb each chunk's rows into ONE hash table as
+     they arrive: memory stays O(keys) instead of O(chunks * keys), and the combine
+     never appends to a list whose length is its own recursion depth. Tying γ to β
+     (the Monoid shape) forces the accumulator to be the same unconfined value the
+     threads return, which is exactly the thing you cannot afford to keep N of. *)
+  par_enumerate_with :: ∀α β γ s. Enumerator α s |- Int -> (γ -> β -> IO γ) -> IO γ -> (α -> IO β) : unconfined -> s -> IO γ :=
+    λwindow combine identity f source.
+      (* Retire the oldest in-flight thread into the accumulator. *)
+      let reap = λpending acc.
+        deconstruct Ring_Buffer.pop pending into
+          Nope -> pure (pending, acc)
+        | This (handle, rest) ->
+            let* value = Thread.join handle in
+            let* combined = combine acc value in
+            pure (rest, combined)
+      in
+      (* Everything still in flight when the source runs dry. *)
+      let drain = λstate.
+        deconstruct state into
+          (pending, acc) ->
+            if Ring_Buffer.is_empty pending
+              then pure acc
+              else
+                let* reaped = reap pending acc in
+                drain reaped
+      in
+      (* One element: make room if the window is full, then spawn into it. *)
+      let step = λstate element.
+        deconstruct state into
+          (pending, acc) ->
+            let* (pending, acc) =
+              if Ring_Buffer.is_full pending then reap pending acc else pure (pending, acc)
+            in
+            (* `IO.suspend (λ_. unsafe_run_IO ...)` is the IDENTITY on `IO` -- `spawn` was
+               going to run this action on the thread anyway. It is written out because
+               it is the shape the simplifier needs to collapse the worker's monadic
+               chain: with it, `f` is specialised at the call site and a `let*` loop
+               becomes a straight loop; without it the worker rebuilds a `Suspend` per
+               bind, per row. Measured on 1e9 rows: 30.7 GB allocated with, 745 GB
+               without -- a 10x wall-clock difference. It does NOT work one level down
+               in `spawn`, whose parameter is already an opaque `IO`. *)
+            let* handle = Thread.spawn (IO.suspend (λ_. unsafe_run_IO (f element))) in
+            let* pushed = Ring_Buffer.push pending handle in
+            deconstruct pushed into
+              Nope -> pure (pending, acc)
+            | This grown -> pure (grown, acc)
+      in
+      let* empty = Ring_Buffer.new window in
+      let* zero = identity in
+      let* final = enumerate_m step (empty, zero) source in
+      drain final
+
+
+  (* The `Monoid` case, which is most of them: a pure algebra lifted into IO.
+
+     `par_enumerate_with` exists because that is NOT most of them. A per-chunk hash
+     table -- `Cheeky_Map` in the 1BRC benchmark, and the reason this generalisation
+     exists -- cannot have a `Monoid` witness at all: `mempty :: α` would have to
+     allocate its bucket array and `mappend :: α -> α -> α` would have to write into
+     it, and both of those are `IO`. The algebra being effectful is the normal case
+     for the workloads this is for, not an exception. *)
+  par_enumerate :: ∀α β s. Monoid β + Enumerator α s |- Int -> (α -> β) : unconfined -> s -> IO β :=
+    λwindow f source.
+      (* `IO.suspend (λ_. f x)`, NOT `pure (f x)`: `pure` is `λa. Suspend (λ_. a)`, so
+         its argument is already evaluated by the time the thunk exists. Lifting with
+         `pure` would run every chunk on THIS thread as the worker is applied, and the
+         threads would each be handed a finished answer -- correct, and completely
+         serial. *)
+      par_enumerate_with window (λa b. pure (mappend a b)) (pure mempty)
+        (λx. IO.suspend (λ_. f x)) source
+
+  (* ---------------------------------------------------------------- worker pool
+
+     `par_enumerate_with` spawns one thread PER ITEM and joins them in order. That is
+     the wrong shape once items outnumber cores: the window can only advance when its
+     OLDEST thread finishes, so one slow item leaves the other `window - 1` cores with
+     nothing to do but wait for it. On a machine with asymmetric cores -- an M4 Max is
+     12 performance + 4 efficiency, and an efficiency core is ~6x slower -- a straggler
+     is not a rare accident, it is a quarter of the schedule.
+
+     This is the pull model instead. A FIXED pool of `workers` threads shares one
+     `Work_Queue` cursor, and each takes the next index the moment it is free. Nothing
+     waits for anything: a thread that draws a slow unit delays only itself, and a
+     thread on a fast core simply takes more units. Load balances itself with no
+     stealing protocol, because the queue is the shared deque.
+
+     Each worker folds into its OWN accumulator, so `f` writes into thread-local state
+     with no synchronisation on the hot path -- one atomic per UNIT, not per row. The
+     parent combines the `workers` accumulators at the end, so `combine` runs
+     `workers - 1` times rather than once per unit.
+
+     `identity` runs once per worker (each needs its own), `f acc i` folds unit `i`
+     into that worker's accumulator, and `combine` merges two accumulators. `combine`
+     must be associative; it is applied to whole per-worker accumulators, in
+     completion order, so it should be commutative too unless the units are
+     independent of order (for a hash table keyed by the data, both hold). *)
+  par_pool :: ∀γ. Int -> Int -> ((γ -> γ -> IO γ) : unconfined) -> ((IO γ) : unconfined) -> ((γ -> Int -> IO γ) : unconfined) -> IO γ :=
+    λworkers units combine identity f.
+      let* queue = Work_Queue.new units in
+      (* One worker: take indices until the queue is drained, folding into `acc`. *)
+      let worker = λ_.
+        let* zero = identity in
+        let drain = λacc.
+          let* index = Work_Queue.next queue in
+          if index < 0
+            then pure acc
+            else
+              let* stepped = f acc index in
+              drain stepped
+        in drain zero
+      in
+      let spawn_pool = λn acc.
+        if n <= 0
+          then pure acc
+          else
+            let* handle = Thread.spawn (IO.suspend (λ_. unsafe_run_IO (worker ()))) in
+            spawn_pool (n - 1) (Cons handle acc)
+      in
+      let* handles = spawn_pool workers Nil in
+      let* results = join_all handles in
+      let fold_results = λacc rest.
+        deconstruct rest into
+          Nil -> pure acc
+        | Cons r more ->
+            let* merged = combine acc r in
+            fold_results merged more
+      in
+      deconstruct results into
+        Nil -> identity
+      | Cons first rest ->
+          let* folded = fold_results first rest in
+          let* _ = Work_Queue.free queue in
+          pure folded
+
+  (* Fork/join over a bare coalgebra, for a source with no `Enumerator` witness of
+     its own -- counting down an Int, walking a file offset. `Unfold` supplies the
+     type the witness hangs on, so this is the same operation with the packaging
+     done for you. *)
+  par_unfold :: ∀α β s. Monoid β |- Int -> (s -> Perhaps (α, s)) -> (α -> β) : unconfined -> s -> IO β :=
+    λwindow step f seed. par_enumerate window f (Make_Unfold step seed)

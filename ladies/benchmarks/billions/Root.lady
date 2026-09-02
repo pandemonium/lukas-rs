@@ -4,6 +4,7 @@ use Stdlib.Data.Hash_Table.
 use Stdlib.Control.
 use Stdlib.Random.
 use Stdlib.IO.
+use Stdlib.Threading.
 
 module Stats.
 
@@ -107,19 +108,72 @@ witness Display Aggregate_Stats :=
       "min `format_tenths self.Min`, max `format_tenths self.Max`, avg `format_tenths (mean_tenths self.Sum self.Count)`"
   }
 
+advance_to_row_end :: Bytes -> Int -> Int := λsource i.
+  let length = Bytes.length source in
+  if i >= length
+    then length
+    else if Bytes.get_u8 source i = 10
+      then 1 + i
+      else advance_to_row_end source (1 + i)
+
+chunks :: Bytes -> Int -> (Bytes, Int) -> Perhaps (Bytes, (Bytes, Int)) := λsource stride state.
+  deconstruct state into
+    (_, offset) ->
+      let length = Bytes.length source in
+      if offset >= length
+        then Nope
+        else
+          let stop = advance_to_row_end source (min length (offset + stride)) in
+          This (Bytes.slice source offset (stop - offset), (source, stop))
+
+absorb :: Stats.Cheeky_Map Text Aggregate_Stats -> Stats.Cheeky_Map Text Aggregate_Stats -> IO (Stats.Cheeky_Map Text Aggregate_Stats) := λtarget source.
+  let* _ = Stats.Cheeky_Map.merge source target in
+  pure target
+
+(* Chunk `i` by ARITHMETIC rather than by unfolding: both ends are the next row
+   boundary at or after a fixed offset, so any worker can compute its own chunk from
+   an index alone with nothing shared and nothing sequential. That is what lets a
+   fixed pool pull work instead of a driver handing it out. *)
+chunk_at :: Bytes -> Int -> Int -> Bytes := λsource stride i.
+  let length = Bytes.length source in
+  let start  = if i = 0 then 0 else advance_to_row_end source (min length (i * stride)) in
+  let stop   = advance_to_row_end source (min length ((1 + i) * stride)) in
+  Bytes.slice source start (stop - start)
+
+(* One table per WORKER, not per chunk: a worker folds every chunk it draws into the
+   same table, so the run allocates `workers` tables instead of one per chunk, and the
+   parent merges `workers - 1` times instead of once per chunk. *)
+aggregate_in_parallel :: Int -> Int -> Bytes -> IO (Stats.Cheeky_Map Text Aggregate_Stats) :=
+  λworkers units_per_worker file_bytes.
+    let length = Bytes.length file_bytes in
+    (* Chunk COUNT is the knob, not a byte stride: the file is cut into
+       `workers * units_per_worker` equal pieces, so the split scales with the input
+       instead of needing a new stride every time the file changes size. Several units
+       per worker is what lets the pool balance -- with exactly one each, a worker that
+       draws a slow unit has nothing left to hand off. *)
+    let units  = workers * units_per_worker in
+    let stride = (length + units - 1) / units in
+    Thread.par_pool workers units
+      absorb
+      (Stats.Cheeky_Map.make_default chunk_capacity)
+      (λtable i. process_chunk_into table (chunk_at file_bytes stride i))
+
 read_file_data :: Text -> IO (Result Fault (List (Text, Aggregate_Stats))) := λfile_path.
   let* file_bytes = Binary.mmap file_path in
   deconstruct file_bytes into
-    Return file_bytes -> fmap Return (process_file_bytes file_bytes)
+    Return file_bytes ->
+      (* 16 workers (this machine's CPU count), 3 chunks each -- bologna's ratio.
+         Measured: 1 chunk per worker is a hair faster on an idle machine but leaves
+         the pool no balancing headroom at all; past ~3 it gets slower, since finer
+         chunks buy nothing once the pool is self-balancing and cost a `Bytes.slice`
+         and a boundary scan each. *)
+      let* table = aggregate_in_parallel 16 3 file_bytes in
+      fmap Return (Stats.Cheeky_Map.to_list table)
   | Fault e -> pure (Fault (File_IO e))
 
-(* The checked-in fixture has only three rows. Repeat it so this remains a *)
-(* meaningful HashTable/update benchmark without committing a huge data file. *)
-(* Fix the seed so allocation and probe counts are comparable between builds. *)
-(* let table = Hash_Table.make 47521 (Simple_Hasher.make 1) in *)
-(* let* _ = Hash_Table.modify row.City aggregate table in *)
-process_file_bytes :: Bytes -> IO (List (Text, Aggregate_Stats)) := λfile_bytes.
-  let* table = Stats.Cheeky_Map.make_default 47521 in
+chunk_capacity :: Int := 8191
+
+process_chunk_into :: Stats.Cheeky_Map Text Aggregate_Stats -> Bytes -> IO (Stats.Cheeky_Map Text Aggregate_Stats) := λtable file_bytes.
   let length = Bytes.length file_bytes in
   let loop = λi.
     if i < length then
@@ -142,8 +196,7 @@ process_file_bytes :: Bytes -> IO (List (Text, Aggregate_Stats)) := λfile_bytes
       pure ()
   in
     let* _ = loop 0 in
-    let* table_data = Stats.Cheeky_Map.to_list table
-    in pure table_data
+    pure table
 
 (* First index at or after `i` whose byte equals `delim`. *)
 scan_to :: Bytes -> Int -> Int -> Int := λsource i delim.

@@ -115,6 +115,18 @@ zip :: ∀α β. List α -> List β -> List (α, β) := λxs ys.
     Cons x xs, Cons y ys -> Cons (x, y) (zip xs ys)
   | otherwise            -> Nil
 
+(* The anamorphism, dual to `fold_right`: `fold_right` consumes a list down to a
+   value, `unfold` grows one up from a seed. `step` returns either `Nope` -- the
+   sequence ends -- or an element and the seed to continue from.
+
+   This is exactly the shape of `Enumerator.next`, which is why any enumeration is
+   an unfold and any unfold an enumeration: `next` IS a coalgebra, and the
+   `enumeration` type IS the seed. *)
+unfold :: ∀α s. (s -> Perhaps (α, s)) -> s -> List α := λstep seed.
+  deconstruct step seed into
+    Nope -> Nil
+  | This (element, next_seed) -> Cons element (unfold step next_seed)
+
 append :: ∀α. List α -> List α -> List α :=
   λxs ys. fold_right Cons ys xs
 

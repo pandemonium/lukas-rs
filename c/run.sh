@@ -72,7 +72,7 @@ done
 . "$C_DIR/cflags.sh"
 
 # shellcheck disable=SC2086 # $foreign_cs and $CFLAGS are intentional lists.
-if ! clang -std=c11 -I"$C_DIR" $CFLAGS -o "$work/prog" "$C_DIR/runtime.c" "$C_DIR/gc.c" $foreign_cs "$work/program.c" 2>"$work/cc.err"; then
+if ! clang $CSTD -I"$C_DIR" $CFLAGS -o "$work/prog" "$C_DIR/runtime.c" "$C_DIR/gc.c" $foreign_cs "$work/program.c" 2>"$work/cc.err"; then
     echo "[$name] COMPILE-ERR"
     cat "$work/cc.err"
     exit 1

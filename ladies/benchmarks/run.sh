@@ -24,7 +24,7 @@ cargo run --release -q --manifest-path "$ROOT/Cargo.toml" --bin mc -- \
 # link the program + runtime + every stdlib companion (foreign bindings)
 companions="$(find "$LIB" -name '*.c' 2>/dev/null)"
 # shellcheck disable=SC2086
-clang -std=c11 -I"$ROOT/c" $CFLAGS -g -o "$W/bench" \
+clang $CSTD -I"$ROOT/c" $CFLAGS -g -o "$W/bench" \
     "$ROOT/c/runtime.c" "$ROOT/c/gc.c" $companions "$W/prog.c" || exit 1
 
 if [ "${SAMPLE:-0}" = "1" ]; then

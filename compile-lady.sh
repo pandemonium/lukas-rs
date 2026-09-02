@@ -154,7 +154,7 @@ case "$BACKEND" in
     # CFLAGS is intentionally word-split, matching normal compiler-variable
     # behavior in build scripts.
     # shellcheck disable=SC2086
-    if ! "$CC" -std=c11 -I"$C_DIR" $CFLAGS -o "$BIN" "$@"; then
+    if ! "$CC" $CSTD -I"$C_DIR" $CFLAGS -o "$BIN" "$@"; then
       die "native C compilation failed"
     fi
 

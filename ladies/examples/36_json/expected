@@ -1,0 +1,81 @@
+-- objects --
+>> [obj1] {}  =>  {}
+>> [obj2] {"a": 1}  =>  {(a, 1.0); }
+>> [obj3] {"a": 1,"b": 2}  =>  {(a, 1.0); (b, 2.0); }
+>> [obj4] {"a": "x"}  =>  {(a, x); }
+>> [obj5] {"a": 1,"b": 2,"c": 3,"d": 4}  =>  {(a, 1.0); (b, 2.0); (c, 3.0); (d, 4.0); }
+>> [obj6] {"a": {}}  =>  {(a, {}); }
+>> [obj7] {"a": []}  =>  {(a, []); }
+>> [obj8] {"outer": {"inner": 7}}  =>  {(outer, {(inner, 7.0); }); }
+>> [obj9] {"": 1}  =>  {(, 1.0); }
+-- arrays --
+>> [arr1] []  =>  []
+>> [arr2] [1]  =>  [1.0; ]
+>> [arr3] [1,2,3]  =>  [1.0; 2.0; 3.0; ]
+>> [arr4] ["a","b"]  =>  [a; b; ]
+>> [arr5] [1,2,3,4,5,6,7,8,9,10]  =>  [1.0; 2.0; 3.0; 4.0; 5.0; 6.0; 7.0; 8.0; 9.0; 1e+01; ]
+>> [arr6] [[]]  =>  [[]; ]
+>> [arr7] [{},{}]  =>  [{}; {}; ]
+>> [arr8] [[1],[2],[3]]  =>  [[1.0; ]; [2.0; ]; [3.0; ]; ]
+-- numbers --
+>> [num1] [0]  =>  [0.0; ]
+>> [num2] [42]  =>  [42.0; ]
+>> [num3] [1234567890]  =>  [1.23456789e+09; ]
+>> [num4] [1.5]  =>  [1.5; ]
+>> [num5] [-1]  =>  [-1.0; ]
+>> [num6] [3.14159]  =>  [3.14159; ]
+>> [num7] [1e5]  =>  [1e+05; ]
+>> [num8] [007]  =>  [7.0; ]
+-- strings --
+>> [str1] [""]  =>  [; ]
+>> [str2] ["hello world"]  =>  [hello world; ]
+>> [str3] ["a,b"]  =>  [a,b; ]
+>> [str4] ["a]b"]  =>  [a]b; ]
+>> [str5] ["a}b"]  =>  [a}b; ]
+>> [str6] ["it's fine"]  =>  [it's fine; ]
+>> [str7] ["a\"b"]  =>  [a"b; ]
+>> [str8] ["café"]  =>  [café; ]
+>> [str9] {"key with spaces": 1}  =>  {(key with spaces, 1.0); }
+-- whitespace --
+>> [ws1]  [1]   =>  [1.0; ]
+>> [ws2] [ 1 , 2 ]  =>  [1.0; 2.0; ]
+>> [ws3] { "a" : 1 }  =>  {(a, 1.0); }
+>> [ws4] [	1,	2]  =>  [1.0; 2.0; ]
+>> [ws5] [1,  2,   3]  =>  [1.0; 2.0; 3.0; ]
+-- deep nesting --
+>> [deep1] [[[[1]]]]  =>  [[[[1.0; ]; ]; ]; ]
+>> [deep2] {"a": {"b": {"c": 1}}}  =>  {(a, {(b, {(c, 1.0); }); }); }
+>> [deep3] [{"a": [{"b": 2}]}]  =>  [{(a, [{(b, 2.0); }; ]); }; ]
+>> [deep4] {"xs": [1,2,3],"ys": ["p","q"]}  =>  {(xs, [1.0; 2.0; 3.0; ]); (ys, [p; q; ]); }
+-- decoding --
+>> [dec1] [1,2,3]  =>  1; 2; 3; 
+>> [dec2] [1.5,-2,3.25]  =>  1.5; -2.0; 3.25; 
+>> [dec3] ["a","b","c"]  =>  a; b; c; 
+>> [dec4] {"age": 42}  =>  42
+>> [dec5] {"name": "Ada"}  =>  Ada
+>> [dec6] {"name": "Ada","age": 42}  =>  (Ada, 42)
+>> [dec7] {"values": [1,2,3]}  =>  1; 2; 3; 
+-- decoding faults --
+>> [dec_bad1] {}  =>  Expected field "missing" in object
+>> [dec_bad2] {"age": "old"}  =>  Expected a number
+>> [dec_bad3] [1,"two",3]  =>  Expected a number
+>> [dec_bad4] {}  =>  Expected an array
+>> [dec_bad5] []  =>  Expected an object
+-- malformed (expect a Fault) --
+>> [bad1]   =>  End of file
+>> [bad2] [  =>  End of file
+>> [bad3] {  =>  End of file
+>> [bad4] !  =>  Unexpected input !
+>> [bad5] 1  =>  Unexpected input 1
+>> [bad6] "bare"  =>  Unexpected input "
+>> [bad7] [1,]  =>  Unexpected input ]
+>> [bad8] [1 2]  =>  Unexpected input 2
+>> [bad9] {"a"}  =>  Found }; expected :
+>> [bad10] {"a":}  =>  Unexpected input }
+>> [bad11] {a: 1}  =>  Unexpected input a
+>> [bad12] [1,2,3  =>  End of file
+>> [bad13] ]  =>  Unexpected input ]
+>> [bad14] [1,2]extra  =>  Unexpected remains: 1
+>> [bad15] [1,2,]  =>  Unexpected input ]
+>> [bad16] {"a": 1,}  =>  Unexpected input }
+>> [bad17] [,1]  =>  Unexpected input ,

@@ -1,0 +1,8 @@
+original=3,4 inline=10,4
+layout=3,40
+swapped=4,3
+replaced=30,40
+computed=7,90
+Originally, Ada spoke in London, hosted by Grace in New York.
+Now Ada speaks in New York (30), while Grace hosts from Stockholm.
+generic=5,7 -> 42,7

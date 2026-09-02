@@ -7,5 +7,10 @@
 # Value slot" bugs into loud failures instead of letting them ride on whether the
 # word happens to be odd.
 #
-# Override by exporting CFLAGS before invoking either script.
-: "${CFLAGS:=-O2 -flto}"
+# CSTD is separate from CFLAGS so an override of one does not silently drop the
+# other. C23 for `thread_local`: Apple ships no <threads.h>, so under C11 the only
+# spelling is `_Thread_local`, which C23 deprecates.
+#
+# Override by exporting CSTD or CFLAGS before invoking either script.
+: "${CSTD:=-std=c23}"
+: "${CFLAGS:=-O2 -flto -pthread}"

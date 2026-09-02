@@ -1,6 +1,14 @@
 use Stdlib.Data.Array.
 
-Cheeky_Map ::= ∀α β.
+(* `unconfined opaque` is the trusted override, and this is what it is for. The
+   structural rule infers `Cheeky_Map` confined -- it holds a `Mutable_Array` -- which
+   would stop a chunk's finished table from crossing `join`. The override asserts what
+   the checker cannot see: a chunk table is written by exactly one thread, and `join`
+   is a happens-before edge, so by the time the parent touches it the writer has
+   finished and no one else ever had a reference. Merging on arrival is the whole point
+   -- going out through a `List` would allocate a cons cell and a pair per city per
+   chunk purely to hand the same data over. *)
+unconfined opaque Cheeky_Map ::= ∀α β.
   { Buckets :: Mutable_Array (Entry α β)
   }
 
@@ -58,6 +66,21 @@ module Cheeky_Map:
       in
         let* _ = loop initial_index in
         pure ()
+
+  merge :: ∀α β. Eq α + Hashable α + Semigroup β |- Cheeky_Map α β -> Cheeky_Map α β -> IO Unit :=
+    λsource target.
+      let length = Mutable_Array.length source.Buckets in
+      let loop = λi.
+        if i >= length
+          then pure ()
+          else
+            let entry = Mutable_Array.unsafe_get_unchecked source.Buckets i in
+            deconstruct entry.Entry_Key into
+              Nope -> loop (1 + i)
+            | This key ->
+                let* _ = modify key entry.Entry_Value target in
+                loop (1 + i)
+      in loop 0
 
   to_list :: ∀α β. Cheeky_Map α β -> IO (List (α, β)) := λ({ Buckets: buckets }).
     let length = Mutable_Array.length buckets in

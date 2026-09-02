@@ -160,7 +160,20 @@ impl phase::SymbolTable<Types> {
                             simplify_term(body, &inlinables)
                         } else {
                             let fused = simplify_term(body.clone(), &inlinables);
-                            if fusion_safe(&fused) {
+                            let safe = fusion_safe(&fused);
+                            if std::env::var_os("DUMP_FUSION").is_some() {
+                                eprintln!("[fusion] {name}  fusion_safe={safe}");
+                                if !safe {
+                                    let mut live = Vec::new();
+                                    let mut found = Vec::new();
+                                    scope_collisions(&fused, &mut live, &mut found);
+                                    found.dedup();
+                                    for line in found.iter().take(6) {
+                                        eprintln!("[fusion]   COLLISION: {line}");
+                                    }
+                                }
+                            }
+                            if safe {
                                 fused
                             } else {
                                 simplify_term(body, &leaf_inlinables)
@@ -276,14 +289,63 @@ fn build_inlinables(
         .filter(|(name, body)| reaches_self(name, &dependencies) || contains_recursion(body))
         .map(|(name, _)| (*name).clone())
         .collect();
+    // `recursive` above answers "may we inline INTO this term?" -- fusing an effectful
+    // combinator into a loop is the space leak `fusion_safe` exists to police. It is the
+    // WRONG question for "may this term be inlined elsewhere?", and using it for both is
+    // why `Cheeky_Map.modify` never inlines: `modify` is not recursive, it merely CONTAINS
+    // a local tail-recursive probe loop, which loopifies to a `for(;;)` and comes along
+    // intact when the body is spliced.
+    //
+    // For the inliner to diverge, unfolding `f` must reintroduce a call to `f` -- that is,
+    // `f` must reference itself by FREE NAME, which is exactly `reaches_self`. A local
+    // `RecursiveLambda` refers to itself through a `Bound` level, self-contained inside the
+    // spliced body, so it can never loop the inliner. Size is policed separately by
+    // `within_budget`, and inlining into loops by `guard_loops`.
+    //
+    // `MARM_INLINE_LOCAL_LOOPS` frees terms judged by the narrow rule. Panel-green at
+    // 85/87 with it fully on (`*`), and byte-identical with it unset.
+    //
+    // What it buys: `Cheeky_Map.modify` and `FNV1a.hash` become inlinable, which is the
+    // precondition for ever unboxing 1BRC's per-row slice -- the slice's producer and its
+    // consumers have to end up in ONE body before any escape analysis can see them.
+    //
+    // What still blocks that: actually splicing `modify` into the row loop also needs
+    // inlining INTO a loop, i.e. `MARM_INLINE_LOOPS=1`, and THAT is independently broken --
+    // 83/87 on the panel with it alone, no flag of ours involved. Fix that first.
+    //
+    // Value is a comma-separated list of name substrings, or `*` for every term. Only a
+    // matching term is judged by the narrow rule; everything else keeps the conservative
+    // `recursive` exclusion. Selective on purpose: it lets a single term be freed and
+    // measured without betting the whole program on the narrow predicate being right.
+    let local_loops = std::env::var("MARM_INLINE_LOCAL_LOOPS").ok();
+    let unfold_hazard: HashSet<QualifiedName> = match local_loops.as_deref() {
+        None => recursive.clone(),
+        Some(pattern) => terms
+            .iter()
+            .filter(|(name, body)| {
+                let text = name.to_string();
+                let freed = pattern == "*"
+                    || pattern.split(',').any(|p| !p.is_empty() && text.contains(p));
+                if freed {
+                    // narrow rule: only genuine self-recursion is a hazard
+                    reaches_self(name, &dependencies) || is_self_recursive(body)
+                } else {
+                    recursive.contains(*name)
+                }
+            })
+            .map(|(name, _)| (*name).clone())
+            .collect(),
+    };
     if std::env::var_os("DUMP_INLINE_EXCLUSION").is_some() {
         let budget = inline_budget();
         for (name, body) in &terms {
             eprintln!(
-                "[inline?] {name}  recursive={} within_budget={} nullary={}",
+                "[inline?] {name}  recursive={} self_rec={} reaches_self={} hazard={} within_budget={}",
                 recursive.contains(*name),
-                within_budget(body, budget),
-                is_nullary_injection(body)
+                is_self_recursive(body),
+                reaches_self(name, &dependencies),
+                unfold_hazard.contains(*name),
+                within_budget(body, budget)
             );
         }
     }
@@ -302,7 +364,7 @@ fn build_inlinables(
         // Inlining it is what lets a `deconstruct` whose scrutinee is such a singleton
         // (e.g. an `Ordering` flowing out of `compare` after case-of-`if` commuting)
         // see a known constructor and collapse. So keep it regardless of `recursive`.
-        is_nullary_injection(body) || (within_budget(body, budget) && !recursive.contains(name))
+        is_nullary_injection(body) || (within_budget(body, budget) && !unfold_hazard.contains(name))
     };
     let inlinables: Inlinables<_> = terms
         .iter()
@@ -459,6 +521,46 @@ fn is_nullary_injection<A>(body: &Expr<A, Identifier>) -> bool {
 
 /// Whether `expr` contains a self-referential lambda that actually uses its self-binder
 /// -- i.e. a real loop. (An unused self-binder is not recursion; `derecursify` drops it.)
+/// Is this term ITSELF recursive, as opposed to merely CONTAINING a recursive function?
+///
+/// The distinction is the whole point. `Tree_Map.insert` IS recursive: its body is a root
+/// `RecursiveLambda` whose self-binder it uses, so unfolding it splices a copy of a
+/// recursive function -- which the inliner has no business doing. `Cheeky_Map.modify` and
+/// `FNV1a.hash` merely CONTAIN a local tail-recursive loop nested inside an ordinary lambda
+/// chain; that loop loopifies to a `for(;;)` and travels intact when the body is spliced.
+///
+/// `reaches_self` alone cannot make this call: direct recursion is expressed as a `Bound`
+/// self-reference inside the `RecursiveLambda`, invisible to the free-name graph. So this
+/// checks the ROOT specifically -- `contains_recursion` searches the whole tree and so
+/// cannot tell the two apart.
+fn is_self_recursive<A>(body: &Expr<A, Identifier>) -> bool {
+    // A top-level symbol's own self-binder is ALWAYS level 0 -- it is the outermost thing
+    // the term introduces. A local loop is introduced further in and receives whatever
+    // level was next, which is necessarily > 0. So "is this term itself recursive?" is
+    // "does it introduce a self-referential lambda AT LEVEL 0?", and that survives however
+    // specialization has wrapped the body -- which the spine/root/peel checks did not,
+    // because `build_inlinables` runs once per pass and reshapes the term between them.
+    //
+    // `contains_recursion` asks the weaker question (is there ANY self-referential lambda
+    // anywhere), which is right for "may we inline INTO this" and wrong for this.
+    fn search<A>(expr: &Expr<A, Identifier>) -> bool {
+        if let Expr::RecursiveLambda(
+            _,
+            SelfReferential {
+                own_name: Identifier::Bound(0),
+                lambda,
+            },
+        ) = expr
+        {
+            if mentions_level(&lambda.body, 0) {
+                return true;
+            }
+        }
+        children(expr).into_iter().any(|c| search(c))
+    }
+    search(body)
+}
+
 fn contains_recursion<A>(expr: &Expr<A, Identifier>) -> bool {
     match expr {
         Expr::RecursiveLambda(
@@ -484,17 +586,96 @@ fn contains_recursion<A>(expr: &Expr<A, Identifier>) -> bool {
 /// shape stay guarded. That is sound because `inlinables` never holds a recursive term, so
 /// fusion can only splice *non-recursive* helpers into the body -- it relocates the term's own
 /// `Bound` self-call but never introduces a fused call to another recursive term.
-fn fusion_safe<A>(body: &Expr<A, Identifier>) -> bool {
-    match body {
-        Expr::RecursiveLambda(
-            _,
-            SelfReferential {
-                own_name: Identifier::Bound(level),
-                lambda,
-            },
-        ) => self_calls_all_tail(&lambda.body, *level, true, true),
-        _ => false,
+/// Debug check: does any binder introduce a de Bruijn LEVEL that an enclosing binder
+/// already holds? With levels-as-depth, sibling scopes legitimately reuse a level, so only
+/// re-binding along one PATH is wrong -- and that is exactly what a splice that failed to
+/// shift produces: the callee's levels 0.. land inside a caller that already bound them.
+/// Reported under `DUMP_FUSION=1`; costs nothing otherwise.
+fn scope_collisions<A>(expr: &Expr<A, Identifier>, live: &mut Vec<usize>, out: &mut Vec<String>) {
+    let mut note = |live: &Vec<usize>, l: &usize, what: &str, out: &mut Vec<String>| {
+        if live.contains(l) {
+            out.push(format!("{what} re-binds level {l} (already bound by an ancestor)"));
+        }
+    };
+    match expr {
+        Expr::Lambda(_, Lambda { parameter, body }) => {
+            if let Identifier::Bound(l) = parameter {
+                note(live, l, "lambda parameter", out);
+                live.push(*l);
+                scope_collisions(body, live, out);
+                live.pop();
+                return;
+            }
+            scope_collisions(body, live, out);
+        }
+        Expr::RecursiveLambda(_, SelfReferential { own_name, lambda }) => {
+            let mut pushed = 0;
+            if let Identifier::Bound(o) = own_name {
+                note(live, o, "recursive-lambda self-binder", out);
+                live.push(*o);
+                pushed += 1;
+            }
+            if let Identifier::Bound(p) = &lambda.parameter {
+                note(live, p, "recursive-lambda parameter", out);
+                live.push(*p);
+                pushed += 1;
+            }
+            scope_collisions(&lambda.body, live, out);
+            for _ in 0..pushed {
+                live.pop();
+            }
+        }
+        Expr::Let(_, Binding { binder, bound, body, .. }) => {
+            scope_collisions(bound, live, out);
+            if let Identifier::Bound(l) = binder {
+                note(live, l, "let binder", out);
+                live.push(*l);
+                scope_collisions(body, live, out);
+                live.pop();
+                return;
+            }
+            scope_collisions(body, live, out);
+        }
+        _ => {
+            for child in children(expr) {
+                scope_collisions(child, live, out);
+            }
+        }
     }
+}
+
+fn fusion_safe<A>(body: &Expr<A, Identifier>) -> bool {
+    // EVERY recursive-lambda introduction has to survive fusion in tail position, not just
+    // one at the root. The old form matched the root only and returned `false` for anything
+    // else, so a term that merely CONTAINS local loops -- `Cheeky_Map.modify`, `FNV1a.hash`,
+    // `process_chunk_into`, i.e. most functional code -- could never pass and always fell
+    // back to `leaf_inlinables`. That is why inlining into loops looked like it needed the
+    // blunt `MARM_INLINE_LOOPS` escape hatch: the safe path was rejecting by construction
+    // rather than by analysis.
+    //
+    // For each introduction, check the level IT received against its own body: a top-level
+    // term's own recursion binds level 0, a local loop binds whatever came next. Same rule,
+    // applied everywhere instead of once.
+    fn go<A>(expr: &Expr<A, Identifier>) -> bool {
+        let here = match expr {
+            Expr::RecursiveLambda(
+                _,
+                SelfReferential {
+                    own_name: Identifier::Bound(level),
+                    lambda,
+                },
+            ) => {
+                let ok = self_calls_all_tail(&lambda.body, *level, true, true);
+                if !ok && std::env::var_os("DUMP_FUSION").is_some() {
+                    eprintln!("[fusion]   non-tail self-call at level {level}");
+                }
+                ok
+            }
+            _ => true,
+        };
+        here && children(expr).into_iter().all(|c| go(c))
+    }
+    go(body)
 }
 
 /// Check that every self-reference (`Bound(level)` -- the absolute De Bruijn level of the
@@ -520,7 +701,16 @@ fn self_calls_all_tail<A>(
         | Expr::MakeClosure(..) => true,
 
         Expr::RecursiveLambda(_, SelfReferential { lambda, .. }) => {
-            self_calls_all_tail(&lambda.body, level, tail, leading)
+            // A NESTED recursive lambda -- the term's OWN root one is consumed by
+            // `fusion_safe` before this walk starts, so anything reached here is a local
+            // loop inside the body. It is a deferred closure exactly like an inner
+            // `Lambda`, so an outer self-call occurring inside it is NOT a tail call of
+            // the outer term: it runs with that closure's frame still live. Inheriting
+            // `tail`/`leading` here judged such a call safe, the fused body was kept, and
+            // the outer recursion stopped being a tail call -- one stack frame per
+            // iteration. Caught by `32_trees` (1e6 `fill` iterations) only once bodies
+            // containing local loops became inlinable at all.
+            self_calls_all_tail(&lambda.body, level, false, false)
         }
         Expr::Lambda(_, Lambda { body, .. }) => {
             // Leading lambdas are the term's arity, so their body inherits `tail`. An inner

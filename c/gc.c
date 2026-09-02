@@ -1,6 +1,8 @@
 #include "gc.h"
 
 #include <assert.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <setjmp.h>
 #include <stddef.h>
 #include <stdarg.h>
@@ -157,8 +159,209 @@ static bool is_object_immix(uintptr_t w);
 static void ix_mark_lines(void *body); // mark the lines a live object spans
 static void ix_reset_lines(void);      // clear data-line marks before a collection
 static void ix_reclaim(void);          // free empty lines, keep occupied ones
-static size_t ix_bytes;                // bytes allocated since the last immix collection
-static size_t ix_threshold;            // collect once ix_bytes crosses this (Appel: 2x live)
+static size_t ix_threshold;            // collect once allocation crosses this (Appel: 2x live)
+
+typedef struct IxBlock IxBlock;  // defined with the immix heap, further down
+
+// Everything a mutator owns exclusively. `ix_blocks`/`ix_recycle` stay global -- a
+// thread owns a *cursor into* the shared heap, never a region of it (see
+// notes/threading.md 4.1). One `thread_local` POINTER rather than a set of
+// `thread_local` scalars: Darwin has no local-exec TLS, so each distinct
+// thread-local costs an indirect call at every access, while one pointer costs one
+// call and leaves every field a plain offset (notes/threading.md 3.1).
+typedef struct ThreadCtx {
+    void *stack_bottom;      // base of this thread's stack, for the conservative scan
+    void *stack_top;         // where it parked; read only for threads other than the
+                             // collector, which scans from its own live frame (M2
+                             // fills this in when a thread parks or goes foreign)
+    int state;               // ThreadState: running, parked, or in a foreign region
+    uintptr_t *rem;          // write-barrier roots this thread recorded (see
+    size_t rem_len, rem_cap; //   gc_remember_object); merged at a collection
+    IxBlock *ix_cur;         // block currently being bump-filled
+    IxBlock *ix_spare;       // blocks claimed but not yet filled, linked by `rnext`.
+                             // Taking the allocator lock once per 32 KiB block was a
+                             // million acquisitions and 7% contention on a 16-thread
+                             // run; claiming IX_BATCH at a time divides both by the
+                             // batch. MUST be dropped at every collection -- see
+                             // `ix_release_spares`.
+    uintptr_t ix_ptr, ix_limit; // bump cursor + end of the current free run
+    uintptr_t ix_run;        // start of the current run (for bulk line marking)
+    size_t ix_bytes;         // bytes allocated since the last collection
+} ThreadCtx;
+
+static thread_local ThreadCtx *self = NULL;
+
+// Force callee-saved registers into the current frame, so the conservative scan of
+// this thread's stack sees them. A live `Value` may exist ONLY in a register, and a
+// thread handing its roots to the collector must publish those too -- the collector
+// spills its own with `_setjmp`, but it cannot reach anyone else's. Cheaper than
+// `setjmp`, which on Darwin also saves the signal mask via a syscall.
+#define GC_SPILL_REGISTERS()                                                          \
+    __asm__ volatile("" ::: "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26",   \
+                            "x27", "x28", "d8", "d9", "d10", "d11", "d12", "d13",     \
+                            "d14", "d15", "memory")
+
+// Where the collector must start scanning this thread's stack -- the STACK POINTER,
+// not `__builtin_frame_address(0)`. The two are not interchangeable: AArch64 clang
+// lays a frame out as [callee-saved spills | x29, x30 | locals] and points x29 at
+// the saved x29/x30 pair, so the frame pointer sits ABOVE the spill area. Publishing
+// it would skip precisely the words `GC_SPILL_REGISTERS` just wrote -- the whole
+// reason the spill exists -- and the collector would free objects a parked thread
+// holds only in x19-x28/d8-d15. The stack pointer is below the entire frame, so it
+// covers the spills, the locals, and every frame above.
+#if defined(__aarch64__)
+#define GC_STACK_TOP()                                                                \
+    ({ void *__sp; __asm__ volatile("mov %0, sp" : "=r"(__sp)); __sp; })
+#elif defined(__x86_64__)
+#define GC_STACK_TOP()                                                                \
+    ({ void *__sp; __asm__ volatile("movq %%rsp, %0" : "=r"(__sp)); __sp; })
+#else
+#define GC_STACK_TOP() __builtin_frame_address(0)
+#endif
+
+
+// The registry the collector walks to reach every mutator's roots and cursor.
+// Contexts are individually allocated and cache-line aligned: a thread writes
+// `self->ix_ptr` and `self->ix_bytes` on every allocation, so packing them adjacently would
+// make each thread's allocations invalidate its neighbour's line.
+#define GC_MAX_THREADS 256
+#define GC_CACHE_LINE 64
+static ThreadCtx *gc_threads[GC_MAX_THREADS];
+static size_t gc_thread_count = 0;
+static pthread_mutex_t gc_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// Guards the genuinely shared allocator state: the block list and its recyclable
+// links, the pointer sets, and the large-object list. Everything else a mutator
+// touches while allocating is its own cursor. Never held across `gc_reserve`, so a
+// collection can never be triggered from inside it.
+static pthread_mutex_t gc_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// Roots that live outside both the emitted global table and any thread's stack.
+// A spawned thread's action and its eventual result are the motivating case: the
+// action is handed to a thread that has not started, and the result outlives the
+// thread that produced it but is not yet held by the joiner -- in both windows the
+// only reference is a C struct the collector would otherwise never look at.
+#define GC_MAX_PINS 4096
+static Value *gc_pins[GC_MAX_PINS];
+static size_t gc_pin_count = 0;
+static pthread_mutex_t gc_pin_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void gc_pin(Value *slot) {
+    pthread_mutex_lock(&gc_pin_lock);
+    if (gc_pin_count == GC_MAX_PINS) {
+        fprintf(stderr, "marmelade: more than %d pinned roots\n", GC_MAX_PINS);
+        abort();
+    }
+    gc_pins[gc_pin_count++] = slot;
+    pthread_mutex_unlock(&gc_pin_lock);
+}
+
+void gc_unpin(Value *slot) {
+    pthread_mutex_lock(&gc_pin_lock);
+    for (size_t i = 0; i < gc_pin_count; i++)
+        if (gc_pins[i] == slot) { gc_pins[i] = gc_pins[--gc_pin_count]; break; }
+    pthread_mutex_unlock(&gc_pin_lock);
+}
+
+// Bytes SETTLED by all threads since the last collection -- finished runs and
+// large objects. Deciding to collect is global even though allocating is local
+// (notes/threading.md 4.1), but summing the registry per allocation would be
+// absurd, so each thread adds its run's total when it leaves the run: once per
+// ~32 KiB rather than once per object. `gc_reserve` adds the asking thread's own
+// in-flight run exactly and under-counts other threads' by at most one run each,
+// which the Appel threshold absorbs.
+static _Atomic size_t ix_total_bytes = 0;
+
+// Batching these RMWs per thread (fold in only every 1 MiB) was tried and MEASURED
+// on the 1e9-row benchmark: ~950k contended RMWs became a few thousand, and both
+// wall and CPU time were unchanged. Not kept -- it buys nothing and costs precision
+// in the collection trigger. The thread-count CPU growth it was aimed at is mostly
+// the memory system: 12 INDEPENDENT processes streaming distinct regions show +13.9%
+// of the same growth with nothing of ours shared.
+
+// ---------------------------------------------------------------- rendezvous
+//
+// A collection needs every mutator stopped, because conservative roots mean the
+// collector cannot read a running thread's stack. Stopping is COOPERATIVE: the
+// requester raises `gc_pending` and each thread parks at its next poll. Nothing
+// writes another thread's state, and a thread stops at a point it chose -- which
+// makes the whole thing deterministic and debuggable, unlike signal-based
+// suspension (notes/threading.md 3.1, 3.3).
+//
+// Mutators only ever READ the flag. If each cleared it on seeing it, the first
+// thread to notice would clear it and the rest would sail past.
+static atomic_bool gc_pending = false;
+static pthread_mutex_t gc_stw_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gc_stw_resume = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t gc_stw_parked = PTHREAD_COND_INITIALIZER;
+static size_t gc_parked = 0;     // threads parked, or in a no-heap foreign region
+
+typedef enum { THREAD_RUNNING, THREAD_PARKED, THREAD_FOREIGN } ThreadState;
+
+// Park until the in-flight collection finishes. The predicate loop is not
+// optional: checking the flag and then waiting has a window in which the
+// requester finishes and broadcasts, and the wakeup is lost forever.
+static void gc_park(void) {
+    GC_SPILL_REGISTERS();
+    pthread_mutex_lock(&gc_stw_lock);
+    self->state = THREAD_PARKED;
+    self->stack_top = GC_STACK_TOP(); // where the collector scans from (see GC_STACK_TOP)
+    gc_parked++;
+    pthread_cond_signal(&gc_stw_parked);
+    while (atomic_load_explicit(&gc_pending, memory_order_acquire))
+        pthread_cond_wait(&gc_stw_resume, &gc_stw_lock);
+    gc_parked--;
+    self->state = THREAD_RUNNING;
+    pthread_mutex_unlock(&gc_stw_lock);
+
+    // The collection rebuilt `ix_recycle`, so any run held from the previous epoch
+    // is gone; take a fresh one on the next allocation. The privately-held spares go
+    // back too: reclaim relisted them from `ix_blocks`, so holding one now would mean
+    // two threads bump into the same block.
+    self->ix_cur = NULL; self->ix_ptr = 0; self->ix_limit = 0; self->ix_run = 0;
+    self->ix_spare = NULL;
+}
+
+
+
+// Called by generated code at loop back-edges, and by any long-running foreign
+// that neither allocates nor blocks. Free when no collection is pending.
+void gc_poll(void) {
+    if (__builtin_expect(atomic_load_explicit(&gc_pending, memory_order_relaxed), 0))
+        gc_park();
+}
+
+// Bracket a call that blocks in the kernel for an unbounded time -- a read from a
+// pipe or socket, opening a cold file. Inside, the thread may NOT allocate, touch
+// a managed object, or call back into Marmelade: it publishes its stack top on the
+// way in and the collector then treats it as parked, scanning those roots while it
+// sleeps. Because it cannot touch the heap, that snapshot stays accurate however
+// long it blocks.
+//
+// Do not bracket an ordinary foreign. A `FOREIGN_DECL` worker is a managed mutator
+// -- it inspects, allocates and calls closures -- and one that merely runs a long
+// time wants `gc_poll` in its loop instead (notes/threading.md 3.2).
+void enter_blocking_call(void) {
+    GC_SPILL_REGISTERS();
+    pthread_mutex_lock(&gc_stw_lock);
+    self->stack_top = GC_STACK_TOP();
+    self->state = THREAD_FOREIGN;
+    gc_parked++;
+    pthread_cond_signal(&gc_stw_parked);
+    pthread_mutex_unlock(&gc_stw_lock);
+}
+
+// On the way out, wait for any collection already in flight: it is tracing against
+// a snapshot that assumes this thread is not running.
+void leave_blocking_call(void) {
+    pthread_mutex_lock(&gc_stw_lock);
+    while (atomic_load_explicit(&gc_pending, memory_order_acquire))
+        pthread_cond_wait(&gc_stw_resume, &gc_stw_lock);
+    gc_parked--;
+    self->state = THREAD_RUNNING;
+    pthread_mutex_unlock(&gc_stw_lock);
+}
+
 
 static Slab *slab_of(uintptr_t slot) { return (Slab *)(slot & SLAB_MASK); }
 
@@ -226,6 +429,49 @@ static bool is_object(uintptr_t w) {
 // objects are rare, so a growable array (compacted at each sweep) is ample.
 static GcHeader **gc_large = NULL;
 static size_t gc_large_len = 0, gc_large_cap = 0;
+
+// Handles that own something the OS must be told about: an OBJ_MMAP's mapping.
+// Immix -- the default collector -- reclaims a small object by freeing the LINE it
+// sits in and never touches the object itself, so it never reaches `free_object`,
+// which is where the paired `munmap` lives. An Mmap handle is 32 B, i.e. small, so
+// under Immix every mapping leaked (measured: 0 of 2000 handles unmapped, against
+// 2000 of 2000 under MARM_GC=slab). The destructor cannot ride on the storage
+// reclaim, so track the handles and run it explicitly while the mark bits still
+// stand. One entry per mapped file, so a growable array compacted at each sweep is
+// ample -- the same shape as `gc_large`.
+static GcHeader **gc_mmaps = NULL;
+static size_t gc_mmaps_len = 0, gc_mmaps_cap = 0;
+
+// Called from `mk_mmap` on whatever thread mapped the file, so it takes the
+// allocator lock like the other shared-list append.
+static void mmap_track(GcHeader *h) {
+    pthread_mutex_lock(&gc_alloc_lock);
+    if (gc_mmaps_len == gc_mmaps_cap) {
+        gc_mmaps_cap = gc_mmaps_cap ? gc_mmaps_cap * 2 : 8;
+        gc_mmaps = realloc(gc_mmaps, gc_mmaps_cap * sizeof *gc_mmaps);
+    }
+    gc_mmaps[gc_mmaps_len++] = h;
+    pthread_mutex_unlock(&gc_alloc_lock);
+}
+
+// Unmap every mapping whose handle this collection proved unreachable. Runs after
+// the trace and BEFORE either collector's reclaim, because both clear mark bits as
+// they go. A minor keeps tenured handles regardless of their mark: a minor never
+// marks the old generation, so an unmarked old handle says nothing about liveness
+// (under Immix nothing tenures, so this only matters to the slab collector).
+static void sweep_mmaps(bool major) {
+    size_t w = 0; // compact survivors to the front, as `sweep_large` does
+    for (size_t i = 0; i < gc_mmaps_len; i++) {
+        GcHeader *h = gc_mmaps[i];
+        if (h->mark || (!major && h->old)) { gc_mmaps[w++] = h; continue; }
+        Mmap *m = BODY(h);
+        if (!m->closed) { // `mmap_close` is the eager opt-in; don't unmap twice
+            munmap(m->region, m->len);
+            m->closed = true;
+        }
+    }
+    gc_mmaps_len = w;
+}
 static void large_push(GcHeader *h) {
     if (gc_large_len == gc_large_cap) {
         gc_large_cap = gc_large_cap ? gc_large_cap * 2 : 16;
@@ -244,15 +490,37 @@ static size_t gc_old_bytes = 0;        // live bytes tenured in the old generati
 static uintptr_t *gc_rem = NULL; // body pointers of old mutated containers
 static size_t gc_rem_len = 0, gc_rem_cap = 0;
 
+// Appends to the CALLING THREAD's buffer: this runs from user code on any thread,
+// and a racing append to one shared array drops a root -- after which the collector
+// frees a live object and fails somewhere unrelated. The buffers are merged into
+// `gc_rem` at the start of a collection, when every mutator is parked.
 static void gc_remember_object(void *body) {
     if (!HEADER(body)->old) return; // young container: a minor traces it anyway
-    for (size_t i = 0; i < gc_rem_len; i++)
-        if (gc_rem[i] == (uintptr_t)body) return; // already remembered
-    if (gc_rem_len == gc_rem_cap) {
-        gc_rem_cap = gc_rem_cap ? gc_rem_cap * 2 : 16;
-        gc_rem = realloc(gc_rem, gc_rem_cap * sizeof *gc_rem);
+    ThreadCtx *ctx = self;
+    for (size_t i = 0; i < ctx->rem_len; i++)
+        if (ctx->rem[i] == (uintptr_t)body) return; // already remembered
+    if (ctx->rem_len == ctx->rem_cap) {
+        ctx->rem_cap = ctx->rem_cap ? ctx->rem_cap * 2 : 16;
+        ctx->rem = realloc(ctx->rem, ctx->rem_cap * sizeof *ctx->rem);
     }
-    gc_rem[gc_rem_len++] = (uintptr_t)body;
+    ctx->rem[ctx->rem_len++] = (uintptr_t)body;
+}
+
+// Fold every thread's buffer into the collector's set. Called with all mutators
+// parked. Duplicates across threads are harmless -- an entry is only ever used as
+// an extra tracing root.
+static void gc_merge_remembered(void) {
+    for (size_t t = 0; t < gc_thread_count; t++) {
+        ThreadCtx *ctx = gc_threads[t];
+        for (size_t i = 0; i < ctx->rem_len; i++) {
+            if (gc_rem_len == gc_rem_cap) {
+                gc_rem_cap = gc_rem_cap ? gc_rem_cap * 2 : 16;
+                gc_rem = realloc(gc_rem, gc_rem_cap * sizeof *gc_rem);
+            }
+            gc_rem[gc_rem_len++] = ctx->rem[i];
+        }
+        ctx->rem_len = 0;
+    }
 }
 
 static void gc_prune_remembered(void) {
@@ -262,6 +530,28 @@ static void gc_prune_remembered(void) {
     gc_rem_len = kept;
 }
 static size_t gc_nursery = 256u << 20; // trigger a minor GC once the nursery fills.
+
+// N threads fill one fixed budget N times faster, so collections would fire N
+// times more often for the same total work -- each now paying a rendezvous over N
+// threads. Only the FLOOR needs to scale: the Appel `2 * live` term already grows
+// with the live set that N threads carry. Linear per added thread holds
+// collections-per-unit-work flat; the cap is what bounds memory, since the floor
+// is a licence to accumulate that much garbage.
+//
+// From the HIGH-WATER MARK, never the live count: monotone, so the floor cannot
+// oscillate as threads come and go, and there is no feedback loop between
+// collection and what triggers it. The collector may adapt to the program, never
+// to the schedule (notes/threading.md 4.2). `MARM_THREAD_NURSERY=0` restores exact
+// single-thread behaviour, which is the clean A/B baseline.
+#define GC_MAX_THREAD_FACTOR 4
+static size_t gc_threads_hwm = 1;      // most threads ever registered at once
+static size_t gc_thread_extra = 0;     // MARM_THREAD_NURSERY, in bytes
+
+static size_t gc_threshold_floor(void) {
+    size_t capped = gc_nursery * GC_MAX_THREAD_FACTOR;
+    size_t scaled = gc_nursery + gc_thread_extra * (gc_threads_hwm - 1);
+    return scaled < capped ? scaled : capped;
+}
 // 256 MiB (was 16 MiB): high-churn workloads (e.g. the binary_codec benchmark)
 // pay a per-collection fixed cost (a full conservative stack scan) plus
 // false-tenuring of transient garbage that is live when a too-frequent minor GC
@@ -281,13 +571,18 @@ static bool gc_on = false;
 static bool gc_major = false;          // is the in-progress collection a major one?
 static bool gc_generational = true;    // MARM_NOGEN=1 forces a full sweep every GC
 static bool gc_disabled = false;       // MARM_NOGC=1 never collects (leaks; baseline only)
-static void *gc_stack_bottom = NULL;
 
 // Statistics, reported at exit when MARM_GC_STATS is set.
 static unsigned long gc_minor_count = 0, gc_major_count = 0;
 static unsigned long long gc_total_bytes = 0;
-static double gc_time = 0.0;   // seconds spent inside gc_run (collection)
-static double alloc_time = 0.0; // seconds in the allocation slow path, EXCLUDING any
+// Timing counters are read and written by every thread that allocates or
+// collects, so they are atomic nanoseconds rather than plain doubles -- a benign
+// race is still a data race, and TSan is the only thing that finds the class.
+// Stored as integers because C11 atomics on floating point are not lock-free.
+static _Atomic unsigned long long gc_time_ns = 0;   // inside gc_run (collection)
+static _Atomic unsigned long long alloc_time_ns = 0; // in the allocation slow path,
+#define gc_time (gc_time_ns / 1e9)
+#define alloc_time (alloc_time_ns / 1e9)
                                 // collection it triggered (run/block refill overhead);
                                 // the fast bump in gc_new is folded into mutator time
 static double gc_started = 0.0; // wall clock at gc_init
@@ -298,6 +593,12 @@ static double gc_started = 0.0; // wall clock at gc_init
 // State + stack closures would remove. Gated: a single predictable branch off the hot
 // path, no effect unless MARM_ALLOC_STATS is set.
 static bool gc_alloc_stats = false;
+// Is anyone going to READ the timing counters? Taking them is not free: two
+// `clock_gettime`s and an `atomic_fetch_add` on one shared cache line, on EVERY
+// allocation slow-path call -- roughly once per 32 KiB, from every thread at once.
+// That RMW is the contended kind, and it inflates the very number it is measuring:
+// the more threads, the longer the interval it reports. Off unless asked for.
+static bool gc_timing = false;
 #define ALLOC_MAX_ARITY 16
 static unsigned long long alloc_hist_n[OBJ_KIND_COUNT][ALLOC_MAX_ARITY + 1];
 static unsigned long long alloc_hist_b[OBJ_KIND_COUNT][ALLOC_MAX_ARITY + 1];
@@ -354,6 +655,14 @@ static void mark_obj(void *body) {
 // is monomorphised per-type at codegen. `GcHeader.kind` (the OBJ_* kinds) is untouched;
 // the GC still dispatches its field tracing on it.
 
+// MARM_GC_VERIFY=1: check every traced child really is a live object. The fast path
+// deliberately skips this ("children of live objects are always valid"), which is
+// true only if the heap is intact -- so when it is not, this is what says so, at the
+// point the bad pointer is FOLLOWED rather than wherever it is later dereferenced.
+static bool gc_verify = false;
+static const GcHeader *gc_tracing = NULL;   // the object whose fields are being traced
+static const char *gc_trace_phase = "roots";
+
 static void mark_value(Value v) {
     // A precise Value: immediates (Int/Bool/Char/Unit) are odd; every even word
     // is a heap body pointer, save 0 (an uninitialised root). No `is_object`
@@ -361,6 +670,17 @@ static void mark_value(Value v) {
     // objects are always valid. (Stage 1b's static-text descriptors will be the
     // one even non-heap case; they get handled when introduced.)
     if (!v.w || (v.w & 1)) return;
+    // A static text descriptor lives in .rodata: `is_object` is false for it by
+    // design and `mark_obj` skips it, so it is not corruption.
+    if (__builtin_expect(gc_verify, 0) && !is_object(v.w)
+        && HEADER(as_ptr(v))->old != MARM_ETERNAL) {
+        fprintf(stderr,
+                "marmelade: traced a child that is not a live object: %p\n"
+                "  phase=%s parent=%p parent_kind=%d parent_body=%u\n",
+                (void *)v.w, gc_trace_phase, (void *)gc_tracing,
+                gc_tracing ? gc_tracing->kind : -1, gc_tracing ? gc_tracing->body : 0);
+        abort();
+    }
     mark_obj(as_ptr(v));
 }
 
@@ -373,8 +693,10 @@ static void mark_candidate(uintptr_t w) {
 }
 
 static void gc_trace(void) {
+    gc_trace_phase = "trace";
     while (gc_work_len) {
         GcHeader *h = gc_work[--gc_work_len];
+        gc_tracing = h;
         switch (h->kind) {
         case OBJ_TUPLE: {
             Tuple *t = BODY(h);
@@ -437,15 +759,13 @@ static void scan_words(void *lo, void *hi) {
 
 // Reclaim a dead object: clear its membership record and recycle its storage.
 static void free_object(GcHeader *h) {
-    // An OBJ_MMAP handle owns an OS mapping. Reclaim it here, when the collector
-    // frees the (now unreachable) handle -- a borrowed Bytes/Text view keeps the
-    // handle alive through its traced `owner`, so the mapping stays valid exactly
-    // as long as something references it, and is unmapped once nothing does. This
-    // is the mapping's destructor, not a general finalizer: no user code, no
-    // resurrection, just the `munmap` that pairs with the handle's `free` (the
-    // same shape as the `free()` a large object gets below). `mmap_close` is the
-    // rare explicit opt-in that unmaps eagerly; its `closed` flag guards a double
-    // unmap here.
+    // An OBJ_MMAP handle owns an OS mapping, unmapped once nothing references it
+    // (a borrowed Bytes/Text view keeps the handle alive through its traced
+    // `owner`, so the mapping outlives every view of it). That destructor is driven
+    // by `sweep_mmaps`, not from here: Immix reclaims small objects by line and
+    // never calls this at all. This stays as the belt-and-braces path for a handle
+    // that ever becomes large enough to take the malloc route; `closed` -- set by
+    // `sweep_mmaps` and by the explicit `mmap_close` -- guards the double unmap.
     if (h->kind == OBJ_MMAP) {
         Mmap *m = BODY(h);
         if (!m->closed) munmap(m->region, m->len);
@@ -524,7 +844,53 @@ static void sweep_large(bool major, size_t *young_live, size_t *old_live) {
 
 // One collection. `major` selects a full sweep of both generations; otherwise a
 // minor collection sweeps only the nursery, tenuring its survivors.
+// Try to become the collector. Returns true holding the right to collect, with
+// every other mutator stopped; false if another thread got there first, in which
+// case THIS thread has just parked through that collection and the caller must not
+// collect again -- the heap it was about to make room in has already been swept.
+//
+// Without this, two threads reaching the threshold together each raise the flag
+// and each wait for the other to park: neither ever does, and the program hangs.
+// With one registered thread it is a flag set and cleared, no waiting.
+static bool gc_stop_the_world(void) {
+    pthread_mutex_lock(&gc_stw_lock);
+    if (atomic_load_explicit(&gc_pending, memory_order_acquire)) {
+        // Someone else is collecting. Park here rather than queueing to collect
+        // again: this is exactly what a poll would have done.
+        GC_SPILL_REGISTERS();
+        self->state = THREAD_PARKED;
+        self->stack_top = GC_STACK_TOP();
+        gc_parked++;
+        pthread_cond_signal(&gc_stw_parked);
+        while (atomic_load_explicit(&gc_pending, memory_order_acquire))
+            pthread_cond_wait(&gc_stw_resume, &gc_stw_lock);
+        gc_parked--;
+        self->state = THREAD_RUNNING;
+        pthread_mutex_unlock(&gc_stw_lock);
+        self->ix_cur = NULL; self->ix_ptr = 0; self->ix_limit = 0; self->ix_run = 0;
+        self->ix_spare = NULL; // relisted by the reclaim; see gc_park
+        return false;
+    }
+    atomic_store_explicit(&gc_pending, true, memory_order_release);
+    // A thread in a no-heap foreign region counts as parked: it cannot touch the
+    // heap, and it published its stack top on the way in.
+    while (gc_parked + 1 < gc_thread_count) pthread_cond_wait(&gc_stw_parked, &gc_stw_lock);
+    pthread_mutex_unlock(&gc_stw_lock);
+    return true;
+}
+
+static void gc_resume_mutators(void) {
+    pthread_mutex_lock(&gc_stw_lock);
+    atomic_store_explicit(&gc_pending, false, memory_order_release);
+    pthread_cond_broadcast(&gc_stw_resume);
+    pthread_mutex_unlock(&gc_stw_lock);
+}
+
 static void gc_run(bool major) {
+    // Everything below reads other threads' stacks and rewrites shared heap
+    // metadata, so no mutator may be running. If another thread is already
+    // collecting, this one parks through it and returns -- the work is done.
+    if (!gc_stop_the_world()) return;
     double t0 = now();
     if (major) gc_major_count++;
     else gc_minor_count++;
@@ -535,21 +901,54 @@ static void gc_run(bool major) {
     // into `regs`, which we then scan conservatively (a live pointer may sit only in a
     // register). There is no matching `longjmp`, so the return value is intentionally
     // discarded -- the `(void)` cast documents that and quiets unused-return linters.
-    (void)setjmp(regs); // NOLINT(bugprone-unused-return-value): spill-only, no longjmp
-    void *stack_top = (void *)&regs;
+    // `_setjmp` rather than `setjmp`: on Darwin the latter also saves the signal mask
+    // via `sigprocmask`, a syscall this has no use for.
+    (void)_setjmp(regs); // NOLINT(bugprone-unused-return-value): spill-only, no longjmp
+    // The collector scans ITSELF from its stack pointer, not from `&regs`. `_setjmp`
+    // captures the registers as they stand *here*, by which point this function's own
+    // calls (`gc_stop_the_world`, `now`, `ix_reset_lines`) may already have overwritten
+    // a callee-saved register that still held a mutator's live `Value` on the way in.
+    // That incoming value survives only in gc_run's prologue spill slots -- which
+    // AArch64 clang places at the BOTTOM of this frame, below `&regs`. Starting at the
+    // stack pointer covers them; starting at a local skips them (see GC_STACK_TOP).
+    void *stack_top = GC_STACK_TOP();
 
     // Precise roots: runtime builtins and the emitted global table.
+    gc_trace_phase = "builtin-roots";
     for (size_t i = 0; i < sizeof gc_builtin_roots / sizeof *gc_builtin_roots; i++)
         mark_value(*gc_builtin_roots[i]);
+    gc_trace_phase = "user-roots";
     for (size_t i = 0; i < gc_user_roots_count; i++) mark_value(*gc_user_roots[i]);
+    // Pinned roots: every mutator is parked, so no one is adding or removing.
+    gc_trace_phase = "pinned-roots";
+    for (size_t i = 0; i < gc_pin_count; i++) mark_value(*gc_pins[i]);
+    gc_trace_phase = "stacks";
 
     // Conservative roots: the saved registers and the live portion of the stack
-    // (which grows down, so `stack_top` is below `gc_stack_bottom`).
+    // (which grows down, so `stack_top` is below `self->stack_bottom`).
+    // ...then the live portion of every registered thread's stack. The collecting
+    // thread scans itself from the frame it is standing in; any other thread is
+    // scanned from where it parked. With one thread this is the old single scan.
     scan_words(&regs, (char *)&regs + sizeof regs);
-    scan_words(stack_top, gc_stack_bottom);
+    pthread_mutex_lock(&gc_registry_lock);
+    for (size_t i = 0; i < gc_thread_count; i++) {
+        ThreadCtx *ctx = gc_threads[i];
+        void *top = ctx == self ? stack_top : ctx->stack_top;
+        // A registered thread that is neither the collector nor parked has published
+        // no roots: scanning from NULL would walk the whole address space, and NOT
+        // scanning it silently frees whatever only it can see.
+        if (!top) {
+            fprintf(stderr, "marmelade: thread %zu has no published stack top (state %d)\n",
+                    i, ctx->state);
+            abort();
+        }
+        scan_words(top, ctx->stack_bottom);
+    }
+    pthread_mutex_unlock(&gc_registry_lock);
 
     // Write-barrier roots. A minor skips each old container itself, so trace its
     // mutable children directly and enqueue any young objects they reference.
+    gc_merge_remembered();
     if (!major) {
         for (size_t i = 0; i < gc_rem_len; i++) {
             void *body = (void *)gc_rem[i];
@@ -565,6 +964,9 @@ static void gc_run(bool major) {
     }
 
     gc_trace();
+
+    // Mark bits are still standing here; both reclaim paths below clear them.
+    sweep_mmaps(major);
 
     if (gc_immix) {
         ix_reclaim(); // mark-region: free empty lines/keep occupied ones, no per-object free
@@ -596,7 +998,9 @@ static void gc_run(bool major) {
     }
 
     gc_major = false;
-    gc_time += now() - t0;
+    atomic_fetch_add_explicit(&gc_time_ns, (unsigned long long)((now() - t0) * 1e9),
+                              memory_order_relaxed);
+    gc_resume_mutators();
 }
 
 // Public entry: force a full collection.
@@ -605,14 +1009,26 @@ void gc_collect(void) { gc_run(true); }
 // Collect if this next allocation would fill the nursery. Called before
 // allocating, while the operands are still live on the stack/registers. A minor
 // collection that leaves the old generation too large escalates to a major.
+static bool gc_stress = false;         // MARM_GC_STRESS=1 collects on EVERY allocation
+
 static void gc_reserve(size_t need) {
     if (!gc_on || gc_disabled) return;
+    // The allocation poll. Here rather than in `gc_new`'s inline fast path: this is
+    // reached once per exhausted run (~32 KiB) instead of once per object, so it
+    // costs the hot path nothing and still bounds how long a rendezvous waits.
+    // It is also already where a collection happens, so parking instead of
+    // collecting is a branch at a point the thread was going to reach anyway.
+    gc_poll();
     if (gc_immix) {
         // Collect once allocation since the last collection crosses the adaptive
         // threshold (Appel: ~2x the live set, floored at one nursery). This keeps a
         // whole-heap trace cheap-per-garbage on a large stable live set (the codec)
         // while staying frequent when little survives (utf8_get).
-        if (ix_bytes + need > ix_threshold) gc_run(false);
+        size_t allocated = atomic_load_explicit(&ix_total_bytes, memory_order_relaxed)
+                         + (size_t)(self->ix_ptr - self->ix_run);
+        // Under stress, collect every time round: the point is to make a rare
+        // interleaving certain, so pay any price for frequency.
+        if (gc_stress || allocated + need > ix_threshold) gc_run(false);
         return;
     }
     if (gc_young_bytes + need > gc_nursery) {
@@ -635,24 +1051,21 @@ static void gc_reserve(size_t need) {
 #define IX_LINES (IX_BLOCK / IX_LINE)      // 256 lines / block
 #define IX_MASK  (~((uintptr_t)IX_BLOCK - 1))
 #define IX_MAX_ALLOC (IX_LINE * 4u)        // bigger than this -> large-object space
+#define IX_BATCH 8                         // blocks claimed per allocator-lock acquisition
 
-typedef struct IxBlock {
+struct IxBlock {
     struct IxBlock *next;            // link over every block, for reclaim iteration
     struct IxBlock *rnext;           // recyclable list: blocks with free lines to bump into
     uint8_t line[IX_LINES];          // per line: occupied? (rebuilt each collection)
     uint8_t start[IX_BLOCK / 8 / 8]; // object-start bitmap, 1 bit per 8 B (conservative)
     uint32_t data_line;              // first data line (past this header)
-} IxBlock;
+};
 
 #define IX_GBYTES (IX_LINE / 8u / 8u)      // object-start bytes per line (16 granules = 2)
 
 static IxBlock *ix_blocks = NULL, *ix_tail = NULL; // all blocks, in allocation order
 static IxBlock *ix_recycle = NULL;         // blocks with free lines (rebuilt each collection)
 static PtrSet ix_set;                      // block bases, O(1) conservative membership
-static IxBlock *ix_cur = NULL;             // block currently being bump-filled
-static uintptr_t ix_ptr = 0, ix_limit = 0; // bump cursor + end of the current free run
-static uintptr_t ix_run = 0;               // start of the current run (for bulk line marking)
-static size_t ix_bytes = 0;                // bytes allocated since the last collection
 
 static inline void ix_set_start(IxBlock *b, uintptr_t body) {
     size_t g = (body - (uintptr_t)b) / 8;
@@ -695,47 +1108,88 @@ static bool ix_find_run(IxBlock *b, uint32_t from, uintptr_t *s, uintptr_t *e) {
 // of line (and never inlined) so `gc_new`'s fast path folds into the fixed-arity
 // constructors as a tight bump with no call. `total` arrives already 8-rounded.
 static __attribute__((noinline)) void *gc_alloc_slow(size_t total, ObjKind kind) {
-    double slow_t0 = now();
-    double gc_before = gc_time; // subtract any collection triggered below
+    double slow_t0 = 0.0;
+    unsigned long long gc_before = 0;
+    if (__builtin_expect(gc_timing, 0)) {
+        slow_t0 = now();
+        gc_before = atomic_load_explicit(&gc_time_ns, memory_order_relaxed); // subtract
+                                                    // any collection triggered below
+    }
     gc_reserve(total); // Appel (immix) / nursery (slab) threshold: collect if due
     GcHeader *h;
     if (gc_immix) {
         if (total > IX_MAX_ALLOC) {                 // large: malloc, shared large path
             assert(total - sizeof(GcHeader) <= UINT32_MAX); // body is uint32 (see GcHeader)
             h = malloc(total);
+            pthread_mutex_lock(&gc_alloc_lock);
             ps_insert(&large_set, (uintptr_t)BODY(h));
             large_push(h);
+            pthread_mutex_unlock(&gc_alloc_lock);
+            // A large object never enters a run, so it is counted here; everything
+            // else is counted when its run is left, into `ix_total_bytes`.
+            self->ix_bytes += total;
+            atomic_fetch_add_explicit(&ix_total_bytes, total, memory_order_relaxed);
         } else {
-            while (ix_ptr + total > ix_limit) {
+            while (self->ix_ptr + total > self->ix_limit) {
                 // Leaving the current run: bulk-mark the lines we filled as occupied, in
                 // one memset, so `ix_find_run` never re-fills them. Doing this per run
                 // (not per object) is the Phase-3 win.
-                if (ix_cur && ix_ptr > ix_run) {
-                    uint32_t a = (uint32_t)((ix_run - (uintptr_t)ix_cur) / IX_LINE);
-                    uint32_t z = (uint32_t)((ix_ptr - 1 - (uintptr_t)ix_cur) / IX_LINE);
-                    memset(ix_cur->line + a, 1, z - a + 1);
+                if (self->ix_cur && self->ix_ptr > self->ix_run) {
+                    uint32_t a = (uint32_t)((self->ix_run - (uintptr_t)self->ix_cur) / IX_LINE);
+                    uint32_t z = (uint32_t)((self->ix_ptr - 1 - (uintptr_t)self->ix_cur) / IX_LINE);
+                    memset(self->ix_cur->line + a, 1, z - a + 1);
+                    size_t filled = self->ix_ptr - self->ix_run;   // this run's allocation
+                    self->ix_bytes += filled;
+                    atomic_fetch_add_explicit(&ix_total_bytes, filled, memory_order_relaxed);
                 }
                 uintptr_t s, e;
-                if (ix_cur) {                        // more free lines forward in this block?
-                    uint32_t from = (uint32_t)((ix_limit - (uintptr_t)ix_cur) / IX_LINE);
-                    if (from < IX_LINES && ix_find_run(ix_cur, from, &s, &e)) {
-                        ix_ptr = s; ix_limit = e; ix_run = s; continue;
+                if (self->ix_cur) {                        // more free lines forward in this block?
+                    uint32_t from = (uint32_t)((self->ix_limit - (uintptr_t)self->ix_cur) / IX_LINE);
+                    if (from < IX_LINES && ix_find_run(self->ix_cur, from, &s, &e)) {
+                        self->ix_ptr = s; self->ix_limit = e; self->ix_run = s; continue;
                     }
                 }
                 // Next block with free lines: pop the recyclable list (never walks full
                 // blocks -- that was O(blocks) per fill), else grow a fresh block.
-                if (ix_recycle) { ix_cur = ix_recycle; ix_recycle = ix_recycle->rnext; }
-                else ix_cur = ix_new_block();
-                (void)ix_find_run(ix_cur, ix_cur->data_line, &s, &e); // recyclable/fresh => a run
-                ix_ptr = s; ix_limit = e; ix_run = s;
+                // Taking blocks is the one shared step: after it, each block is this
+                // thread's alone to bump into (block-exclusive ownership), so
+                // `ix_find_run` below needs no lock. Claim IX_BATCH of them per
+                // acquisition -- one lock per 32 KiB is a million acquisitions on this
+                // workload, and every thread wants one at once.
+                if (!self->ix_spare) {
+                    pthread_mutex_lock(&gc_alloc_lock);
+                    for (int k = 0; k < IX_BATCH && ix_recycle; k++) {
+                        IxBlock *b = ix_recycle;
+                        ix_recycle = b->rnext;
+                        b->rnext = self->ix_spare;
+                        self->ix_spare = b;
+                    }
+                    if (!self->ix_spare) // pool dry: grow, also a batch at a time
+                        for (int k = 0; k < IX_BATCH; k++) {
+                            IxBlock *b = ix_new_block();
+                            b->rnext = self->ix_spare;
+                            self->ix_spare = b;
+                        }
+                    pthread_mutex_unlock(&gc_alloc_lock);
+                }
+                self->ix_cur = self->ix_spare;
+                self->ix_spare = self->ix_spare->rnext;
+                (void)ix_find_run(self->ix_cur, self->ix_cur->data_line, &s, &e); // recyclable/fresh => a run
+                self->ix_ptr = s; self->ix_limit = e; self->ix_run = s;
             }
-            h = (GcHeader *)ix_ptr;
-            ix_ptr += total;
-            ix_set_start(ix_cur, (uintptr_t)BODY(h));
+            h = (GcHeader *)self->ix_ptr;
+            self->ix_ptr += total;
+            ix_set_start(self->ix_cur, (uintptr_t)BODY(h));
+            // Under stress, end the run here so the very next allocation misses the
+            // bump check and comes back through `gc_reserve` -- which is what turns
+            // "collect often" into "collect on every allocation".
+            if (__builtin_expect(gc_stress, 0)) self->ix_limit = self->ix_ptr;
         }
-        ix_bytes += total; // accumulated into gc_total_bytes at each reclaim (stats)
     } else {
         // Slab collector (non-default): every allocation lands here.
+        // The slab allocator (MARM_GC=slab) keeps all of its state shared, so the
+        // whole path is under the lock rather than just an acquisition step.
+        pthread_mutex_lock(&gc_alloc_lock);
         if (total <= SMALL_MAX) {
             size_t c = (total + 15) / 16;
             if (!free_list[c]) grow_class(c);
@@ -749,6 +1203,7 @@ static __attribute__((noinline)) void *gc_alloc_slow(size_t total, ObjKind kind)
             ps_insert(&large_set, (uintptr_t)BODY(h));
             large_push(h);
         }
+        pthread_mutex_unlock(&gc_alloc_lock);
         gc_young_bytes += total;
         gc_total_bytes += total;
     }
@@ -757,7 +1212,14 @@ static __attribute__((noinline)) void *gc_alloc_slow(size_t total, ObjKind kind)
     h->kind = (uint8_t)kind;
     h->old = 0;
     if (gc_alloc_stats) alloc_record(kind, total);
-    alloc_time += (now() - slow_t0) - (gc_time - gc_before);
+    if (__builtin_expect(gc_timing, 0)) {
+        unsigned long long slow_ns = (unsigned long long)((now() - slow_t0) * 1e9);
+        unsigned long long collected_ns =
+            atomic_load_explicit(&gc_time_ns, memory_order_relaxed) - gc_before;
+        atomic_fetch_add_explicit(&alloc_time_ns,
+                                  slow_ns > collected_ns ? slow_ns - collected_ns : 0,
+                                  memory_order_relaxed);
+    }
     return BODY(h);
 }
 
@@ -818,10 +1280,29 @@ static void ix_reclaim(void) {
         else free_object(h);
     }
     gc_large_len = w;
-    gc_total_bytes += ix_bytes; // fold this epoch's allocation into the lifetime total
-    ix_bytes = 0;               // (the fast path no longer updates gc_total_bytes per object)
-    ix_threshold = 2 * live > gc_nursery ? 2 * live : gc_nursery; // grow with the live set
-    ix_cur = NULL; ix_ptr = 0; ix_limit = 0; // restart bump allocation from the first block
+    // Every mutator is parked here, so walking the registry is safe. Settle each
+    // thread's in-flight run into the global total before folding it, or those
+    // bytes are simply lost. One thread or many, this is the same number the
+    // single-threaded code folded.
+    for (size_t t = 0; t < gc_thread_count; t++) {
+        ThreadCtx *ctx = gc_threads[t];
+        atomic_fetch_add_explicit(&ix_total_bytes, (size_t)(ctx->ix_ptr - ctx->ix_run),
+                                  memory_order_relaxed);
+        ctx->ix_bytes = 0;
+    }
+    gc_total_bytes += atomic_exchange_explicit(&ix_total_bytes, 0, memory_order_relaxed); // fold this epoch's allocation into the lifetime total
+    self->ix_bytes = 0;               // (the fast path no longer updates gc_total_bytes per object)
+    size_t floor = gc_threshold_floor();
+    ix_threshold = 2 * live > floor ? 2 * live : floor; // grow with the live set
+    // Every thread restarts bump allocation: the reclaim rebuilt `ix_recycle`, so a
+    // run held from the previous epoch may no longer be valid. `ix_run` resets with
+    // the cursor -- the in-flight run is measured as `ix_ptr - ix_run`, which would
+    // underflow if a stale run start outlived it.
+    for (size_t t = 0; t < gc_thread_count; t++) {
+        ThreadCtx *ctx = gc_threads[t];
+        ctx->ix_cur = NULL; ctx->ix_ptr = 0; ctx->ix_limit = 0; ctx->ix_run = 0;
+        ctx->ix_spare = NULL; // every block is back in `ix_recycle` above
+    }
 }
 
 // Conservative membership for the Immix heap: is `w` the body of a live object?
@@ -853,15 +1334,19 @@ static_assert(sizeof(GcHeader) == 8 && offsetof(GcHeader, body) == 0 &&
               "gc_new fast path packs the header into one little-endian 8-byte store");
 static inline void *gc_new(size_t body, ObjKind kind) {
     size_t total = (sizeof(GcHeader) + body + 7u) & ~(size_t)7u; // 8-align the bump
-    uintptr_t p = ix_ptr;
-    if (__builtin_expect(gc_immix && total <= IX_MAX_ALLOC && p + total <= ix_limit, 1)) {
-        ix_ptr = p + total;
+    uintptr_t p = self->ix_ptr;
+    if (__builtin_expect(gc_immix && total <= IX_MAX_ALLOC && p + total <= self->ix_limit, 1)) {
+        self->ix_ptr = p + total;
         GcHeader *h = (GcHeader *)p;
-        ix_set_start(ix_cur, (uintptr_t)BODY(h));
+        // The owning block is a mask of the address (blocks are IX_BLOCK-aligned),
+        // which is how `ix_mark_lines` finds it too. Deriving it beats loading
+        // `self->ix_cur`: one field fewer to reach through the thread-context
+        // pointer on every allocation, and that pointer chase is the whole cost of
+        // making the cursor per-thread.
+        ix_set_start((IxBlock *)((uintptr_t)h & IX_MASK), (uintptr_t)BODY(h));
         // One store initialises the whole 8-byte header (little-endian): body in
         // bytes 0-3, kind in byte 5, mark/old/pad zero. See the static_assert above.
         *(uint64_t *)h = (uint64_t)(total - sizeof(GcHeader)) | ((uint64_t)(uint8_t)kind << 40);
-        ix_bytes += total;
         if (gc_alloc_stats) alloc_record(kind, total);
         return BODY(h);
     }
@@ -876,7 +1361,8 @@ static void gc_report(void) {
             "nursery %zu KiB\n"
             "[gc] gc %.3fs / total %.3fs -> mutator throughput %.1f%%\n"
             "[time] mutator %.3fs (%.1f%%)  alloc %.3fs (%.1f%%)  gc %.3fs (%.1f%%)\n",
-            gc_minor_count, gc_major_count, (gc_total_bytes + ix_bytes) / 1048576.0,
+            gc_minor_count, gc_major_count, (gc_total_bytes + atomic_load_explicit(&ix_total_bytes, memory_order_relaxed)
+                  + (size_t)(self->ix_ptr - self->ix_run)) / 1048576.0,
             gc_old_bytes / 1048576.0, gc_nursery >> 10, gc_time, total,
             total > 0 ? 100.0 * (total - gc_time) / total : 100.0,
             mutator, total > 0 ? 100.0 * mutator / total : 0.0,
@@ -917,13 +1403,73 @@ static void alloc_report(void) {
             100.0 * (double)(tup2 + clos + dat) / (double)grand);
 }
 
+// A thread makes itself known to the collector. Called by the thread itself at the
+// top of its entry function, so `stack_bottom` is the highest address it will use
+// and everything it allocates lives below. Must happen before the thread's first
+// allocation and be undone after its last, or its roots go unscanned. The registry
+// lock is the one a collection holds while walking the registry, so a thread cannot
+// join or leave mid-collection.
+void gc_register_thread(void *stack_bottom) {
+    ThreadCtx *ctx = aligned_alloc(
+        GC_CACHE_LINE, ((sizeof *ctx + GC_CACHE_LINE - 1) / GC_CACHE_LINE) * GC_CACHE_LINE);
+    if (!ctx) {
+        fprintf(stderr, "marmelade: out of memory registering a thread\n");
+        abort();
+    }
+    *ctx = (ThreadCtx){.stack_bottom = stack_bottom};
+
+    // A thread must not appear mid-collection: the collector has already decided
+    // how many threads it is waiting for, and a new RUNNING one would never park,
+    // leaving it waiting forever. Wait out any collection first.
+    pthread_mutex_lock(&gc_stw_lock);
+    while (atomic_load_explicit(&gc_pending, memory_order_acquire))
+        pthread_cond_wait(&gc_stw_resume, &gc_stw_lock);
+    pthread_mutex_unlock(&gc_stw_lock);
+
+    pthread_mutex_lock(&gc_registry_lock);
+    if (gc_thread_count == GC_MAX_THREADS) {
+        fprintf(stderr, "marmelade: more than %d threads\n", GC_MAX_THREADS);
+        abort();
+    }
+    gc_threads[gc_thread_count++] = ctx;
+    if (gc_thread_count > gc_threads_hwm) gc_threads_hwm = gc_thread_count;
+    pthread_mutex_unlock(&gc_registry_lock);
+    self = ctx;
+}
+
+void gc_unregister_thread(void) {
+    if (!self) return;
+    // Leaving satisfies a waiting collector just as parking would: it is one fewer
+    // thread to wait for. Take the rendezvous lock across the removal and signal,
+    // or a collector already counting heads waits for a thread that has gone.
+    pthread_mutex_lock(&gc_stw_lock);
+    pthread_mutex_lock(&gc_registry_lock);
+    for (size_t i = 0; i < gc_thread_count; i++) {
+        if (gc_threads[i] == self) {
+            gc_threads[i] = gc_threads[--gc_thread_count];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gc_registry_lock);
+    pthread_cond_signal(&gc_stw_parked);
+    pthread_mutex_unlock(&gc_stw_lock);
+    free(self->rem);
+    free(self);
+    self = NULL;
+}
+
 void gc_init(void *stack_bottom) {
     gc_started = now();
-    gc_stack_bottom = stack_bottom;
+    gc_register_thread(stack_bottom);
     // Generation sizes are tunable (in KiB) for experimentation/benchmarking.
     const char *nursery = getenv("MARM_NURSERY");
     const char *major = getenv("MARM_MAJOR");
     if (nursery) gc_nursery = (size_t)strtoull(nursery, NULL, 10) << 10;
+    // Extra budget per additional thread (KiB). Zero -- the default -- keeps the
+    // floor at exactly one nursery however many threads run, which is the
+    // single-threaded baseline any A/B should be measured against.
+    const char *thread_nursery = getenv("MARM_THREAD_NURSERY");
+    if (thread_nursery) gc_thread_extra = (size_t)strtoull(thread_nursery, NULL, 10) << 10;
     // Major-GC trigger: after each major, gc_major_at = max(live_old * 2, floor).
     // The `* 2` (Appel's rule) keeps a major's cost proportional to the live set
     // once it is large; the FLOOR makes major *frequency* track allocation when
@@ -945,8 +1491,13 @@ void gc_init(void *stack_bottom) {
     if (which && strcmp(which, "slab") == 0) gc_immix = false;
     if (which && strcmp(which, "immix") == 0) gc_immix = true;
     ix_threshold = gc_nursery; // first immix collection after one nursery of allocation
-    if (getenv("MARM_GC_STATS")) atexit(gc_report);
-    if (getenv("MARM_ALLOC_STATS")) { gc_alloc_stats = true; atexit(alloc_report); }
+    if (getenv("MARM_GC_STATS")) { gc_timing = true; atexit(gc_report); }
+    // Collect on every allocation. Ruinously slow by design -- a GC race that fires
+    // once an hour is indistinguishable from working, and this is what makes it
+    // fire every time instead.
+    gc_stress = getenv("MARM_GC_STRESS") != NULL;
+    gc_verify = getenv("MARM_GC_VERIFY") != NULL;
+    if (getenv("MARM_ALLOC_STATS")) { gc_alloc_stats = true; gc_timing = true; atexit(alloc_report); }
     gc_on = true;
 }
 
@@ -1930,7 +2481,13 @@ SLICE_GET_BE(slice_get_i64_be, int64_t, 8)
 #define UTF8_CONT(x) (((x) & 0xC0) == 0x80)
 static bool utf8_is_valid(const uint8_t *b, size_t len) {
     size_t i = 0;
+    // A managed foreign that runs long without allocating: over a 10 MB slice it
+    // would hold up a rendezvous for its whole duration. It does not block, so it
+    // must not be bracketed as a foreign region -- it polls instead, amortised so
+    // the check costs nothing measurable (notes/threading.md 3.2).
+    size_t next_poll = 0;
     while (i < len) {
+        if (__builtin_expect(i >= next_poll, 0)) { gc_poll(); next_poll = i + (1u << 16); }
         if (b[i] < 0x80) { // ASCII (single or a run)
             while (i + 8 <= len) {
                 uint64_t w;
@@ -2036,6 +2593,7 @@ static Value mk_mmap(uint8_t *region, size_t len) {
     m->region = region;
     m->len = len;
     m->closed = false;
+    mmap_track(HEADER(m)); // so the collector can run the munmap destructor
     return VObject(m);
 }
 

@@ -16,5 +16,25 @@ module Mutable_Cell:
   get :: ∀α. Mutable_Cell α -> IO α :=
     λ(Cell cell). Mutable_Array.get_unchecked cell 0
 
+  (* A read with no `IO` wrapper. Reading a cell IS an effect -- another thread may
+     have written it -- so this is only sound where the caller knows the contents
+     are stable, e.g. storage that is installed once and thereafter only read. It
+     exists because the suspension, not the load, is what a hot path pays for. *)
+  unsafe_get :: ∀α. Mutable_Cell α -> α :=
+    λ(Cell cell). Mutable_Array.unsafe_get_unchecked cell 0
+
   modify :: ∀α. (α -> α) -> Mutable_Cell α -> IO Unit :=
     λf (Cell cell). Mutable_Array.modify_at cell 0 f
+
+  (* Rust's `Option::take`: swap `Nope` in and hand back what was there. The array
+     primitive already returns the previous element, so this is the swap itself
+     rather than a read followed by a write -- nothing can observe the cell between
+     the two halves.
+
+     What it buys is a MOVE. After a take the cell no longer holds the value, so
+     the taker is its only holder by way of this cell -- which is what makes a
+     one-shot handoff (a thread's result, a filled slot) meaningful rather than a
+     copy. It does NOT by itself prove the producer kept no other alias; see
+     notes/threading.md 0 on why there is no general move escape hatch. *)
+  take :: ∀α. Mutable_Cell (Perhaps α) -> IO (Perhaps α) := λcell.
+    Mutable_Cell.put Nope cell

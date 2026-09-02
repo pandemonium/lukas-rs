@@ -256,6 +256,34 @@ Value mk_textn(const char *src, size_t len);
 // top-level `Value` the collector treats as a root; builtins are rooted inside
 // the runtime).
 void gc_init(void *stack_bottom);
+
+// A thread joins and leaves the collector's registry. The whole interface between
+// the thread API and the GC: a thread reports ITSELF, so `Threads.c` needs no
+// knowledge of the collector and the collector needs none of pthreads' users.
+// `stack_bottom` is the highest stack address the thread will use -- take `&arg`
+// at the top of its entry function. `gc_init` registers the main thread.
+void gc_register_thread(void *stack_bottom);
+void gc_unregister_thread(void);
+
+// Check in with the collector. Generated code calls this at loop back-edges, so a
+// thread that allocates nothing still reaches a stopping point; a long-running
+// foreign that neither allocates nor blocks should call it in its own loop. Free
+// when no collection is pending.
+void gc_poll(void);
+
+// Bracket a call that blocks in the kernel for an unbounded time. Inside, the
+// thread may NOT allocate, touch a managed object, or call back into Marmelade --
+// the collector treats it as parked and scans the roots it published on entry.
+// Ordinary foreigns are managed mutators and must NOT be bracketed; a long-running
+// one wants `gc_poll` instead.
+void enter_blocking_call(void);
+void leave_blocking_call(void);
+
+// Keep a `Value` held outside the heap and outside any stack reachable. Needed
+// wherever a live reference exists only in C memory -- a spawned thread's action
+// before it starts, and its result after it finishes. Unpin when the slot dies.
+void gc_pin(Value *slot);
+void gc_unpin(Value *slot);
 void gc_collect(void);
 extern Value *const gc_user_roots[];
 extern const size_t gc_user_roots_count;

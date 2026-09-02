@@ -39,6 +39,48 @@ fn direct_array_enabled() -> bool {
     std::env::var_os("MARM_NO_DIRECT_ARRAY").is_none() && std::env::var_os("MARM_NOFLAT").is_none()
 }
 
+/// A loop that allocates nothing never reaches the allocator's poll in
+/// `gc_reserve`, so a collection would wait for it forever. That is not an exotic
+/// case: a zero-allocation loop is what the optimiser is *trying* to produce, and
+/// every unbounded computation reaches back through one of the three loopify sites
+/// below.
+///
+/// But a loop that DOES allocate, or that calls anything which might, already
+/// reaches `gc_reserve` at least once per bump run -- polling it again per
+/// iteration is pure cost. And it is not small: the flag is atomic precisely so it
+/// cannot be hoisted out of the loop, which measured **+10% on `billions`**, whose
+/// hot loops are tight and allocate constantly. So the poll goes only where it is
+/// the only thing standing between a loop and a hung collector.
+///
+/// The test is over the emitted body and errs towards keeping the poll: only a
+/// direct allocation in the loop removes it, because that is the one case where
+/// `gc_reserve` is guaranteed to be reached. A loop that merely *calls* something
+/// keeps its poll -- the callee may be a non-allocating leaf, and then nothing on
+/// the path would ever check in. `MARM_NO_POLL` removes it entirely, to measure
+/// what it costs.
+/// The poll itself, amortised. Reading the flag every iteration costs real time --
+/// it is atomic precisely so it cannot be hoisted, which measured ~10% on tight
+/// loops. A register countdown is far cheaper than a memory read, and checking one
+/// iteration in 4096 still bounds the rendezvous at well under a microsecond for
+/// any loop tight enough for this to matter.
+const POLL: &str = "if (__builtin_expect(--_poll == 0, 0)) { _poll = 4096; gc_poll(); } ";
+const POLL_DECL: &str = "unsigned _poll = 4096; ";
+
+fn poll_decl(body: &str) -> &'static str {
+    if back_edge_poll(body).is_empty() { "" } else { POLL_DECL }
+}
+
+fn back_edge_poll(body: &str) -> &'static str {
+    if std::env::var_os("MARM_NO_POLL").is_some() {
+        return "";
+    }
+    // Only a DIRECT allocation lets the poll go. A call is not enough: the callee
+    // may itself be a non-allocating leaf, and then nothing on the path polls and
+    // the collector waits forever -- the exact hang this exists to prevent.
+    let allocates = ["mk_", "prim_str", "gc_"].iter().any(|call| body.contains(call));
+    if allocates { "" } else { POLL }
+}
+
 fn direct_write_enabled() -> bool {
     direct_array_enabled() && std::env::var_os("MARM_NO_DIRECT_WRITE").is_none()
 }
@@ -682,9 +724,9 @@ impl lambda_lift::Program {
             // one parameter); a curried self-call applies more and simply does not match.
             let loopify = std::env::var_os("MARM_NO_LOOPIFY").is_none();
             if loopify && self.has_tail_self_call(SelfCall::SelfRef, 1, code) {
-                write!(out, "  for (;;) {{ ")?;
-                self.compile_tail(SelfCall::SelfRef, 1, code, out)?;
-                writeln!(out, " }}\n}}\n")?;
+                let mut body = CodeBuffer::default();
+                self.compile_tail(SelfCall::SelfRef, 1, code, &mut body)?;
+                write!(out, "  {}for (;;) {{ {}{body} }}\n}}\n\n", poll_decl(&body.0), back_edge_poll(&body.0))?;
             } else {
                 write!(out, "  return ")?;
                 self.compile_expr(code, out)?;
@@ -712,9 +754,9 @@ impl lambda_lift::Program {
             // plain `return <expr>;` form (output-identical to before).
             let loopify = std::env::var_os("MARM_NO_LOOPIFY").is_none();
             if loopify && self.has_tail_self_call(SelfCall::Named(name), *params, body) {
-                write!(out, "\n  for (;;) {{ ")?;
-                self.compile_tail(SelfCall::Named(name), *params, body, out)?;
-                writeln!(out, " }}\n}}\n")?;
+                let mut emitted = CodeBuffer::default();
+                self.compile_tail(SelfCall::Named(name), *params, body, &mut emitted)?;
+                write!(out, "\n  {}for (;;) {{ {}{emitted} }}\n}}\n\n", poll_decl(&emitted.0), back_edge_poll(&emitted.0))?;
             } else {
                 write!(out, "\n  return ")?;
                 self.compile_expr(body, out)?;
@@ -742,9 +784,9 @@ impl lambda_lift::Program {
             // a saturated tail `self`-call reassigns `l0..l{arity-1}` and continues.
             let loopify = std::env::var_os("MARM_NO_LOOPIFY").is_none();
             if loopify && self.has_tail_self_call(SelfCall::SelfRef, *arity, body) {
-                write!(out, "\n  for (;;) {{ ")?;
-                self.compile_tail(SelfCall::SelfRef, *arity, body, out)?;
-                writeln!(out, " }}\n}}\n")?;
+                let mut emitted = CodeBuffer::default();
+                self.compile_tail(SelfCall::SelfRef, *arity, body, &mut emitted)?;
+                write!(out, "\n  {}for (;;) {{ {}{emitted} }}\n}}\n\n", poll_decl(&emitted.0), back_edge_poll(&emitted.0))?;
             } else {
                 write!(out, "\n  return ")?;
                 self.compile_expr(body, out)?;

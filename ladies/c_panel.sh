@@ -72,7 +72,7 @@ for dir in "$ROOT_DIR"/ladies/"$PANEL"/*/; do
     # crashing under LTO, suspect the program's own layout/dictionary handling before
     # suspecting the optimiser -- that is exactly how the `Default`-dictionary swap
     # was found.
-    if ! clang -std=c11 -I"$C_DIR" $CFLAGS -o "$work/prog" \
+    if ! clang $CSTD -I"$C_DIR" $CFLAGS -o "$work/prog" \
         "$C_DIR/runtime.c" "$C_DIR/gc.c" $foreign_cs "$work/program.c" \
         2>"$work/cc.err"; then
       status="COMPILE-ERR"

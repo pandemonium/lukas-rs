@@ -1,0 +1,89 @@
+use Stdlib.
+use Stdlib.Data.Array.
+use Stdlib.Control.Enumerator.
+use Stdlib.IO.
+
+(* A fixed-capacity circular queue over one `Mutable_Array`.
+
+   The storage is allocated once and never grows: pushing past capacity is refused
+   rather than reallocating. That is the whole point -- a bounded window of work in
+   flight, where the reason to reach for it is that the memory stays bounded.
+   Compare a `List` used as a queue, which allocates a cell per push and costs
+   O(n) to append at the tail.
+
+   `Head` and `Count` are threaded functionally rather than mutated: the ARRAY is
+   the mutable part, and every operation hands the buffer back with its indices
+   advanced. Holding on to a stale buffer is then a logic error, not a
+   memory-safety one.
+
+   Opaque: the indices only mean anything together with the storage, and the
+   wrap-around arithmetic is the module's business. *)
+opaque Ring_Buffer ::= ∀α.
+  { Storage  :: Mutable_Array (Perhaps α)
+    Capacity :: Int
+    Head     :: Int
+    Count    :: Int
+  }
+
+module Ring_Buffer:
+  (* `Perhaps α` slots seeded with `Nope`, so no filler element has to be invented
+     for a buffer that is still empty. *)
+  new :: ∀α. Int -> IO (Ring_Buffer α) := λcapacity.
+    let* storage = Mutable_Array.generate capacity (λ_. Nope) in
+    pure { Storage := storage; Capacity := capacity; Head := 0; Count := 0 }
+
+  capacity :: ∀α. Ring_Buffer α -> Int := λbuffer. buffer.Capacity
+
+  length :: ∀α. Ring_Buffer α -> Int := λbuffer. buffer.Count
+
+  is_empty :: ∀α. Ring_Buffer α -> Bool := λbuffer. buffer.Count = 0
+
+  is_full :: ∀α. Ring_Buffer α -> Bool := λbuffer. buffer.Count >= buffer.Capacity
+
+  (* `Nope` when full: the caller decides whether to drop, wait, or drain first. *)
+  push :: ∀α. Ring_Buffer α -> α -> IO (Perhaps (Ring_Buffer α)) := λbuffer element.
+    if is_full buffer
+      then pure Nope
+      else
+        let slot = (buffer.Head + buffer.Count) % buffer.Capacity in
+        let* _ = Mutable_Array.put_unchecked buffer.Storage slot (This element) in
+        pure (This { buffer: Count := buffer.Count + 1 })
+
+  (* Oldest first; `Nope` when empty. Pure, because only the indices move -- which
+     is what lets `pop` serve as the Enumerator coalgebra below. *)
+  pop :: ∀α. Ring_Buffer α -> Perhaps (α, Ring_Buffer α) := λbuffer.
+    if is_empty buffer
+      then Nope
+      else
+        deconstruct Mutable_Array.unsafe_get_unchecked buffer.Storage buffer.Head into
+          Nope -> Nope
+        | This element ->
+            let advanced = { buffer: Head := (buffer.Head + 1) % buffer.Capacity } in
+            This (element, { advanced: Count := buffer.Count - 1 })
+
+  (* The oldest element, without removing it. *)
+  peek :: ∀α. Ring_Buffer α -> Perhaps α := λbuffer.
+    deconstruct pop buffer into
+      Nope -> Nope
+    | This (element, _) -> This element
+
+(* `pop` IS a coalgebra -- seed in, element and next seed out -- so a ring buffer is
+   an unfold, and everything Enumerator-shaped works over it unchanged. This is also
+   the second Enumerator witness in the stdlib, which is what makes generalising
+   consumers from `List` to `Enumerator` worth doing at all. *)
+witness ∀α. Enumerator α (Ring_Buffer α) :=
+  { size_hint := λbuffer. This (Ring_Buffer.length buffer)
+    next := Ring_Buffer.pop
+  }
+
+(* Folds walk oldest to newest, the order `pop` yields. *)
+witness Foldable Ring_Buffer :=
+  { fold_right := λf z buffer.
+      deconstruct Ring_Buffer.pop buffer into
+        Nope -> z
+      | This (element, rest) -> f element (fold_right f z rest)
+    fold_left := λf z buffer.
+      deconstruct Ring_Buffer.pop buffer into
+        Nope -> z
+      | This (element, rest) -> fold_left f (f z element) rest
+  }

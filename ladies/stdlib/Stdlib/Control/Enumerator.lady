@@ -3,6 +3,27 @@ signature Enumerator ::= ∀element enumeration.
     next      :: enumeration -> Perhaps (element, enumeration)
   }
 
+(* Any coalgebra as an enumeration: the step function and its seed, packaged into a
+   type that can carry a witness.
+
+   This is what makes the class as general as passing the step function directly.
+   Without it an ad-hoc unfold -- counting down an Int, walking a file offset --
+   has no `Enumerator` instance and cannot get one, because there is no type to
+   hang the witness on; `Enumerator α Int` would have to mean one particular
+   enumeration of Int, and there isn't a canonical one. Wrapping supplies the type.
+
+   `size_hint` is `Nope`: a general unfold does not know when it will stop, and
+   running it to find out would consume it. *)
+Unfold ::= ∀α s. Make_Unfold (s -> Perhaps (α, s)) s
+
+witness ∀α s. Enumerator α (Unfold α s) :=
+  { size_hint := λ_. Nope
+    next := λ(Make_Unfold step seed).
+      deconstruct step seed into
+        Nope -> Nope
+      | This (element, next_seed) -> This (element, Make_Unfold step next_seed)
+  }
+
 Indexed_Enumerator ::= ∀α enumeration.
   Make_Indexed_Enumerator Direction enumeration Int Int
 
@@ -52,3 +73,17 @@ witness ∀α enumeration. Enumerator α enumeration |- Enumerator (Int, α) (In
   { size_hint := λenumerator. This (Indexed_Enumerator.size enumerator)
     next := Indexed_Enumerator.advance
   }
+
+(* A monadic left fold over an enumeration: `fold_left` whose step computes in a
+   monad. `Foldable.fold_left` cannot do this -- its step is pure -- and `traverse`
+   is the wrong shape, since it collects every result rather than combining them,
+   which is exactly what a bounded fold is trying to avoid.
+
+   Left, not right: the whole point is to consume the enumeration in order while
+   carrying state, so the accumulator has to be threaded through the effects. *)
+enumerate_m :: ∀α β s m : *->*. Monad m + Enumerator α s |- (β -> α -> m β) -> β -> s -> m β := λf acc source.
+  deconstruct next source into
+    Nope -> pure acc
+  | This (element, rest) ->
+      let* acc' = f acc element in
+      enumerate_m f acc' rest
