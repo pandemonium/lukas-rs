@@ -106,6 +106,12 @@ impl<A> ast::Expr<A, Identifier> {
                 }
             }
 
+            Self::Array(_, array) => {
+                for elt in &array.elements {
+                    elt.gather_free_variables(free)
+                }
+            }
+
             Self::Record(_, record) => {
                 for (_, init) in &record.fields {
                     init.gather_free_variables(free)

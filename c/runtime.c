@@ -46,6 +46,11 @@ bool val_eq(Value a, Value b) {
     if (a.w & IMM_TAG) {
         return a.w == b.w;
     }
+    if (is_borrowed(a) || is_borrowed(b)) {
+        if ((a.w & IMM_TAG) || (b.w & IMM_TAG)) return false;
+        size_t na = slice_len(a), nb = slice_len(b);
+        return na == nb && memcmp(slice_ptr(a), slice_ptr(b), na) == 0;
+    }
     // Text/Bytes are OBJ_SLICE (OBJ_TEXT is legacy): compare by length then bytes.
     uint8_t ka = HEADER(as_ptr(a))->kind;
     if (ka != HEADER(as_ptr(b))->kind) {

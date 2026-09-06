@@ -20,6 +20,70 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Generated workers selected by the compiler's loop-hotness and size analysis.
+// Keep this an attribute rather than C `inline`: workers have ordinary external
+// linkage because closure descriptors and companion translation units may name
+// them.  Unsupported compilers simply retain their normal inlining policy.
+#ifndef MARM_ALWAYS_INLINE
+#if defined(__has_attribute)
+#if __has_attribute(always_inline)
+#define MARM_ALWAYS_INLINE __attribute__((always_inline))
+#endif
+#endif
+#ifndef MARM_ALWAYS_INLINE
+#define MARM_ALWAYS_INLINE
+#endif
+#endif
+
+// Semantic attributes emitted from the compiler's intrinsic catalogue. They
+// decorate declarations in generated translation units; unsupported compilers
+// retain the same behavior without the optimisation promises.
+#ifndef MARM_PURE
+#if defined(__has_attribute)
+#if __has_attribute(pure)
+#define MARM_PURE __attribute__((pure))
+#endif
+#endif
+#ifndef MARM_PURE
+#define MARM_PURE
+#endif
+#endif
+
+#ifndef MARM_NORETURN
+#if defined(__has_attribute)
+#if __has_attribute(noreturn)
+#define MARM_NORETURN __attribute__((noreturn))
+#endif
+#endif
+#ifndef MARM_NORETURN
+#define MARM_NORETURN
+#endif
+#endif
+
+#ifndef MARM_COLD
+#if defined(__has_attribute)
+#if __has_attribute(cold)
+#define MARM_COLD __attribute__((cold))
+#endif
+#endif
+#ifndef MARM_COLD
+#define MARM_COLD
+#endif
+#endif
+
+#ifndef MARM_UNREACHABLE
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_unreachable)
+#define MARM_UNREACHABLE() __builtin_unreachable()
+#endif
+#endif
+#ifndef MARM_UNREACHABLE
+// A non-returning function that unexpectedly reaches here must not continue
+// into a caller compiled on the promise that it cannot return.
+#define MARM_UNREACHABLE() do { for (;;) {} } while (0)
+#endif
+#endif
+
 typedef struct Value Value;
 typedef struct Closure Closure;
 typedef struct Tuple Tuple;
@@ -114,6 +178,18 @@ static inline Value VChar(char x)       { return (Value){((uint64_t)(uint8_t)x <
 static inline Value VUnit_(void)        { return (Value){IMM_TAG}; }
 #define VUnit() (VUnit_())
 static inline Value VObject(void *p)    { return (Value){(uint64_t)(uintptr_t)p}; }
+// A borrowed object is valid only while its compiler-owned stack slot is live.
+// Bit 1 is available because heap/stack object bodies are 8-aligned and every
+// immediate has bit 0 set. Heap escape barriers materialise these values before
+// storing them; pointer decoders erase the representation-only tag.
+#define BORROWED_TAG UINT64_C(2)
+static inline bool is_borrowed(Value v) { return (v.w & 3u) == BORROWED_TAG; }
+static inline Value VBorrowed(void *p) {
+    return (Value){(uint64_t)(uintptr_t)p | BORROWED_TAG};
+}
+static inline uintptr_t pointer_word(Value v) {
+    return (uintptr_t)(v.w & ~BORROWED_TAG);
+}
 // A Float is a pointer to a heap-boxed double (OBJ_FLOAT); it can never be immediate.
 static inline Value VFloat(double x)    { return mk_float(x); }
 
@@ -126,14 +202,14 @@ static inline char    as_char(Value v) { return (char)((v.w >> 1) & 0xFFu); }
 
 // A boxed Float: the word is the OBJ_FLOAT body pointer, which points straight at the
 // stored double (the box body is exactly one double). Read it back by value.
-static inline double   as_float(Value v)    { return *(const double *)(uintptr_t)v.w; }
+static inline double   as_float(Value v)    { return *(const double *)pointer_word(v); }
 
-// Pointer decoders. A pointer value's word *is* the body pointer.
-static inline void     *as_ptr(Value v)     { return (void *)(uintptr_t)v.w; }
-static inline Closure  *as_closure(Value v) { return (Closure *)(uintptr_t)v.w; }
-static inline Tuple    *as_tuple(Value v)   { return (Tuple *)(uintptr_t)v.w; }
-static inline Data     *as_data(Value v)    { return (Data *)(uintptr_t)v.w; }
-static inline const char *as_text(Value v)  { return (const char *)(uintptr_t)v.w; }
+// Pointer decoders erase the borrowed bit; an ordinary pointer is unchanged.
+static inline void     *as_ptr(Value v)     { return (void *)pointer_word(v); }
+static inline Closure  *as_closure(Value v) { return (Closure *)pointer_word(v); }
+static inline Tuple    *as_tuple(Value v)   { return (Tuple *)pointer_word(v); }
+static inline Data     *as_data(Value v)    { return (Data *)pointer_word(v); }
+static inline const char *as_text(Value v)  { return (const char *)pointer_word(v); }
 
 // Primitive operations behind the builtins. Codegen emits direct calls to these
 // for *saturated* applications, bypassing the curried closures (and their heap

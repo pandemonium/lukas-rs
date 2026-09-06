@@ -58,3 +58,48 @@ start :: Int -> Int := λn.
         "the two Pair words were not stored directly in a heap closure"
     );
 }
+
+#[test]
+fn nested_projection_stops_at_a_boxed_oversized_record() {
+    let dir = std::env::temp_dir().join("lukas_flat_record_projection_boundary");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("Root.lady"),
+        r#"Large ::=
+  { A :: Int; B :: Int; C :: Int; D :: Int; E :: Int
+    F :: Int; G :: Int; H :: Int; I :: Int
+  }
+
+Middle ::= { Marker :: Int; Payload :: Large }
+Outer ::= { Marker :: Int; Middle :: Middle }
+
+get :: Outer -> Int := λouter. outer.Middle.Payload.I
+
+start := λ_.
+  let large =
+    { A := 1; B := 2; C := 3; D := 4; E := 5
+      F := 6; G := 7; H := 8; I := 9
+    }
+  in
+  let middle = { Marker := 1; Payload := large } in
+  get { Marker := 0; Middle := middle }
+"#,
+    )
+    .unwrap();
+
+    let output = dir.join("program.c");
+    Compiler {
+        library_path: PathBuf::from("ladies/stdlib"),
+        source_path: dir,
+        backend: Backend::Native,
+        output_file: Some(output.clone()),
+    }
+    .compiler_main()
+    .expect("native code generation");
+
+    let generated = fs::read_to_string(output).expect("generated C source");
+    assert!(
+        generated.contains("proj(proj(l0, 2), 8)"),
+        "projection did not dereference the boxed Large field: {generated}"
+    );
+}

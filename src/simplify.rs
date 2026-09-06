@@ -31,6 +31,7 @@ use crate::{
         namer::{Identifier, QualifiedName, Symbol, TermSymbol},
         pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern},
     },
+    intrinsic::{self, IntrinsicOperation},
     lexer::BindingOperator,
     phase,
     typer::{MetaVariable, Substitutable, Substitutions, Type, TypeInfo, Types},
@@ -325,7 +326,9 @@ fn build_inlinables(
             .filter(|(name, body)| {
                 let text = name.to_string();
                 let freed = pattern == "*"
-                    || pattern.split(',').any(|p| !p.is_empty() && text.contains(p));
+                    || pattern
+                        .split(',')
+                        .any(|p| !p.is_empty() && text.contains(p));
                 if freed {
                     // narrow rule: only genuine self-recursion is a hazard
                     reaches_self(name, &dependencies) || is_self_recursive(body)
@@ -354,7 +357,9 @@ fn build_inlinables(
     let inlinable = |name: &QualifiedName, body: &phase::Expr<Types>| {
         // This public wrapper is a compiler-recognised diagnostic boundary. Keeping
         // the call intact preserves its caller's source annotation for codegen.
-        if name.to_string().ends_with("Prelude.omg_wtf_bbq") {
+        if intrinsic::term(name)
+            .is_some_and(|semantics| semantics.operation == IntrinsicOperation::Panic)
+        {
             return false;
         }
         // A nullary constructor's term is `Inject(C, [])` -- a shared, immutable value.
@@ -594,7 +599,9 @@ fn contains_recursion<A>(expr: &Expr<A, Identifier>) -> bool {
 fn scope_collisions<A>(expr: &Expr<A, Identifier>, live: &mut Vec<usize>, out: &mut Vec<String>) {
     let mut note = |live: &Vec<usize>, l: &usize, what: &str, out: &mut Vec<String>| {
         if live.contains(l) {
-            out.push(format!("{what} re-binds level {l} (already bound by an ancestor)"));
+            out.push(format!(
+                "{what} re-binds level {l} (already bound by an ancestor)"
+            ));
         }
     };
     match expr {
@@ -625,7 +632,15 @@ fn scope_collisions<A>(expr: &Expr<A, Identifier>, live: &mut Vec<usize>, out: &
                 live.pop();
             }
         }
-        Expr::Let(_, Binding { binder, bound, body, .. }) => {
+        Expr::Let(
+            _,
+            Binding {
+                binder,
+                bound,
+                body,
+                ..
+            },
+        ) => {
             scope_collisions(bound, live, out);
             if let Identifier::Bound(l) = binder {
                 note(live, l, "let binder", out);

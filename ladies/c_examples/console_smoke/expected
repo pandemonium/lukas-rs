@@ -1,0 +1,11 @@
+warning: plain=careful coloured=^[[1;33mcareful^[[0m
+emphatic: plain=careful coloured=^[[1;33;4mcareful^[[0m
+override: plain=which colour coloured=^[[31;34mwhich colour^[[0m
+bright: plain=hot coloured=^[[91mhot^[[0m
+palette: plain=indexed coloured=^[[48;5;27mindexed^[[0m
+truecolour: plain=exact coloured=^[[38;2;12;34;56mexact^[[0m
+nested: plain=green BOLD still green coloured=^[[32mgreen ^[[0m^[[32m^[[32;1mBOLD^[[0m^[[32m still green^[[0m
+unstyled: plain=no escapes at all coloured=no escapes at all
+inside the alternate screen
+written through Console.write
+supports_colour=false is_tty=false

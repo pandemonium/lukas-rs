@@ -101,6 +101,9 @@ fold_left :: ∀z α. (z -> α -> z) -> z -> List α -> z :=
       Cons a tail -> fold_left f (f z a) tail
     | Nil         -> z
 
+for_each :: ∀α. (α -> Unit) -> List α -> Unit := λf xs.
+  let _ = map f xs in ()
+
 map :: ∀α β. (α -> β) -> List α -> List β :=
   λf. fold_right (compose Cons f) Nil
 
@@ -115,13 +118,6 @@ zip :: ∀α β. List α -> List β -> List (α, β) := λxs ys.
     Cons x xs, Cons y ys -> Cons (x, y) (zip xs ys)
   | otherwise            -> Nil
 
-(* The anamorphism, dual to `fold_right`: `fold_right` consumes a list down to a
-   value, `unfold` grows one up from a seed. `step` returns either `Nope` -- the
-   sequence ends -- or an element and the seed to continue from.
-
-   This is exactly the shape of `Enumerator.next`, which is why any enumeration is
-   an unfold and any unfold an enumeration: `next` IS a coalgebra, and the
-   `enumeration` type IS the seed. *)
 unfold :: ∀α s. (s -> Perhaps (α, s)) -> s -> List α := λstep seed.
   deconstruct step seed into
     Nope -> Nil
@@ -160,6 +156,30 @@ concat :: List Text -> Text := λxs.
 
 singleton :: ∀α. α -> List α := λa. Cons a Nil
 
+choose :: ∀α. (α -> Bool) -> List α -> (Perhaps α, List α) := λε list.
+  let loop = λprefix suffix.
+    deconstruct suffix into
+      Cons x suffix ->
+        if ε x then This x, List.append (List.reverse prefix) suffix
+        else loop (Cons x prefix) suffix
+    | Nil -> Nope, list
+  in loop Nil list
+
+pick :: ∀α. Int -> List α -> (Perhaps α, List α) := λindex list.
+  let loop = λi prefix suffix.
+    deconstruct suffix into
+      Cons x suffix ->
+        if i = index then This x, List.append (List.reverse prefix) suffix
+        else loop (1 + i) (Cons x prefix) suffix
+    | Nil -> Nope, list
+  in loop 0 Nil list
+
+text :: ∀α. Display α |- Text -> List α -> Text := λseparator list.
+  deconstruct list into
+    Cons x xs ->
+      let tail = concat (map (λy. "`separator``y`") xs) in
+      "`x``tail`"
+  | Nil -> ""
 
 module Associative:
   lookup :: ∀α β. Eq α |- α -> List (α, β) -> Perhaps β := λkey assoc.

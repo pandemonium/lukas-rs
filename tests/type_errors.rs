@@ -59,20 +59,27 @@ start := λ_. 0
 
 #[test]
 fn thread_spawn_rejects_io_returning_a_confined_value() {
-    let error = Compiler {
-        library_path: PathBuf::from("ladies/stdlib"),
-        source_path: PathBuf::from("ladies/examples/37_threads"),
-        backend: Backend::Native,
-        output_file: None,
-    }
-    .compiler_main()
-    .expect_err("an IO action returning a confined Buffer must not be spawnable");
-    let diagnostic = error.to_string();
+    // Inline, like every other case here. This used to compile `ladies/examples/37_threads`
+    // instead -- a program that must NOT compile, sitting in the suite `c/run-all.sh`
+    // expects to pass end to end, where it read as a broken example rather than as this
+    // test's fixture.
+    let diagnostic = rejects(
+        "thread_confined_result",
+        r#"
+use Stdlib.
+use Stdlib.Threading.
+use Stdlib.IO.
 
-    assert!(
-        diagnostic.contains("37_threads/Root.lady:7:"),
-        "{diagnostic}"
+main :: IO Int :=
+  let* buffer = Buffer.new_buffer 3 in
+  let* t = Thread.spawn (pure buffer) in
+  pure 2
+
+start := λ_. ()
+"#,
     );
+
+    assert!(diagnostic.contains("Root.lady:8:"), "{diagnostic}");
     assert!(
         diagnostic.contains(
             "type `Root.Prelude.Buffer` is confined, but this context requires unconfined"
@@ -300,3 +307,135 @@ start := λ_. ()
         "{diagnostic}"
     );
 }
+
+// ---------------------------------------------------------------- exhaustiveness
+//
+// The covered space of a match is a UNION OF BOXES, and widening it to the single box
+// that contains them accepts matches that are not exhaustive. These pin the boundary
+// from both sides: the widening cases must be rejected, and the ordinary case splits a
+// person actually writes must still be accepted.
+
+#[test]
+fn a_missing_combination_of_two_scrutinees_is_not_exhaustive() {
+    // Three of the four pairs. Joining them gives {This,Nope} x {This,Nope} -- the full
+    // space -- which is exactly the false "exhaustive" this guards.
+    let source = r#"
+use Stdlib.
+
+both :: Perhaps Int -> Perhaps Int -> Int := λa b.
+  deconstruct (a, b) into
+    (This x, This y) -> x + y
+  | (This x, Nope)   -> x
+  | (Nope,   This y) -> y
+
+start := λ_. 0
+"#;
+
+    let diagnostic = rejects("nonexhaustive_pair", source);
+    assert!(diagnostic.contains("not exhaustive"), "{diagnostic}");
+    assert!(diagnostic.contains("(Nope, Nope)"), "{diagnostic}");
+}
+
+#[test]
+fn a_gap_inside_a_matched_constructor_is_not_exhaustive() {
+    let source = r#"
+use Stdlib.
+
+inner :: Perhaps (Perhaps Int) -> Int := λa.
+  deconstruct a into
+    This (This x) -> x
+  | Nope -> 0
+
+start := λ_. 0
+"#;
+
+    let diagnostic = rejects("nonexhaustive_nested", source);
+    assert!(diagnostic.contains("not exhaustive"), "{diagnostic}");
+    assert!(diagnostic.contains("This Nope"), "{diagnostic}");
+}
+
+#[test]
+fn every_combination_of_two_scrutinees_is_exhaustive() {
+    let source = r#"
+use Stdlib.
+
+both :: Perhaps Int -> Perhaps Int -> Int := λa b.
+  deconstruct (a, b) into
+    (This x, This y) -> x + y
+  | (This x, Nope)   -> x
+  | (Nope,   This y) -> y
+  | (Nope,   Nope)   -> 0
+
+start := λ_. 0
+"#;
+
+    accepts("exhaustive_pair", source);
+}
+
+#[test]
+fn the_fourth_clause_of_a_two_scrutinee_split_is_still_useful() {
+    // The reject-side twin of the case above: `Nope, Nope` is reachable, and reporting
+    // it as dead code would refuse a perfectly ordinary program.
+    let source = r#"
+use Stdlib.
+
+both :: Perhaps Int -> Perhaps Int -> Int := λa b.
+  deconstruct (a, b) into
+    (This x, This y) -> x + y
+  | (This x, Nope)   -> x
+  | (Nope,   This y) -> y
+  | (Nope,   Nope)   -> 0
+
+start := λ_. 0
+"#;
+
+    accepts("useful_fourth_clause", source);
+}
+
+#[test]
+fn a_recursive_type_matched_only_by_a_binding_is_exhaustive() {
+    // Splitting a column whose constructors nobody wrote would expand `List` for ever;
+    // this is the termination case.
+    let source = r#"
+use Stdlib.
+
+count :: List Int -> Int := λxs.
+  deconstruct xs into
+    everything -> 0
+
+start := λ_. 0
+"#;
+
+    accepts("wildcard_over_recursive_type", source);
+}
+
+// ------------------------------------------------- constraints at repeated use sites
+//
+// Two self-recursive calls spliced into ONE interpolation used to leave the second
+// `display` with a metavariable that no substitution could ground: unification reached
+// the lambda's codomain twice and bound it to a fresh variable each time, and composing
+// the two dropped the earlier image instead of recording that the two were equal. The
+// stale constraint was then misread as parametric, giving a signature-free dictionary
+// parameter to a term whose signature has no context -- and the generated code called a
+// `Node` as though it were a dictionary.
+
+#[test]
+fn two_self_recursive_calls_in_one_interpolation_ground_the_same_constraint() {
+    let source = r#"
+use Stdlib.
+
+Node ::= Leaf Text | Pair Node Node
+
+render :: Node -> Text := λnode.
+  let walk = λn.
+    deconstruct n into
+      Leaf t -> t
+    | Pair x y -> "`walk x``walk y`"
+  in walk node
+
+start := λ_. 0
+"#;
+
+    accepts("repeated_self_recursive_splice", source);
+}
+

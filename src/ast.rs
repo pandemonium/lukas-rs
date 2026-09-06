@@ -960,6 +960,13 @@ impl<A, Id> Expr<A, Id> {
                 },
             ),
 
+            Expr::Array(a, the) => Expr::Array(
+                a,
+                Array {
+                    elements: the.elements.into_iter().map(|e| go(e, f)).collect(),
+                },
+            ),
+
             Expr::Project(a, the) => Expr::Project(
                 a,
                 Projection {

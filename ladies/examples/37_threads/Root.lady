@@ -1,13 +1,67 @@
+(* Threads.
+   
+   `Thread.spawn` runs an `IO α` on its own OS thread and hands back a handle;
+   `Thread.join` waits for it and returns the value. Everything else in
+   `Stdlib.Threading` is built from those two.
+   
+   The one rule is about WHAT may cross the boundary. A type can be declared
+   `confined`, meaning a value of it belongs to the thread that made it, and
+   `Thread.spawn` demands its action be `unconfined`. So this does not compile:
+   
+       let* buffer = Buffer.new_buffer 3 in
+       let* handle = Thread.spawn (pure buffer) in      <-- rejected
+       ...
+   
+       type `Root.Prelude.Buffer` is confined, but this context requires unconfined
+   
+   `Buffer` is a growable mutable byte buffer, and handing one to a second thread
+   while this one still holds it is a data race with no lock in sight. The checker
+   says so at compile time rather than leaving it to be discovered later. Plain
+   values -- Int, Text, List, a tuple of those -- are unconfined and cross freely,
+   which is what everything below uses. *)
 use Stdlib.
 use Stdlib.Threading.
 use Stdlib.IO.
 
-main :: IO Int :=
-  let* buffer = Buffer.new_buffer 3 in
-  let* t = Thread.spawn (pure buffer) in
-  pure 2
+(* Deliberately not a one-liner: each of these runs on its own thread, so the work
+   wants to be worth the thread. *)
+collatz_length :: Int -> Int := λstart.
+  let step = λn steps.
+    if n <= 1
+      then steps
+      else if n % 2 = 0
+        then step (n / 2) (steps + 1)
+        else step ((3 * n) + 1) (steps + 1)
+  in step start 0
+
+(* One thread per element, joined in order, results collected into a list. The
+   worker is a pure function, so `par_map` lifts it into IO for us. *)
+lengths :: IO (List Int) :=
+  Thread.par_map collatz_length (Cons 27 (Cons 97 (Cons 871 (Cons 6171 Nil))))
+
+(* `spawn` and `join` by hand, which is all `par_map` is doing above. The handle is
+   opaque -- it cannot be copied or fabricated -- and `join` consumes it exactly once. *)
+one_by_hand :: IO Int :=
+  let* handle = Thread.spawn (IO.suspend (λ_. collatz_length 63728127)) in
+  Thread.join handle
+
+(* Fold in parallel through the `Monoid Int` witness: each element becomes a value
+   on its own thread and the results are `mappend`ed as they arrive, with at most
+   `window` threads alive at once. *)
+total :: IO Int :=
+  Thread.par_fold_map collatz_length (Cons 27 (Cons 97 (Cons 871 (Cons 6171 Nil))))
+
+comma :: Text := ", "
+
+main :: IO Unit :=
+  let* each = lengths in
+  let* longest = one_by_hand in
+  let* sum = total in
+  let listed = List.text comma each in
+  let* _ = IO.output "lengths: `listed`" in
+  let* _ = IO.output "by hand: `longest`" in
+  IO.output "total:   `sum`"
 
 start := λ_.
-  print_endline "Hi, threads"
-  let x = unsafe_run_IO main in
-  print_endline "`x`"
+  print_endline "##TC"
+  IO.unsafe_run_IO main

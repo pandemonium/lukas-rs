@@ -973,7 +973,7 @@ impl fmt::Display for TokenKind {
             Self::Literal(literal) => write!(f, "{literal}"),
             Self::Interpolate(prefix) => write!(f, "{prefix}`"),
             Self::Layout(layout) => write!(f, "{layout}"),
-            Self::End => write!(f, "°"),
+            Self::End => write!(f, "<end of input>"),
         }
     }
 }
@@ -1040,31 +1040,31 @@ impl fmt::Display for Operator {
 impl fmt::Display for Keyword {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Let(op) => write!(f, "Let{op}"),
-            Self::In => write!(f, "In"),
-            Self::If => write!(f, "If"),
-            Self::Then => write!(f, "Then"),
-            Self::Else => write!(f, "Else"),
-            Self::Struct => write!(f, "Struct"),
-            Self::Coproduct => write!(f, "Coproduct"),
-            Self::Alias => write!(f, "Alias"),
-            Self::Module => write!(f, "Module"),
-            Self::Use => write!(f, "Use"),
-            Self::Lambda => write!(f, "Lambda"),
-            Self::And => write!(f, "And"),
-            Self::Or => write!(f, "Or"),
-            Self::Xor => write!(f, "Xor"),
-            Self::Not => write!(f, "Not"),
-            Self::Forall => write!(f, "Forall"),
-            Self::Deconstruct => write!(f, "Deconstruct"),
-            Self::Into => write!(f, "Into"),
-            Self::Where => write!(f, "Where"),
-            Self::Signature => write!(f, "Signature"),
-            Self::Witness => write!(f, "Witness"),
-            Self::Foreign => write!(f, "Foreign"),
-            Self::Opaque => write!(f, "Opaque"),
-            Self::Confined => write!(f, "Confined"),
-            Self::Unconfined => write!(f, "Unconfined"),
+            Self::Let(op) => write!(f, "let{op}"),
+            Self::In => write!(f, "in"),
+            Self::If => write!(f, "if"),
+            Self::Then => write!(f, "then"),
+            Self::Else => write!(f, "else"),
+            Self::Struct => write!(f, "struct"),
+            Self::Coproduct => write!(f, "coproduct"),
+            Self::Alias => write!(f, "alias"),
+            Self::Module => write!(f, "module"),
+            Self::Use => write!(f, "use"),
+            Self::Lambda => write!(f, "lambda"),
+            Self::And => write!(f, "and"),
+            Self::Or => write!(f, "or"),
+            Self::Xor => write!(f, "xor"),
+            Self::Not => write!(f, "not"),
+            Self::Forall => write!(f, "forall"),
+            Self::Deconstruct => write!(f, "deconstruct"),
+            Self::Into => write!(f, "into"),
+            Self::Where => write!(f, "where"),
+            Self::Signature => write!(f, "signature"),
+            Self::Witness => write!(f, "witness"),
+            Self::Foreign => write!(f, "foreign"),
+            Self::Opaque => write!(f, "opaque"),
+            Self::Confined => write!(f, "confined"),
+            Self::Unconfined => write!(f, "unconfined"),
         }
     }
 }
@@ -1138,4 +1138,3 @@ mod tests {
         assert_eq!(positions, vec![1, 6]);
     }
 }
-

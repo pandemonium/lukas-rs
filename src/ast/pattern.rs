@@ -98,17 +98,16 @@ pub enum Denotation {
 }
 
 impl Denotation {
-    pub fn join(&self, rhs: &Self) -> Option<Self> {
-        match (self, rhs) {
-            (Self::Empty, x) | (x, Self::Empty) => Some(x.clone()),
+    pub fn is_subsumed_by(&self, wider: &Self) -> bool {
+        match (self, wider) {
+            (_, Self::Universal) => true,
+            (Self::Empty, _) => true,
 
-            (Self::Structured(p), Self::Structured(q)) => p.join(q).map(Self::Structured),
+            (Self::Structured(narrow), Self::Structured(wide)) => narrow.is_subsumed_by(wide),
 
-            (Self::Finite(t), Self::Finite(u)) => Some(Self::Finite(t.union(u).cloned().collect())),
+            (Self::Finite(narrow), Self::Finite(wide)) => narrow.is_subset(wide),
 
-            (Self::Universal, _) | (_, Self::Universal) => Some(Self::Universal),
-
-            _ => None,
+            _ => false,
         }
     }
 
@@ -164,49 +163,38 @@ impl Shape {
         }
     }
 
-    fn join(&self, rhs: &Self) -> Option<Self> {
-        match (self, rhs) {
-            (Self::Coproduct(lhs), Self::Coproduct(rhs)) => {
-                let mut lhs = lhs.clone();
-                for (constructor, rhs) in rhs {
-                    if let Some(lhs) = lhs.get_mut(constructor) {
-                        join_many(lhs, rhs)?;
-                    } else {
-                        lhs.insert(constructor.clone(), rhs.clone());
-                    }
-                }
-
-                Some(Self::Coproduct(lhs))
+    fn is_subsumed_by(&self, wider: &Self) -> bool {
+        match (self, wider) {
+            // Every constructor this shape can match must be one `wider` matches too,
+            // with arguments that are themselves subsumed.
+            (Self::Coproduct(narrow), Self::Coproduct(wide)) => {
+                narrow.iter().all(|(constructor, arguments)| {
+                    wide.get(constructor).is_some_and(|wide_arguments| {
+                        arguments.len() == wide_arguments.len()
+                            && arguments
+                                .iter()
+                                .zip(wide_arguments)
+                                .all(|(narrow, wide)| narrow.is_subsumed_by(wide))
+                    })
+                })
             }
 
-            (Self::Struct(lhs), Self::Struct(rhs)) => {
-                let mut lhs = lhs.clone();
-                for (field, rhs) in rhs {
-                    if let Some(lhs) = lhs.get_mut(field) {
-                        *lhs = lhs.join(rhs)?;
-                    } else {
-                        None?
-                    }
-                }
-                Some(Self::Struct(lhs))
+            (Self::Struct(narrow), Self::Struct(wide)) => narrow.iter().all(|(field, narrow)| {
+                wide.get(field)
+                    .is_some_and(|wide| narrow.is_subsumed_by(wide))
+            }),
+
+            (Self::Tuple(narrow), Self::Tuple(wide)) => {
+                narrow.len() == wide.len()
+                    && narrow
+                        .iter()
+                        .zip(wide)
+                        .all(|(narrow, wide)| narrow.is_subsumed_by(wide))
             }
 
-            (Self::Tuple(lhs), Self::Tuple(rhs)) => {
-                let mut lhs = lhs.clone();
-                join_many(&mut lhs, rhs);
-                Some(Self::Tuple(lhs))
-            }
-
-            _ => None,
+            _ => false,
         }
     }
-}
-
-fn join_many(lhs: &mut [Denotation], rhs: &[Denotation]) -> Option<()> {
-    for (lhs, rhs) in lhs.iter_mut().zip(rhs) {
-        *lhs = lhs.join(rhs)?;
-    }
-    Some(())
 }
 
 impl<A, Id> fmt::Display for MatchClause<A, Id>

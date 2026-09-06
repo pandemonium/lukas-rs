@@ -18,6 +18,48 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// Keep the thousands of inlined allocation fast paths from spilling their live
+// registers around the shared slow-path call.  Clang's preserve_most convention
+// moves that burden to the uncommon callee; it is only implemented on these two
+// targets.  Other compilers and architectures retain the ordinary C ABI.
+#if defined(__clang__) && (defined(__aarch64__) || defined(__x86_64__))
+#if __has_attribute(preserve_most)
+#define MARM_GC_SLOW_CC __attribute__((preserve_most))
+#endif
+#endif
+#ifndef MARM_GC_SLOW_CC
+#define MARM_GC_SLOW_CC
+#endif
+
+// gc_new returns an aligned body pointer and cannot return null: allocation
+// failure traps while initialising the header. It is deliberately *not* marked
+// malloc/alloc_size. The allocation's hidden GcHeader precedes the returned
+// body, and constructors legally recover it with HEADER(body); describing the
+// body address as a standalone C allocation base makes that access out of
+// bounds in clang's object model. Public mk_* functions return Value rather
+// than a pointer, so pointer-result attributes do not apply there either.
+#ifndef MARM_GC_NONNULL
+#if defined(__has_attribute)
+#if __has_attribute(returns_nonnull)
+#define MARM_GC_NONNULL __attribute__((returns_nonnull))
+#endif
+#endif
+#ifndef MARM_GC_NONNULL
+#define MARM_GC_NONNULL
+#endif
+#endif
+
+#ifndef MARM_GC_ALIGNED
+#if defined(__has_attribute)
+#if __has_attribute(assume_aligned)
+#define MARM_GC_ALIGNED __attribute__((assume_aligned(8)))
+#endif
+#endif
+#ifndef MARM_GC_ALIGNED
+#define MARM_GC_ALIGNED
+#endif
+#endif
+
 // ===========================================================================
 // Garbage collector: generational, conservative mark-sweep, non-moving, backed
 // by a slab allocator.
@@ -154,7 +196,8 @@ static PtrSet large_set;        // body pointers of live large objects
 // Defined further down (needs the generation globals); forward-declared here for
 // the dispatch in `is_object` / `gc_new`.
 static bool gc_immix = true;
-static void *gc_alloc_slow(size_t total, ObjKind kind);
+static MARM_GC_NONNULL MARM_GC_ALIGNED MARM_GC_SLOW_CC
+void *gc_alloc_slow(size_t total, ObjKind kind);
 static bool is_object_immix(uintptr_t w);
 static void ix_mark_lines(void *body); // mark the lines a live object spans
 static void ix_reset_lines(void);      // clear data-line marks before a collection
@@ -247,6 +290,7 @@ static size_t gc_pin_count = 0;
 static pthread_mutex_t gc_pin_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void gc_pin(Value *slot) {
+    *slot = gc_escape_borrowed(*slot);
     pthread_mutex_lock(&gc_pin_lock);
     if (gc_pin_count == GC_MAX_PINS) {
         fprintf(stderr, "marmelade: more than %d pinned roots\n", GC_MAX_PINS);
@@ -295,6 +339,11 @@ static pthread_mutex_t gc_stw_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t gc_stw_resume = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t gc_stw_parked = PTHREAD_COND_INITIALIZER;
 static size_t gc_parked = 0;     // threads parked, or in a no-heap foreign region
+// Read-mostly after gc_init.  Declared with the rendezvous state because the hot
+// poll-side parking path records its sleep directly when diagnostics are enabled.
+static bool gc_timing = false;
+static _Atomic unsigned long long gc_stw_parked_ns = 0;
+static double now(void);
 
 typedef enum { THREAD_RUNNING, THREAD_PARKED, THREAD_FOREIGN } ThreadState;
 
@@ -302,6 +351,7 @@ typedef enum { THREAD_RUNNING, THREAD_PARKED, THREAD_FOREIGN } ThreadState;
 // optional: checking the flag and then waiting has a window in which the
 // requester finishes and broadcasts, and the wakeup is lost forever.
 static void gc_park(void) {
+    double parked_t0 = gc_timing ? now() : 0.0;
     GC_SPILL_REGISTERS();
     pthread_mutex_lock(&gc_stw_lock);
     self->state = THREAD_PARKED;
@@ -310,6 +360,10 @@ static void gc_park(void) {
     pthread_cond_signal(&gc_stw_parked);
     while (atomic_load_explicit(&gc_pending, memory_order_acquire))
         pthread_cond_wait(&gc_stw_resume, &gc_stw_lock);
+    if (gc_timing)
+        atomic_fetch_add_explicit(
+            &gc_stw_parked_ns,
+            (unsigned long long)((now() - parked_t0) * 1e9), memory_order_relaxed);
     gc_parked--;
     self->state = THREAD_RUNNING;
     pthread_mutex_unlock(&gc_stw_lock);
@@ -581,6 +635,16 @@ static unsigned long long gc_total_bytes = 0;
 // Stored as integers because C11 atomics on floating point are not lock-free.
 static _Atomic unsigned long long gc_time_ns = 0;   // inside gc_run (collection)
 static _Atomic unsigned long long alloc_time_ns = 0; // in the allocation slow path,
+// Stop-the-world and collection phase accounting.  `gc_time_ns` deliberately
+// remains the collector's serial work so existing reports keep their meaning;
+// these counters expose the time on either side of it and the aggregate mutator
+// capacity lost while threads sleep.  The parked total is expected to be roughly
+// (threads - 1) * gc_time on a saturated workload -- it must not be added to wall.
+static _Atomic unsigned long long gc_stw_rendezvous_ns = 0;
+static _Atomic unsigned long long gc_stw_resume_ns = 0;
+static _Atomic unsigned long long gc_reset_ns = 0;
+static _Atomic unsigned long long gc_trace_ns = 0;
+static _Atomic unsigned long long gc_reclaim_ns = 0;
 #define gc_time (gc_time_ns / 1e9)
 #define alloc_time (alloc_time_ns / 1e9)
                                 // collection it triggered (run/block refill overhead);
@@ -598,7 +662,6 @@ static bool gc_alloc_stats = false;
 // allocation slow-path call -- roughly once per 32 KiB, from every thread at once.
 // That RMW is the contended kind, and it inflates the very number it is measuring:
 // the more threads, the longer the interval it reports. Off unless asked for.
-static bool gc_timing = false;
 #define ALLOC_MAX_ARITY 16
 static unsigned long long alloc_hist_n[OBJ_KIND_COUNT][ALLOC_MAX_ARITY + 1];
 static unsigned long long alloc_hist_b[OBJ_KIND_COUNT][ALLOC_MAX_ARITY + 1];
@@ -853,6 +916,7 @@ static void sweep_large(bool major, size_t *young_live, size_t *old_live) {
 // and each wait for the other to park: neither ever does, and the program hangs.
 // With one registered thread it is a flag set and cleared, no waiting.
 static bool gc_stop_the_world(void) {
+    double stw_t0 = gc_timing ? now() : 0.0;
     pthread_mutex_lock(&gc_stw_lock);
     if (atomic_load_explicit(&gc_pending, memory_order_acquire)) {
         // Someone else is collecting. Park here rather than queueing to collect
@@ -864,6 +928,10 @@ static bool gc_stop_the_world(void) {
         pthread_cond_signal(&gc_stw_parked);
         while (atomic_load_explicit(&gc_pending, memory_order_acquire))
             pthread_cond_wait(&gc_stw_resume, &gc_stw_lock);
+        if (gc_timing)
+            atomic_fetch_add_explicit(
+                &gc_stw_parked_ns,
+                (unsigned long long)((now() - stw_t0) * 1e9), memory_order_relaxed);
         gc_parked--;
         self->state = THREAD_RUNNING;
         pthread_mutex_unlock(&gc_stw_lock);
@@ -876,14 +944,23 @@ static bool gc_stop_the_world(void) {
     // heap, and it published its stack top on the way in.
     while (gc_parked + 1 < gc_thread_count) pthread_cond_wait(&gc_stw_parked, &gc_stw_lock);
     pthread_mutex_unlock(&gc_stw_lock);
+    if (gc_timing)
+        atomic_fetch_add_explicit(
+            &gc_stw_rendezvous_ns,
+            (unsigned long long)((now() - stw_t0) * 1e9), memory_order_relaxed);
     return true;
 }
 
 static void gc_resume_mutators(void) {
+    double resume_t0 = gc_timing ? now() : 0.0;
     pthread_mutex_lock(&gc_stw_lock);
     atomic_store_explicit(&gc_pending, false, memory_order_release);
     pthread_cond_broadcast(&gc_stw_resume);
     pthread_mutex_unlock(&gc_stw_lock);
+    if (gc_timing)
+        atomic_fetch_add_explicit(
+            &gc_stw_resume_ns,
+            (unsigned long long)((now() - resume_t0) * 1e9), memory_order_relaxed);
 }
 
 static void gc_run(bool major) {
@@ -895,7 +972,15 @@ static void gc_run(bool major) {
     if (major) gc_major_count++;
     else gc_minor_count++;
     gc_major = major;
+    double phase_t0 = gc_timing ? now() : 0.0;
     if (gc_immix) ix_reset_lines(); // clear line marks so the trace rebuilds liveness
+    if (gc_timing) {
+        double phase_t1 = now();
+        atomic_fetch_add_explicit(&gc_reset_ns,
+                                  (unsigned long long)((phase_t1 - phase_t0) * 1e9),
+                                  memory_order_relaxed);
+        phase_t0 = phase_t1;
+    }
     jmp_buf regs;
     // `setjmp` is used ONLY for its side effect: it spills the callee-saved registers
     // into `regs`, which we then scan conservatively (a live pointer may sit only in a
@@ -965,6 +1050,14 @@ static void gc_run(bool major) {
 
     gc_trace();
 
+    if (gc_timing) {
+        double phase_t1 = now();
+        atomic_fetch_add_explicit(&gc_trace_ns,
+                                  (unsigned long long)((phase_t1 - phase_t0) * 1e9),
+                                  memory_order_relaxed);
+        phase_t0 = phase_t1;
+    }
+
     // Mark bits are still standing here; both reclaim paths below clear them.
     sweep_mmaps(major);
 
@@ -996,6 +1089,11 @@ static void gc_run(bool major) {
         gc_young_bytes = 0;
         gc_old_bytes += promoted;
     }
+
+    if (gc_timing)
+        atomic_fetch_add_explicit(&gc_reclaim_ns,
+                                  (unsigned long long)((now() - phase_t0) * 1e9),
+                                  memory_order_relaxed);
 
     gc_major = false;
     atomic_fetch_add_explicit(&gc_time_ns, (unsigned long long)((now() - t0) * 1e9),
@@ -1107,7 +1205,8 @@ static bool ix_find_run(IxBlock *b, uint32_t from, uintptr_t *s, uintptr_t *e) {
 // collection trigger (`gc_reserve`), then allocate + initialise the header. Kept out
 // of line (and never inlined) so `gc_new`'s fast path folds into the fixed-arity
 // constructors as a tight bump with no call. `total` arrives already 8-rounded.
-static __attribute__((noinline)) void *gc_alloc_slow(size_t total, ObjKind kind) {
+static MARM_GC_NONNULL MARM_GC_ALIGNED MARM_GC_SLOW_CC __attribute__((noinline))
+void *gc_alloc_slow(size_t total, ObjKind kind) {
     double slow_t0 = 0.0;
     unsigned long long gc_before = 0;
     if (__builtin_expect(gc_timing, 0)) {
@@ -1332,7 +1431,7 @@ static bool is_object_immix(uintptr_t w) {
 static_assert(sizeof(GcHeader) == 8 && offsetof(GcHeader, body) == 0 &&
                   offsetof(GcHeader, kind) == 5,
               "gc_new fast path packs the header into one little-endian 8-byte store");
-static inline void *gc_new(size_t body, ObjKind kind) {
+static inline MARM_GC_NONNULL MARM_GC_ALIGNED void *gc_new(size_t body, ObjKind kind) {
     size_t total = (sizeof(GcHeader) + body + 7u) & ~(size_t)7u; // 8-align the bump
     uintptr_t p = self->ix_ptr;
     if (__builtin_expect(gc_immix && total <= IX_MAX_ALLOC && p + total <= self->ix_limit, 1)) {
@@ -1368,6 +1467,17 @@ static void gc_report(void) {
             mutator, total > 0 ? 100.0 * mutator / total : 0.0,
             alloc_time, total > 0 ? 100.0 * alloc_time / total : 0.0,
             gc_time, total > 0 ? 100.0 * gc_time / total : 0.0);
+    fprintf(stderr,
+            "[stw] rendezvous %.3fs  collect %.3fs  resume-broadcast %.3fs; "
+            "parked %.3f thread-s (aggregate, not wall)\n"
+            "[gc-phase] reset %.3fs  roots+trace %.3fs  reclaim+sweep %.3fs\n",
+            atomic_load_explicit(&gc_stw_rendezvous_ns, memory_order_relaxed) / 1e9,
+            gc_time,
+            atomic_load_explicit(&gc_stw_resume_ns, memory_order_relaxed) / 1e9,
+            atomic_load_explicit(&gc_stw_parked_ns, memory_order_relaxed) / 1e9,
+            atomic_load_explicit(&gc_reset_ns, memory_order_relaxed) / 1e9,
+            atomic_load_explicit(&gc_trace_ns, memory_order_relaxed) / 1e9,
+            atomic_load_explicit(&gc_reclaim_ns, memory_order_relaxed) / 1e9);
 }
 
 // B5 opportunity report (MARM_ALLOC_STATS): allocation count + volume by kind/arity,
@@ -1420,12 +1530,12 @@ void gc_register_thread(void *stack_bottom) {
 
     // A thread must not appear mid-collection: the collector has already decided
     // how many threads it is waiting for, and a new RUNNING one would never park,
-    // leaving it waiting forever. Wait out any collection first.
+    // leaving it waiting forever. Keep the rendezvous lock through insertion;
+    // otherwise a collection can start in the gap after the wait and observe a
+    // newly registered thread with no published stack top.
     pthread_mutex_lock(&gc_stw_lock);
     while (atomic_load_explicit(&gc_pending, memory_order_acquire))
         pthread_cond_wait(&gc_stw_resume, &gc_stw_lock);
-    pthread_mutex_unlock(&gc_stw_lock);
-
     pthread_mutex_lock(&gc_registry_lock);
     if (gc_thread_count == GC_MAX_THREADS) {
         fprintf(stderr, "marmelade: more than %d threads\n", GC_MAX_THREADS);
@@ -1435,6 +1545,7 @@ void gc_register_thread(void *stack_bottom) {
     if (gc_thread_count > gc_threads_hwm) gc_threads_hwm = gc_thread_count;
     pthread_mutex_unlock(&gc_registry_lock);
     self = ctx;
+    pthread_mutex_unlock(&gc_stw_lock);
 }
 
 void gc_unregister_thread(void) {
@@ -1510,8 +1621,9 @@ static Value mk_closure_dva(const ClosureDesc *desc, size_t nfree, va_list ap) {
     size_t body = sizeof(Closure) + nfree * sizeof(Value);
     Closure *c = gc_new(body, OBJ_CLOSURE);
     c->desc = desc;
+    memset(c->caps, 0, nfree * sizeof(Value));
     for (size_t i = 0; i < nfree; i++) {
-        c->caps[i] = va_arg(ap, Value);
+        c->caps[i] = gc_escape_borrowed(va_arg(ap, Value));
     }
     return VObject(c);
 }
@@ -1582,10 +1694,11 @@ Value mk_text(const char *src) { return mk_textn(src, strlen(src)); }
 Value mk_tuple(size_t len, ...) {
     size_t body = sizeof(Tuple) + len * sizeof(Value);
     Tuple *t = gc_new(body, OBJ_TUPLE);
+    memset(t->elems, 0, len * sizeof(Value));
     va_list ap;
     va_start(ap, len);
     for (size_t i = 0; i < len; i++) {
-        t->elems[i] = va_arg(ap, Value);
+        t->elems[i] = gc_escape_borrowed(va_arg(ap, Value));
     }
     va_end(ap);
     return VObject(t);
@@ -1674,6 +1787,7 @@ static size_t build_shape(Value v, int64_t *shape, size_t *slen, int depth, bool
     // `v.w != 0` guard rejects a zero word (e.g. a sum element's inline padding) that
     // would otherwise be chased as a pointer and fault.
     if (!noflat && depth <= FLAT_MAX_DEPTH && v.w != 0 && !(v.w & IMM_TAG) &&
+        !is_borrowed(v) &&
         HEADER(as_ptr(v))->kind == OBJ_TUPLE && HEADER(as_ptr(v))->ctag != FLAT_ARRAY_CTAG) {
         Tuple *t = as_tuple(v);
         size_t k = HEADER(t)->body / sizeof(Value);
@@ -1697,7 +1811,7 @@ static void flatten(Value v, const int64_t *shape, size_t *si, Value *dest, size
     int64_t node = shape[*si];
     if (node == 0) { // leaf: one stored word
         (*si)++;
-        dest[(*di)++] = v;
+        dest[(*di)++] = gc_escape_borrowed(v);
         return;
     }
     if (node > 0) { // product/record: `v` is a Tuple, flatten its fields in order
@@ -1890,7 +2004,8 @@ Value flat_array_get_word(Value arr, size_t i, size_t word_offset) {
 void flat_array_set_word(Value arr, size_t i, size_t word_offset, Value value) {
     Tuple *t = as_tuple(arr);
     size_t stride = (size_t)as_int(t->elems[1]);
-    t->elems[flat_elem_base(arr) + i * stride + word_offset] = value;
+    t->elems[flat_elem_base(arr) + i * stride + word_offset] =
+        gc_escape_borrowed(value);
     gc_remember_object(t);
 }
 
@@ -2155,7 +2270,9 @@ Value flat_from_enumerator(int64_t length, Value enumeration, Value next) {
 Value mk_data_inline(Value tag_imm, size_t payload_words, const Value *src) {
     Data *d = gc_new(sizeof(Data) + payload_words * sizeof(Value), OBJ_DATA);
     HEADER(d)->ctag = (uint8_t)as_int(tag_imm);
-    if (payload_words) memcpy(d->fields, src, payload_words * sizeof(Value));
+    memset(d->fields, 0, payload_words * sizeof(Value));
+    for (size_t i = 0; i < payload_words; i++)
+        d->fields[i] = gc_escape_borrowed(src[i]);
     return VObject(d);
 }
 
@@ -2163,10 +2280,11 @@ Value mk_data(uint64_t tag, size_t nfields, ...) {
     size_t body = sizeof(Data) + nfields * sizeof(Value);
     Data *d = gc_new(body, OBJ_DATA);
     HEADER(d)->ctag = (uint8_t)tag;
+    memset(d->fields, 0, nfields * sizeof(Value));
     va_list ap;
     va_start(ap, nfields);
     for (size_t i = 0; i < nfields; i++) {
-        d->fields[i] = va_arg(ap, Value);
+        d->fields[i] = gc_escape_borrowed(va_arg(ap, Value));
     }
     va_end(ap);
     return VObject(d);
@@ -2201,23 +2319,32 @@ Value mk_data0(uint64_t tag) {
     return VObject(d);
 }
 Value mk_data1(uint64_t tag, Value f0) {
+    f0 = gc_escape_borrowed(f0);
     Data *d = alloc_body(sizeof(Data) + 1 * sizeof(Value), OBJ_DATA);
     HEADER(d)->ctag = (uint8_t)tag, d->fields[0] = f0;
     return VObject(d);
 }
 Value mk_data2(uint64_t tag, Value f0, Value f1) {
+    f0 = gc_escape_borrowed(f0), f1 = gc_escape_borrowed(f1);
     Data *d = alloc_body(sizeof(Data) + 2 * sizeof(Value), OBJ_DATA);
-    HEADER(d)->ctag = (uint8_t)tag, d->fields[0] = f0, d->fields[1] = f1;
+    HEADER(d)->ctag = (uint8_t)tag;
+    d->fields[0] = f0, d->fields[1] = f1;
     return VObject(d);
 }
 Value mk_data3(uint64_t tag, Value f0, Value f1, Value f2) {
+    f0 = gc_escape_borrowed(f0), f1 = gc_escape_borrowed(f1);
+    f2 = gc_escape_borrowed(f2);
     Data *d = alloc_body(sizeof(Data) + 3 * sizeof(Value), OBJ_DATA);
-    HEADER(d)->ctag = (uint8_t)tag, d->fields[0] = f0, d->fields[1] = f1, d->fields[2] = f2;
+    HEADER(d)->ctag = (uint8_t)tag;
+    d->fields[0] = f0, d->fields[1] = f1, d->fields[2] = f2;
     return VObject(d);
 }
 Value mk_data4(uint64_t tag, Value f0, Value f1, Value f2, Value f3) {
+    f0 = gc_escape_borrowed(f0), f1 = gc_escape_borrowed(f1);
+    f2 = gc_escape_borrowed(f2), f3 = gc_escape_borrowed(f3);
     Data *d = alloc_body(sizeof(Data) + 4 * sizeof(Value), OBJ_DATA);
-    HEADER(d)->ctag = (uint8_t)tag, d->fields[0] = f0, d->fields[1] = f1, d->fields[2] = f2, d->fields[3] = f3;
+    HEADER(d)->ctag = (uint8_t)tag;
+    d->fields[0] = f0, d->fields[1] = f1, d->fields[2] = f2, d->fields[3] = f3;
     return VObject(d);
 }
 
@@ -2226,21 +2353,27 @@ Value mk_tuple0(void) {
     return VObject(t);
 }
 Value mk_tuple1(Value e0) {
+    e0 = gc_escape_borrowed(e0);
     Tuple *t = alloc_body(sizeof(Tuple) + 1 * sizeof(Value), OBJ_TUPLE);
     t->elems[0] = e0;
     return VObject(t);
 }
 Value mk_tuple2(Value e0, Value e1) {
+    e0 = gc_escape_borrowed(e0), e1 = gc_escape_borrowed(e1);
     Tuple *t = alloc_body(sizeof(Tuple) + 2 * sizeof(Value), OBJ_TUPLE);
     t->elems[0] = e0, t->elems[1] = e1;
     return VObject(t);
 }
 Value mk_tuple3(Value e0, Value e1, Value e2) {
+    e0 = gc_escape_borrowed(e0), e1 = gc_escape_borrowed(e1);
+    e2 = gc_escape_borrowed(e2);
     Tuple *t = alloc_body(sizeof(Tuple) + 3 * sizeof(Value), OBJ_TUPLE);
     t->elems[0] = e0, t->elems[1] = e1, t->elems[2] = e2;
     return VObject(t);
 }
 Value mk_tuple4(Value e0, Value e1, Value e2, Value e3) {
+    e0 = gc_escape_borrowed(e0), e1 = gc_escape_borrowed(e1);
+    e2 = gc_escape_borrowed(e2), e3 = gc_escape_borrowed(e3);
     Tuple *t = alloc_body(sizeof(Tuple) + 4 * sizeof(Value), OBJ_TUPLE);
     t->elems[0] = e0, t->elems[1] = e1, t->elems[2] = e2, t->elems[3] = e3;
     return VObject(t);
@@ -2255,23 +2388,32 @@ Value mk_closure_d0(const ClosureDesc *desc) {
     return VObject(c);
 }
 Value mk_closure_d1(const ClosureDesc *desc, Value c0) {
+    c0 = gc_escape_borrowed(c0);
     Closure *c = alloc_body(sizeof(Closure) + 1 * sizeof(Value), OBJ_CLOSURE);
     c->desc = desc, c->caps[0] = c0;
     return VObject(c);
 }
 Value mk_closure_d2(const ClosureDesc *desc, Value c0, Value c1) {
+    c0 = gc_escape_borrowed(c0), c1 = gc_escape_borrowed(c1);
     Closure *c = alloc_body(sizeof(Closure) + 2 * sizeof(Value), OBJ_CLOSURE);
-    c->desc = desc, c->caps[0] = c0, c->caps[1] = c1;
+    c->desc = desc;
+    c->caps[0] = c0, c->caps[1] = c1;
     return VObject(c);
 }
 Value mk_closure_d3(const ClosureDesc *desc, Value c0, Value c1, Value c2) {
+    c0 = gc_escape_borrowed(c0), c1 = gc_escape_borrowed(c1);
+    c2 = gc_escape_borrowed(c2);
     Closure *c = alloc_body(sizeof(Closure) + 3 * sizeof(Value), OBJ_CLOSURE);
-    c->desc = desc, c->caps[0] = c0, c->caps[1] = c1, c->caps[2] = c2;
+    c->desc = desc;
+    c->caps[0] = c0, c->caps[1] = c1, c->caps[2] = c2;
     return VObject(c);
 }
 Value mk_closure_d4(const ClosureDesc *desc, Value c0, Value c1, Value c2, Value c3) {
+    c0 = gc_escape_borrowed(c0), c1 = gc_escape_borrowed(c1);
+    c2 = gc_escape_borrowed(c2), c3 = gc_escape_borrowed(c3);
     Closure *c = alloc_body(sizeof(Closure) + 4 * sizeof(Value), OBJ_CLOSURE);
-    c->desc = desc, c->caps[0] = c0, c->caps[1] = c1, c->caps[2] = c2, c->caps[3] = c3;
+    c->desc = desc;
+    c->caps[0] = c0, c->caps[1] = c1, c->caps[2] = c2, c->caps[3] = c3;
     return VObject(c);
 }
 
@@ -2358,6 +2500,15 @@ Value mk_slice_at(void *owner, const uint8_t *base, size_t len) {
     s->base = base;
     s->len = len;
     return VObject(s);
+}
+
+Value gc_materialize_borrowed(Value value) {
+    assert(is_borrowed(value));
+    // Copy the descriptor before allocating. Its owner remains an exact body
+    // pointer in this stack frame, so the conservative collector keeps it live
+    // if materialisation itself triggers a collection.
+    volatile Slice source = *(const Slice *)as_ptr(value);
+    return mk_slice_at(source.owner, source.base, source.len);
 }
 
 // Resolve `owner + offset` to a read pointer ONCE, here, rather than on every byte

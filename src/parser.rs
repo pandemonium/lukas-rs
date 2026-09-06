@@ -172,6 +172,39 @@ impl Identifier {
     }
 }
 
+/// The name of the enclosing function, for a [`ParseError::Fault`]. Rust has no
+/// stable way to ask for it, so this names a local `fn` and reads the path back out
+/// of its type name -- the usual trick. Deriving it beats writing the name out by
+/// hand, which would rot silently the first time a parse function is renamed.
+macro_rules! parser_name {
+    () => {{
+        fn marker() {}
+        fn path_of<A>(_: A) -> &'static str {
+            std::any::type_name::<A>()
+        }
+        $crate::parser::trim_parser_path(path_of(marker))
+    }};
+}
+
+/// `lukas::parser::Parser<'_>::parse_expr_prefix::marker` -> `parse_expr_prefix`.
+/// Closures are transparent here: a fault raised inside one should still name the
+/// parse function that owns it.
+#[doc(hidden)]
+pub fn trim_parser_path(path: &'static str) -> &'static str {
+    let mut path = path.strip_suffix("::marker").unwrap_or(path);
+    while let Some(enclosing) = path.strip_suffix("::{{closure}}") {
+        path = enclosing;
+    }
+    path.rsplit("::").next().unwrap_or(path)
+}
+
+/// Quote the offending source line beneath a fault, with a caret under the column --
+/// the same treatment name and type errors get through `Located`'s `Display`.
+fn quoted_line(at: &ParseInfo) -> String {
+    source_map::snippet(at.file, at.location.row, at.location.column)
+        .map_or_else(String::new, |snippet| format!("\n{snippet}"))
+}
+
 #[derive(Debug, Error)]
 pub enum ParseError {
     #[error("unexpected overflow")]
@@ -209,9 +242,30 @@ pub enum ParseError {
         found: TokenKind,
         position: SourceLocation,
     },
+
+    /// A parse function ran out of alternatives. These arms mark syntax the parser
+    /// does not handle *yet* as much as they mark bad input, so the message says
+    /// which function gave up -- that is what tells the two apart -- and quotes the
+    /// tokens ahead, where a layout desync shows up as a stray `<Ind>`/`<Ded>`.
+    #[error(
+        "{at}: `{parser}` has no rule for this input\n\
+         found: {found}\n\
+         next:  {lookahead}{}",
+        quoted_line(.at)
+    )]
+    Fault {
+        parser: &'static str,
+        at: ParseInfo,
+        found: TokenKind,
+        lookahead: String,
+    },
 }
 
 type Result<A> = result::Result<A, ParseError>;
+
+/// How many upcoming tokens a fault quotes. Enough to show the shape of what the
+/// parser choked on -- a whole short declaration, usually -- without a wall of text.
+const FAULT_LOOKAHEAD: usize = 8;
 
 #[derive(Debug)]
 struct TraceLogEntry<'a> {
@@ -299,6 +353,10 @@ pub struct Parser<'a> {
     /// body already consumed this block's closer -- e.g. a coproduct whose `|`
     /// alternatives dedent back before the bar, eating the type body's dedent.
     indent_columns: Vec<u32>,
+    /// How many `(` are open around the expression being parsed. Inside parentheses
+    /// there is no enclosing block for a line break to belong to, so an `Indent` there
+    /// continues the expression instead of opening one -- see `parse_expr_infix`.
+    paren_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -307,6 +365,7 @@ impl<'a> Parser<'a> {
             remains,
             offset: 0,
             indent_columns: Vec::new(),
+            paren_depth: 0,
         }
     }
 
@@ -369,6 +428,54 @@ impl<'a> Parser<'a> {
         }
 
         TraceGuard::enter()
+    }
+
+    /// A fault at the next token: the parser is standing on input it has no rule
+    /// for. `parser` comes from [`parser_name!`] at the call site.
+    fn fault(&self, parser: &'static str) -> ParseError {
+        match self.remains() {
+            [found, rest @ ..] => Self::fault_with(parser, found.position, found.kind.clone(), rest),
+
+            // Nothing left to stand on: report at the last token consumed, so the
+            // caret still lands in the file instead of at 1:1.
+            [] => Self::fault_with(parser, self.last_position(), TokenKind::End, &[]),
+        }
+    }
+
+    /// A fault at a token already consumed -- for a `match self.consume()?` that
+    /// falls through, where the offending token is no longer what comes next.
+    fn fault_at(&self, parser: &'static str, position: SourceLocation, found: TokenKind) -> ParseError {
+        Self::fault_with(parser, position, found, self.remains())
+    }
+
+    fn fault_with(
+        parser: &'static str,
+        position: SourceLocation,
+        found: TokenKind,
+        next: &[Token],
+    ) -> ParseError {
+        ParseError::Fault {
+            parser,
+            at: ParseInfo::from_position(position),
+            found,
+            // By kind, not by `Token`'s `Display`: a row:col on every one of eight
+            // consecutive tokens buries the shape of the input, which is the thing
+            // worth reading here. The caret line carries the position.
+            lookahead: next
+                .iter()
+                .take(FAULT_LOOKAHEAD)
+                .map(|token| token.kind.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+
+    /// Where the last consumed token sat, for a fault raised at end of input.
+    fn last_position(&self) -> SourceLocation {
+        self.offset
+            .checked_sub(1)
+            .and_then(|previous| self.remains.get(previous))
+            .map_or_else(SourceLocation::default, |token| token.position)
     }
 
     fn peek(&self) -> Result<&Token> {
@@ -902,7 +1009,7 @@ impl<'a> Parser<'a> {
                 ))
             }
 
-            otherwise => panic!("{otherwise:?}"),
+            _ => Err(self.fault(parser_name!())),
         }
     }
 
@@ -1024,7 +1131,7 @@ impl<'a> Parser<'a> {
                 Ok(Kind::star())
             }
 
-            otherwise => panic!("{otherwise:?}"),
+            _ => Err(self.fault(parser_name!())),
         }
     }
 
@@ -1120,7 +1227,7 @@ impl<'a> Parser<'a> {
                     .map(|decl| TypeDeclarator::Coproduct(info, decl))
             }),
 
-            otherwise => panic!("{otherwise:?}"),
+            _ => Err(self.fault(parser_name!())),
         }
     }
 
@@ -1212,7 +1319,7 @@ impl<'a> Parser<'a> {
             }
 
             // parens
-            otherwise => panic!("{otherwise:?}"),
+            _ => Err(self.fault(parser_name!())),
         }
     }
 
@@ -1334,10 +1441,16 @@ impl<'a> Parser<'a> {
 
             TypeExprOperator::ConfinementAscription => {
                 let position = self.consume()?.position;
-                let confinement = match self.consume()?.kind {
+                let keyword = self.consume()?;
+                let (keyword_position, keyword_kind) = (keyword.position, keyword.kind.clone());
+                let confinement = match keyword_kind {
                     TokenKind::Keyword(Keyword::Confined) => ConfinementModifier::Confined,
                     TokenKind::Keyword(Keyword::Unconfined) => ConfinementModifier::Unconfined,
-                    _ => unreachable!("peek_type_expr_operator validated the capability keyword"),
+                    // `peek_type_expr_operator` only reports an ascription when a
+                    // capability keyword follows the `:`. A fault rather than an
+                    // assertion, so that if the two ever disagree the parser says so
+                    // instead of taking the process down.
+                    found => return Err(self.fault_at(parser_name!(), keyword_position, found)),
                 };
                 self.parse_type_expr_infix(
                     TypeExpression::ConfinementAscription(
@@ -1590,7 +1703,10 @@ impl<'a> Parser<'a> {
                         .into_iter()
                         .map(|field| {
                             (
-                                field.path.into_iter().next().expect("construction field"),
+                                // One segment: a construction's fields are built as
+                                // `path: vec![name]` in the loop above (an update is
+                                // the branch with a base, and keeps the whole path).
+                                field.path.into_iter().next().expect("one-segment path"),
                                 field.value,
                             )
                         })
@@ -1722,6 +1838,19 @@ impl<'a> Parser<'a> {
         }
         self.expect(TokenKind::Period)?;
         Ok(params)
+    }
+
+    /// Run `parse` with the parenthesis relaxation suspended.
+    ///
+    /// `(` delimits an expression, so layout inside it is noise and a continuation may
+    /// hang left (see `parse_expr_infix`). `[` and `{` are different: their contents are
+    /// newline-separated, so layout inside THEM is significant again, even when they sit
+    /// inside parentheses.
+    fn within_own_layout<T>(&mut self, parse: impl Fn(&mut Self) -> Result<T>) -> Result<T> {
+        let outer = std::mem::take(&mut self.paren_depth);
+        let parsed = parse(self);
+        self.paren_depth = outer;
+        parsed
     }
 
     fn is_expr_start(&self, t: &TokenKind) -> bool {
@@ -1858,7 +1987,7 @@ impl<'a> Parser<'a> {
                     ..
                 },
                 ..,
-            ] => self.parse_record(),
+            ] => self.within_own_layout(Self::parse_record),
 
             [
                 Token {
@@ -1866,7 +1995,7 @@ impl<'a> Parser<'a> {
                     ..
                 },
                 ..,
-            ] => self.parse_array(),
+            ] => self.within_own_layout(Self::parse_array),
 
             [t, ..] if t.is_keyword(Keyword::Lambda) => self.parse_lambda(),
 
@@ -1955,12 +2084,14 @@ impl<'a> Parser<'a> {
             ] => {
                 // '('
                 self.advance(1);
+                self.paren_depth += 1;
                 let expr = self.parse_expression(0);
+                self.paren_depth -= 1;
                 self.expect(TokenKind::RightParen)?;
                 expr
             }
 
-            otherwise => panic!("{otherwise:?}"),
+            _ => Err(self.fault(parser_name!())),
         }
     }
 
@@ -2041,11 +2172,10 @@ impl<'a> Parser<'a> {
                 if (layout.is_dedent() || layout.is_newline())
                     && operator_token.location().column < expr_context.anchor_column
                     && Self::is_expr_prefix(&operand.kind)
-                    && Operator::try_from(&operator_token.kind)
-                        .is_some_and(|op| op.binding_precedence() > expr_context.precedence) =>
+                    && let Some(operator) = Operator::try_from(&operator_token.kind)
+                    && operator.binding_precedence() > expr_context.precedence =>
             {
                 let operator_position = *operator_token.location();
-                let operator = Operator::try_from(&operator_token.kind).expect("guard ensured Ok");
                 self.advance(2); // the layout token and the operator
                 self.parse_operator(lhs, operator, operator_position, expr_context)
             }
@@ -2064,11 +2194,10 @@ impl<'a> Parser<'a> {
                 if layout.is_indent()
                     && operator_token.location().column < expr_context.anchor_column
                     && Self::is_expr_prefix(&operand.kind)
-                    && Operator::try_from(&operator_token.kind)
-                        .is_some_and(|op| op.binding_precedence() > expr_context.precedence) =>
+                    && let Some(operator) = Operator::try_from(&operator_token.kind)
+                    && operator.binding_precedence() > expr_context.precedence =>
             {
                 let operator_position = *operator_token.location();
-                let operator = Operator::try_from(&operator_token.kind).expect("guard ensured Ok");
                 self.advance(2); // the Indent and the operator
                 let folded = self.parse_operator(lhs, operator, operator_position, expr_context)?;
                 if self.peek()?.is_dedent() {
@@ -2088,8 +2217,7 @@ impl<'a> Parser<'a> {
 
             [t, u, ..] if t.is_layout() && is_terminal(&u.kind) => Ok(lhs),
 
-            [t, ..] if Operator::is_defined(&t.kind) => {
-                let operator = Operator::try_from(&t.kind).expect("msg");
+            [t, ..] if let Some(operator) = Operator::try_from(&t.kind) => {
                 // the operator
                 self.advance(1);
                 self.parse_operator(lhs, operator, *t.location(), expr_context)
@@ -2105,7 +2233,19 @@ impl<'a> Parser<'a> {
                 if (t.is_indent() || t.is_newline())
                     && Self::is_expr_prefix(&u.kind)
                     && Operator::Juxtaposition.precedence() > expr_context.precedence
-                    && u.position.is_descendant_of(lhs.position()) =>
+                    && (u.position.is_descendant_of(lhs.position())
+                        // Inside parentheses the bracket already delimits the
+                        // expression, so the offside rule does not have to: a
+                        // continuation may hang LEFT of the function it applies to.
+                        // This is what let a multi-line argument list be written
+                        // `f (g\n  [ a\n    b\n  ]) h` instead of being bounced out to a
+                        // `let`.
+                        //
+                        // `Indent` only. A `Newline` at the same level separates
+                        // statements in a block that is genuinely there -- a lambda body
+                        // inside parens -- and juxtaposing across it would turn two
+                        // statements into an application.
+                        || (t.is_indent() && self.paren_depth > 0)) =>
             {
                 self.advance(1); //the indent
                 self.parse_juxtaposed(lhs, expr_context)
@@ -2152,7 +2292,11 @@ impl<'a> Parser<'a> {
                     break Ok(Expr::Interpolate(pi, interpolator));
                 }
 
-                unexpected => panic!("{unexpected:?}"),
+                // Already consumed, so the fault has to be told what it was.
+                unexpected => {
+                    let (position, found) = (unexpected.position, unexpected.kind.clone());
+                    break Err(self.fault_at(parser_name!(), position, found));
+                }
             }
         }
     }
@@ -2360,7 +2504,7 @@ impl<'a> Parser<'a> {
                 ..,
             ] => ast::ProductElement::Ordinal(*id as usize),
 
-            otherwise => panic!("{otherwise:?}"),
+            _ => return Err(self.fault(parser_name!())),
         };
 
         // The Id or Int literal
@@ -2716,7 +2860,7 @@ impl<'a> Parser<'a> {
                 ..,
             ] => self.parse_literal_pattern(*position, literal),
 
-            otherwise => panic!("{otherwise:?}"),
+            _ => Err(self.fault(parser_name!())),
         }
     }
 
@@ -2991,6 +3135,69 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Lex and parse a declaration list, expecting it to fail.
+    fn parse_failure(source: &str) -> ParseError {
+        let characters = source.chars().collect::<Vec<_>>();
+        let mut lexer = LexicalAnalyzer::default();
+        let tokens = lexer.tokenize(&characters);
+        Parser::from_tokens(tokens)
+            .parse_declaration_list()
+            .expect_err("expected this source to fail to parse")
+    }
+
+    #[test]
+    fn syntax_with_no_rule_faults_instead_of_panicking() {
+        // Each of these lands in a different parse function's catch-all arm. The
+        // point of the fault is that it *names* that function: these arms mark
+        // syntax the parser does not handle as much as they mark bad input, and
+        // the name is what tells a reader which of the two they are looking at.
+        let cases = [
+            ("declaration", ":= 3\n", "parse_declaration"),
+            ("expression", "bad :: Int := :=\n", "parse_expr_prefix"),
+            ("type", "bad :: := := 3\n", "parse_type_expr_prefix"),
+            ("type declarator", "Bad ::= :=\n", "parse_type_declarator"),
+            ("projection", "bad :: Int := (1, 2).+\n", "parse_projection"),
+            (
+                "pattern",
+                "bad :: Int := deconstruct 1 into := -> 2\n",
+                "parse_pattern_prefix",
+            ),
+        ];
+
+        for (what, source, expected) in cases {
+            match parse_failure(source) {
+                ParseError::Fault { parser, .. } => {
+                    assert_eq!(parser, expected, "wrong parse function named for {what}");
+                }
+                otherwise => panic!("{what}: expected a fault, got {otherwise:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_fault_reports_where_it_is_and_what_follows() {
+        let error = parse_failure("bad :: Int := :=\nnext :: Int := 1\n");
+
+        let ParseError::Fault {
+            at,
+            found,
+            lookahead,
+            ..
+        } = &error
+        else {
+            panic!("expected a fault, got {error:?}");
+        };
+
+        assert_eq!((at.location.row, at.location.column), (1, 15));
+        assert_eq!(*found, TokenKind::Assign);
+        // The tokens after the offending one, by kind -- enough of them to show the
+        // shape of what the parser was standing in front of.
+        assert!(
+            lookahead.starts_with("<NL> next :: Int"),
+            "unhelpful lookahead: {lookahead}"
+        );
     }
 
     #[test]

@@ -1,0 +1,507 @@
+(* A tiny menu-driven dungeon crawl, written against Stdlib.Console in the shape Elm
+   made famous: a MODEL that is the whole state, a VIEW that turns it into a picture,
+   and an UPDATE that turns a keypress into the next model.
+
+       ./compile-lady.sh ladies/interactive/dungeon && ladies/interactive/dungeon/exe
+
+   What makes that shape work here is that `Console α` is itself a monad of console
+   programs, so `update` can BE a console program: "wait for a keypress, and if it is
+   `c` show the character sheet" is an ordinary monadic expression returning the next
+   model. Nothing in this file performs an effect -- `Console.execute` at the very
+   bottom is the single place where any of it happens.
+
+   The game runs inside `in_alternate_screen` and `in_raw_mode`, so the player's
+   terminal comes back exactly as it was however the game ends. *)
+use Stdlib.
+use Stdlib.Console.
+use Stdlib.Random.
+
+(* ---------------------------------------------------------------- the world *)
+
+Hero ::=
+  { Name       :: Text
+    Level      :: Int
+    Health     :: Int
+    Max_Health :: Int
+    Might      :: Int
+    Guard      :: Int
+    Gold       :: Int
+    Experience :: Int
+    Potions    :: Int
+  }
+
+Foe ::=
+  { Foe_Name   :: Text
+    Foe_Health :: Int
+    Foe_Might  :: Int
+    Foe_Gold   :: Int
+    Foe_Reward :: Int
+  }
+
+(* The hero and the dice travel together: every roll returns a new world, so no mutable
+   state is needed anywhere and a battle is a plain recursion over turns. *)
+World ::=
+  { Player :: Hero
+    Dice   :: LCG
+  }
+
+new_hero :: Text -> Hero := λname.
+  { Name       := name
+    Level      := 1
+    Health     := 20
+    Max_Health := 20
+    Might      := 4
+    Guard      := 1
+    Gold       := 15
+    Experience := 0
+    Potions    := 1
+  }
+
+
+(* ---------------------------------------------------------------- the model *)
+
+(* A battle is a PANEL model: state that belongs to one screen and dies with it. The
+   foe's remaining health lives here and not in the world, because when this page is
+   left the fight is over either way. *)
+Battle ::=
+  { Enemy        :: Foe
+    Enemy_Health :: Int
+  }
+
+(* Which page is on screen. A page is a VALUE, so "show the character sheet" is an
+   assignment rather than a call -- which is the whole point of this shape. Anything a
+   page needs and the world does not travels inside its constructor. *)
+Page ::=
+    Town
+  | Sheet
+  | Inventory
+  | Shop
+  | Fighting Battle
+  | Won
+  | Lost
+
+(* The entire state of the game. `Note` is the one line of feedback under every panel:
+   it belongs in the model because what the player has been told is state, not an
+   effect -- a redraw for any other reason must not silently lose it. *)
+Model ::=
+  { Realm :: World
+    Page  :: Page
+    Note  :: Text
+  }
+
+(* What an update decided. A page that wants to end the game says so; everything else
+   hands back the next model and the loop draws it. *)
+Step ::= Continue Model | Stop
+
+
+(* ---------------------------------------------------------------- the menus *)
+
+(* A menu entry: the cap to show, the words beside it, and the value it stands for.
+   The three are bundled, so a key cannot be listed without being handled nor handled
+   without being listed -- the two lists that used to drift apart are one list. *)
+Choice ::= ∀α. Offer Text Text α
+
+Town_Choice      ::= Delve | Trade | Rest | Read_Sheet | Open_Inventory | Leave
+Battle_Choice    ::= Attack | Quaff | Flee
+Inventory_Choice ::= Drink | Shut_Inventory
+Shop_Choice      ::= Buy_Potion | Buy_Might | Buy_Guard | Shut_Shop
+
+town_choices :: List (Choice Town_Choice) :=
+  from
+    [ Offer "d" "into the dungeon" Delve
+      Offer "s" "visit the shop" Trade
+      Offer "r" "rest at the inn (5 gold)" Rest
+      Offer "c" "character sheet" Read_Sheet
+      Offer "i" "inventory" Open_Inventory
+      Offer "q" "quit" Leave
+    ]
+
+battle_choices :: List (Choice Battle_Choice) :=
+  from
+    [ Offer "a" "attack" Attack
+      Offer "p" "drink a potion" Quaff
+      Offer "r" "run away" Flee
+    ]
+
+inventory_choices :: List (Choice Inventory_Choice) :=
+  from
+    [ Offer "p" "drink a potion" Drink
+      Offer "b" "back to town" Shut_Inventory
+    ]
+
+(* The note a page returns to town with, when nothing in particular has happened. *)
+quiet :: Text := "The road is quiet."
+
+price_potion :: Int := 8
+price_might  :: Int := 20
+price_guard  :: Int := 16
+
+shop_choices :: List (Choice Shop_Choice) :=
+  from
+    [ Offer "1" "a potion .......... `price_potion` gold" Buy_Potion
+      Offer "2" "sharpen your blade  `price_might` gold (+1 might)" Buy_Might
+      Offer "3" "patch your armour   `price_guard` gold (+1 guard)" Buy_Guard
+      Offer "b" "back to town" Shut_Shop
+    ]
+
+(* The cap that was pressed, looked up in this page's own table. *)
+resolve :: ∀α. List (Choice α) -> Text -> Perhaps α := λchoices typed.
+  deconstruct choices into
+    Nil -> Nope
+  | Cons (Offer cap _ outcome) rest ->
+      if cap = typed then This outcome else resolve rest typed
+
+
+(* --------------------------------------------------------------- the palette *)
+
+title   :: Style := mappend Style.bold (Style.fg (Bright Yellow))
+key_cap :: Style := mappend Style.bold (Style.fg (Bright White))
+dim     :: Style := Style.faint
+good    :: Style := Style.fg (Bright Green)
+bad     :: Style := Style.fg (Bright Red)
+coin    :: Style := Style.fg Yellow
+
+
+(* ------------------------------------------------------------------- drawing *)
+(* Every function here has type `Console Unit`: a picture as a value. They compose with
+   `let*` because that is what sequencing is now -- there is no second vocabulary. *)
+
+run_of :: Int -> Char -> Text := λn glyph.
+  List.concat (List.tabulate (max n 0) (λ_. "`glyph`"))
+
+gauge :: Style -> Int -> Int -> Markup := λstyle value limit.
+  let filled = if limit <= 0 then 0 else (value * 20) / limit in
+  let parts =
+    from
+      [ Markup.paint style (run_of (max filled 0) '#')
+        Markup.paint dim (run_of (max (20 - filled) 0) '.')
+      ]
+  in mconcat parts
+
+row :: Text -> Markup -> Console Unit := λlabel value.
+  let parts =
+    from
+      [ Markup.paint dim "  `label`  "
+        value
+      ]
+  in Console.write_line (mconcat parts)
+
+stat :: Text -> Text -> Console Unit := λlabel value. row label (Markup.text value)
+
+key_line :: Text -> Text -> Console Unit := λcap label.
+  let parts =
+    from
+      [ Markup.text "  ["
+        Markup.paint key_cap cap
+        Markup.text "] "
+        Markup.text label
+      ]
+  in Console.write_line (mconcat parts)
+
+menu :: ∀α. List (Choice α) -> Console Unit :=
+  traverse_ (λ(Offer cap label _). key_line cap label)
+
+(* Erase, home, title, body, note. One frame, and because output is buffered until the
+   next read the whole of it reaches the terminal as a single write. *)
+panel :: Text -> Text -> Console Unit -> Console Unit := λwhat note body.
+  let* _ = Console.clear in
+  let* _ = Console.write_line (Markup.paint title "  `what`") in
+  let* _ = Console.new_line in
+  let* _ = body in
+  let* _ = Console.new_line in
+  Console.write_line (Markup.paint dim "  `note`")
+
+sheet_body :: Hero -> Console Unit := λhero.
+  let health =
+    from
+      [ gauge good hero.Health hero.Max_Health
+        Markup.text "  `hero.Health`/`hero.Max_Health`"
+      ]
+  in
+  let* _ = row "health" (mconcat health) in
+  let* _ = stat "level " "`hero.Level`" in
+  let* _ = stat "might " "`hero.Might`" in
+  let* _ = stat "guard " "`hero.Guard`" in
+  let* _ = stat "exp   " "`hero.Experience` of `hero.Level * 10` needed" in
+  let* _ = row "gold  " (Markup.paint coin "`hero.Gold`") in
+  stat "potion" "`hero.Potions`"
+
+any_key :: Console Unit :=
+  Console.write_line (Markup.paint dim "  Press any key.")
+
+
+(* ---------------------------------------------------------------------- view *)
+
+(* The only function that draws, and the only one that looks at `Page` in order to
+   draw. It reads a model and returns a picture; it decides nothing. *)
+view :: Model -> Console Unit := λmodel.
+  let hero = model.Realm.Player in
+  deconstruct model.Page into
+    Town ->
+      panel "Rivermouth" model.Note
+        (let* _ = sheet_body hero in
+         let* _ = Console.new_line in
+         menu town_choices)
+  | Sheet ->
+      panel hero.Name model.Note
+        (let* _ = sheet_body hero in
+         let* _ = Console.new_line in
+         any_key)
+  | Inventory ->
+      panel "Your pack" model.Note
+        (let* _ = stat "potions" "`hero.Potions`" in
+         let* _ = row "gold   " (Markup.paint coin "`hero.Gold`") in
+         let* _ = Console.new_line in
+         menu inventory_choices)
+  | Shop ->
+      panel "The shop" model.Note
+        (let* _ = sheet_body hero in
+         let* _ = Console.new_line in
+         menu shop_choices)
+  | Fighting battle ->
+      panel "The dungeon" model.Note
+        (let* _ = row battle.Enemy.Foe_Name (gauge bad battle.Enemy_Health battle.Enemy.Foe_Health) in
+         let* _ = Console.new_line in
+         let* _ = sheet_body hero in
+         let* _ = Console.new_line in
+         menu battle_choices)
+  | Won ->
+      panel "Victory" model.Note
+        (let* _ = sheet_body hero in
+         let* _ = Console.new_line in
+         any_key)
+  | Lost ->
+      panel "Defeated" model.Note
+        (let* _ = Console.say "  You fall in the dark, and the dungeon keeps its gold." in
+         let* _ = Console.new_line in
+         any_key)
+
+
+(* ------------------------------------------------------------------ the dice *)
+
+roll :: Int -> World -> (Int, World) := λbound world.
+  let (n, dice) = LCG.next world.Dice in
+  ((n % bound), { world: Dice := dice })
+
+foes :: List Foe :=
+  from
+    [ { Foe_Name := "a giant rat"   ; Foe_Health := 8  ; Foe_Might := 3 ; Foe_Gold := 4  ; Foe_Reward := 4 }
+      { Foe_Name := "a goblin"      ; Foe_Health := 12 ; Foe_Might := 4 ; Foe_Gold := 7  ; Foe_Reward := 6 }
+      { Foe_Name := "a cave spider" ; Foe_Health := 10 ; Foe_Might := 5 ; Foe_Gold := 6  ; Foe_Reward := 7 }
+      { Foe_Name := "a skeleton"    ; Foe_Health := 16 ; Foe_Might := 6 ; Foe_Gold := 12 ; Foe_Reward := 10 }
+      { Foe_Name := "an ogre"       ; Foe_Health := 24 ; Foe_Might := 8 ; Foe_Gold := 20 ; Foe_Reward := 16 }
+    ]
+
+fallback_foe :: Foe :=
+  { Foe_Name := "a shadow"; Foe_Health := 6; Foe_Might := 2; Foe_Gold := 2; Foe_Reward := 2 }
+
+after :: ∀α. Int -> List α -> List α := λn xs.
+  if n <= 0 then xs else after (n - 1) (List.tail xs)
+
+pick_foe :: World -> (Foe, World) := λworld.
+  deconstruct roll (List.length foes) world into
+    (n, next) ->
+      deconstruct List.head (after n foes) into
+        This foe -> (foe, next)
+      | Nope -> (fallback_foe, next)
+
+(* Damage is might, minus the defender's guard, plus a d3 -- so a weak hero still lands
+   something and a strong one is not deterministic. *)
+strike :: Int -> Int -> World -> (Int, World) := λmight guard world.
+  let (extra, next) = roll 3 world in
+  (max 1 (might + extra - guard), next)
+
+reward :: Foe -> Hero -> Hero := λfoe hero.
+  { hero: Gold := hero.Gold + foe.Foe_Gold
+          Experience := hero.Experience + foe.Foe_Reward }
+
+level_up :: Hero -> (Hero, Bool) := λhero.
+  if hero.Experience < hero.Level * 10
+    then (hero, false)
+    else
+      let spent = hero.Experience - hero.Level * 10 in
+      let bigger = hero.Max_Health + 5 in
+      let grown =
+        { hero: Level := hero.Level + 1
+                Experience := spent
+                Max_Health := bigger
+                Health := bigger
+                Might := hero.Might + 1
+                Guard := hero.Guard + 1 }
+      in (grown, true)
+
+
+(* -------------------------------------------------------------- the updates *)
+
+(* Small builders, so a page's decision reads as what it means and not as a record
+   literal with three fields. *)
+go_to :: Page -> Text -> Model -> Step := λpage note model.
+  Continue { model: Page := page; Note := note }
+
+say_only :: Text -> Model -> Step := λnote model.
+  Continue { model: Note := note }
+
+(* Wait for one keypress and hand what it means to `then_do`.
+
+   The two edge cases are decided HERE and nowhere else: a key with no entry in this
+   page's table redraws the page unchanged, and input closing ends the game. No page
+   can forget either, and none of them has to mention them. *)
+on_key :: ∀α. Model -> List (Choice α) -> (α -> Console Step) -> Console Step :=
+  λmodel choices then_do.
+    let* pressed = Console.read_key in
+    deconstruct pressed into
+      Return (Character typed) ->
+        deconstruct resolve choices typed into
+          This outcome -> then_do outcome
+        | Nope -> pure (Continue model)
+    | Return _ -> pure (Continue model)
+    | Fault _ -> pure Stop
+
+(* For the pages that only want acknowledgement. *)
+on_any_key :: Console Step -> Console Step := λnext.
+  let* pressed = Console.read_key in
+  deconstruct pressed into
+    Return _ -> next
+  | Fault _ -> pure Stop
+
+(* Enter the dungeon: roll a foe, and the battle page carries it. *)
+begin_battle :: Model -> Step := λmodel.
+  let (foe, ready) = pick_foe model.Realm in
+  Continue
+    { model: Realm := ready
+             Page  := Fighting { Enemy := foe; Enemy_Health := foe.Foe_Health }
+             Note  := "`foe.Foe_Name` blocks your way." }
+
+(* One exchange of blows. The hero swings; if the foe survives it swings back. Every
+   outcome is a page, which is why there is no recursion here and no separate battle
+   loop -- the ONE loop at the bottom of the file drives this like any other page. *)
+trade_blows :: Battle -> Model -> Step := λbattle model.
+  let hero = model.Realm.Player in
+  let (dealt, swung) = strike hero.Might 0 model.Realm in
+  let hurt = battle.Enemy_Health - dealt in
+  if hurt <= 0
+    then
+      let won = reward battle.Enemy swung.Player in
+      Continue
+        { model: Realm := { swung: Player := won }
+                 Page  := Won
+                 Note  := "The foe falls." }
+    else
+      let (taken, struck) = strike battle.Enemy.Foe_Might hero.Guard swung in
+      let bled = { hero: Health := hero.Health - taken } in
+      let bloodied = { struck: Player := bled } in
+      if bled.Health <= 0
+        then Continue { model: Realm := bloodied; Page := Lost; Note := "" }
+        else
+          Continue
+            { model: Realm := bloodied
+                     Page  := Fighting { battle: Enemy_Health := hurt }
+                     Note  := "You hit for `dealt`. It hits for `taken`." }
+
+(* Drink one, from anywhere that allows it. *)
+quaff :: Model -> Step := λmodel.
+  let hero = model.Realm.Player in
+  if hero.Potions <= 0
+    then say_only "You have no potions." model
+    else
+      let healed = min hero.Max_Health (hero.Health + 10) in
+      Continue
+        { model: Realm.Player.Health  := healed
+                 Realm.Player.Potions := hero.Potions - 1
+                 Note                 := "You drink a potion." }
+
+(* Charge for an ALREADY-improved hero. A signature, so `improved` has a type: a record
+   update cannot name its own record's type, so an unannotated parameter would leave
+   inference nothing to work with. *)
+purchase :: Int -> Hero -> Text -> Model -> Step := λcost improved note model.
+  if model.Realm.Player.Gold < cost
+    then say_only "You cannot afford that." model
+    else
+      Continue
+        { model: Realm.Player := { improved: Gold := improved.Gold - cost }
+                 Note := note }
+
+(* The only function that decides anything, and the only one that looks at `Page` in
+   order to decide. Each arm is this page's table beside what each entry means. *)
+update :: Model -> Console Step := λmodel.
+  let hero = model.Realm.Player in
+  deconstruct model.Page into
+    Town ->
+      on_key model town_choices (λchosen.
+        deconstruct chosen into
+          Delve -> pure (begin_battle model)
+        | Trade -> pure (go_to Shop "What will it be?" model)
+        | Read_Sheet -> pure (go_to Sheet quiet model)
+        | Open_Inventory -> pure (go_to Inventory quiet model)
+        | Leave -> pure Stop
+        | Rest ->
+            if hero.Gold < 5
+              then pure (say_only "You cannot afford a bed." model)
+              else
+                pure
+                  (Continue
+                    { model: Realm.Player.Gold   := hero.Gold - 5
+                             Realm.Player.Health := hero.Max_Health
+                             Note                := "You sleep until morning." }))
+  | Sheet -> on_any_key (pure (go_to Town quiet model))
+  | Inventory ->
+      on_key model inventory_choices (λchosen.
+        deconstruct chosen into
+          Drink -> pure (quaff model)
+        | Shut_Inventory -> pure (go_to Town quiet model))
+  | Shop ->
+      on_key model shop_choices (λchosen.
+        deconstruct chosen into
+          Buy_Potion ->
+            pure (purchase price_potion { hero: Potions := hero.Potions + 1 } "You pocket a potion." model)
+        | Buy_Might ->
+            pure (purchase price_might { hero: Might := hero.Might + 1 } "The smith sharpens your blade." model)
+        | Buy_Guard ->
+            pure (purchase price_guard { hero: Guard := hero.Guard + 1 } "Your armour is patched." model)
+        | Shut_Shop -> pure (go_to Town quiet model))
+  | Fighting battle ->
+      on_key model battle_choices (λchosen.
+        deconstruct chosen into
+          Attack -> pure (trade_blows battle model)
+        | Quaff -> pure (quaff model)
+        | Flee -> pure (go_to Town "You slip away." model))
+  | Won ->
+      on_any_key
+        (let (grown, levelled) = level_up hero in
+         let note = if levelled then "You feel stronger. Level `grown.Level`." else quiet in
+         pure (Continue { model: Realm.Player := grown; Page := Town; Note := note }))
+  | Lost -> on_any_key (pure Stop)
+
+
+(* ---------------------------------------------------------------- the loop *)
+
+(* Draw the page, let it decide, draw the next one. This is the whole control flow of
+   the game, and it knows nothing about towns or dungeons -- every one of those is a
+   value that `view` and `update` happen to understand. *)
+game_loop :: Model -> Console Unit := λmodel.
+  let* _ = view model in
+  let* next = update model in
+  deconstruct next into
+    Continue onward -> game_loop onward
+  | Stop -> pure ()
+
+(* The one line typed rather than pressed, which is why it is here and not a page:
+   `Console.prompt` reads a whole line, with the module's own editor supplying
+   backspace and the arrow keys because raw mode has taken them from the driver. *)
+play_game :: Int -> Console Unit := λseed.
+  let* _ = panel "A very small dungeon" "" (Console.say "  What is your name?") in
+  let* typed = Console.prompt (Markup.text "  > ") in
+  let given =
+    deconstruct typed into
+      Return name -> name
+    | otherwise -> ""
+  in
+  game_loop
+    { Realm := { Player := new_hero (if given = "" then "Nameless" else given); Dice := LCG.from_seed seed }
+      Page  := Town
+      Note  := quiet
+    }
+
+start :: Int -> Unit := λseed.
+  IO.unsafe_run_IO
+    (Console.execute (Console.in_alternate_screen (Console.in_raw_mode (play_game seed))))

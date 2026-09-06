@@ -65,6 +65,52 @@ module FNV1a:
     in
       loop 0 offset_basis
 
+(* Bologna uses rustc-hash's FxHash: rotate the accumulator left by five,
+   xor in a native-endian word, then multiply. Marmelade Ints contain 63
+   payload bits, so this is the same mixer over that native integer width. *)
+module Bologna_Hash:
+  multiplier := -3351591030290773355
+  two_to_58  := 288230376151711744
+
+  rotate_left_5 :: Int -> Int := λvalue.
+    (* Masking first leaves an exact multiple, so signed division recovers the
+       five high bits without a sign-dependent branch. *)
+    let high = ((value and (0 - two_to_58)) / two_to_58) and 31 in
+      (value * 32) or high
+
+  mix :: Int -> Int -> Int := λhash_value word.
+    (rotate_left_5 hash_value xor word) * multiplier
+
+  hash :: Bytes -> Int := λbytes.
+    let length = Bytes.length bytes in
+
+    let loop = λi hash_value.
+      if i + 8 <= length then
+        loop (i + 8) (mix hash_value (Bytes.get_u64_le bytes i))
+      else
+        let hash4, i4 =
+          if i + 4 <= length then
+            mix hash_value (Bytes.get_u32_le bytes i), i + 4
+          else
+            hash_value, i
+        in
+        let hash2, i2 =
+          if i4 + 2 <= length then
+            mix hash4 (Bytes.get_u16_le bytes i4), i4 + 2
+          else
+            hash4, i4
+        in
+        let hash1 =
+          if i2 < length then
+            mix hash2 (Bytes.get_u8 bytes i2)
+          else
+            hash2
+        in
+          (* Hash for str appends 0xff to distinguish strings from byte arrays. *)
+          mix hash1 255
+    in
+      loop 0 0
+
 witness Stats.Hashable Text :=
   { compute_hash := λt.
       let bs = Text.to_bytes t in
@@ -140,34 +186,39 @@ chunk_at :: Bytes -> Int -> Int -> Bytes := λsource stride i.
   let stop   = advance_to_row_end source (min length ((1 + i) * stride)) in
   Bytes.slice source start (stop - start)
 
-(* One table per WORKER, not per chunk: a worker folds every chunk it draws into the
-   same table, so the run allocates `workers` tables instead of one per chunk, and the
-   parent merges `workers - 1` times instead of once per chunk. *)
-aggregate_in_parallel :: Int -> Int -> Bytes -> IO (Stats.Cheeky_Map Text Aggregate_Stats) :=
-  λworkers units_per_worker file_bytes.
+(* Static fork/join: cut the input into `pieces` slices up front, spawn one thread
+   and one private table per slice, then join and merge them. There is no shared
+   queue, stealing, or coordination between workers. *)
+aggregate_in_parallel :: Int -> Bytes -> IO (Stats.Cheeky_Map Text Aggregate_Stats) :=
+  λpieces file_bytes.
     let length = Bytes.length file_bytes in
-    (* Chunk COUNT is the knob, not a byte stride: the file is cut into
-       `workers * units_per_worker` equal pieces, so the split scales with the input
-       instead of needing a new stride every time the file changes size. Several units
-       per worker is what lets the pool balance -- with exactly one each, a worker that
-       draws a slow unit has nothing left to hand off. *)
-    let units  = workers * units_per_worker in
-    let stride = (length + units - 1) / units in
-    Thread.par_pool workers units
-      absorb
-      (Stats.Cheeky_Map.make_default chunk_capacity)
-      (λtable i. process_chunk_into table (chunk_at file_bytes stride i))
+    let stride = (length + pieces - 1) / pieces in
+    let worker = λi.
+      let* table = Stats.Cheeky_Map.make_default chunk_capacity in
+      process_chunk_into table (chunk_at file_bytes stride i)
+    in
+    let* tables =
+      Thread.par_map
+        (λi. unsafe_run_IO (worker i))
+        (List.tabulate pieces (λi. i))
+    in
+    let merge_all = λtarget sources.
+      deconstruct sources into
+        Nil -> pure target
+      | Cons source rest ->
+          let* merged = absorb target source in
+          merge_all merged rest
+    in
+    deconstruct tables into
+      Nil -> Stats.Cheeky_Map.make_default chunk_capacity
+    | Cons first rest -> merge_all first rest
 
 read_file_data :: Text -> IO (Result Fault (List (Text, Aggregate_Stats))) := λfile_path.
   let* file_bytes = Binary.mmap file_path in
   deconstruct file_bytes into
     Return file_bytes ->
-      (* 16 workers (this machine's CPU count), 3 chunks each -- bologna's ratio.
-         Measured: 1 chunk per worker is a hair faster on an idle machine but leaves
-         the pool no balancing headroom at all; past ~3 it gets slower, since finer
-         chunks buy nothing once the pool is self-balancing and cost a `Bytes.slice`
-         and a boundary scan each. *)
-      let* table = aggregate_in_parallel 16 3 file_bytes in
+      (* One statically assigned piece per hardware thread. *)
+      let* table = aggregate_in_parallel 16 file_bytes in
       fmap Return (Stats.Cheeky_Map.to_list table)
   | Fault e -> pure (Fault (File_IO e))
 

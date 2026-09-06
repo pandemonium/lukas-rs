@@ -1,0 +1,175 @@
+(* A guided tour of Stdlib.Console. Interactive by nature -- it wants a terminal and a
+   person at it -- so it lives outside the automated panel:
+   
+       ./compile-lady.sh ladies/interactive/console && ladies/interactive/console/exe
+
+   It still behaves sensibly with input piped in, which is how it gets exercised without
+   a person: `Console.in_raw_mode` becomes a no-op when standard input is not a terminal,
+   and `Console.write` drops every escape sequence when standard output is not one. *)
+use Stdlib.
+use Stdlib.Console.
+
+(* ------------------------------------------------------------------ the palette *)
+(* Styles are values, so a program names them ONCE, here, and the rest of the code
+   refers to the meaning rather than to the colour. Changing the theme is changing this
+   block; no call site moves. *)
+
+heading :: Style :=
+  mappend Style.bold (Style.fg (Bright Cyan))
+
+muted :: Style :=
+  Style.faint
+
+answer :: Style :=
+  Style.fg (Bright Green)
+
+alarm :: Style :=
+  mappend Style.bold (Style.fg (Bright Red))
+
+(* A style is built by APPENDING, so it can be assembled in pieces. This one is the
+   `heading` above with an underline added -- no repetition of the colour. *)
+banner :: Style :=
+  mappend heading Style.underline
+
+
+(* --------------------------------------------------------------------- markup *)
+
+rule :: Markup :=
+  Markup.paint muted "----------------------------------------"
+
+(* Markup is a Monoid, so `mappend` glues two pieces together and `mconcat` glues a
+   whole list -- the module deliberately provides no `Markup.concat` of its own.
+   Nesting is safe: the `answer`-styled span inside a `muted` line ends
+   without wiping the muted style, because the renderer re-applies the enclosing style
+   after every nested span. *)
+labelled :: Text -> Text -> Markup := λlabel value.
+  let parts =
+    from
+      [ Markup.text "  "
+        Markup.text label
+        Markup.text ": "
+        Markup.paint answer value
+      ]
+  in Markup.styled muted (mconcat parts)
+
+
+(* -------------------------------------------------------------- the environment *)
+
+describe_size :: Perhaps (Int, Int) -> Text := λmeasured.
+  deconstruct measured into
+    This (columns, rows) -> "`columns` x `rows`"
+  | Nope -> "not a terminal"
+
+report_environment :: Console Unit :=
+  let* coloured = Console.supports_colour in
+  let* terminal = Console.is_tty in
+  let* measured = Console.size in
+  let* _ = Console.write_line (Markup.paint heading "Environment") in
+  let* _ = Console.write_line (labelled "colour output" "`coloured`") in
+  let* _ = Console.write_line (labelled "input is a tty" "`terminal`") in
+  Console.write_line (labelled "window" (describe_size measured))
+
+
+(* ------------------------------------------------- buffered (cooked) line input *)
+(* `Console.prompt` writes the question, flushes, and reads a line. In cooked mode the
+   editing is the driver's own; inside `in_raw_mode` the module supplies its own editor,
+   so the same call means the same thing either way. *)
+
+greet :: Console Unit :=
+  let* _ = Console.write_line mempty in
+  let* _ = Console.write_line (Markup.paint heading "Buffered input") in
+  let* _ = Console.write_line (Markup.paint muted "  Type a name and press Enter (Ctrl-D to skip).") in
+  let* typed = Console.prompt (Markup.text "  name> ") in
+  deconstruct typed into
+    Return name -> Console.write_line (labelled "you typed" name)
+  | Fault (Not_Utf8 _) -> Console.write_line (Markup.paint alarm "  (that was not UTF-8)")
+  | otherwise -> Console.write_line (Markup.paint alarm "  (input ended)")
+
+
+(* ---------------------------------------------- unbuffered (raw) keystroke input *)
+(* Inside `in_raw_mode` the driver stops echoing and stops waiting for Enter, so every
+   keystroke arrives the moment it is pressed. `Console.read_key` does the decoding: an
+   arrow key is three bytes and a bare Escape is one, and the only thing separating them
+   is that nothing follows the Escape -- which is why the decoder reads with a timeout
+   and why this is worth having in a library rather than in each program. *)
+
+watch_keys :: Console Unit :=
+  (* Read keys until `q`, describing each one. Recursion, not a loop: `read_key` returns
+     `Nope` at end of input, which is the other way out.
+
+     Note that a key is MATCHED, not tested with a helper: `Character "q"` is an ordinary
+     pattern, so a key-binding table reads like any other `deconstruct`. *)
+  let watch = λseen.
+    let* pressed = Console.read_key in
+    deconstruct pressed into
+      Return (Character "q") -> Console.write_line (labelled "keys seen" "`seen + 1`")
+    | Return key ->
+        let* _ = Console.write_line (labelled "key" "`key`") in
+        watch (seen + 1)
+    | otherwise -> Console.write_line (Markup.paint muted "  (input ended)")
+  in
+  let* _ = Console.write_line mempty in
+  let* _ = Console.write_line (Markup.paint heading "Unbuffered input") in
+  let* _ = Console.write_line (Markup.paint muted "  Press keys -- arrows, function keys, Ctrl-A. Press q to finish.") in
+  (* The bracket. Everything inside sees a terminal in raw mode; on the way out the
+     terminal is exactly as it was, and it is restored even if the program dies inside. *)
+  Console.in_raw_mode (watch 0)
+
+
+(* ------------------------------------------------------------------------ colour *)
+
+swatch :: Text -> Colour -> Markup := λlabel colour.
+  mappend (Markup.paint (Style.fg colour) "  ##  ") (Markup.paint muted label)
+
+show_palette :: Console Unit :=
+  let rows =
+    from
+      [ swatch "Red" Red
+        swatch "Bright Red" (Bright Red)
+        swatch "Green" Green
+        swatch "256-colour 208" (Palette 208)
+        swatch "24-bit 255,140,0" (Rgb 255 140 0)
+      ]
+  in
+  let* _ = Console.write_line mempty in
+  let* _ = Console.write_line (Markup.paint heading "Colour") in
+  let* _ = Console.lines rows in
+  Console.new_line
+
+
+(* ------------------------------------------------------------- bounded waiting *)
+(* `read_key_within` is the only deadline in the interface, and it is the one a UI
+   needs: stop waiting, do something, wait again. Here it just counts the times nothing
+   was pressed, but the same shape drives a spinner, a clock, or a prompt that gives up. *)
+wait_briefly :: Console Unit :=
+  let tick = λremaining quiet.
+    if remaining <= 0
+      then Console.write_line (labelled "quiet ticks" "`quiet`")
+      else
+        let* pressed = Console.read_key_within (Milliseconds 200) in
+        deconstruct pressed into
+          Fault Timed_Out -> tick (remaining - 1) (quiet + 1)
+        | Return key -> Console.write_line (labelled "pressed" "`key`")
+        | otherwise -> Console.write_line (Markup.paint muted "  (input ended)")
+  in
+  let* _ = Console.write_line mempty in
+  let* _ = Console.write_line (Markup.paint heading "Waiting with a deadline") in
+  let* _ = Console.write_line (Markup.paint muted "  Press a key within a second, or do not.") in
+  Console.in_raw_mode (tick 5 0)
+
+
+(* The whole tour is ONE value of type `Console Unit`, built by binding the sections
+   together, and `Console.execute` is the single point where any of it happens. *)
+tour :: Console Unit :=
+  let* _ = Console.write_line (Markup.paint banner "Stdlib.Console") in
+  let* _ = Console.write_line rule in
+  let* _ = report_environment in
+  let* _ = show_palette in
+  let* _ = greet in
+  let* _ = watch_keys in
+  let* _ = wait_briefly in
+  let* _ = Console.write_line rule in
+  Console.write_line (Markup.paint muted "done")
+
+
+start :: Int -> Unit := λ_. IO.unsafe_run_IO (Console.execute tour)

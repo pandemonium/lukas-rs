@@ -1,7 +1,10 @@
 use fmt::Write;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::{collections::HashMap, fmt, fs, io, path};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt, fs, io, path,
+};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -13,6 +16,10 @@ use crate::{
         pattern::Pattern,
     },
     closed::{self, CaptureInfo, Closed, Identifier, LexicalLevel},
+    intrinsic::{
+        AllocationEffect, ControlFlow, IntrinsicOperation, IntrinsicSemantics, IntrinsicType,
+        ResultRepresentation, raw_panic_name,
+    },
     lambda_lift::{
         self, ChainWorker, ClosureInfo, CoproductLayout, LiftedFunction, TopLevelBinding, Worker,
     },
@@ -34,6 +41,28 @@ enum SelfCall<'a> {
 const FLAT_INLINE_CAP: usize = 8;
 const FLAT_MAX_SHAPE: usize = 128;
 const FLAT_MAX_FIELDS: usize = 64;
+const C_INLINE_BUDGET: usize = 32;
+
+fn c_expr_size(expr: &Expr) -> usize {
+    let mut count = 0;
+    let mut pending = vec![expr];
+    while let Some(node) = pending.pop() {
+        count += 1;
+        pending.extend(
+            crate::simplify::children(node)
+                .into_iter()
+                .map(|child| child.as_ref()),
+        );
+    }
+    count
+}
+
+fn c_inline_budget() -> usize {
+    std::env::var("MARM_C_INLINE_BUDGET")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(C_INLINE_BUDGET)
+}
 
 fn direct_array_enabled() -> bool {
     std::env::var_os("MARM_NO_DIRECT_ARRAY").is_none() && std::env::var_os("MARM_NOFLAT").is_none()
@@ -52,12 +81,9 @@ fn direct_array_enabled() -> bool {
 /// hot loops are tight and allocate constantly. So the poll goes only where it is
 /// the only thing standing between a loop and a hung collector.
 ///
-/// The test is over the emitted body and errs towards keeping the poll: only a
-/// direct allocation in the loop removes it, because that is the one case where
-/// `gc_reserve` is guaranteed to be reached. A loop that merely *calls* something
-/// keeps its poll -- the callee may be a non-allocating leaf, and then nothing on
-/// the path would ever check in. `MARM_NO_POLL` removes it entirely, to measure
-/// what it costs.
+/// A structural summary proves this per backedge, including calls transitively.
+/// It errs towards keeping the poll whenever allocation cannot be established on
+/// every route to the backedge. `MARM_NO_POLL` removes it entirely for measurement.
 /// The poll itself, amortised. Reading the flag every iteration costs real time --
 /// it is atomic precisely so it cannot be hoisted, which measured ~10% on tight
 /// loops. A register countdown is far cheaper than a memory read, and checking one
@@ -66,19 +92,19 @@ fn direct_array_enabled() -> bool {
 const POLL: &str = "if (__builtin_expect(--_poll == 0, 0)) { _poll = 4096; gc_poll(); } ";
 const POLL_DECL: &str = "unsigned _poll = 4096; ";
 
-fn poll_decl(body: &str) -> &'static str {
-    if back_edge_poll(body).is_empty() { "" } else { POLL_DECL }
+fn poll_decl(needs_poll: bool) -> &'static str {
+    if back_edge_poll(needs_poll).is_empty() {
+        ""
+    } else {
+        POLL_DECL
+    }
 }
 
-fn back_edge_poll(body: &str) -> &'static str {
+fn back_edge_poll(needs_poll: bool) -> &'static str {
     if std::env::var_os("MARM_NO_POLL").is_some() {
         return "";
     }
-    // Only a DIRECT allocation lets the poll go. A call is not enough: the callee
-    // may itself be a non-allocating leaf, and then nothing on the path polls and
-    // the collector waits forever -- the exact hang this exists to prevent.
-    let allocates = ["mk_", "prim_str", "gc_"].iter().any(|call| body.contains(call));
-    if allocates { "" } else { POLL }
+    if needs_poll { POLL } else { "" }
 }
 
 fn direct_write_enabled() -> bool {
@@ -180,7 +206,10 @@ impl RuntimeShape {
             // a `Data` that is not there. Every word it occupies may be zero,
             // though, since that is how it spells its nullary constructor.
             niche @ Self::NicheSum { .. } => {
-                out.extend(std::iter::repeat_n(Self::ZeroableLeaf, niche.stored_words()));
+                out.extend(std::iter::repeat_n(
+                    Self::ZeroableLeaf,
+                    niche.stored_words(),
+                ));
             }
             one_word if one_word.stored_words() == 1 => out.push(one_word),
             wide => out.extend(std::iter::repeat_n(Self::Leaf, wide.stored_words())),
@@ -235,6 +264,19 @@ struct CapturePlace {
     ty: Type,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ImmutableSliceSource {
+    Local(usize),
+    Captured(usize),
+}
+
+struct ImmutableSliceBase {
+    source: ImmutableSliceSource,
+    value: String,
+    name: String,
+    aliases: Vec<ImmutableSliceSource>,
+}
+
 thread_local! {
     /// Lexical locals whose value is represented by a packed array element rather
     /// than an eagerly rebuilt canonical object. Entries are scoped by
@@ -247,6 +289,17 @@ thread_local! {
         RefCell::new(HashMap::new());
     /// Logical closure capture index -> physical range in the flat capture array.
     static CAPTURE_PLACES: RefCell<Vec<CapturePlace>> = RefCell::new(Vec::new());
+    /// Saturated `raw_sub` applications in the loop currently being emitted.
+    /// Each points at a reusable stack Slice whose lifetime is the loop frame;
+    /// heap/return/back-edge barriers materialise it only when it escapes.
+    static BORROWED_SLICE_PLACES: RefCell<HashMap<usize, String>> =
+        RefCell::new(HashMap::new());
+    /// Loop-invariant immutable byte views whose resolved base pointer has been
+    /// snapshotted before the loop. A safepoint may mark the Slice but the
+    /// non-moving collector and immutable Slice representation cannot change its
+    /// `base`, so byte reads can keep using the snapshot across `gc_poll`.
+    static IMMUTABLE_SLICE_BASES: RefCell<HashMap<ImmutableSliceSource, String>> =
+        RefCell::new(HashMap::new());
 }
 
 pub struct Codegen;
@@ -448,13 +501,13 @@ fn is_text_type(ty: &Type) -> bool {
 }
 
 fn show_prim(arg: &Expr) -> &'static str {
-    match &arg.annotation().type_info.inferred_type {
+    let ty = &arg.annotation().type_info.inferred_type;
+    match ty {
         Type::Base(BaseType::Int) => "prim_show_int",
         Type::Base(BaseType::Float) => "prim_show_float",
         Type::Base(BaseType::Char) => "prim_show_char",
-        Type::Base(BaseType::Text) => "prim_show_text",
-        // `Text` is the stdlib DU `Text ::= Text Bytes`, so it appears as a constructor.
-        Type::Constructor(name) if name.member.as_str() == "Text" => "prim_show_text",
+        // Includes both the legacy base type and the exact stdlib Text newtype.
+        _ if is_text_type(ty) => "prim_show_text",
         other => panic!(
             "prim_show applied to non-primitive type {other:?}; render compound values \
              through `display` / string interpolation, not raw `prim_show`"
@@ -509,21 +562,6 @@ fn array_element_type(ty: &Type) -> Option<&Type> {
             argument,
             ..
         } if matches!(constructor.as_ref(), Type::Constructor(name) if *name == QualifiedName::builtin("Array")) => {
-            Some(argument)
-        }
-        _ => None,
-    }
-}
-
-fn mutable_array_element_type(ty: &Type) -> Option<&Type> {
-    match ty {
-        Type::Apply {
-            constructor,
-            argument,
-            ..
-        } if matches!(constructor.as_ref(), Type::Constructor(name)
-            if surface_name(name).ends_with("Stdlib_Data_Array_Mutable_Array")) =>
-        {
             Some(argument)
         }
         _ => None,
@@ -590,46 +628,12 @@ fn strip_ascription(mut expr: &Expr) -> &Expr {
     expr
 }
 
-fn raw_array_get_arguments(expr: &Expr) -> Option<(&Expr, &Expr)> {
-    let mut head = expr;
-    let mut arguments = Vec::new();
-    while let Expr::Apply(_, application) = head {
-        arguments.push(application.argument.as_ref());
-        head = application.function.as_ref();
+fn expression_name(expr: &Expr) -> Option<&QualifiedName> {
+    match strip_ascription(expr) {
+        Expr::Variable(_, Identifier::Global(name)) => Some(name.as_ref()),
+        Expr::InvokeBridge(_, bridge) => Some(&bridge.qualified_name),
+        _ => None,
     }
-    arguments.reverse();
-    if arguments.len() != 2 {
-        return None;
-    }
-    let name = match head {
-        Expr::Variable(_, Identifier::Global(name)) => name.as_ref(),
-        Expr::InvokeBridge(_, bridge) => &bridge.qualified_name,
-        _ => return None,
-    };
-    surface_name(name)
-        .ends_with("Stdlib_Data_Array_Mutable_Array_raw_get_unchecked")
-        .then_some((arguments[0], arguments[1]))
-}
-
-fn raw_array_set_arguments(expr: &Expr) -> Option<(&Expr, &Expr, &Expr)> {
-    let mut head = strip_ascription(expr);
-    let mut arguments = Vec::new();
-    while let Expr::Apply(_, application) = head {
-        arguments.push(application.argument.as_ref());
-        head = strip_ascription(&application.function);
-    }
-    arguments.reverse();
-    if arguments.len() != 3 {
-        return None;
-    }
-    let name = match head {
-        Expr::Variable(_, Identifier::Global(name)) => name.as_ref(),
-        Expr::InvokeBridge(_, bridge) => &bridge.qualified_name,
-        _ => return None,
-    };
-    surface_name(name)
-        .ends_with("Stdlib_Data_Array_Mutable_Array_raw_set_unchecked")
-        .then_some((arguments[0], arguments[1], arguments[2]))
 }
 
 fn projection_root_and_selectors(
@@ -650,12 +654,831 @@ fn projection_root_and_selectors(
 static MATCH_ID: AtomicUsize = AtomicUsize::new(0);
 
 impl lambda_lift::Program {
+    fn intrinsic_for_name(&self, name: &QualifiedName) -> Option<IntrinsicSemantics> {
+        self.term_intrinsics.get(name).copied()
+    }
+
+    fn intrinsic_for_expr(&self, expression: &Expr) -> Option<IntrinsicSemantics> {
+        self.intrinsic_for_name(expression_name(expression)?)
+    }
+
+    fn intrinsic_call<'a>(
+        &self,
+        expression: &'a Expr,
+    ) -> Option<(IntrinsicSemantics, Vec<&'a Expr>)> {
+        let mut head = strip_ascription(expression);
+        let mut arguments = Vec::new();
+        while let Expr::Apply(_, application) = head {
+            arguments.push(application.argument.as_ref());
+            head = strip_ascription(&application.function);
+        }
+        arguments.reverse();
+        let semantics = self.intrinsic_for_expr(head)?;
+        (semantics.arity == arguments.len()).then_some((semantics, arguments))
+    }
+
+    fn intrinsic_arguments<'a, const N: usize>(
+        &self,
+        expression: &'a Expr,
+        expected: IntrinsicOperation,
+    ) -> Option<[&'a Expr; N]> {
+        let (semantics, arguments) = self.intrinsic_call(expression)?;
+        (semantics.operation == expected).then(|| arguments.try_into().ok())?
+    }
+
+    fn borrowable_slice_arguments<'a>(&self, expression: &'a Expr) -> Option<[&'a Expr; 3]> {
+        let (semantics, arguments) = self.intrinsic_call(expression)?;
+        let ResultRepresentation::BorrowableSlice {
+            owner_argument,
+            offset_argument,
+            length_argument,
+        } = semantics.result
+        else {
+            return None;
+        };
+        Some([
+            *arguments.get(owner_argument)?,
+            *arguments.get(offset_argument)?,
+            *arguments.get(length_argument)?,
+        ])
+    }
+
+    fn mutable_array_element_type<'a>(&self, ty: &'a Type) -> Option<&'a Type> {
+        match ty {
+            Type::Apply {
+                constructor,
+                argument,
+                ..
+            } if matches!(constructor.as_ref(), Type::Constructor(name)
+                if self.type_intrinsics.get(name) == Some(&IntrinsicType::MutableArray)) =>
+            {
+                Some(argument)
+            }
+            _ => None,
+        }
+    }
+
+    /// Functions guaranteed to allocate before returning normally.  The seed is
+    /// the small set of foreign primitives whose implementation is part of the
+    /// runtime ABI; generated direct workers are then propagated to a fixed point.
+    /// Unknown/indirect calls remain non-allocating for this proof, which is the
+    /// safe direction (their callers retain a poll).
+    fn allocation_summaries(&self) -> HashSet<QualifiedName> {
+        let mut allocating: HashSet<QualifiedName> = self
+            .term_intrinsics
+            .iter()
+            .filter(|(_, semantics)| semantics.allocation == AllocationEffect::Always)
+            .map(|(name, _)| name.clone())
+            .collect();
+        // A loopified worker that borrows even one slice is conservatively not
+        // advertised as allocating. Its raw_sub may have been the only proof,
+        // and the worker's own amortised poll counter restarts on each call: a
+        // caller repeatedly invoking it for fewer than 4096 inner iterations
+        // therefore still needs its own safepoint.
+        let scalar_replacing: HashSet<_> = if std::env::var_os("MARM_NO_LOOPIFY").is_none() {
+            self.workers
+                .iter()
+                .filter(|Worker { name, params, body }| {
+                    self.has_tail_self_call(SelfCall::Named(name), *params, body)
+                        && !self
+                            .borrowed_slice_places(SelfCall::Named(name), *params, body)
+                            .is_empty()
+                })
+                .map(|worker| worker.name.clone())
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
+        loop {
+            let additions: Vec<_> = self
+                .workers
+                .iter()
+                .filter(|worker| {
+                    !allocating.contains(&worker.name)
+                        && !scalar_replacing.contains(&worker.name)
+                        && self.expression_must_allocate(&worker.body, &allocating)
+                })
+                .map(|worker| worker.name.clone())
+                .collect();
+            if additions.is_empty() {
+                break;
+            }
+            allocating.extend(additions);
+        }
+        allocating
+    }
+
+    /// True only when every normal evaluation of `expression` crosses a known
+    /// allocation.  Branches use conjunction; sequentially evaluated children
+    /// use disjunction.  We intentionally do not infer allocation from source
+    /// constructors here because later codegen can erase or scalarise them.
+    fn expression_must_allocate(
+        &self,
+        expression: &Expr,
+        allocating: &HashSet<QualifiedName>,
+    ) -> bool {
+        let direct_call_allocates = || {
+            let mut arity = 0usize;
+            let mut head = expression;
+            while let Expr::Apply(_, application) = head {
+                arity += 1;
+                head = &application.function;
+            }
+            matches!(head, Expr::Variable(_, Identifier::Global(name))
+                if self.arities.get(name.as_ref()) == Some(&arity)
+                    && allocating.contains(name.as_ref()))
+        };
+
+        match expression {
+            Expr::Ascription(_, the) => {
+                self.expression_must_allocate(&the.ascribed_tree, allocating)
+            }
+            Expr::Let(_, the) => {
+                self.expression_must_allocate(&the.bound, allocating)
+                    || self.expression_must_allocate(&the.body, allocating)
+            }
+            Expr::Sequence(_, the) => {
+                self.expression_must_allocate(&the.this, allocating)
+                    || self.expression_must_allocate(&the.and_then, allocating)
+            }
+            Expr::If(_, the) => {
+                self.expression_must_allocate(&the.predicate, allocating)
+                    || (self.expression_must_allocate(&the.consequent, allocating)
+                        && self.expression_must_allocate(&the.alternate, allocating))
+            }
+            Expr::Deconstruct(_, the) => {
+                self.expression_must_allocate(&the.scrutinee, allocating)
+                    || (!the.match_clauses.is_empty()
+                        && the.match_clauses.iter().all(|clause| {
+                            self.expression_must_allocate(&clause.consequent, allocating)
+                        }))
+            }
+            Expr::Apply(..) if direct_call_allocates() => true,
+            _ => crate::simplify::children(expression)
+                .into_iter()
+                .any(|child| self.expression_must_allocate(child, allocating)),
+        }
+    }
+
+    /// Prove that each tail self-call (the `continue` emitted by `compile_tail`)
+    /// is preceded on that path by a guaranteed allocation.  Exit paths need no
+    /// proof.  This is stronger than “the loop may call an allocator”: one cold
+    /// allocating branch must not suppress the only safepoint on another cycle.
+    fn back_edges_are_safepointed(
+        &self,
+        target: SelfCall<'_>,
+        arity: usize,
+        expression: &Expr,
+        allocating: &HashSet<QualifiedName>,
+        already_allocated: bool,
+    ) -> bool {
+        if self.is_self_call(target, arity, expression) {
+            // `compile_tail` evaluates every new argument before reassigning the
+            // loop parameters.  The self-call itself is erased into `continue`,
+            // so never count the callee summary here.
+            let mut head = expression;
+            let mut argument_allocates = false;
+            while let Expr::Apply(_, application) = head {
+                argument_allocates |=
+                    self.expression_must_allocate(&application.argument, allocating);
+                head = &application.function;
+            }
+            return already_allocated || argument_allocates;
+        }
+
+        match expression {
+            Expr::Ascription(_, the) => self.back_edges_are_safepointed(
+                target,
+                arity,
+                &the.ascribed_tree,
+                allocating,
+                already_allocated,
+            ),
+            Expr::Let(_, the) => self.back_edges_are_safepointed(
+                target,
+                arity,
+                &the.body,
+                allocating,
+                already_allocated || self.expression_must_allocate(&the.bound, allocating),
+            ),
+            Expr::Sequence(_, the) => self.back_edges_are_safepointed(
+                target,
+                arity,
+                &the.and_then,
+                allocating,
+                already_allocated || self.expression_must_allocate(&the.this, allocating),
+            ),
+            Expr::If(_, the) => {
+                let before_branch =
+                    already_allocated || self.expression_must_allocate(&the.predicate, allocating);
+                self.back_edges_are_safepointed(
+                    target,
+                    arity,
+                    &the.consequent,
+                    allocating,
+                    before_branch,
+                ) && self.back_edges_are_safepointed(
+                    target,
+                    arity,
+                    &the.alternate,
+                    allocating,
+                    before_branch,
+                )
+            }
+            Expr::Deconstruct(_, the) => {
+                let before_clause =
+                    already_allocated || self.expression_must_allocate(&the.scrutinee, allocating);
+                the.match_clauses.iter().all(|clause| {
+                    self.back_edges_are_safepointed(
+                        target,
+                        arity,
+                        &clause.consequent,
+                        allocating,
+                        before_clause,
+                    )
+                })
+            }
+            // `compile_tail` returns every other tail expression; there is no
+            // back-edge on this path.
+            _ => true,
+        }
+    }
+
+    fn loop_needs_poll(
+        &self,
+        target: SelfCall<'_>,
+        arity: usize,
+        expression: &Expr,
+        allocating: &HashSet<QualifiedName>,
+    ) -> bool {
+        !self.back_edges_are_safepointed(target, arity, expression, allocating, false)
+    }
+
+    /// Small direct workers called from a generated loop are statically hot even
+    /// without PGO.  Clang's default threshold narrowly rejects some of these
+    /// after the worker expands an immediately-called local loop (notably the
+    /// FNV hash worker), leaving a call and a stack closure in the row path.
+    ///
+    /// Keep the policy structural: collect saturated direct calls from every
+    /// loopified body, then apply a conservative source-IR size budget.  Genuine
+    /// self-recursive workers are excluded -- loopification, not recursive
+    /// inlining, is what makes those constant-stack.
+    fn c_inline_workers(&self) -> HashSet<QualifiedName> {
+        if std::env::var_os("MARM_NO_C_INLINE").is_some() {
+            return HashSet::new();
+        }
+
+        fn collect_calls(
+            expression: &Expr,
+            arities: &HashMap<QualifiedName, usize>,
+            calls: &mut HashSet<QualifiedName>,
+        ) {
+            if let Expr::Apply(..) = expression {
+                let mut arity = 0usize;
+                let mut head = expression;
+                while let Expr::Apply(_, application) = head {
+                    arity += 1;
+                    head = &application.function;
+                }
+                if let Expr::Variable(_, Identifier::Global(name)) = head
+                    && arities.get(name.as_ref()) == Some(&arity)
+                {
+                    calls.insert(name.as_ref().clone());
+                }
+            }
+            for child in crate::simplify::children(expression) {
+                collect_calls(child, arities, calls);
+            }
+        }
+
+        fn collect_back_edge_calls(
+            program: &lambda_lift::Program,
+            target: SelfCall<'_>,
+            arity: usize,
+            expression: &Expr,
+            calls: &mut HashSet<QualifiedName>,
+        ) {
+            match expression {
+                Expr::Ascription(_, the) => {
+                    collect_back_edge_calls(program, target, arity, &the.ascribed_tree, calls)
+                }
+                Expr::Let(_, the) => {
+                    if program.has_tail_self_call(target, arity, &the.body) {
+                        collect_calls(&the.bound, &program.arities, calls);
+                        collect_back_edge_calls(program, target, arity, &the.body, calls);
+                    }
+                }
+                Expr::Sequence(_, the) => {
+                    if program.has_tail_self_call(target, arity, &the.and_then) {
+                        collect_calls(&the.this, &program.arities, calls);
+                        collect_back_edge_calls(program, target, arity, &the.and_then, calls);
+                    }
+                }
+                Expr::If(_, the) => {
+                    let consequent_loops =
+                        program.has_tail_self_call(target, arity, &the.consequent);
+                    let alternate_loops = program.has_tail_self_call(target, arity, &the.alternate);
+                    if consequent_loops || alternate_loops {
+                        collect_calls(&the.predicate, &program.arities, calls);
+                    }
+                    if consequent_loops {
+                        collect_back_edge_calls(program, target, arity, &the.consequent, calls);
+                    }
+                    if alternate_loops {
+                        collect_back_edge_calls(program, target, arity, &the.alternate, calls);
+                    }
+                }
+                Expr::Deconstruct(_, the) => {
+                    let looping_clauses = the
+                        .match_clauses
+                        .iter()
+                        .filter(|clause| {
+                            program.has_tail_self_call(target, arity, &clause.consequent)
+                        })
+                        .collect::<Vec<_>>();
+                    if !looping_clauses.is_empty() {
+                        collect_calls(&the.scrutinee, &program.arities, calls);
+                        for clause in looping_clauses {
+                            collect_back_edge_calls(
+                                program,
+                                target,
+                                arity,
+                                &clause.consequent,
+                                calls,
+                            );
+                        }
+                    }
+                }
+                _ if program.is_self_call(target, arity, expression) => {
+                    // The arguments execute before the generated `continue`; the
+                    // self callee does not.  Inspecting only the arguments also
+                    // avoids ever selecting a recursive worker for inlining.
+                    let mut head = expression;
+                    while let Expr::Apply(_, application) = head {
+                        collect_calls(&application.argument, &program.arities, calls);
+                        head = &application.function;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut hot = HashSet::new();
+        for LiftedFunction { code, .. } in &self.functions {
+            if self.has_tail_self_call(SelfCall::SelfRef, 1, code) {
+                collect_back_edge_calls(self, SelfCall::SelfRef, 1, code, &mut hot);
+            }
+        }
+        for Worker { name, params, body } in &self.workers {
+            if self.has_tail_self_call(SelfCall::Named(name), *params, body) {
+                collect_back_edge_calls(self, SelfCall::Named(name), *params, body, &mut hot);
+            }
+        }
+        for ChainWorker { arity, body, .. } in &self.chain_workers {
+            if self.has_tail_self_call(SelfCall::SelfRef, *arity, body) {
+                collect_back_edge_calls(self, SelfCall::SelfRef, *arity, body, &mut hot);
+            }
+        }
+
+        let budget = c_inline_budget();
+        self.workers
+            .iter()
+            .filter(|Worker { name, params, body }| {
+                hot.contains(name)
+                    && c_expr_size(body) <= budget
+                    && !self.has_tail_self_call(SelfCall::Named(name), *params, body)
+            })
+            .map(|worker| worker.name.clone())
+            .collect()
+    }
+
+    fn borrowed_slice_places(
+        &self,
+        target: SelfCall<'_>,
+        arity: usize,
+        expression: &Expr,
+    ) -> HashMap<usize, String> {
+        if std::env::var_os("MARM_NO_BORROWED_SLICES").is_some() {
+            return HashMap::new();
+        }
+
+        fn collect(
+            program: &lambda_lift::Program,
+            target: SelfCall<'_>,
+            arity: usize,
+            expression: &Expr,
+            tail: bool,
+            places: &mut HashMap<usize, String>,
+        ) {
+            if tail && program.is_self_call(target, arity, expression) {
+                // A slice passed around the back edge must materialise before
+                // this frame's reusable slot is overwritten, so borrowing it
+                // would only add a tag/barrier round trip.
+                return;
+            }
+            if let Expr::Apply(_, application) = strip_ascription(expression)
+                && program.borrowable_slice_arguments(expression).is_some()
+            {
+                let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+                places.insert(application as *const _ as usize, format!("_bs{id}"));
+            }
+            match expression {
+                Expr::Ascription(_, the) => {
+                    collect(program, target, arity, &the.ascribed_tree, tail, places)
+                }
+                Expr::Let(_, the) => {
+                    collect(program, target, arity, &the.bound, false, places);
+                    collect(program, target, arity, &the.body, tail, places);
+                }
+                Expr::Sequence(_, the) => {
+                    collect(program, target, arity, &the.this, false, places);
+                    collect(program, target, arity, &the.and_then, tail, places);
+                }
+                Expr::If(_, the) => {
+                    collect(program, target, arity, &the.predicate, false, places);
+                    collect(program, target, arity, &the.consequent, tail, places);
+                    collect(program, target, arity, &the.alternate, tail, places);
+                }
+                Expr::Deconstruct(_, the) => {
+                    collect(program, target, arity, &the.scrutinee, false, places);
+                    for clause in &the.match_clauses {
+                        collect(program, target, arity, &clause.consequent, tail, places);
+                    }
+                }
+                // A raw slice created inside an opaque tail expression may be
+                // part of the returned value. Keep the conservative heap form.
+                _ if tail => {}
+                _ => {
+                    for child in crate::simplify::children(expression) {
+                        collect(program, target, arity, child, false, places);
+                    }
+                }
+            }
+        }
+
+        let mut places = HashMap::new();
+        collect(self, target, arity, expression, true, &mut places);
+        places
+    }
+
+    fn install_borrowed_slice_places(places: HashMap<usize, String>) -> HashMap<usize, String> {
+        BORROWED_SLICE_PLACES.with(|current| std::mem::replace(&mut *current.borrow_mut(), places))
+    }
+
+    fn restore_borrowed_slice_places(previous: HashMap<usize, String>) {
+        BORROWED_SLICE_PLACES.with(|current| *current.borrow_mut() = previous);
+    }
+
+    fn invariant_loop_parameters(
+        &self,
+        target: SelfCall<'_>,
+        arity: usize,
+        expression: &Expr,
+    ) -> Vec<bool> {
+        fn visit(
+            program: &lambda_lift::Program,
+            target: SelfCall<'_>,
+            arity: usize,
+            expression: &Expr,
+            invariant: &mut [bool],
+        ) {
+            match expression {
+                Expr::Ascription(_, the) => {
+                    visit(program, target, arity, &the.ascribed_tree, invariant)
+                }
+                Expr::If(_, the) => {
+                    visit(program, target, arity, &the.consequent, invariant);
+                    visit(program, target, arity, &the.alternate, invariant);
+                }
+                Expr::Let(_, the) => visit(program, target, arity, &the.body, invariant),
+                Expr::Sequence(_, the) => visit(program, target, arity, &the.and_then, invariant),
+                Expr::Deconstruct(_, the) => {
+                    for clause in &the.match_clauses {
+                        visit(program, target, arity, &clause.consequent, invariant);
+                    }
+                }
+                _ if program.is_self_call(target, arity, expression) => {
+                    let mut arguments = Vec::new();
+                    let mut head = expression;
+                    while let Expr::Apply(_, application) = head {
+                        arguments.push(application.argument.as_ref());
+                        head = &application.function;
+                    }
+                    arguments.reverse();
+                    let all_parameters_invariant = vec![true; arity];
+                    for (index, argument) in arguments.into_iter().enumerate() {
+                        if lambda_lift::Program::immutable_slice_source(
+                            argument,
+                            &all_parameters_invariant,
+                            &HashMap::new(),
+                        ) != Some(ImmutableSliceSource::Local(index))
+                        {
+                            invariant[index] = false;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut invariant = vec![true; arity];
+        visit(self, target, arity, expression, &mut invariant);
+        invariant
+    }
+
+    fn immutable_slice_source(
+        expression: &Expr,
+        invariant_parameters: &[bool],
+        aliases: &HashMap<usize, ImmutableSliceSource>,
+    ) -> Option<ImmutableSliceSource> {
+        fn provenance(
+            expression: &Expr,
+            aliases: &HashMap<usize, ImmutableSliceSource>,
+        ) -> Option<ImmutableSliceSource> {
+            match strip_ascription(expression) {
+                Expr::Variable(_, Identifier::Local(LexicalLevel(level))) => aliases
+                    .get(level)
+                    .copied()
+                    .or(Some(ImmutableSliceSource::Local(*level))),
+                Expr::Variable(_, Identifier::Captured(capture)) => {
+                    Some(ImmutableSliceSource::Captured(capture.index()))
+                }
+                // Elaboration uses single-arm matches to introduce a type-erased
+                // alias. Follow that identity wrapper both in byte reads and on a
+                // recursive back-edge.
+                Expr::Deconstruct(_, deconstruct)
+                    if deconstruct.match_clauses.len() == 1
+                        && matches!(
+                            &deconstruct.match_clauses[0].pattern,
+                            Pattern::Bind(_, Identifier::Local(_))
+                        ) =>
+                {
+                    let source = provenance(&deconstruct.scrutinee, aliases)?;
+                    let Pattern::Bind(_, Identifier::Local(LexicalLevel(level))) =
+                        &deconstruct.match_clauses[0].pattern
+                    else {
+                        unreachable!()
+                    };
+                    let mut nested = aliases.clone();
+                    nested.insert(*level, source);
+                    provenance(&deconstruct.match_clauses[0].consequent, &nested)
+                }
+                Expr::Let(_, binding) => {
+                    let source = provenance(&binding.bound, aliases)?;
+                    let Identifier::Local(LexicalLevel(level)) = binding.binder else {
+                        return None;
+                    };
+                    let mut nested = aliases.clone();
+                    nested.insert(level, source);
+                    provenance(&binding.body, &nested)
+                }
+                _ => None,
+            }
+        }
+
+        match provenance(expression, aliases)? {
+            source @ ImmutableSliceSource::Local(level)
+                if invariant_parameters.get(level) == Some(&true) =>
+            {
+                Some(source)
+            }
+            source @ ImmutableSliceSource::Captured(_) => Some(source),
+            _ => None,
+        }
+    }
+
+    fn immutable_slice_bases(
+        &self,
+        target: SelfCall<'_>,
+        arity: usize,
+        expression: &Expr,
+    ) -> Vec<ImmutableSliceBase> {
+        fn collect(
+            program: &lambda_lift::Program,
+            expression: &Expr,
+            invariant_parameters: &[bool],
+            sources: &mut HashSet<ImmutableSliceSource>,
+            aliases: &mut HashMap<usize, ImmutableSliceSource>,
+            seen_aliases: &mut HashMap<ImmutableSliceSource, HashSet<ImmutableSliceSource>>,
+        ) {
+            if let Some((semantics, arguments)) = program.intrinsic_call(expression)
+                && matches!(
+                    semantics.operation,
+                    IntrinsicOperation::BytesGetU8 | IntrinsicOperation::BytesGetU64Le
+                )
+                && let Some(source) = lambda_lift::Program::immutable_slice_source(
+                    arguments[0],
+                    invariant_parameters,
+                    aliases,
+                )
+            {
+                sources.insert(source);
+            }
+
+            match strip_ascription(expression) {
+                Expr::Ascription(_, the) => collect(
+                    program,
+                    &the.ascribed_tree,
+                    invariant_parameters,
+                    sources,
+                    aliases,
+                    seen_aliases,
+                ),
+                Expr::Let(_, binding) => {
+                    collect(
+                        program,
+                        &binding.bound,
+                        invariant_parameters,
+                        sources,
+                        aliases,
+                        seen_aliases,
+                    );
+                    let source = lambda_lift::Program::immutable_slice_source(
+                        &binding.bound,
+                        invariant_parameters,
+                        aliases,
+                    );
+                    let Identifier::Local(LexicalLevel(level)) = binding.binder else {
+                        return;
+                    };
+                    let previous = source.and_then(|source| {
+                        seen_aliases
+                            .entry(source)
+                            .or_default()
+                            .insert(ImmutableSliceSource::Local(level));
+                        aliases.insert(level, source)
+                    });
+                    collect(
+                        program,
+                        &binding.body,
+                        invariant_parameters,
+                        sources,
+                        aliases,
+                        seen_aliases,
+                    );
+                    if let Some(previous) = previous {
+                        aliases.insert(level, previous);
+                    } else {
+                        aliases.remove(&level);
+                    }
+                }
+                Expr::Deconstruct(_, deconstruct) => {
+                    collect(
+                        program,
+                        &deconstruct.scrutinee,
+                        invariant_parameters,
+                        sources,
+                        aliases,
+                        seen_aliases,
+                    );
+                    let source = lambda_lift::Program::immutable_slice_source(
+                        &deconstruct.scrutinee,
+                        invariant_parameters,
+                        aliases,
+                    );
+                    for clause in &deconstruct.match_clauses {
+                        // Ask the existing representation-aware pattern planner
+                        // whether this binds the complete value unchanged. In
+                        // particular, `Bytes raw` is an erased newtype; ordinary
+                        // constructors and tuples produce a field/projection path
+                        // and are correctly rejected here.
+                        let mut tests = Vec::new();
+                        let mut binds = Vec::new();
+                        program.collect_pattern(
+                            &clause.pattern,
+                            "_slice_source",
+                            &mut tests,
+                            &mut binds,
+                        );
+                        let bound_level = match binds.as_slice() {
+                            [(level, path)] if tests.is_empty() && path == "_slice_source" => {
+                                Some(*level)
+                            }
+                            _ => None,
+                        };
+                        let previous = source.zip(bound_level).and_then(|(source, level)| {
+                            seen_aliases
+                                .entry(source)
+                                .or_default()
+                                .insert(ImmutableSliceSource::Local(level));
+                            aliases
+                                .insert(level, source)
+                                .map(|previous| (level, previous))
+                        });
+                        collect(
+                            program,
+                            &clause.consequent,
+                            invariant_parameters,
+                            sources,
+                            aliases,
+                            seen_aliases,
+                        );
+                        if let Some((level, previous)) = previous {
+                            aliases.insert(level, previous);
+                        } else if let Some(level) = bound_level {
+                            aliases.remove(&level);
+                        }
+                    }
+                }
+                _ => {
+                    for child in crate::simplify::children(expression) {
+                        collect(
+                            program,
+                            child,
+                            invariant_parameters,
+                            sources,
+                            aliases,
+                            seen_aliases,
+                        );
+                    }
+                }
+            }
+        }
+
+        if std::env::var_os("MARM_NO_SLICE_BASE_CACHE").is_some() {
+            return Vec::new();
+        }
+        let invariant_parameters = self.invariant_loop_parameters(target, arity, expression);
+        let mut sources = HashSet::new();
+        let mut aliases = HashMap::new();
+        let mut seen_aliases = HashMap::new();
+        collect(
+            self,
+            expression,
+            &invariant_parameters,
+            &mut sources,
+            &mut aliases,
+            &mut seen_aliases,
+        );
+        let mut sources = sources.into_iter().collect::<Vec<_>>();
+        sources.sort();
+        sources
+            .into_iter()
+            .map(|source| {
+                let value = match source {
+                    ImmutableSliceSource::Local(level) => format!("l{level}"),
+                    ImmutableSliceSource::Captured(index) => Self::current_capture_place(index)
+                        .map_or_else(
+                            || format!("env_get(self, {index})"),
+                            |place| {
+                                debug_assert_eq!(place.width, 1);
+                                format!("env_get(self, {})", place.offset)
+                            },
+                        ),
+                };
+                let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+                let mut aliases = seen_aliases
+                    .remove(&source)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                aliases.sort();
+                ImmutableSliceBase {
+                    source,
+                    value,
+                    name: format!("_ib{id}"),
+                    aliases,
+                }
+            })
+            .collect()
+    }
+
+    fn install_immutable_slice_bases(
+        bases: &[ImmutableSliceBase],
+    ) -> HashMap<ImmutableSliceSource, String> {
+        let mut places = HashMap::new();
+        for base in bases {
+            places.insert(base.source, base.name.clone());
+            for alias in &base.aliases {
+                places.insert(*alias, base.name.clone());
+            }
+        }
+        IMMUTABLE_SLICE_BASES.with(|current| std::mem::replace(&mut *current.borrow_mut(), places))
+    }
+
+    fn restore_immutable_slice_bases(previous: HashMap<ImmutableSliceSource, String>) {
+        IMMUTABLE_SLICE_BASES.with(|current| *current.borrow_mut() = previous);
+    }
+
+    fn static_int_initializer(expression: &Expr) -> Option<String> {
+        if std::env::var_os("MARM_NO_STATIC_INT_GLOBALS").is_some() {
+            return None;
+        }
+        let Expr::Constant(_, Literal::Int(value)) = strip_ascription(expression) else {
+            return None;
+        };
+        Some(format!("{{((uint64_t)(int64_t){value} << 1) | IMM_TAG}}"))
+    }
+
     // Emit a complete, self-contained C translation unit: every lifted lambda
     // becomes a `Value f(Value self, Value arg)` function, every top-level
     // definition a `Value` global initialised once in `startup`, and `main`
     // runs the program's `start` entry point. Builtin definitions are omitted --
     // the runtime (`c/runtime.c`) provides them.
     pub fn generate_code(&self, out: &mut CodeBuffer) -> fmt::Result {
+        let c_inline_workers = self.c_inline_workers();
+        let allocating = self.allocation_summaries();
         writeln!(out, "#include \"runtime.h\"")?;
         writeln!(out, "#include \"gc.h\"\n")?;
 
@@ -666,7 +1489,20 @@ impl lambda_lift::Program {
         }
         for Worker { name, params, .. } in &self.workers {
             let signature = vec!["Value"; *params].join(", ");
-            writeln!(out, "Value {}_worker({});", c_name(name), signature)?;
+            let inline = if c_inline_workers.contains(name) {
+                "MARM_ALWAYS_INLINE "
+            } else {
+                ""
+            };
+            let intrinsic = self
+                .intrinsic_for_name(name)
+                .map_or("", IntrinsicSemantics::c_attribute);
+            writeln!(
+                out,
+                "{intrinsic}{inline}Value {}_worker({});",
+                c_name(name),
+                signature
+            )?;
         }
         for ChainWorker { head, .. } in &self.chain_workers {
             writeln!(
@@ -675,9 +1511,13 @@ impl lambda_lift::Program {
                 c_name(head)
             )?;
         }
-        for TopLevelBinding { name, .. } in &self.globals {
+        for TopLevelBinding { name, value, .. } in &self.globals {
             if !is_builtin(name) {
-                writeln!(out, "Value {};", c_name(name))?;
+                if let Some(initializer) = Self::static_int_initializer(value) {
+                    writeln!(out, "static const Value {} = {initializer};", c_name(name))?;
+                } else {
+                    writeln!(out, "Value {};", c_name(name))?;
+                }
             }
         }
 
@@ -697,7 +1537,15 @@ impl lambda_lift::Program {
             if let Some(&arity) = self.arities.get(name) {
                 if arity > 0 {
                     let params = vec!["Value"; arity].join(", ");
-                    writeln!(out, "extern Value {0}_worker({1});", c_name(name), params)?;
+                    let intrinsic = self
+                        .intrinsic_for_name(name)
+                        .map_or("", IntrinsicSemantics::c_attribute);
+                    writeln!(
+                        out,
+                        "{intrinsic}extern Value {0}_worker({1});",
+                        c_name(name),
+                        params
+                    )?;
                 }
             }
         }
@@ -724,9 +1572,36 @@ impl lambda_lift::Program {
             // one parameter); a curried self-call applies more and simply does not match.
             let loopify = std::env::var_os("MARM_NO_LOOPIFY").is_none();
             if loopify && self.has_tail_self_call(SelfCall::SelfRef, 1, code) {
+                let borrowed = self.borrowed_slice_places(SelfCall::SelfRef, 1, code);
+                let immutable_bases = self.immutable_slice_bases(SelfCall::SelfRef, 1, code);
+                let borrows_slices = !borrowed.is_empty();
+                let mut slots = borrowed.values().cloned().collect::<Vec<_>>();
+                slots.sort();
+                let previous = Self::install_borrowed_slice_places(borrowed);
+                let previous_bases = Self::install_immutable_slice_bases(&immutable_bases);
                 let mut body = CodeBuffer::default();
-                self.compile_tail(SelfCall::SelfRef, 1, code, &mut body)?;
-                write!(out, "  {}for (;;) {{ {}{body} }}\n}}\n\n", poll_decl(&body.0), back_edge_poll(&body.0))?;
+                let result = self.compile_tail(SelfCall::SelfRef, 1, code, &mut body);
+                Self::restore_immutable_slice_bases(previous_bases);
+                Self::restore_borrowed_slice_places(previous);
+                result?;
+                let needs_poll =
+                    borrows_slices || self.loop_needs_poll(SelfCall::SelfRef, 1, code, &allocating);
+                let slots = slots
+                    .iter()
+                    .map(|slot| format!("Slice {slot}; "))
+                    .collect::<String>();
+                let bases = immutable_bases
+                    .iter()
+                    .map(|base| {
+                        format!("const uint8_t *{} = slice_ptr({}); ", base.name, base.value)
+                    })
+                    .collect::<String>();
+                write!(
+                    out,
+                    "  {slots}{bases}{}for (;;) {{ {}{body} }}\n}}\n\n",
+                    poll_decl(needs_poll),
+                    back_edge_poll(needs_poll)
+                )?;
             } else {
                 write!(out, "  return ")?;
                 self.compile_expr(code, out)?;
@@ -739,11 +1614,31 @@ impl lambda_lift::Program {
         // no captures. `compile_apply` calls them directly at saturated call sites.
         CAPTURE_PLACES.with(|places| places.borrow_mut().clear());
         for Worker { name, params, body } in &self.workers {
+            if std::env::var_os("MARM_DUMP_C_INLINE").is_some() {
+                eprintln!(
+                    "[c-inline] worker {name} nodes={} selected={}",
+                    c_expr_size(body),
+                    c_inline_workers.contains(name)
+                );
+            }
             let signature = (0..*params)
                 .map(|i| format!("Value l{i}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            writeln!(out, "Value {}_worker({}) {{", c_name(name), signature)?;
+            let inline = if c_inline_workers.contains(name) {
+                "MARM_ALWAYS_INLINE "
+            } else {
+                ""
+            };
+            let intrinsic = self
+                .intrinsic_for_name(name)
+                .map_or("", IntrinsicSemantics::c_attribute);
+            writeln!(
+                out,
+                "{intrinsic}{inline}Value {}_worker({}) {{",
+                c_name(name),
+                signature
+            )?;
             for i in 0..*params {
                 write!(out, "  (void)l{i};")?;
             }
@@ -754,13 +1649,50 @@ impl lambda_lift::Program {
             // plain `return <expr>;` form (output-identical to before).
             let loopify = std::env::var_os("MARM_NO_LOOPIFY").is_none();
             if loopify && self.has_tail_self_call(SelfCall::Named(name), *params, body) {
+                let borrowed = self.borrowed_slice_places(SelfCall::Named(name), *params, body);
+                let immutable_bases =
+                    self.immutable_slice_bases(SelfCall::Named(name), *params, body);
+                let borrows_slices = !borrowed.is_empty();
+                let mut slots = borrowed.values().cloned().collect::<Vec<_>>();
+                slots.sort();
+                let previous = Self::install_borrowed_slice_places(borrowed);
+                let previous_bases = Self::install_immutable_slice_bases(&immutable_bases);
                 let mut emitted = CodeBuffer::default();
-                self.compile_tail(SelfCall::Named(name), *params, body, &mut emitted)?;
-                write!(out, "\n  {}for (;;) {{ {}{emitted} }}\n}}\n\n", poll_decl(&emitted.0), back_edge_poll(&emitted.0))?;
+                let result = self.compile_tail(SelfCall::Named(name), *params, body, &mut emitted);
+                Self::restore_immutable_slice_bases(previous_bases);
+                Self::restore_borrowed_slice_places(previous);
+                result?;
+                let needs_poll = borrows_slices
+                    || self.loop_needs_poll(SelfCall::Named(name), *params, body, &allocating);
+                let slots = slots
+                    .iter()
+                    .map(|slot| format!("Slice {slot}; "))
+                    .collect::<String>();
+                let bases = immutable_bases
+                    .iter()
+                    .map(|base| {
+                        format!("const uint8_t *{} = slice_ptr({}); ", base.name, base.value)
+                    })
+                    .collect::<String>();
+                write!(
+                    out,
+                    "\n  {slots}{bases}{}for (;;) {{ {}{emitted} }}\n}}\n\n",
+                    poll_decl(needs_poll),
+                    back_edge_poll(needs_poll)
+                )?;
             } else {
-                write!(out, "\n  return ")?;
-                self.compile_expr(body, out)?;
-                writeln!(out, ";\n}}\n")?;
+                let never_returns = self
+                    .intrinsic_for_name(name)
+                    .is_some_and(|semantics| semantics.control_flow == ControlFlow::NeverReturns);
+                if never_returns {
+                    write!(out, "\n  ")?;
+                    self.compile_expr(body, out)?;
+                    writeln!(out, ";\n  MARM_UNREACHABLE();\n}}\n")?;
+                } else {
+                    write!(out, "\n  return ")?;
+                    self.compile_expr(body, out)?;
+                    writeln!(out, ";\n}}\n")?;
+                }
             }
         }
 
@@ -770,6 +1702,9 @@ impl lambda_lift::Program {
         // captures); the flattened parameters arrive in `args[0..arity]`, which we
         // name `l0..l{arity-1}` to match the frame the flattened body expects.
         for ChainWorker { head, arity, body } in &self.chain_workers {
+            if std::env::var_os("MARM_DUMP_C_INLINE").is_some() {
+                eprintln!("[c-inline] uworker {head} nodes={}", c_expr_size(body));
+            }
             CAPTURE_PLACES.with(|places| *places.borrow_mut() = self.capture_places(head));
             writeln!(
                 out,
@@ -784,9 +1719,36 @@ impl lambda_lift::Program {
             // a saturated tail `self`-call reassigns `l0..l{arity-1}` and continues.
             let loopify = std::env::var_os("MARM_NO_LOOPIFY").is_none();
             if loopify && self.has_tail_self_call(SelfCall::SelfRef, *arity, body) {
+                let borrowed = self.borrowed_slice_places(SelfCall::SelfRef, *arity, body);
+                let immutable_bases = self.immutable_slice_bases(SelfCall::SelfRef, *arity, body);
+                let borrows_slices = !borrowed.is_empty();
+                let mut slots = borrowed.values().cloned().collect::<Vec<_>>();
+                slots.sort();
+                let previous = Self::install_borrowed_slice_places(borrowed);
+                let previous_bases = Self::install_immutable_slice_bases(&immutable_bases);
                 let mut emitted = CodeBuffer::default();
-                self.compile_tail(SelfCall::SelfRef, *arity, body, &mut emitted)?;
-                write!(out, "\n  {}for (;;) {{ {}{emitted} }}\n}}\n\n", poll_decl(&emitted.0), back_edge_poll(&emitted.0))?;
+                let result = self.compile_tail(SelfCall::SelfRef, *arity, body, &mut emitted);
+                Self::restore_immutable_slice_bases(previous_bases);
+                Self::restore_borrowed_slice_places(previous);
+                result?;
+                let needs_poll = borrows_slices
+                    || self.loop_needs_poll(SelfCall::SelfRef, *arity, body, &allocating);
+                let slots = slots
+                    .iter()
+                    .map(|slot| format!("Slice {slot}; "))
+                    .collect::<String>();
+                let bases = immutable_bases
+                    .iter()
+                    .map(|base| {
+                        format!("const uint8_t *{} = slice_ptr({}); ", base.name, base.value)
+                    })
+                    .collect::<String>();
+                write!(
+                    out,
+                    "\n  {slots}{bases}{}for (;;) {{ {}{emitted} }}\n}}\n\n",
+                    poll_decl(needs_poll),
+                    back_edge_poll(needs_poll)
+                )?;
             } else {
                 write!(out, "\n  return ")?;
                 self.compile_expr(body, out)?;
@@ -813,7 +1775,7 @@ impl lambda_lift::Program {
         // but one that eagerly applies another user global depends on that global
         // already being built, which the ordering guarantees.
         for TopLevelBinding { name, value, .. } in &self.globals {
-            if is_builtin(name) {
+            if is_builtin(name) || Self::static_int_initializer(value).is_some() {
                 continue;
             }
             write!(out, "  {} = ", c_name(name))?;
@@ -829,8 +1791,10 @@ impl lambda_lift::Program {
         let root_names = self
             .globals
             .iter()
-            .map(|b| &b.name)
-            .filter(|name| !is_builtin(name))
+            .filter(|binding| {
+                !is_builtin(&binding.name) && Self::static_int_initializer(&binding.value).is_none()
+            })
+            .map(|binding| &binding.name)
             .chain(self.foreign.iter())
             // The `memory_layout` marker has no companion Value global to root.
             .filter(|name| **name != memory_layout_evidence_name())
@@ -1651,12 +2615,15 @@ impl lambda_lift::Program {
     }
 
     fn flat_width_on_path(&self, ty: &Type, on_path: &mut Vec<Type>) -> usize {
+        if on_path.contains(ty) {
+            return 1;
+        }
         // A ground unary sum may use a one-word zero niche directly inside a
         // canonical flat record. Parametric sums retain their fixed tagged
         // representation: `Perhaps (Perhaps a)` must still distinguish
         // `This Nope` from `Nope` until the payload type is known.
         if ty.variables().is_empty()
-            && let Some((_niche_tag, _payload_tag)) = self.one_word_niche(ty)
+            && let Some((_niche_tag, _payload_tag)) = self.one_word_niche_on_path(ty, on_path)
         {
             return 1;
         }
@@ -1679,9 +2646,65 @@ impl lambda_lift::Program {
         }
     }
 
-    // The inline layout of a coproduct type (peeling `Perhaps τ` to `Perhaps`),
-    // if it is an inlined (non-recursive, under-cap) sum. `None` for records,
-    // recursive/boxed sums, and everything else.
+    // The fixed inline layout of a coproduct type (peeling `Perhaps τ` to
+    // `Perhaps`). `None` for records, sums whose recursion knot cannot be cut to
+    // a pointer within the cap, and everything else.
+    /// Splat a boxed sum value into the `width` words of an inline union.
+    ///
+    /// The tag word, then the ACTIVE variant's fields flattened. A field whose own
+    /// flat width is one word is the boxed node's field as it stands; a wider one is
+    /// itself a flat aggregate, stored boxed, so its words are projected out. Which
+    /// variant is active is a runtime question, and two variants can put different
+    /// fields in the same word, so each word switches on the tag.
+    ///
+    /// Reading `data_field` straight across -- one word per constructor field -- is
+    /// wrong the moment any field is wider than a word: it puts the aggregate's
+    /// POINTER where the layout wants its first word, and pads the rest with zeroes.
+    fn sum_splat_leaves(
+        &self,
+        value: &str,
+        layout: &CoproductLayout,
+        width: usize,
+    ) -> Vec<String> {
+        let mut leaves = vec![format!("VInt(data_tag({value}))")];
+        for slot in 0..width.saturating_sub(1) {
+            let mut arms: Vec<(usize, String)> = Vec::new();
+            for (tag, fields) in layout.variant_widths.iter().enumerate() {
+                let mut offset = 0;
+                for (index, &field_width) in fields.iter().enumerate() {
+                    if slot < offset + field_width {
+                        arms.push((
+                            tag,
+                            if field_width == 1 {
+                                format!("data_field({value}, {index})")
+                            } else {
+                                format!(
+                                    "proj(data_field({value}, {index}), {})",
+                                    slot - offset
+                                )
+                            },
+                        ));
+                        break;
+                    }
+                    offset += field_width;
+                }
+            }
+            let every_variant_agrees = arms.len() == layout.variant_widths.len()
+                && arms.iter().all(|(_, arm)| *arm == arms[0].1);
+            leaves.push(if every_variant_agrees {
+                arms[0].1.clone()
+            } else {
+                arms.iter().rev().fold(
+                    "((Value){0})".to_string(),
+                    |otherwise, (tag, arm)| {
+                        format!("(data_tag({value}) == {tag} ? {arm} : {otherwise})")
+                    },
+                )
+            });
+        }
+        leaves
+    }
+
     fn sum_layout(&self, ty: &Type) -> Option<&CoproductLayout> {
         let mut head = ty;
         while let Type::Apply { constructor, .. } = head {
@@ -1694,12 +2717,22 @@ impl lambda_lift::Program {
     }
 
     fn one_word_niche(&self, ty: &Type) -> Option<(usize, usize)> {
+        self.one_word_niche_on_path(ty, &[])
+    }
+
+    fn one_word_niche_on_path(&self, ty: &Type, on_path: &[Type]) -> Option<(usize, usize)> {
+        // A niche only matters for a sum accepted by fixed-layout analysis. Carry
+        // the caller's record-expansion path into runtime-shape analysis as well:
+        // starting it from an empty path can reopen a record-mediated recursion
+        // knot such as State -> Transition -> State.
+        self.sum_layout(ty)?;
+        let mut runtime_path = on_path.to_vec();
         let RuntimeShape::NicheSum {
             niche_tag,
             payload_tag,
             payload_fields,
             ..
-        } = self.runtime_shape(ty, &mut Vec::new()).shape
+        } = self.runtime_shape(ty, &mut runtime_path).shape
         else {
             return None;
         };
@@ -1778,6 +2811,60 @@ impl lambda_lift::Program {
     // sub-object is never built), anything else is splatted from a hoisted temp
     // (its `width` words copied out -- the value-semantics copy of a small
     // existing record). Temp bindings accumulate in `prelude`.
+    /// Peel a constructor application down to its constructor and arguments:
+    /// `Inject` (the elaborated form), a saturated `Apply` chain onto a global, or a
+    /// bare global for a nullary constructor. `None` for anything else.
+    fn constructor_application<'e>(value: &'e Expr) -> Option<(&'e QualifiedName, Vec<&'e Expr>)> {
+        match strip_ascription(value) {
+            Expr::Inject(_, inject) => Some((
+                &inject.constructor,
+                inject.arguments.iter().map(|a| &**a).collect(),
+            )),
+            application @ Expr::Apply(..) => {
+                let mut arguments = Vec::new();
+                let mut head = application;
+                while let Expr::Apply(_, inner) = head {
+                    arguments.push(&*inner.argument);
+                    head = &inner.function;
+                }
+                arguments.reverse();
+                let Expr::Variable(_, Identifier::Global(constructor)) = head else {
+                    return None;
+                };
+                Some((constructor, arguments))
+            }
+            Expr::Variable(_, Identifier::Global(constructor)) => Some((constructor, Vec::new())),
+            _ => None,
+        }
+    }
+
+    /// The single word a one-word niche field stores for a LITERAL constructor: the
+    /// zero word for the niche constructor, the payload's own compiled value for the
+    /// payload constructor.
+    ///
+    /// Deliberately the BOXED form -- the same word `encode_one_word_niche` produces
+    /// with `data_field(v, 0)`, and the same word `decode_one_word_niche` reads back.
+    /// Splatting the payload STRUCTURALLY instead is wrong here: when the payload is
+    /// itself an inlined sum (`Perhaps Colour`, where `Colour` is a nullary enum) its
+    /// structural word is the sum's TAG, and every reader would rebuild `This <tag>`
+    /// and then dereference the tag as though it were the value.
+    fn literal_niche_word(
+        &self,
+        value: &Expr,
+        niche_tag: usize,
+        payload_tag: usize,
+    ) -> Option<String> {
+        let (constructor, arguments) = Self::constructor_application(value)?;
+        let tag = *self.constructor_tags.get(constructor)? as usize;
+        if tag == niche_tag && arguments.is_empty() {
+            return Some("((Value){0})".to_string());
+        }
+        if tag == payload_tag && arguments.len() == 1 {
+            return Some(self.compile_to_string(arguments[0]));
+        }
+        None
+    }
+
     fn flat_leaves(&self, value: &Expr, width: usize, prelude: &mut Vec<String>) -> Vec<String> {
         if let Some(words) = self.flat_words_for(value)
             && words.len() == width
@@ -1789,9 +2876,8 @@ impl lambda_lift::Program {
             if ty.variables().is_empty()
                 && let Some((niche_tag, payload_tag)) = self.one_word_niche(ty)
             {
-                let shape = self.runtime_shape(ty, &mut Vec::new()).shape;
-                if let Some(leaves) = self.literal_shape_leaves(value, &shape, prelude) {
-                    return leaves;
+                if let Some(word) = self.literal_niche_word(value, niche_tag, payload_tag) {
+                    return vec![word];
                 }
                 let temp = format!("_fn{}", MATCH_ID.fetch_add(1, Ordering::Relaxed));
                 prelude.push(format!("Value {temp} = {};", self.compile_to_string(value)));
@@ -1881,19 +2967,9 @@ impl lambda_lift::Program {
         // Non-literal: hoist to a temp and splat its `width` words.
         let temp = format!("_fr{}", MATCH_ID.fetch_add(1, Ordering::Relaxed));
         prelude.push(format!("Value {temp} = {};", self.compile_to_string(value)));
-        if self
-            .sum_layout(&value.annotation().type_info.inferred_type)
-            .is_some()
-        {
-            // A boxed sum -> the inline union: tag from the header, then the active
-            // variant's fields (its count is `data_len`), zero-padding the rest.
-            let mut leaves = vec![format!("VInt(data_tag({temp}))")];
-            for k in 0..width - 1 {
-                leaves.push(format!(
-                    "(({k}) < data_len({temp}) ? data_field({temp}, {k}) : ((Value){{0}}))"
-                ));
-            }
-            leaves
+        if let Some(layout) = self.sum_layout(&value.annotation().type_info.inferred_type) {
+            // A boxed sum -> the inline union.
+            self.sum_splat_leaves(&temp, layout, width)
         } else {
             (0..width).map(|k| format!("proj({temp}, {k})")).collect()
         }
@@ -1968,9 +3044,20 @@ impl lambda_lift::Program {
                     Self::canonical_product_leaves(&format!("proj({path}, {index})"), field, out);
                 }
             }
-            // A dynamically-tagged canonical sum needs variant-dependent traversal.
-            // Known constructor applications are handled by
-            // `constructor_shape_leaves`; other sums keep the runtime fallback.
+            // A sum stored in ONE word is a leaf as far as word extraction goes: the
+            // parent object's slot holds exactly that word, so it is projected like any
+            // other field. The shape still says `Sum` because the collector needs the
+            // variant structure -- only the splatting does not.
+            RuntimeShape::Sum { .. } | RuntimeShape::NicheSum { .. }
+                if shape.stored_words() == 1 =>
+            {
+                out.push(path.to_string())
+            }
+            // A WIDER sum is spliced across several words, and which words those are
+            // depends on the variant -- so it needs variant-dependent traversal that
+            // this static walk cannot do. Known constructor applications are handled by
+            // `constructor_shape_leaves`; the rest fall out of the caller's length
+            // check and keep the runtime fallback.
             RuntimeShape::Sum { .. } | RuntimeShape::NicheSum { .. } => {}
         }
     }
@@ -2152,9 +3239,32 @@ impl lambda_lift::Program {
         let words = self.flat_words_for(root)?;
         let mut current_type = root.annotation().type_info.inferred_type.clone();
         let mut offset = 0;
-        for selector in &selectors {
+        for (step, selector) in selectors.iter().enumerate() {
             let (next_type, field_offset) =
                 self.runtime_projection_field(&current_type, selector)?;
+            // A field kept in ONE word whose own value needs more is a POINTER to a
+            // separate object, so offsets cannot be accumulated across it -- the words
+            // on the far side are not in this region at all. Give up and let
+            // `flat_place` compile the dereference as a new base. `flat_place` already
+            // guards this; without the same guard here, `h.Inner.A` through a
+            // split local read `offset(Inner) + offset(A)` of the enclosing frame.
+            if step + 1 < selectors.len() {
+                let stored = self.flat_widths(&current_type).and_then(|widths| {
+                    match selector {
+                        ProductElement::Ordinal(index) => widths.get(*index).copied(),
+                        _ => None,
+                    }
+                });
+                if stored == Some(1)
+                    && self
+                        .runtime_shape(&next_type, &mut Vec::new())
+                        .shape
+                        .stored_words()
+                        > 1
+                {
+                    return None;
+                }
+            }
             offset += field_offset;
             current_type = next_type;
         }
@@ -2180,10 +3290,14 @@ impl lambda_lift::Program {
         let widths = self.flat_widths(base_type)?;
         let offset: usize = widths[..index].iter().sum();
         let width = widths[index];
-        // Reach through a base that is itself a flat projection (accumulating
-        // offsets), so `r.b.c` -- even through an inlined tuple field -- is one load.
+        // Reach through a base that is itself an inlined flat projection,
+        // accumulating offsets so `r.b.c` is one load. A one-word record field
+        // is a pointer to its own object, however, so projection must stop there
+        // and compile that inner dereference as the new base.
         if let Expr::Project(_, inner) = strip_ascription(&projection.base) {
-            if let Some((base, base_offset, _)) = self.flat_place(inner) {
+            if let Some((base, base_offset, base_width)) = self.flat_place(inner)
+                && base_width > 1
+            {
                 return Some((base, base_offset + offset, width));
             }
         }
@@ -2276,7 +3390,9 @@ impl lambda_lift::Program {
             aliases: &mut Vec<(usize, &'a Expr)>,
         ) -> Option<(&'a Expr, &'a Expr, &'a Type)> {
             let expression = strip_ascription(expression);
-            if let Some((array, index)) = raw_array_get_arguments(expression) {
+            if let Some([array, index]) = program
+                .intrinsic_arguments::<2>(expression, IntrinsicOperation::PackedArrayGetUnchecked)
+            {
                 return Some((
                     resolve_alias(array, aliases),
                     resolve_alias(index, aliases),
@@ -2324,12 +3440,15 @@ impl lambda_lift::Program {
                 }
                 _ => return None,
             };
-            let (array, index) = raw_array_get_arguments(&clause.consequent)?;
+            let [array, index] = program.intrinsic_arguments::<2>(
+                &clause.consequent,
+                IntrinsicOperation::PackedArrayGetUnchecked,
+            )?;
             if !matches!(strip_ascription(array), Expr::Variable(_, Identifier::Local(level)) if level == bound_level)
             {
                 return None;
             }
-            let element_type = mutable_array_element_type(
+            let element_type = program.mutable_array_element_type(
                 &deconstruct.scrutinee.annotation().type_info.inferred_type,
             )?;
             Some((
@@ -2371,7 +3490,9 @@ impl lambda_lift::Program {
             aliases: &mut Vec<(usize, &'a Expr)>,
         ) -> Option<(&'a Expr, &'a Expr, &'a Expr)> {
             let expression = strip_ascription(expression);
-            if let Some((array, index, replacement)) = raw_array_set_arguments(expression) {
+            if let Some([array, index, replacement]) = program
+                .intrinsic_arguments::<3>(expression, IntrinsicOperation::PackedArraySetUnchecked)
+            {
                 return Some((
                     resolve_alias(array, aliases),
                     resolve_alias(index, aliases),
@@ -2413,7 +3534,10 @@ impl lambda_lift::Program {
                 }
                 _ => return None,
             };
-            let (array, index, replacement) = raw_array_set_arguments(&clause.consequent)?;
+            let [array, index, replacement] = program.intrinsic_arguments::<3>(
+                &clause.consequent,
+                IntrinsicOperation::PackedArraySetUnchecked,
+            )?;
             if !matches!(strip_ascription(array), Expr::Variable(_, Identifier::Local(level)) if level == bound_level)
             {
                 return None;
@@ -3174,36 +4298,78 @@ impl lambda_lift::Program {
     // held in a canonical order (sorted by name at construction) and projection
     // is already lowered to `Ordinal`, so the field labels carry no runtime
     // weight -- we just emit the values in field order.
+    /// The physical words a flat record literal stores, field by field.
+    ///
+    /// THE single producer of a flat record's body. `compile_record` builds the object
+    /// out of these words and `flat_record_literal` spreads the same words across a
+    /// split local's slots, so the two cannot disagree about how a field is spelled --
+    /// which they did: the record path niche-encoded a one-word sum field while the
+    /// split-local path splatted it STRUCTURALLY through `literal_shape_leaves`, so the
+    /// same `{ First := This Red }` became `Root_Red` in an object and `VInt(1)` in a
+    /// local, and every reader decoded whichever it got as the other.
+    fn record_literal_leaves(
+        &self,
+        record_type: &Type,
+        the: &phase::Record<Closed>,
+        prelude: &mut Vec<String>,
+    ) -> Option<Vec<String>> {
+        let widths = self.flat_widths(record_type)?;
+        (widths.len() == the.fields.len()).then_some(())?;
+        let mut leaves = Vec::new();
+        for ((_label, value), width) in the.fields.iter().zip(&widths) {
+            leaves.extend(self.flat_leaves(value, *width, prelude));
+        }
+        (leaves.len() == widths.iter().sum::<usize>()).then_some(leaves)
+    }
+
     fn compile_record(
         &self,
         annotation: &CaptureInfo,
         the: &phase::Record<Closed>,
         code: &mut CodeBuffer,
     ) -> fmt::Result {
-        // Flat path: when the record has a nested inlined field (some width > 1),
-        // build ONE object whose body is the fields' flattened leaves. A record
-        // with only width-1 fields falls through to the identical tuple lowering
-        // below, so non-nested records stay byte-identical.
-        if self.flat_records_enabled() {
-            if let Some(widths) = self.flat_widths(&annotation.type_info.inferred_type) {
-                if widths.iter().any(|&w| w > 1) {
-                    let total: usize = widths.iter().sum();
-                    let mut prelude = Vec::new();
-                    let mut leaves = Vec::new();
-                    for ((_label, value), width) in the.fields.iter().zip(&widths) {
-                        leaves.extend(self.flat_leaves(value, *width, &mut prelude));
-                    }
-                    write!(code, "({{ ")?;
-                    for binding in &prelude {
-                        write!(code, "{binding} ")?;
-                    }
-                    write!(code, "mk_tuple({total}")?;
-                    for leaf in &leaves {
-                        write!(code, ", {leaf}")?;
-                    }
-                    return write!(code, "); }})");
-                }
+        // Flat path: build ONE object whose body is the fields' flattened leaves.
+        //
+        // This runs for EVERY record with a known layout, not only for one with a
+        // nested inlined field (some width > 1). It has to: `flat_leaves` is also what
+        // niche-ENCODES a one-word sum field (`Nope` becomes the zero word), and every
+        // reader -- `flat_place` in `compile_projection`, `collect_pattern_flat`,
+        // `canonical_update_leaves` -- decodes a width-1 field that way. When
+        // construction skipped the flat path it stored the BOXED sum instead and the
+        // reader decoded a pointer as though it were a niche, so a record field holding
+        // `Nope` read back as `This <garbage>`.
+        //
+        // Records with no niche field stay byte-identical: `flat_leaves` of a width-1
+        // non-niche field is the field's own compiled expression, and `tuple_from_words`
+        // picks the same `mk_tupleN` the fallback below would.
+        if self.flat_records_enabled()
+            && let Some(leaves) = {
+                let mut probe = Vec::new();
+                let found = self.record_literal_leaves(
+                    &annotation.type_info.inferred_type,
+                    the,
+                    &mut probe,
+                );
+                found.map(|leaves| (probe, leaves))
             }
+        {
+            let (prelude, leaves) = leaves;
+            let total = leaves.len();
+            // A record wider than its field count has an inlined aggregate in it: keep
+            // the general `mk_tuple(n, ...)` builder it already used.
+            let build = if total > the.fields.len() {
+                format!("mk_tuple({total}, {})", leaves.join(", "))
+            } else {
+                Self::tuple_from_words(&leaves)
+            };
+            if prelude.is_empty() {
+                return write!(code, "{build}");
+            }
+            write!(code, "({{ ")?;
+            for binding in &prelude {
+                write!(code, "{binding} ")?;
+            }
+            return write!(code, "{build}; }})");
         }
 
         let mut written = if the.fields.len() <= 4 {
@@ -3268,12 +4434,8 @@ impl lambda_lift::Program {
             }
             return vec![value.to_string()];
         }
-        if self.sum_layout(ty).is_some() {
-            let mut leaves = vec![format!("VInt(data_tag({value}))")];
-            for index in 0..width - 1 {
-                leaves.push(format!("(({index}) < data_len({value}) ? data_field({value}, {index}) : ((Value){{0}}))"));
-            }
-            leaves
+        if let Some(layout) = self.sum_layout(ty) {
+            self.sum_splat_leaves(value, layout, width)
         } else {
             (0..width)
                 .map(|index| format!("proj({value}, {index})"))
@@ -3322,13 +4484,27 @@ impl lambda_lift::Program {
                 .iter()
                 .any(|field| field.indices.starts_with(&path))
             {
-                result.extend(self.record_update_leaves(
+                let rebuilt = self.record_update_leaves(
                     update,
                     &path,
                     &field_type,
                     base_leaves[offset..offset + width].to_vec(),
                     replacements,
-                ));
+                );
+                if rebuilt.len() == width {
+                    result.extend(rebuilt);
+                } else {
+                    // The field is BOXED: this record keeps one word for it (a
+                    // pointer), but the sub-record's own layout is wider, so the
+                    // recursion unpacked the pointee and rebuilt all of its words.
+                    // Box them back up, or they spill into the slots of the fields
+                    // that follow and every later offset is wrong.
+                    result.push(format!(
+                        "mk_tuple({}, {})",
+                        rebuilt.len(),
+                        rebuilt.join(", ")
+                    ));
+                }
             } else {
                 result.extend(base_leaves[offset..offset + width].iter().cloned());
             }
@@ -3673,13 +4849,36 @@ impl lambda_lift::Program {
         }
         args.reverse();
 
+        let borrowed_slot = BORROWED_SLICE_PLACES
+            .with(|places| places.borrow().get(&(the as *const _ as usize)).cloned());
+        if let Some(slot) = borrowed_slot
+            && let Some(semantics) = self.intrinsic_for_expr(head)
+            && semantics.arity == args.len()
+            && let ResultRepresentation::BorrowableSlice {
+                owner_argument,
+                offset_argument,
+                length_argument,
+            } = semantics.result
+        {
+            write!(code, "slice_sub_borrowed(")?;
+            self.compile_expr(args[owner_argument], code)?;
+            write!(code, ", (size_t)as_int(")?;
+            self.compile_expr(args[offset_argument], code)?;
+            write!(code, "), (size_t)as_int(")?;
+            self.compile_expr(args[length_argument], code)?;
+            return write!(code, "), &{slot})");
+        }
+
         // `omg_wtf_bbq` deliberately keeps the ordinary surface type `Text -> a`.
         // Its private foreign worker has extra diagnostic parameters; inject them
         // here, after all transformations, from metadata carried by the call node.
         if args.len() == 1
-            && let Expr::Variable(_, Identifier::Global(name)) = head
-            && (surface_name(name).ends_with("Root_Prelude_raw_omg_wtf_bbq")
-                || surface_name(name).ends_with("Root_Prelude_omg_wtf_bbq"))
+            && self.intrinsic_for_expr(head).is_some_and(|semantics| {
+                matches!(
+                    semantics.operation,
+                    IntrinsicOperation::Panic | IntrinsicOperation::RawPanic
+                )
+            })
         {
             let info = &annotation.type_info;
             let function = info
@@ -3693,7 +4892,7 @@ impl lambda_lift::Program {
             write!(
                 code,
                 "{}_worker({}, {}, VInt({}), VInt({}), ",
-                "Root_Prelude_raw_omg_wtf_bbq",
+                c_name(&raw_panic_name()),
                 self.compile_constant(&Literal::Text(function)),
                 self.compile_constant(&Literal::Text(file)),
                 info.parse_info.location.row,
@@ -3709,86 +4908,78 @@ impl lambda_lift::Program {
         // runtime shape interpreter to immediately dismantle it again.
         if direct_write_enabled()
             && args.len() == 3
-            && matches!(
-                head,
-                Expr::Variable(_, Identifier::Global(..)) | Expr::InvokeBridge(..)
-            )
+            && self.intrinsic_for_expr(head).is_some_and(|semantics| {
+                semantics.operation == IntrinsicOperation::PackedArraySetUnchecked
+            })
         {
-            let name = match head {
-                Expr::Variable(_, Identifier::Global(name)) => name.as_ref(),
-                Expr::InvokeBridge(_, bridge) => &bridge.qualified_name,
-                _ => unreachable!(),
-            };
-            if surface_name(name).ends_with("Stdlib_Data_Array_Mutable_Array_raw_set_unchecked") {
-                let ground = args[2]
-                    .annotation()
-                    .type_info
-                    .inferred_type
-                    .variables()
-                    .is_empty();
-                if std::env::var_os("DUMP_DIRECT_WRITE").is_some() && !ground {
+            let ground = args[2]
+                .annotation()
+                .type_info
+                .inferred_type
+                .variables()
+                .is_empty();
+            if std::env::var_os("DUMP_DIRECT_WRITE").is_some() && !ground {
+                eprintln!(
+                    "[direct-write-skip] non-ground type={}",
+                    args[2].annotation().type_info.inferred_type,
+                );
+            }
+            if ground {
+                let shape = self
+                    .runtime_shape(
+                        &args[2].annotation().type_info.inferred_type,
+                        &mut Vec::new(),
+                    )
+                    .shape;
+                let width = shape.stored_words();
+                let mut prelude = Vec::new();
+                let leaves = self.literal_shape_leaves(args[2], &shape, &mut prelude);
+                if std::env::var_os("DUMP_DIRECT_WRITE").is_some() {
                     eprintln!(
-                        "[direct-write-skip] non-ground type={}",
+                        "[direct-write] type={} node={} width={width} leaves={} prelude={}",
                         args[2].annotation().type_info.inferred_type,
+                        match strip_ascription(args[2]) {
+                            Expr::Record(..) => "record",
+                            Expr::Tuple(..) => "tuple",
+                            Expr::Inject(..) => "inject",
+                            Expr::Apply(..) => "apply",
+                            Expr::Let(..) => "let",
+                            Expr::Variable(..) => "variable",
+                            _ => "other",
+                        },
+                        leaves.as_ref().map_or(0, Vec::len),
+                        prelude.len(),
                     );
+                    for binding in &prelude {
+                        eprintln!("[direct-write-prelude] {binding}");
+                    }
                 }
-                if ground {
-                    let shape = self
-                        .runtime_shape(
-                            &args[2].annotation().type_info.inferred_type,
-                            &mut Vec::new(),
-                        )
-                        .shape;
-                    let width = shape.stored_words();
-                    let mut prelude = Vec::new();
-                    let leaves = self.literal_shape_leaves(args[2], &shape, &mut prelude);
-                    if std::env::var_os("DUMP_DIRECT_WRITE").is_some() {
-                        eprintln!(
-                            "[direct-write] type={} node={} width={width} leaves={} prelude={}",
-                            args[2].annotation().type_info.inferred_type,
-                            match strip_ascription(args[2]) {
-                                Expr::Record(..) => "record",
-                                Expr::Tuple(..) => "tuple",
-                                Expr::Inject(..) => "inject",
-                                Expr::Apply(..) => "apply",
-                                Expr::Let(..) => "let",
-                                Expr::Variable(..) => "variable",
-                                _ => "other",
-                            },
-                            leaves.as_ref().map_or(0, Vec::len),
-                            prelude.len(),
-                        );
-                        for binding in &prelude {
-                            eprintln!("[direct-write-prelude] {binding}");
-                        }
+                if let Some(leaves) = leaves
+                    && leaves.len() == width
+                {
+                    let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+                    write!(code, "({{ Value _wa{id} = ")?;
+                    self.compile_expr(args[0], code)?;
+                    write!(code, "; Value _wi{id} = ")?;
+                    self.compile_expr(args[1], code)?;
+                    write!(code, "; ")?;
+                    // Prelude bindings evaluate a non-literal replacement exactly
+                    // once, after the array and index as required by source order.
+                    // Value locals remain visible to the conservative stack scanner
+                    // across any allocations performed by later leaf expressions.
+                    for binding in &prelude {
+                        write!(code, "{binding} ")?;
                     }
-                    if let Some(leaves) = leaves
-                        && leaves.len() == width
-                    {
-                        let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
-                        write!(code, "({{ Value _wa{id} = ")?;
-                        self.compile_expr(args[0], code)?;
-                        write!(code, "; Value _wi{id} = ")?;
-                        self.compile_expr(args[1], code)?;
-                        write!(code, "; ")?;
-                        // Prelude bindings evaluate a non-literal replacement exactly
-                        // once, after the array and index as required by source order.
-                        // Value locals remain visible to the conservative stack scanner
-                        // across any allocations performed by later leaf expressions.
-                        for binding in &prelude {
-                            write!(code, "{binding} ")?;
-                        }
-                        for (offset, leaf) in leaves.iter().enumerate() {
-                            write!(code, "Value _wv{id}_{offset} = {leaf}; ")?;
-                        }
-                        for offset in 0..leaves.len() {
-                            write!(
-                                code,
-                                "flat_array_set_word(_wa{id}, (size_t)as_int(_wi{id}), {offset}, _wv{id}_{offset}); "
-                            )?;
-                        }
-                        return write!(code, "VUnit(); }})");
+                    for (offset, leaf) in leaves.iter().enumerate() {
+                        write!(code, "Value _wv{id}_{offset} = {leaf}; ")?;
                     }
+                    for offset in 0..leaves.len() {
+                        write!(
+                            code,
+                            "flat_array_set_word(_wa{id}, (size_t)as_int(_wi{id}), {offset}, _wv{id}_{offset}); "
+                        )?;
+                    }
+                    return write!(code, "VUnit(); }})");
                 }
             }
         }
@@ -3826,6 +5017,48 @@ impl lambda_lift::Program {
                     self.compile_expr(arg, code)?;
                 }
                 return write!(code, ")");
+            }
+        }
+
+        // `gc_poll` is an opaque call to C's optimiser, so it cannot prove that
+        // reloading an immutable Slice's `base` on every byte access gives the
+        // same pointer. Loop emission snapshots bases which are invariant on every
+        // self back-edge; lower reads from those exact variables to the snapshot.
+        // The owner Value remains live in the loop frame, and the collector is
+        // non-moving, so this changes neither rooting nor lifetime.
+        if args.len() == 2
+            && let Some(semantics) = self.intrinsic_for_expr(head)
+            && matches!(
+                semantics.operation,
+                IntrinsicOperation::BytesGetU8 | IntrinsicOperation::BytesGetU64Le
+            )
+        {
+            let source = match strip_ascription(args[0]) {
+                Expr::Variable(_, Identifier::Local(LexicalLevel(level))) => {
+                    Some(ImmutableSliceSource::Local(*level))
+                }
+                Expr::Variable(_, Identifier::Captured(capture)) => {
+                    Some(ImmutableSliceSource::Captured(capture.index()))
+                }
+                _ => None,
+            };
+            let base = source.and_then(|source| {
+                IMMUTABLE_SLICE_BASES.with(|bases| bases.borrow().get(&source).cloned())
+            });
+            if let Some(base) = base {
+                match semantics.operation {
+                    IntrinsicOperation::BytesGetU8 => write!(
+                        code,
+                        "VInt((int64_t)slice_base_get_u8({base}, (size_t)as_int("
+                    )?,
+                    IntrinsicOperation::BytesGetU64Le => write!(
+                        code,
+                        "VInt((int64_t)slice_base_get_u64_le({base}, (size_t)as_int("
+                    )?,
+                    _ => unreachable!(),
+                }
+                self.compile_expr(args[1], code)?;
+                return write!(code, ")))");
             }
         }
 
@@ -3905,7 +5138,7 @@ impl lambda_lift::Program {
         for (capture, (element, place)) in elements.iter().zip(&places).enumerate() {
             if place.width == 1 {
                 let name = format!("{stem}_{capture}");
-                write!(code, "volatile Value {name} = ")?;
+                write!(code, "Value {name} = ")?;
                 self.compile_expr(element, code)?;
                 write!(code, "; ")?;
                 values.push(name);
@@ -3917,13 +5150,29 @@ impl lambda_lift::Program {
             let leaves = self
                 .literal_shape_leaves(element, &shape, &mut prelude)
                 .filter(|leaves| leaves.len() == place.width)
-                .ok_or(fmt::Error)?;
+                .unwrap_or_else(|| {
+                    // `runtime_shape` and the frame layout can disagree about how deep
+                    // the inlining goes -- a record nested in a record is one pointer to
+                    // the frame (`place.width`) and fully spliced to the shape. The FRAME
+                    // is the authority here: the object was built by `compile_record`
+                    // from the same widths, so it has exactly `place.width` slots.
+                    // Evaluate once and take them.
+                    prelude.clear();
+                    let temp = format!("_cw{}", MATCH_ID.fetch_add(1, Ordering::Relaxed));
+                    prelude.push(format!(
+                        "Value {temp} = {};",
+                        self.compile_to_string(element)
+                    ));
+                    (0..place.width)
+                        .map(|word| format!("proj({temp}, {word})"))
+                        .collect()
+                });
             for binding in prelude {
                 write!(code, "{binding} ")?;
             }
             for (word, leaf) in leaves.into_iter().enumerate() {
                 let name = format!("{stem}_{capture}_{word}");
-                write!(code, "volatile Value {name} = {leaf}; ")?;
+                write!(code, "Value {name} = {leaf}; ")?;
                 values.push(name);
             }
         }
@@ -3993,18 +5242,21 @@ impl lambda_lift::Program {
                 )?;
                 let captures = capture_values.len();
 
-                // The collector finds live Values by scanning C stack memory.  With
-                // LTO, an ordinary local aggregate could be scalar-replaced into
-                // registers across an allocating argument expression; `volatile`
-                // keeps every capture materialized in the stack frame for the whole
-                // immediate call.
+                // Capture temporaries stay C-live until this frame is initialised, and
+                // the frame stays live until the direct call returns. Across a call,
+                // the ABI therefore puts each live word either on the stack or in a
+                // callee-saved register; `gc_park` explicitly spills those registers
+                // before publishing the stack. The collector is non-moving, so no
+                // address needs to be reloaded after a safepoint. Making both the
+                // temporaries and aggregate `volatile` duplicated that rooting and
+                // prevented SROA/LICM throughout an inlined hot loop.
                 write!(
                     code,
                     "static const ClosureDesc _sd{id} = {{{name}, {descriptor_worker}, {descriptor_arity}}}; "
                 )?;
                 write!(
                     code,
-                    "volatile struct {{ const ClosureDesc *desc; Value caps[{captures}]; }} _sc{id} = {{&_sd{id}, {{"
+                    "struct {{ const ClosureDesc *desc; Value caps[{captures}]; }} _sc{id} = {{&_sd{id}, {{"
                 )?;
                 for (index, value) in capture_values.iter().enumerate() {
                     if index > 0 {
@@ -4657,9 +5909,14 @@ impl lambda_lift::Program {
         if width == 1 {
             return None;
         }
-        let shape = self.runtime_shape(ty, &mut Vec::new()).shape;
+        let Expr::Record(_, record) = value else {
+            return None;
+        };
         let mut prelude = Vec::new();
-        let leaves = self.literal_shape_leaves(value, &shape, &mut prelude)?;
+        // The SAME words `compile_record` would build the object from -- see
+        // `record_literal_leaves`. Splatting the literal independently is what let the
+        // two representations drift apart.
+        let leaves = self.record_literal_leaves(ty, record, &mut prelude)?;
         (leaves.len() == width).then_some((bindings, prelude, leaves))
     }
 
@@ -5187,10 +6444,17 @@ impl lambda_lift::Program {
                 }
                 args.reverse();
                 let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+                let escape = BORROWED_SLICE_PLACES.with(|places| !places.borrow().is_empty());
                 write!(code, "{{ ")?;
                 for (i, arg) in args.iter().enumerate() {
                     write!(code, "Value _a{id}_{i} = ")?;
+                    if escape {
+                        write!(code, "gc_escape_borrowed(")?;
+                    }
                     self.compile_expr(arg, code)?;
+                    if escape {
+                        write!(code, ")")?;
+                    }
                     write!(code, "; ")?;
                 }
                 for i in 0..arity {
@@ -5200,8 +6464,15 @@ impl lambda_lift::Program {
             }
 
             _ => {
+                let escape = BORROWED_SLICE_PLACES.with(|places| !places.borrow().is_empty());
                 write!(code, "return ")?;
+                if escape {
+                    write!(code, "gc_escape_borrowed(")?;
+                }
                 self.compile_expr(expr, code)?;
+                if escape {
+                    write!(code, ")")?;
+                }
                 write!(code, ";")
             }
         }

@@ -49,3 +49,49 @@ fn perhaps_uses_zero_niche_and_nested_perhaps_falls_back_to_a_tag() {
         "niche search stopped before the later eligible payload field"
     );
 }
+
+#[test]
+fn record_mediated_recursive_sum_does_not_overflow_layout_analysis() {
+    let dir = std::env::temp_dir().join(format!(
+        "lukas_recursive_sum_layout_{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("Root.lady"),
+        r#"State ::= Idle | In_Transit Transition
+
+Transition ::=
+  { From  :: State
+    To    :: State
+    Turns :: Int
+  }
+
+Player ::= { State :: State; Score :: Int }
+
+step :: Player -> Int := λplayer.
+  deconstruct player.State into
+    Idle                    -> player.Score
+  | In_Transit transition   -> transition.Turns
+
+start := λ_. step { State := Idle; Score := 1 }
+"#,
+    )
+    .unwrap();
+
+    let output = dir.join("program.c");
+    Compiler {
+        library_path: PathBuf::from("ladies/stdlib"),
+        source_path: dir,
+        backend: Backend::Native,
+        output_file: Some(output.clone()),
+    }
+    .compiler_main()
+    .expect("recursive native layout code generation");
+
+    let generated = fs::read_to_string(output).expect("generated C source");
+    assert!(
+        generated.contains("Root_step_worker"),
+        "the projected recursive match was not emitted"
+    );
+}

@@ -83,12 +83,48 @@ signature Traversable ::= ∀t : *->*. Functor t + Foldable t |-
   { traverse :: ∀f : *->* α β. Applicative f |- (α -> f β) -> t α -> f (t β)
   }
 
+traverse_ :: ∀t : *->* m : *->* α β. Foldable t + Monad m |- (α -> m β) -> t α -> m Unit :=
+  λf.
+    fold_right (λx rest. bind (λ_. rest) (f x)) (pure ())
+
 sequence :: ∀t : *->* f : *->* α. Traversable t + Applicative f |- t (f α) -> f (t α) :=
   λtfa.
     traverse id tfa
 
 mconcat :: ∀α. Monoid α |- List α -> α :=
   fold_right mappend mempty
+
+
+Free ::= ∀f : *->* α.
+  Pure α
+| Step (f (Free f α))
+
+map_free :: ∀f : *->* α β. Functor f |- (α -> β) -> Free f α -> Free f β := λg program.
+  deconstruct program into
+    Pure value -> Pure (g value)
+  | Step layer -> Step (fmap (map_free g) layer)
+
+bind_free :: ∀f : *->* α β. Functor f |- (α -> Free f β) -> Free f α -> Free f β := λg program.
+  deconstruct program into
+    Pure value -> g value
+  | Step layer -> Step (fmap (bind_free g) layer)
+
+witness ∀f : *->*. Functor f |- Functor (Free f) :=
+  { fmap := map_free
+  }
+
+witness ∀f : *->*. Functor f |- Applicative (Free f) :=
+  { pure  := Pure
+    apply := λfunctions arguments. bind_free (λg. map_free g arguments) functions
+  }
+
+witness ∀f : *->*. Functor f |- Monad (Free f) :=
+  { bind := bind_free
+  }
+
+lift_free :: ∀f : *->* α. Functor f |- f α -> Free f α := λlayer.
+  Step (fmap Pure layer)
+
 
 module State.
 module Enumerator.

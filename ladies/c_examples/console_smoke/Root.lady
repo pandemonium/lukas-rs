@@ -1,0 +1,61 @@
+(* A non-interactive exercise of Stdlib.Console: everything that can be checked
+   without a terminal attached. Run under the panel, stdout is a pipe, so
+   `Console.supports_colour` is false and `Markup.render` must produce PLAIN text --
+   that is the property this program pins down. *)
+use Stdlib.
+use Stdlib.Console.
+
+(* A style built up in pieces, the way a real program does it: a base, then a
+   decision layered on top. `mappend` is right-biased, so `warning` is bold AND
+   yellow, and `emphatic_warning` is the same with an underline added. *)
+warning :: Style :=
+  mappend Style.bold (Style.fg Yellow)
+
+emphatic_warning :: Style :=
+  mappend warning Style.underline
+
+(* Later decisions win over earlier ones on the SAME attribute -- this is blue,
+   not "red then blue". *)
+overridden :: Style :=
+  mappend (Style.fg Red) (Style.fg Blue)
+
+(* Nesting: an outer style with an inner one inside it. The inner span must be
+   able to end without wiping the outer style -- the reason `Markup` exists rather
+   than a handful of escape-string constants. *)
+nested :: Markup :=
+  mappend
+    (Markup.paint (Style.fg Green) "green ")
+    (Markup.styled (Style.fg Green) (mappend (Markup.paint Style.bold "BOLD") (Markup.text " still green")))
+
+(* Show the escape bytes as visible text so the expected output can be diffed.
+   ESC is replaced by the two characters "^[", everything else passes through. *)
+visible :: Text -> Text := λbody.
+  Text.foldr (λc rest. if c = Char.of_byte 27 then "^[`rest`" else "`c``rest`") "" body
+
+report :: Text -> Markup -> IO Unit := λlabel markup.
+  let plain = Markup.render Monochrome markup in
+  let coloured = Markup.render Coloured markup in
+  IO.output "`label`: plain=`plain` coloured=`visible coloured`"
+
+start :: Int -> Unit := λ_.
+  IO.unsafe_run_IO
+    (let* _ = IO.output "##TC" in
+     let* _ = report "warning" (Markup.paint warning "careful") in
+     let* _ = report "emphatic" (Markup.paint emphatic_warning "careful") in
+     let* _ = report "override" (Markup.paint overridden "which colour") in
+     let* _ = report "bright" (Markup.paint (Style.fg (Bright Red)) "hot") in
+     let* _ = report "palette" (Markup.paint (Style.bg (Palette 27)) "indexed") in
+     let* _ = report "truecolour" (Markup.paint (Style.fg (Rgb 12 34 56)) "exact") in
+     let* _ = report "nested" nested in
+     let* _ = report "unstyled" (Markup.text "no escapes at all") in
+     (* The algebra, interpreted for a pipe. `clear` and the alternate screen are
+        control sequences and a redirected log must not receive them, and `write`
+        decides colour for itself -- so what comes out here is the text and nothing
+        else, no escapes whatsoever. *)
+     Console.execute
+       (let* _ = Console.clear in
+        let* _ = Console.in_alternate_screen (Console.say "inside the alternate screen") in
+        let* _ = Console.write_line (Markup.paint (Style.fg Magenta) "written through Console.write") in
+        let* colour = Console.supports_colour in
+        let* tty = Console.is_tty in
+        Console.say "supports_colour=`colour` is_tty=`tty`"))

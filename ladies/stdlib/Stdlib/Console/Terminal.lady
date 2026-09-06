@@ -1,0 +1,590 @@
+(* Stdlib.Console.Terminal -- the terminal itself: the ECMA-48/DEC/xterm wire protocol,
+   and the IO that drives it. `Stdlib.Console` is the interface; this is how it is done.
+
+   Only `Console.execute` calls into here. *)
+use Stdlib.
+use Stdlib.IO.
+use Stdlib.Data.List.
+use Stdlib.Data.Perhaps.
+use Stdlib.Control.
+use Stdlib.Console.
+
+
+foreign raw_write          :: Text -> Unit
+foreign raw_flush          :: Unit -> Unit
+foreign raw_read_byte      :: Int -> Int
+foreign raw_read_line      :: Unit -> Result Int Bytes
+foreign raw_mode_enter     :: Int -> Int
+foreign raw_mode_leave     :: Unit -> Unit
+foreign raw_mode_current   :: Unit -> Int
+foreign raw_is_output_tty  :: Unit -> Bool
+foreign raw_is_tty         :: Unit -> Bool
+foreign raw_supports_colour :: Unit -> Bool
+foreign raw_window_size    :: Unit -> Perhaps (Int, Int)
+
+
+(* ------------------------------------------------- wire bytes, as the protocols spell them *)
+escape_byte    :: Int := 0x1B
+semicolon_byte :: Int := 0x3B   (* separates CSI parameters *)
+digit_low      :: Int := 0x30
+digit_high     :: Int := 0x39
+c0_limit       :: Int := 0x20   (* below this a byte is a C0 control *)
+ctrl_letter    :: Int := 0x40   (* ^A is 1 and 'A' is 0x41, so this is the gap *)
+ascii_limit    :: Int := 0x80   (* at or above, the start of a UTF-8 sequence *)
+csi_final_low  :: Int := 0x40   (* a CSI sequence ends on 0x40..0x7E *)
+csi_final_high :: Int := 0x7E
+ss3_byte       :: Int := 0x4F   (* the letter O of `ESC O`, not a zero *)
+
+(* Without a cap, a stream of digits would gather forever. *)
+max_csi_parameters :: Int := 16
+
+(* RFC 3629 caps a scalar at four bytes. *)
+utf8_max_bytes :: Int := 4
+
+decimal_base :: Int := 10
+
+(* ------------------------------------------------------------------- SGR codes *)
+bright_offset   :: Int := 60   (* a basic colour's high-intensity twin *)
+extended_colour :: Int := 8    (* 38 or 48: "the colour follows" *)
+palette_form    :: Int := 5    (* ... as one 256-colour index *)
+rgb_form        :: Int := 2    (* ... as three 8-bit components *)
+
+(* The lexer decodes \n \t \r \0 and nothing else, so ESC is built from its byte. *)
+escape :: Text := "`Char.of_byte escape_byte`"
+
+introducer :: Text := "`escape`["
+
+separator :: Text := ";"
+
+reset :: Text := "`introducer`0m"
+
+
+(* An empty parameter list renders to nothing, not `ESC[m`. *)
+sgr :: List Int -> Text := λparameters.
+  perhaps "" (λ_. "`introducer``List.text separator parameters`m") (List.head parameters)
+
+basic_colour :: Colour -> Perhaps Int := λcolour.
+  deconstruct colour into
+    Black   -> This 0
+  | Red     -> This 1
+  | Green   -> This 2
+  | Yellow  -> This 3
+  | Blue    -> This 4
+  | Magenta -> This 5
+  | Cyan    -> This 6
+  | White   -> This 7
+  | otherwise -> Nope
+
+
+Channel ::= Foreground_Channel | Background_Channel
+
+channel_base :: Channel -> Int := λchannel.
+  deconstruct channel into
+    Foreground_Channel -> 30
+  | Background_Channel -> 40
+
+colour_parameters :: Channel -> Colour -> List Int := λchannel colour.
+  let base = channel_base channel in
+  deconstruct colour into
+    Bright inner ->
+      deconstruct basic_colour inner into
+        This offset -> from [base + bright_offset + offset]
+      | Nope -> colour_parameters channel inner
+  | Palette index ->
+      from [base + extended_colour; palette_form; index]
+  | Rgb red green blue ->
+      from [base + extended_colour; rgb_form; red; green; blue]
+  | otherwise ->
+      perhaps Nil (λoffset. from [base + offset]) (basic_colour colour)
+
+weight_parameter :: Weight -> Int := λweight.
+  deconstruct weight into
+    Bold    -> 1
+  | Faint   -> 2
+  | Regular -> 22
+
+attribute_parameters :: Attribute -> List Int := λattribute.
+  deconstruct attribute into
+    Foreground colour -> colour_parameters Foreground_Channel colour
+  | Background colour -> colour_parameters Background_Channel colour
+  | Intensity weight  -> from [weight_parameter weight]
+  | Italic on         -> from [if on then 3 else 23]
+  | Underline on      -> from [if on then 4 else 24]
+  | Inverse on        -> from [if on then 7 else 27]
+  | Strike on         -> from [if on then 9 else 29]
+
+style_parameters :: Style -> List Int := λ(Make_Style chosen).
+  List.bind attribute_parameters chosen
+
+style_sequence :: Style -> Text := λstyle.
+  sgr (style_parameters style)
+
+
+(* `outer` is the style in force around `markup`; leaving a span emits a reset and
+   re-applies it. `tail` is what follows, keeping the walk linear. *)
+markup_chunks :: Colour_Mode -> Style -> Markup -> List Text -> List Text := λmode outer markup tail.
+  deconstruct markup into
+    Empty_Markup -> tail
+  | Raw_Markup body -> Cons body tail
+  | Pair_Markup first second ->
+      markup_chunks mode outer first (markup_chunks mode outer second tail)
+  | Styled_Markup style body ->
+      deconstruct mode into
+        Monochrome -> markup_chunks mode outer body tail
+      | Coloured ->
+          let inner = mappend outer style in
+          let restore = "`reset``style_sequence outer`" in
+          Cons (style_sequence inner) (markup_chunks mode inner body (Cons restore tail))
+
+(* The one place the mode numbers live; Console.c must agree. *)
+mode_as_int :: Terminal_Mode -> Int := λmode.
+  deconstruct mode into
+    Cbreak -> 0
+  | Raw    -> 1
+
+
+(* A negative depth means there is no terminal to switch; the response says whether the
+   bracket owes a `Leave_Mode`. *)
+change_mode :: Mode_Change -> IO Bool := λchange.
+  deconstruct change into
+    Enter_Mode mode ->
+      let* depth = IO.suspend (λ_. raw_mode_enter (mode_as_int mode)) in
+      pure (depth >= 0)
+  | Leave_Mode ->
+      let* _ = IO.suspend (λ_. raw_mode_leave ()) in
+      pure true
+
+
+(* ========================================================= unbuffered input *)
+
+wait_ms :: Wait -> Int := λwait.
+  deconstruct wait into
+    Forever -> -1
+  | Milliseconds ms -> ms
+
+
+(* Long enough for a real sequence to arrive, short enough not to be noticed. *)
+escape_timeout :: Wait := Milliseconds 25
+
+
+(* The CONSOLE_* defines in Console.c. Above the byte range, so a byte can never be
+   mistaken for a status. *)
+console_statuses :: List (Int, Fault) :=
+  from
+    [ (256, End_Of_Input)
+      (257, Timed_Out)
+      (258, Read_Failed)
+    ]
+
+status_fault :: Int -> Fault := λcode.
+  perhaps Read_Failed id (List.Associative.lookup code console_statuses)
+
+classify :: Int -> Result Fault Int := λcode.
+  deconstruct List.Associative.lookup code console_statuses into
+    This fault -> Fault fault
+  | Nope -> Return code
+
+read_byte_within :: Wait -> IO (Result Fault Int) := λwait.
+  IO.suspend (λ_. classify (raw_read_byte (wait_ms wait)))
+
+read_byte :: IO (Result Fault Int) := read_byte_within Forever
+
+
+(* A terminal can deliver bytes that are not UTF-8: a Latin-1 paste, an odd locale. *)
+text_of_bytes :: List Int -> IO (Perhaps Text) := λbytes.
+  let* buffer = Buffer.new_buffer utf8_max_bytes in
+  let* _ = traverse (Buffer.put_u8 buffer) bytes in
+  let* raw = Buffer.move buffer in
+  pure (Text.from_bytes raw)
+
+character_of :: List Int -> IO Key := λbytes.
+  let* decoded = text_of_bytes bytes in
+  deconstruct decoded into
+    This typed -> pure (Character typed)
+  | Nope -> pure (Unknown bytes)
+
+
+(* ---------------------------------------------------------- escape decoding
+
+   Every key that is not a plain character arrives as ESC (0x1B) plus one of two shapes:
+
+     CSI  `ESC [` -- parameters separated by `;`, then a final byte in 0x40..0x7E.
+          `ESC [ A` Up, `ESC [ 1 ; 5 A` Ctrl-Up, `ESC [ 3 ~` Delete.
+     SS3  `ESC O` -- the letter O, not a zero. `ESC O A` Up, `ESC O P`..`S` F1..F4.
+          Exactly one byte follows, and no parameters.
+
+   Anything else after ESC is that key with Meta held; ESC with nothing after it is the
+   Escape key. Only the absence of a follower separates them, hence the timed reads. *)
+
+modifier_bits :: List (Int, Modifier) :=
+  from
+    [ (4, Control)
+      (2, Meta)
+      (1, Shift)
+    ]
+
+
+(* `ESC [ 1 ; 5 ~` is parameters 1 and 5 with final byte `~`. The introducer is already
+   consumed; the final byte is a `Char` because it is always printable. *)
+Csi_Sequence ::=
+  { Parameters :: List Int
+    Final      :: Char
+  }
+
+csi_sequence :: List Int -> Int -> Csi_Sequence := λbytes final.
+  let step = λ(current, done) byte.
+    if byte = semicolon_byte
+      then 0, Cons current done
+      else
+        if byte >= digit_low and byte <= digit_high
+          then (current * decimal_base) + (byte - digit_low), done
+          else current, done
+  in
+  let last, earlier = List.fold_left step (0, Nil) bytes in
+  { Parameters := List.reverse (Cons last earlier)
+    Final      := Char.of_byte final
+  }
+
+(* Absent reads as 0, which is in no table. *)
+primary_parameter :: Csi_Sequence -> Int := λsequence.
+  perhaps 0 id (List.head sequence.Parameters)
+
+(* One PLUS a bitmask. Absent reads as 0, and `max 0 (code - 1)` makes that no modifiers. *)
+parameter_modifiers :: Csi_Sequence -> List Modifier := λsequence.
+  let code = perhaps 0 id (List.head (List.tail sequence.Parameters)) in
+  let bits = max 0 (code - 1) in
+  let when_set = λ(mask, modifier).
+    if ((bits / mask) % 2) = 1 then from [modifier] else Nil
+  in
+  List.bind when_set modifier_bits
+
+modified :: List Modifier -> Key -> Key := λheld key.
+  List.fold_right With key held
+
+(* `ESC [ n ~` -- the editing and function keys by their VT220 numbers. *)
+tilde_keys :: List (Int, Key) :=
+  from
+    [ (1, Home)
+      (2, Insert)
+      (3, Delete)
+      (4, End)
+      (5, Page_Up)
+      (6, Page_Down)
+      (7, Home)
+      (8, End)
+      (11, Function 1)
+      (12, Function 2)
+      (13, Function 3)
+      (14, Function 4)
+      (15, Function 5)
+      (17, Function 6)
+      (18, Function 7)
+      (19, Function 8)
+      (20, Function 9)
+      (21, Function 10)
+      (23, Function 11)
+      (24, Function 12)
+    ]
+
+decode_tilde :: Csi_Sequence -> Perhaps Key := λsequence.
+  List.Associative.lookup (primary_parameter sequence) tilde_keys
+
+decode_csi :: Csi_Sequence -> Perhaps Key := λsequence.
+  let held = parameter_modifiers sequence in
+  let this = λkey. This (modified held key) in
+  deconstruct sequence.Final into
+    'A' -> this Up
+  | 'B' -> this Down
+  | 'C' -> this Right
+  | 'D' -> this Left
+  | 'H' -> this Home
+  | 'F' -> this End
+  | '~' -> fmap (modified held) (decode_tilde sequence)
+  | otherwise -> Nope
+
+(* Two spellings of Return and two of Backspace: terminals disagree about which they send. *)
+control_keys :: List (Int, Key) :=
+  from
+    [ (0x0D, Enter)      (* CR: Return, once ICRNL is off -- i.e. in raw mode *)
+      (0x0A, Enter)      (* LF: Return, with the driver still translating it *)
+      (0x09, Tab)
+      (0x7F, Backspace)  (* DEL, which is what most terminals send *)
+      (0x08, Backspace)  (* BS, which is what the rest send *)
+      (0x1B, Escape)
+    ]
+
+(* A byte below `ascii_limit` is a complete one-byte UTF-8 scalar. *)
+ascii_text :: Int -> Text := λbyte.
+  let character = Char.of_byte byte in
+  "`character`"
+
+decode_ascii_byte :: Int -> Key := λbyte.
+  deconstruct List.Associative.lookup byte control_keys into
+    This key -> key
+  | Nope ->
+      if byte < c0_limit
+        then Ctrl (Char.of_byte (byte + ctrl_letter))
+        else Character (ascii_text byte)
+
+(* RFC 3629: leads are 0xC2..0xF4 and nothing else. `lead >= 0xF0` would call 0xFF a
+   four-byte lead and swallow the next three bytes. *)
+utf8_leads :: List (Int, Int, Int) :=
+  from
+    [ (0xC2, 0xDF, 1)
+      (0xE0, 0xEF, 2)
+      (0xF0, 0xF4, 3)
+    ]
+
+continuation_count :: Int -> Perhaps Int := λlead.
+  let announced = λ(low, high, count).
+    if lead >= low and lead <= high then from [count] else Nil
+  in
+  List.head (List.bind announced utf8_leads)
+
+read_utf8_character :: Int -> IO Key := λlead.
+  let gather = λremaining acc.
+    if remaining <= 0
+      then character_of (List.reverse acc)
+      else
+        let* next = read_byte in
+        deconstruct next into
+          Return byte -> gather (remaining - 1) (Cons byte acc)
+        | otherwise -> pure (Unknown (List.reverse acc))
+  in
+  let start = from [lead] in
+  deconstruct continuation_count lead into
+    This continuations -> gather continuations start
+  | Nope -> pure (Unknown start)
+
+decode_ss3_final :: Char -> Perhaps Key := λfinal.
+  deconstruct final into
+    'P' -> This (Function 1)
+  | 'Q' -> This (Function 2)
+  | 'R' -> This (Function 3)
+  | 'S' -> This (Function 4)
+  | 'A' -> This Up
+  | 'B' -> This Down
+  | 'C' -> This Right
+  | 'D' -> This Left
+  | 'H' -> This Home
+  | 'F' -> This End
+  | otherwise -> Nope
+
+read_ss3 :: IO Key :=
+  let* next = read_byte_within escape_timeout in
+  deconstruct next into
+    Return byte ->
+      deconstruct decode_ss3_final (Char.of_byte byte) into
+        This key -> pure key
+      | Nope -> pure (Unknown (from [ss3_byte; byte]))
+  | otherwise -> pure (Unknown (from [ss3_byte]))
+
+read_csi :: IO Key :=
+  let gather = λgathered.
+    if List.length gathered > max_csi_parameters
+      then pure (Unknown (List.reverse gathered))
+      else
+        let* next = read_byte_within escape_timeout in
+        deconstruct next into
+          Return byte ->
+            if (byte >= csi_final_low) and (byte <= csi_final_high)
+              then
+                let bytes = List.reverse gathered in
+                deconstruct decode_csi (csi_sequence bytes byte) into
+                  This key -> pure key
+                | Nope -> pure (Unknown (List.append bytes (from [byte])))
+              else gather (Cons byte gathered)
+        | otherwise -> pure (Unknown (List.reverse gathered))
+  in gather Nil
+
+read_escape_sequence :: IO Key :=
+  let after = λbyte.
+    deconstruct Char.of_byte byte into
+      '[' -> read_csi
+    | 'O' -> read_ss3
+    | otherwise -> pure (With Meta (decode_ascii_byte byte))
+  in
+  let* next = read_byte_within escape_timeout in
+  result (λ_. pure Escape) after next
+
+
+(* The first byte decides which of three disjoint shapes a keystroke is:
+
+     ESC (0x1B)   an escape sequence
+     >= 0x80      a UTF-8 lead, 1..3 continuations to follow
+     otherwise    complete: a C0 control or an ASCII character *)
+decode_keystroke :: Int -> IO Key := λbyte.
+  if byte = escape_byte
+    then read_escape_sequence
+    else if byte >= ascii_limit
+      then read_utf8_character byte
+      else pure (decode_ascii_byte byte)
+
+
+(* Where output is going, and therefore what a `Screen_Control` means. *)
+Destination ::=
+    File            (* not a terminal: every control sequence is dropped *)
+  | Line_Terminal   (* a terminal whose driver still post-processes output *)
+  | Raw_Terminal    (* a terminal with post-processing off -- full raw mode *)
+
+(* Asked each time: a program can be redirected, and the raw-mode brackets change it. *)
+destination :: IO Destination :=
+  let* terminal = IO.suspend (λ_. raw_is_output_tty ()) in
+  if terminal
+    then
+      let* mode = IO.suspend (λ_. raw_mode_current ()) in
+      deconstruct mode into
+        1 -> pure Raw_Terminal
+      | otherwise -> pure Line_Terminal
+    else pure File
+
+markup_chunks_text :: Colour_Mode -> Markup -> Text := λmode markup.
+  List.concat (markup_chunks mode (Make_Style Nil) markup Nil)
+
+(* ------------------------------------------------------- the interpreters
+
+   Everything that differs between a pipe, a cooked terminal and a raw one is decided here. *)
+control_text :: Destination -> Screen_Control -> Text := λdestination control.
+  let sequence = λbody.
+    deconstruct destination into
+      File -> ""
+    | otherwise -> "`introducer``body`"
+  in
+  deconstruct control into
+    (* With output post-processing off, a line feed no longer returns the carriage. *)
+    New_Line ->
+      deconstruct destination into
+        Raw_Terminal -> "\r\n"
+      | otherwise -> "\n"
+  | Move_To row column -> sequence "`row`;`column`H"
+  | Erase_Line -> sequence "K"
+  | Erase_Screen -> sequence "2J"
+  | Set_Cursor Cursor_Hidden -> sequence "?25l"
+  | Set_Cursor Cursor_Visible -> sequence "?25h"
+  | Set_Screen Alternate_Screen -> sequence "?1049h"
+  | Set_Screen Main_Screen -> sequence "?1049l"
+
+put :: Text -> IO Unit := λbody.
+  let* _ = IO.suspend (λ_. raw_write body) in
+  IO.suspend (λ_. raw_flush ())
+
+erase_to_end :: Text := "`introducer`K"
+
+cursor_left :: Int -> Text := λn.
+  if n <= 0 then "" else "`introducer``n`D"
+
+(* `Hide_Typing` is a password prompt: the prompt is drawn, the line is not. *)
+Echo ::= Show_Typing | Hide_Typing
+
+(* `before` is the text left of the cursor, most recent first. *)
+alias Line_State ::= (List Text, List Text)
+
+edit :: Key -> Line_State -> Line_State := λkey (before, after).
+  let unchanged = (before, after) in
+  deconstruct key into
+    Character typed -> (Cons typed before, after)
+  | Backspace -> (List.tail before, after)
+  | Delete -> (before, List.tail after)
+  | Left -> perhaps unchanged (λc. (List.tail before, Cons c after)) (List.head before)
+  | Right -> perhaps unchanged (λc. (Cons c before, List.tail after)) (List.head after)
+  | Home -> (Nil, List.append (List.reverse before) after)
+  | End -> (List.append (List.reverse after) before, Nil)
+  | Ctrl 'A' -> (Nil, List.append (List.reverse before) after)
+  | Ctrl 'E' -> (List.append (List.reverse after) before, Nil)
+  | Ctrl 'U' -> (Nil, Nil)
+  | otherwise -> unchanged
+
+(* A line editor for raw mode, where the driver supplies none. Every key redraws the whole
+   line, so the prompt's width is never measured. Assumes one screen row and one column
+   per Unicode scalar -- wrong for combining marks and for CJK or emoji. *)
+edit_line :: Echo -> Text -> IO (Result Fault Text) := λecho prompt_text.
+  let whole = λ(before, after). List.append (List.reverse before) after in
+  let shown = λ(before, after) content.
+    deconstruct echo into
+      Show_Typing -> "`List.concat content``erase_to_end``cursor_left (List.length after)`"
+    | Hide_Typing -> erase_to_end
+  in
+  let step = λ(before, after).
+    let state = (before, after) in
+    let content = whole state in
+    let* _ = put "\r`prompt_text``shown state content`" in
+    let* pressed = next_key_within Forever in
+    deconstruct pressed into
+      Fault reason -> pure (Fault reason)
+    | Return Enter ->
+        let* _ = put "\r\n" in
+        pure (Return (List.concat content))
+    | Return (Ctrl 'D') ->
+        deconstruct content into
+          Nil -> pure (Fault End_Of_Input)
+        | otherwise -> step state
+    | Return key -> step (edit key state)
+  in step (Nil, Nil)
+
+(* Negative `timeout_ms` blocks. *)
+next_key_within :: Wait -> IO (Result Fault Key) := λwait.
+  let* first = read_byte_within wait in
+  traverse decode_keystroke first
+
+
+in_mode :: ∀α. Terminal_Mode -> Console α -> Console α := λmode action.
+  let* entered = lift_free (Mode (Enter_Mode mode) id) in
+  let* result = action in
+  let* _ = if entered then lift_free (Mode Leave_Mode id) else pure false in
+  pure result
+
+
+(* ----------------- the IO layer; nothing outside `Terminal` performs a console effect *)
+
+flush :: IO Unit := IO.suspend (λ_. raw_flush ())
+
+emit :: Text -> IO Unit := λbody. IO.suspend (λ_. raw_write body)
+
+colour_mode :: IO Colour_Mode :=
+  let* coloured = IO.suspend (λ_. raw_supports_colour ()) in
+  pure (if coloured then Coloured else Monochrome)
+
+rendered :: Markup -> IO Text := λmarkup.
+  let* mode = colour_mode in
+  pure (markup_chunks_text mode markup)
+
+write_markup :: Markup -> IO Unit := λmarkup.
+  let* where_to = destination in
+  let colours =
+    deconstruct where_to into
+      File -> Monochrome
+    | otherwise -> Coloured
+  in
+  emit (markup_chunks_text colours markup)
+
+write_control :: Screen_Control -> IO Unit := λcontrol.
+  let* where_to = destination in
+  emit (control_text where_to control)
+
+(* In COOKED mode the driver does the editing and the prompt is drawn once; in RAW mode
+   `edit_line` supplies its own and redraws per key. *)
+prompt_line :: Markup -> IO (Result Fault Text) := λquestion.
+  let* drawn = rendered question in
+  let* mode = IO.suspend (λ_. raw_mode_current ()) in
+  if mode >= 0
+    then edit_line Show_Typing drawn
+    else
+      let* _ = put drawn in
+      let* raw = IO.suspend (λ_. raw_read_line ()) in
+      deconstruct raw into
+        Return bytes -> pure (return_or (λ_. Not_Utf8 bytes) (Text.from_bytes bytes))
+      | Fault code -> pure (Fault (status_fault code))
+
+(* Raw mode for the duration whatever the caller was in: suppressing the echo IS raw mode. *)
+masked_line :: Markup -> IO (Result Fault Text) := λquestion.
+  let* drawn = rendered question in
+  let* entered = change_mode (Enter_Mode Cbreak) in
+  let* typed = edit_line Hide_Typing drawn in
+  let* _ = if entered then change_mode Leave_Mode else pure false in
+  pure typed
+
+colour_support :: IO Bool := IO.suspend (λ_. raw_supports_colour ())
+
+input_is_terminal :: IO Bool := IO.suspend (λ_. raw_is_tty ())
+
+window_size :: IO (Perhaps (Int, Int)) := IO.suspend (λ_. raw_window_size ())

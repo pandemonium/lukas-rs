@@ -1,0 +1,406 @@
+(* Stdlib.Console -- ANSI styling, raw mode, and terminal input.
+
+   A console program is a value of type `Console α`, sequenced with `let*` and run by
+   `execute`. `module Terminal` below is the wire protocol and the IO that drives it;
+   termios and the crash-time restore are in Console.c. *)
+use Stdlib.
+use Stdlib.IO.
+use Stdlib.Data.List.
+use Stdlib.Data.Perhaps.
+use Stdlib.Control.
+
+
+
+
+(* ============================================================== public types *)
+
+(* ----------------------------------------------------------- the instructions *)
+
+(* CBREAK stops line assembly and echo, leaving signals alone. RAW also takes the signal
+   and flow-control keys, and stops LF implying CR on output. *)
+Terminal_Mode ::= Cbreak | Raw
+
+Mode_Change ::= Enter_Mode Terminal_Mode | Leave_Mode
+
+Cursor ::= Cursor_Visible | Cursor_Hidden
+
+(* `?1049h` switches to the alternate screen buffer. *)
+Screen_Buffer ::= Main_Screen | Alternate_Screen
+
+(* Everything that puts no glyphs on the screen. `New_Line` is here because its spelling
+   depends on the mode: `\n` under the driver, `\r\n` in full raw mode. *)
+Screen_Control ::=
+    New_Line
+  | Move_To Int Int
+  | Erase_Line
+  | Erase_Screen
+  | Set_Cursor Cursor
+  | Set_Screen Screen_Buffer
+
+(* `β` is the rest of the program; each instruction names the type it hands to it. *)
+Console_F ::= ∀β.
+    Write Markup β
+  | Screen Screen_Control β
+  | Mode Mode_Change (Bool -> β)
+  | Read_Key Wait (Result Fault Key -> β)
+  | Read_Line Markup (Result Fault Text -> β)
+  | Read_Line_Masked Markup (Result Fault Text -> β)
+  | Query_Colour (Bool -> β)
+  | Query_Terminal (Bool -> β)
+  | Query_Size (Perhaps (Int, Int) -> β)
+  | Lift (IO β)
+
+witness Functor Console_F :=
+  { fmap := λg instruction.
+      deconstruct instruction into
+        Write markup next -> Write markup (g next)
+      | Screen control next -> Screen control (g next)
+      | Mode change receive -> Mode change (compose g receive)
+      | Read_Key wait receive -> Read_Key wait (compose g receive)
+      | Read_Line question receive -> Read_Line question (compose g receive)
+      | Read_Line_Masked question receive -> Read_Line_Masked question (compose g receive)
+      | Query_Colour receive -> Query_Colour (compose g receive)
+      | Query_Terminal receive -> Query_Terminal (compose g receive)
+      | Query_Size receive -> Query_Size (compose g receive)
+      | Lift action -> Lift (fmap g action)
+  }
+
+alias Console ::= ∀α. Free Console_F α
+
+(* `Bright` is the basic colour sixty codes up; on `Palette` or `Rgb` it is the identity. *)
+Colour ::=
+    Black
+  | Red
+  | Green
+  | Yellow
+  | Blue
+  | Magenta
+  | Cyan
+  | White
+  | Bright Colour
+  | Palette Int
+  | Rgb Int Int Int
+
+Weight ::= Regular | Bold | Faint
+
+
+(* `Bool`-carrying rather than on/off constructors, so a style can switch an inherited
+   attribute off. *)
+Attribute ::=
+    Foreground Colour
+  | Background Colour
+  | Intensity Weight
+  | Italic Bool
+  | Underline Bool
+  | Inverse Bool
+  | Strike Bool
+
+
+opaque Style ::= Make_Style (List Attribute)
+
+(* Styled text, rendered at `write`. Build with `Markup.text` / `paint` / `mappend`. *)
+Markup ::=
+    Empty_Markup
+  | Raw_Markup Text
+  | Pair_Markup Markup Markup
+  | Styled_Markup Style Markup
+
+(* Whether a render may emit escape sequences. *)
+Colour_Mode ::= Coloured | Monochrome
+
+Wait ::= Forever | Milliseconds Int
+
+Fault ::=
+    End_Of_Input
+  | Read_Failed
+  | Timed_Out
+  | Not_Utf8 Bytes
+
+Modifier ::= Shift | Control | Meta
+
+(* `Character` carries Text because a keystroke may be several bytes. `Ctrl` is the C0
+   byte a control key sends directly; `With Control` is a non-character key whose escape
+   sequence carried the modifier. *)
+Key ::=
+    Character Text
+  | Ctrl Char
+  | Enter
+  | Tab
+  | Backspace
+  | Escape
+  | Up
+  | Down
+  | Left
+  | Right
+  | Home
+  | End
+  | Page_Up
+  | Page_Down
+  | Insert
+  | Delete
+  | Function Int
+  | With Modifier Key
+  | Unknown (List Int)
+
+
+witness Semigroup Style :=
+  { mappend := λ(Make_Style earlier) (Make_Style later).
+      Make_Style (List.append earlier later)
+  }
+
+witness Monoid Style :=
+  { mempty := Make_Style Nil
+  }
+
+witness Semigroup Markup :=
+  { mappend := Pair_Markup
+  }
+
+witness Monoid Markup :=
+  { mempty := Empty_Markup
+  }
+
+
+witness Display Markup :=
+  { display := Markup.render Monochrome
+  }
+
+witness From Text Markup :=
+  { from := Raw_Markup
+  }
+
+witness Display Key :=
+  { display := Key.describe
+  }
+
+
+module Terminal.
+
+module Style:
+  (* `mempty` for `Style`; renders to "", not `ESC[m`. *)
+  plain :: Style := Make_Style Nil
+  one :: Attribute -> Style := λattribute. Make_Style (from [attribute])
+  fg :: Colour -> Style := λcolour. one (Foreground colour)
+  bg :: Colour -> Style := λcolour. one (Background colour)
+  bold      :: Style := one (Intensity Bold)
+  faint     :: Style := one (Intensity Faint)
+  italic    :: Style := one (Italic true)
+  underline :: Style := one (Underline true)
+  inverse   :: Style := one (Inverse true)
+  strike    :: Style := one (Strike true)
+  attributes :: Style -> List Attribute := λ(Make_Style chosen). chosen
+
+
+module Markup:
+  text :: Text -> Markup := Raw_Markup
+  (* A hard line break. Not `line`, which in a pretty-printer means a SOFT break. *)
+
+  styled :: Style -> Markup -> Markup := Styled_Markup
+
+  paint :: Style -> Text -> Markup := λstyle body.
+    Styled_Markup style (Raw_Markup body)
+  join :: Markup -> List Markup -> Markup := λseparator parts.
+    deconstruct parts into
+      Nil -> Empty_Markup
+    | Cons first rest ->
+        List.fold_left (λacc part. Pair_Markup acc (Pair_Markup separator part)) first rest
+
+  (* `Monochrome` drops every escape -- the same markup, for a pipe or a log. *)
+  render :: Colour_Mode -> Markup -> Text := λmode markup.
+    List.concat (Terminal.markup_chunks mode Style.plain markup Nil)
+
+
+module Key:
+  (* To BRANCH, match the key: `Character "q"` and `Ctrl \'C\'` are patterns. *)
+  character :: Key -> Perhaps Text := λkey.
+    deconstruct key into
+      Character typed -> This typed
+    | otherwise -> Nope
+
+  modifier_name :: Modifier -> Text := λheld.
+    deconstruct held into
+      Shift -> "Shift"
+    | Control -> "Ctrl"
+    | Meta -> "Alt"
+
+  (* A readable name, for key-binding tables and for seeing what a terminal sent. *)
+  describe :: Key -> Text := λkey.
+    deconstruct key into
+      Character typed -> "`typed`"
+    | Ctrl letter -> "Ctrl-`letter`"
+    | With held inner -> "`modifier_name held`+`describe inner`"
+    | Function number -> "F`number`"
+    | Unknown codes -> "unknown(`List.text ", " codes`)"
+    | Enter -> "Enter"
+    | Tab -> "Tab"
+    | Backspace -> "Backspace"
+    | Escape -> "Escape"
+    | Up -> "Up"
+    | Down -> "Down"
+    | Left -> "Left"
+    | Right -> "Right"
+    | Home -> "Home"
+    | End -> "End"
+    | Page_Up -> "PageUp"
+    | Page_Down -> "PageDown"
+    | Insert -> "Insert"
+    | Delete -> "Delete"
+
+
+(* ======================================================== the console itself *)
+
+
+(* -------------------------------------------------------------------- output *)
+
+write :: Markup -> Console Unit := λmarkup. lift_free (Write markup ())
+
+(* Not a character: see `Screen_Control`. *)
+new_line :: Console Unit := lift_free (Screen New_Line ())
+
+write_line :: Markup -> Console Unit := λmarkup.
+  let* _ = write markup in
+  new_line
+
+say :: Text -> Console Unit := λbody. write_line (Markup.text body)
+
+lines :: List Markup -> Console Unit := traverse_ write_line
+
+
+(* ------------------------------------------------------------- screen control *)
+
+move_to :: Int -> Int -> Console Unit := λrow column.
+  lift_free (Screen (Move_To row column) ())
+
+home :: Console Unit := move_to 1 1
+
+erase_line :: Console Unit := lift_free (Screen Erase_Line ())
+
+erase_screen :: Console Unit := lift_free (Screen Erase_Screen ())
+
+at :: Int -> Int -> Markup -> Console Unit := λrow column content.
+  let* _ = move_to row column in
+  write content
+
+(* Erase and home the cursor: start a frame. *)
+clear :: Console Unit :=
+  let* _ = erase_screen in
+  home
+
+
+(* ------------------------------------------------------------------- queries *)
+
+(* Is standard OUTPUT a terminal that wants escapes: a tty, NO_COLOR unset, TERM not dumb. *)
+supports_colour :: Console Bool := lift_free (Query_Colour id)
+
+(* Is standard INPUT a terminal. *)
+is_tty :: Console Bool := lift_free (Query_Terminal id)
+
+(* Columns and rows, or `Nope` where there is no terminal to measure. *)
+size :: Console (Perhaps (Int, Int)) := lift_free (Query_Size id)
+
+
+(* ------------------------------------------------------------- terminal mode *)
+
+(* Raw mode is process-wide device state, so these are brackets, not handles. They nest,
+   they are no-ops without a terminal, and Console.c also restores on `atexit` and on the
+   fatal signals. *)
+
+(* Echo and line assembly off, signals left alone: what a prompt or a menu wants. *)
+in_raw_mode :: ∀α. Console α -> Console α := Terminal.in_mode Cbreak
+
+(* Also takes ^C, ^Z, ^S, ^Q: for a program that draws the whole terminal. *)
+in_full_raw_mode :: ∀α. Console α -> Console α := Terminal.in_mode Raw
+
+(* Bracketed for the same reason: leaving either one set wrecks the terminal. *)
+in_alternate_screen :: ∀α. Console α -> Console α := λaction.
+  let* _ = lift_free (Screen (Set_Screen Alternate_Screen) ()) in
+  let* result = action in
+  let* _ = lift_free (Screen (Set_Screen Main_Screen) ()) in
+  pure result
+
+with_cursor_hidden :: ∀α. Console α -> Console α := λaction.
+  let* _ = lift_free (Screen (Set_Cursor Cursor_Hidden) ()) in
+  let* result = action in
+  let* _ = lift_free (Screen (Set_Cursor Cursor_Visible) ()) in
+  pure result
+
+
+(* --------------------------------------------------------------------- input *)
+
+(* One keystroke. In cooked mode the driver holds the line until Enter. *)
+read_key :: Console (Result Fault Key) := read_key_within Forever
+
+(* One keystroke, or `Timed_Out`. The decoder's own 25ms escape framing is separate. *)
+read_key_within :: Wait -> Console (Result Fault Key) := λwait.
+  lift_free (Read_Key wait id)
+
+(* A prompt, then a line, terminator excluded. `Return ""` is a bare Enter, not a closed
+   pipe. *)
+prompt :: Markup -> Console (Result Fault Text) := λquestion.
+  lift_free (Read_Line question id)
+
+read_line :: Console (Result Fault Text) := prompt mempty
+
+(* A line read with nothing painted: a password prompt. *)
+read_masked_line :: Markup -> Console (Result Fault Text) := λquestion.
+  lift_free (Read_Line_Masked question id)
+
+
+(* ---------------------------------------------------------- borrowed effects *)
+
+(* Run an arbitrary `IO` action inside a console program:
+
+       let* text = Console.lift_io (Files.read_file "notes.txt") in
+       Console.say text
+
+   A lifted action is opaque -- only `execute` can run it. *)
+lift_io :: ∀α. IO α -> Console α := λaction. lift_free (Lift action)
+
+
+(* -------------------------------------------------------- running a program *)
+
+(* `Console ~> IO`: one instruction at a time, each response fed to the continuation waiting
+   for it. *)
+
+execute :: ∀α. Console α -> IO α := λprogram.
+  deconstruct program into
+    (* Reached once per program, however deeply bound. *)
+    Pure value ->
+      let* _ = Terminal.flush in
+      pure value
+  | Step instruction ->
+      deconstruct instruction into
+        Write markup next ->
+          let* _ = Terminal.write_markup markup in
+          execute next
+      | Screen control next ->
+          let* _ = Terminal.write_control control in
+          execute next
+      | Mode change receive ->
+          let* entered = Terminal.change_mode change in
+          execute (receive entered)
+      (* Output is stdio-buffered; a read is the moment it must be on screen. *)
+      | Read_Key wait receive ->
+          let* _ = Terminal.flush in
+          let* pressed = Terminal.next_key_within wait in
+          execute (receive pressed)
+      | Read_Line question receive ->
+          let* _ = Terminal.flush in
+          let* typed = Terminal.prompt_line question in
+          execute (receive typed)
+      | Read_Line_Masked question receive ->
+          let* _ = Terminal.flush in
+          let* typed = Terminal.masked_line question in
+          execute (receive typed)
+      | Query_Colour receive ->
+          let* coloured = Terminal.colour_support in
+          execute (receive coloured)
+      | Query_Terminal receive ->
+          let* terminal = Terminal.input_is_terminal in
+          execute (receive terminal)
+      | Query_Size receive ->
+          let* measured = Terminal.window_size in
+          execute (receive measured)
+      | Lift action ->
+          let* next = action in
+          execute next

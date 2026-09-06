@@ -13,6 +13,7 @@ use crate::{
         pattern::MatchClause,
     },
     closed::{self, CaptureInfo, Closed, Expr, Identifier, LexicalLevel},
+    intrinsic::{self, IntrinsicSemantics, IntrinsicType},
     parser::{self, IdentifierPath},
     phase,
     typer::TypeInfo,
@@ -24,9 +25,11 @@ use crate::{
 /// copied into every parent.
 const FLAT_INLINE_CAP: usize = 8;
 
-/// How a non-recursive coproduct is stored inline in a flat parent: a tag word
-/// followed by a payload region sized to the widest variant. Kept per-type; a
-/// recursive or oversized sum has no `CoproductLayout` and stays a boxed pointer.
+/// How a fixed-width coproduct is stored inline in a flat parent: a tag word
+/// followed by a payload region sized to the widest variant. A direct recursion
+/// knot or oversized sum has no `CoproductLayout` and stays a boxed pointer;
+/// record-mediated recursion may still be finite when the nested record cuts its
+/// back-edge to a pointer.
 #[derive(Debug, Clone)]
 pub struct CoproductLayout {
     /// Total inlined width in words: the tag word plus the widest variant's payload.
@@ -160,12 +163,13 @@ impl closed::SymbolTable {
 
     /// The inlined layout of a coproduct: its union width (a tag word plus the
     /// widest variant's flattened payload) and the per-constructor field widths.
-    /// `None` (kept boxed, one word) when it is RECURSIVE -- any constructor field
-    /// references a type on the current expansion path (the recursion knot, S4:
-    /// `List`/`Tree` stay boxed) -- or the union exceeds `FLAT_INLINE_CAP`. Assumes
-    /// `name` is already on `on_path`. Only NON-recursive sums (`Perhaps`, `Result`,
-    /// `Ordering`, enums, small ADTs) inline; matching is nominal, so the
-    /// ground-field rule keeps it safe just like records.
+    /// `None` (kept boxed, one word) when a constructor field directly references
+    /// a type on the current expansion path (an uncut recursion knot, S4:
+    /// `List`/`Tree` stay boxed), or the union exceeds `FLAT_INLINE_CAP`. Assumes
+    /// `name` is already on `on_path`. Ordinary non-recursive sums (`Perhaps`,
+    /// `Result`, `Ordering`, enums, small ADTs) inline, as can record-mediated
+    /// recursion whose nested record cuts the back-edge to a pointer. Matching is
+    /// nominal, so the ground-field rule keeps it safe just like records.
     fn coproduct_layout(
         &self,
         name: &QualifiedName,
@@ -385,7 +389,7 @@ impl closed::SymbolTable {
         // above (their symbol isn't a `Term` with an expression). Carry their
         // names through so codegen can declare, initialise, and root the C
         // globals that the companion `<Module>.c` file defines.
-        let foreign = self
+        let foreign: Vec<QualifiedName> = self
             .foreign_terms
             .iter()
             .map(|ext| ext.name.clone())
@@ -414,6 +418,26 @@ impl closed::SymbolTable {
             .map(|w| (w.head.clone(), w.arity))
             .collect();
 
+        // Attach backend semantics once, while canonical symbol identities are
+        // still together. Codegen consumes these facts without inspecting C
+        // spellings or repeating knowledge of the stdlib module hierarchy.
+        let term_intrinsics: HashMap<QualifiedName, IntrinsicSemantics> = foreign
+            .iter()
+            .chain(globals.iter().map(|global| &global.name))
+            .filter_map(|name| intrinsic::term(name).map(|semantics| (name.clone(), semantics)))
+            .collect();
+        for (name, semantics) in &term_intrinsics {
+            assert_eq!(
+                arities.get(name),
+                Some(&semantics.arity),
+                "intrinsic catalogue arity disagrees with the declared type of {name}"
+            );
+        }
+        let type_intrinsics = type_definitions
+            .keys()
+            .filter_map(|name| intrinsic::intrinsic_type(name).map(|kind| (name.clone(), kind)))
+            .collect();
+
         Program {
             functions,
             globals,
@@ -427,6 +451,8 @@ impl closed::SymbolTable {
             record_layouts,
             coproduct_layouts,
             type_definitions,
+            term_intrinsics,
+            type_intrinsics,
             start: Expr::Apply(
                 CaptureInfo::dummy(),
                 Apply {
@@ -997,6 +1023,11 @@ pub struct Program {
     /// Nominal type declarations retained for type-driven array shapes. Unlike
     /// record/sum width tables, these preserve nested structure and parameters.
     pub type_definitions: HashMap<QualifiedName, TypeDefinition<QualifiedName>>,
+    /// Stable backend semantics attached to canonical terms during lowering.
+    /// Optimisation passes must consult this table rather than mangled names.
+    pub term_intrinsics: HashMap<QualifiedName, IntrinsicSemantics>,
+    /// Backend-known nominal types, likewise attached by canonical identity.
+    pub type_intrinsics: HashMap<QualifiedName, IntrinsicType>,
     pub start: Expr,
 }
 
@@ -1095,6 +1126,8 @@ impl fmt::Display for Program {
             record_layouts: _,
             coproduct_layouts: _,
             type_definitions: _,
+            term_intrinsics: _,
+            type_intrinsics: _,
             start,
         } = self;
 

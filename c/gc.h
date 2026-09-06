@@ -320,6 +320,24 @@ Value mk_slice(void *owner, size_t offset, size_t len);
 // liveness link (see the `Slice` comment); `base` must point into whatever it
 // keeps alive.
 Value mk_slice_at(void *owner, const uint8_t *base, size_t len);
+// Compiler-side partial escape analysis uses a reusable stack `Slice` on the hot
+// path. The tagged Value remains readable by all ordinary slice primitives, but
+// must pass through `gc_escape_borrowed` before reaching the heap or outliving the
+// generated loop frame.
+static inline Value slice_sub_borrowed(Value parent, size_t offset, size_t len,
+                                       Slice *slot) {
+  const Slice *source = (const Slice *)as_ptr(parent);
+  slot->owner = source->owner ? source->owner : (void *)source;
+  slot->base = source->base + offset;
+  slot->len = len;
+  return VBorrowed(slot);
+}
+Value gc_materialize_borrowed(Value value);
+static inline Value gc_escape_borrowed(Value value) {
+  return __builtin_expect(!is_borrowed(value), 1)
+             ? value
+             : gc_materialize_borrowed(value);
+}
 
 // The hot accessors. Each is a single load because the base pointer was resolved
 // once, at construction -- no owner dereference, no kind dispatch, no recursion.
@@ -334,6 +352,17 @@ static inline size_t slice_len(Value slice) {
 }
 static inline uint8_t slice_get_u8(Value slice, size_t i) {
   return ((const Slice *)as_ptr(slice))->base[i];
+}
+static inline uint8_t slice_base_get_u8(const uint8_t *base, size_t i) {
+  return base[i];
+}
+static inline uint64_t slice_base_get_u64_le(const uint8_t *base, size_t off) {
+  uint64_t value;
+  memcpy(&value, base + off, sizeof(value));
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  value = __builtin_bswap64(value);
+#endif
+  return value;
 }
 
 // Monomorphic `=` on Text. `val_eq` is the polymorphic fallback: it must first

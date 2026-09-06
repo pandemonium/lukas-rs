@@ -4346,7 +4346,37 @@ impl Substitutions {
         let mut out = Vec::new();
 
         for (param, ty) in rhs.iter() {
-            out.push((param.clone(), ty.apply(self)));
+            let image = ty.apply(self);
+
+            // Both sides can bind the SAME variable -- unification reaches one
+            // metavariable twice, from two sites, and binds it to a fresh variable
+            // each time. `self`'s binding wins the lookup below, so `rhs`'s image
+            // would simply vanish, and with it the only path to any variable inside
+            // it: an annotation written while THAT image was the winner keeps a
+            // variable that no later substitution can ever ground, and a constraint
+            // on it is misread as parametric -- a spurious dictionary parameter on a
+            // term whose signature has no context.
+            //
+            // The two images are equal (both were unified with `param`), so record
+            // that equality rather than discarding it: bind the variable side to the
+            // other. Nothing existing is removed; this only makes a variable that was
+            // unreachable resolve to the representative it was always equal to.
+            if self.substitution(param).is_some() {
+                let canonical = Type::Variable(param.clone()).apply(self);
+                match (&image, &canonical) {
+                    (Type::Variable(unreachable), _) if unreachable != param => {
+                        out.push((unreachable.clone(), canonical.clone()));
+                    }
+                    (_, Type::Variable(representative)) => {
+                        out.push((representative.clone(), image.clone()));
+                    }
+                    // Both already structured: they must agree, and neither side
+                    // hides a variable that the other could ground.
+                    _ => {}
+                }
+            }
+
+            out.push((param.clone(), image));
         }
 
         for (param, ty) in self.iter() {
@@ -7292,94 +7322,6 @@ impl ParseInfo {
 }
 
 // todo: move to pattern.rs
-impl Denotation {
-    // The uncovered cases of this denotation against `scrutinee`, each a human-readable
-    // pattern description (empty = exhaustive). Mirrors the old boolean `covers`, but
-    // collects *which* cases are missing so the exhaustiveness error can name them.
-    fn uncovered(
-        &self,
-        pi: ParseInfo,
-        scrutinee: &Type,
-        ctx: &TypingContext,
-    ) -> Typing<Vec<String>> {
-        match self {
-            Self::Structured(shape) => shape.uncovered(pi, scrutinee, ctx),
-
-            Self::Universal => Ok(vec![]),
-
-            // Nothing matched (an empty match), or only specific literals over a type we
-            // do not finitely enumerate here (Int/Char/...): report a wildcard gap.
-            Self::Empty | Self::Finite(..) => Ok(vec!["_".to_owned()]),
-        }
-    }
-}
-
-// todo: move to pattern.rs
-impl Shape {
-    fn uncovered(
-        &self,
-        pi: ParseInfo,
-        scrutinee: &Type,
-        ctx: &TypingContext,
-    ) -> Typing<Vec<String>> {
-        let scrutinee = ctx
-            .expand_type_constructor(pi, scrutinee)?
-            .unwrap_or_else(|| TypeStructure::Monotype(scrutinee.clone()));
-
-        match (self, scrutinee) {
-            (
-                Self::Coproduct(denotations),
-                TypeStructure::Monotype(Type::Coproduct(CoproductType(constructors))),
-            ) => {
-                let mut missing = Vec::new();
-
-                // Iterated in the coproduct type's stored constructor order, so the
-                // reported list is deterministic.
-                for (constructor, arguments) in constructors {
-                    match denotations.get(&constructor) {
-                        // The constructor is never matched at all.
-                        None => missing.push(constructor.member.as_str().to_owned()),
-                        // Matched, but an argument leaves a gap -- e.g. `This Nope`.
-                        Some(argument_denotations) => {
-                            for (denotation, scrutinee) in
-                                argument_denotations.iter().zip(arguments)
-                            {
-                                for sub in denotation.uncovered(pi, &scrutinee, ctx)? {
-                                    missing.push(format!("{} {sub}", constructor.member.as_str()));
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Ok(missing)
-            }
-
-            (Self::Struct(denotations), TypeStructure::PolyRecord(record_type)) => {
-                let mut missing = Vec::new();
-                for (field, scrutinee) in record_type.fields() {
-                    let scrutinee = scrutinee.instantiate();
-                    for sub in denotations[field].uncovered(pi, &scrutinee.underlying, ctx)? {
-                        missing.push(format!("{{ {field} = {sub} }}"));
-                    }
-                }
-                Ok(missing)
-            }
-
-            (Self::Tuple(denotations), TypeStructure::Monotype(Type::Tuple(TupleType(types)))) => {
-                let mut missing = Vec::new();
-                for (denotation, scrutinee) in denotations.iter().zip(types) {
-                    missing.extend(denotation.uncovered(pi, &scrutinee, ctx)?);
-                }
-                Ok(missing)
-            }
-
-            otherwise => panic!("Latent type error. {otherwise:?}"),
-        }
-    }
-}
-
-// todo: move to pattern.rs
 impl phase::Pattern<Types> {
     fn denotation(&self) -> Denotation {
         match self {
@@ -7457,10 +7399,261 @@ impl phase::Pattern<Types> {
     }
 }
 
+/// How many gaps to name before stopping. A match with a great many holes is a
+/// design problem, not a diagnostics problem, and the list stops being read.
+const MAX_WITNESSES: usize = 6;
+
+/// Wrap an argument that is itself an application, so `This (Cons _ _)` does not read
+/// as a three-argument `This`.
+fn parenthesised(witness: &str) -> String {
+    if witness.contains(' ') {
+        format!("({witness})")
+    } else {
+        witness.to_owned()
+    }
+}
+
+/// The values this clause matrix does NOT cover -- Maranget's usefulness algorithm,
+/// asking which values the wildcard row would still match.
+///
+/// `matrix` is one row per clause, one column per scrutinee component; `columns` are
+/// those components' types. The recursion looks at the first column and does one of two
+/// things. If every constructor of the column's type was WRITTEN somewhere in it, the
+/// column splits: each branch takes the rows that named that constructor (contributing
+/// its arguments as new leading columns) plus the wildcard rows (contributing
+/// wildcards). Otherwise nothing more can be learnt from this column, so it is dropped
+/// and only the wildcard rows survive -- and the constructor nobody wrote names the gap.
+///
+/// Splitting only on written constructors is also what makes this terminate: splitting
+/// whenever a wildcard row is present would expand `List` into `Cons _ (List _)` for
+/// ever.
+///
+/// The point of the column-by-column split is that the covered space is a UNION OF
+/// BOXES and cannot be collapsed into one. The previous check asked this question of
+/// the JOIN of the clauses -- the smallest box containing them -- so three clauses over
+/// two `Perhaps` scrutinees widened to the full `{This,Nope} x {This,Nope}` and the
+/// missing fourth case was reported as covered, leaving the program to die at run time
+/// with `non-exhaustive deconstruct`.
+fn missing_witnesses(
+    matrix: &[Vec<Denotation>],
+    columns: &[Type],
+    pi: ParseInfo,
+    ctx: &TypingContext,
+) -> Typing<Vec<Vec<String>>> {
+    // Nothing left to discriminate on: a surviving row covers this branch, and an
+    // empty matrix means nothing does.
+    if columns.is_empty() {
+        return Ok(if matrix.is_empty() { vec![vec![]] } else { vec![] });
+    }
+    if matrix.is_empty() {
+        return Ok(vec![vec!["_".to_owned(); columns.len()]]);
+    }
+
+    let rest = &columns[1..];
+
+    // Rows that reach a branch of `width` sub-columns. A wildcard row reaches every
+    // branch; `reaching` says what any other row contributes, or `None` if it does not
+    // reach this one.
+    let specialise = |width: usize, reaching: &dyn Fn(&Denotation) -> Option<Vec<Denotation>>| {
+        matrix
+            .iter()
+            .filter_map(|row| {
+                let mut leading = match &row[0] {
+                    Denotation::Universal => vec![Denotation::Universal; width],
+                    other => reaching(other)?,
+                };
+                leading.extend_from_slice(&row[1..]);
+                Some(leading)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // Recurse into one branch and re-attach `label` to each witness it reports.
+    let descend = |witnesses: &mut Vec<Vec<String>>,
+                   rows: Vec<Vec<Denotation>>,
+                   sub_columns: Vec<Type>,
+                   width: usize,
+                   label: &dyn Fn(&[String]) -> String|
+     -> Typing<()> {
+        for witness in missing_witnesses(&rows, &sub_columns, pi, ctx)? {
+            if witnesses.len() >= MAX_WITNESSES {
+                break;
+            }
+            let (arguments, tail) = witness.split_at(width);
+            let mut row = vec![label(arguments)];
+            row.extend_from_slice(tail);
+            witnesses.push(row);
+        }
+        Ok(())
+    };
+
+    // Learn nothing more from this column: drop it, keep only the rows that matched it
+    // with a wildcard, and name the gap `label`.
+    let drop_column = |witnesses: &mut Vec<Vec<String>>, label: String| -> Typing<()> {
+        let rows = specialise(0, &|_| None);
+        descend(witnesses, rows, rest.to_vec(), 0, &|_| label.clone())
+    };
+
+    let mut witnesses = Vec::new();
+
+    // A literal column is decided by the literals themselves, whatever the type says --
+    // `Text` is a one-constructor DU in the stdlib, but its patterns are literals.
+    if matrix
+        .iter()
+        .any(|row| matches!(row[0], Denotation::Finite(..)))
+    {
+        let mut written = BTreeSet::new();
+        for row in matrix {
+            if let Denotation::Finite(literals) = &row[0] {
+                written.extend(literals.iter().cloned());
+            }
+        }
+        // The only literal types with a finite spelling. For Int, Char, Float and Text
+        // no set of literals is ever complete.
+        let saturated = (written.contains(&Literal::Bool(true))
+            && written.contains(&Literal::Bool(false)))
+            || written.contains(&Literal::Unit);
+
+        if saturated {
+            for literal in &written {
+                let rows = specialise(0, &|denotation| match denotation {
+                    Denotation::Finite(literals) if literals.contains(literal) => Some(vec![]),
+                    _ => None,
+                });
+                let shown = format!("{literal}");
+                descend(&mut witnesses, rows, rest.to_vec(), 0, &|_| shown.clone())?;
+            }
+        } else {
+            drop_column(&mut witnesses, "_".to_owned())?;
+        }
+        return Ok(witnesses);
+    }
+
+    let structure = ctx
+        .expand_type_constructor(pi, &columns[0])?
+        .unwrap_or_else(|| TypeStructure::Monotype(columns[0].clone()));
+
+    match structure {
+        TypeStructure::Monotype(Type::Coproduct(CoproductType(constructors)))
+            if !constructors.is_empty() =>
+        {
+            let spelled = |constructor: &QualifiedName, width: usize| {
+                std::iter::once(constructor.member.as_str().to_owned())
+                    .chain(std::iter::repeat_n("_".to_owned(), width))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let written = |constructor: &QualifiedName| {
+                matrix.iter().any(|row| {
+                    matches!(&row[0], Denotation::Structured(Shape::Coproduct(arms))
+                        if arms.contains_key(constructor))
+                })
+            };
+
+            match constructors
+                .iter()
+                .find(|(constructor, _)| !written(constructor))
+            {
+                Some((unwritten, argument_types)) => {
+                    drop_column(&mut witnesses, spelled(unwritten, argument_types.len()))?
+                }
+                None => {
+                    for (constructor, argument_types) in &constructors {
+                        let width = argument_types.len();
+                        let rows = specialise(width, &|denotation| match denotation {
+                            Denotation::Structured(Shape::Coproduct(arms)) => {
+                                arms.get(constructor).cloned()
+                            }
+                            _ => None,
+                        });
+                        let mut sub_columns = argument_types.clone();
+                        sub_columns.extend_from_slice(rest);
+                        let name = constructor.member.as_str().to_owned();
+                        descend(&mut witnesses, rows, sub_columns, width, &|arguments| {
+                            std::iter::once(name.clone())
+                                .chain(arguments.iter().map(|a| parenthesised(a)))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })?;
+                    }
+                }
+            }
+        }
+
+        TypeStructure::Monotype(Type::Tuple(TupleType(element_types))) => {
+            let width = element_types.len();
+            let reaching = |denotation: &Denotation| match denotation {
+                Denotation::Structured(Shape::Tuple(elements)) if elements.len() == width => {
+                    Some(elements.clone())
+                }
+                _ => None,
+            };
+            if matrix.iter().any(|row| reaching(&row[0]).is_some()) {
+                let rows = specialise(width, &reaching);
+                let mut sub_columns = element_types.clone();
+                sub_columns.extend_from_slice(rest);
+                descend(&mut witnesses, rows, sub_columns, width, &|arguments| {
+                    format!("({})", arguments.join(", "))
+                })?;
+            } else {
+                drop_column(&mut witnesses, "_".to_owned())?;
+            }
+        }
+
+        TypeStructure::PolyRecord(record_type) => {
+            let fields: Vec<(parser::Identifier, Type)> = record_type
+                .fields()
+                .map(|(label, scheme)| (label.clone(), scheme.instantiate().underlying))
+                .collect();
+            let width = fields.len();
+            let labels: Vec<parser::Identifier> =
+                fields.iter().map(|(label, _)| label.clone()).collect();
+            // A record pattern may name only some fields; the rest are wildcards.
+            let reaching = |denotation: &Denotation| match denotation {
+                Denotation::Structured(Shape::Struct(matched)) => Some(
+                    labels
+                        .iter()
+                        .map(|label| matched.get(label).cloned().unwrap_or(Denotation::Universal))
+                        .collect(),
+                ),
+                _ => None,
+            };
+            if matrix.iter().any(|row| reaching(&row[0]).is_some()) {
+                let rows = specialise(width, &reaching);
+                let mut sub_columns: Vec<Type> = fields.iter().map(|(_, ty)| ty.clone()).collect();
+                sub_columns.extend_from_slice(rest);
+                descend(&mut witnesses, rows, sub_columns, width, &|arguments| {
+                    format!(
+                        "{{ {} }}",
+                        labels
+                            .iter()
+                            .zip(arguments)
+                            .map(|(label, witness)| format!("{label} = {witness}"))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )
+                })?;
+            } else {
+                drop_column(&mut witnesses, "_".to_owned())?;
+            }
+        }
+
+        // A type with nothing to split on -- a variable, an arrow, or a base type
+        // reached with no literal patterns at all.
+        _ => drop_column(&mut witnesses, "_".to_owned())?,
+    }
+
+    Ok(witnesses)
+}
+
 // todo: move to pattern.rs
 #[derive(Debug, Default)]
 pub struct MatchSpace {
-    pub covered: Denotation,
+    // Every clause's own denotation, kept apart. Both questions this answers --
+    // is a clause reachable, and is the match exhaustive -- need the clauses
+    // separately: their JOIN is the smallest box containing them, and a union of
+    // boxes is not a box.
+    clauses: Vec<Denotation>,
 }
 
 // todo: move to pattern.rs
@@ -7473,17 +7666,44 @@ impl MatchSpace {
         scrutinee: &Type,
         ctx: &TypingContext,
     ) -> Typing<Vec<String>> {
-        self.covered.normalize().uncovered(pi, scrutinee, ctx)
+        let matrix: Vec<Vec<Denotation>> = self
+            .clauses
+            .iter()
+            .map(|clause| vec![clause.normalize()])
+            .collect();
+
+        Ok(
+            missing_witnesses(&matrix, &[scrutinee.clone()], pi, ctx)?
+                .into_iter()
+                .map(|mut witness| witness.pop().unwrap_or_else(|| "_".to_owned()))
+                .collect(),
+        )
     }
 
+    // Record one clause and report whether it is reachable.
+    //
+    // Reachability is decided against the clauses SEPARATELY, not against `covered`:
+    // `covered` is their join, and joining is a widening for anything with more than one
+    // component. `deconstruct a, b into This _, This _ | This _, Nope | Nope, This _ |
+    // Nope, Nope` joins to `{This,Nope} x {This,Nope}` after three clauses, which
+    // swallowed the fourth and reported the most ordinary two-scrutinee case split in
+    // the language as dead code.
+    //
+    // A clause is dead when ONE earlier clause already covers it, which is the shape a
+    // person actually writes by mistake (a repeat, or anything after a wildcard).
+    // Several earlier clauses can also cover a later one BETWEEN them; that is not
+    // reported. `missing_witnesses` could now decide it exactly -- a clause is dead iff
+    // it is disjoint from the uncovered space of the clauses before it -- but a wrong
+    // "this is dead code" REJECTS a working program, so it stays on the conservative
+    // one-clause test until there is a reason to want the other.
     pub fn join(&mut self, p: &phase::Pattern<Types>) -> bool {
-        let new_coverage = p
-            .denotation()
-            .join(&self.covered)
-            .expect("code that typechecks");
+        let clause = p.denotation();
+        let useful = !self
+            .clauses
+            .iter()
+            .any(|earlier| clause.is_subsumed_by(earlier));
 
-        let useful = new_coverage != self.covered;
-        self.covered = new_coverage;
+        self.clauses.push(clause);
 
         useful
     }

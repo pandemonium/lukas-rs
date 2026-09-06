@@ -20,6 +20,26 @@ Conference ::=
     Host :: Person
   }
 
+(* Wide enough that `Holder` exceeds the inline cap, so `Inner` is stored as a POINTER
+   rather than as inlined words. A path through it has to rebuild the pointee and box
+   it back up; leaving the words loose spills them into the next field's slot. *)
+Wide ::=
+  { A :: Int
+    B :: Int
+    C :: Int
+    D :: Int
+    E :: Int
+    F :: Int
+    G :: Int
+    H :: Int
+    I :: Int
+  }
+
+Holder ::=
+  { Inner :: Wide
+    Tag :: Text
+  }
+
 Box ::= ∀α.
   { Payload :: α
     Count :: Int
@@ -81,3 +101,14 @@ start :: Int -> Unit := λ_.
   let boxed = { Payload := 5; Count := 7 } in
   let boxed2 = replace_payload boxed 42 in
   print_endline "generic=`boxed.Payload`,`boxed.Count` -> `boxed2.Payload`,`boxed2.Count`"
+
+  let wide = { A := 1; B := 2; C := 3; D := 4; E := 5; F := 6; G := 7; H := 8; I := 9 } in
+  let held = { Inner := wide; Tag := "before" } in
+  let touched =
+    { held:
+        Inner.A := 100
+        Inner.I := 900
+        Tag := "after"
+    }
+  in
+  print_endline "boxed=`touched.Inner.A`,`touched.Inner.B`,`touched.Inner.I` tag=`touched.Tag` intact=`held.Inner.A`,`held.Tag`"
