@@ -5,6 +5,7 @@ pub mod chez;
 pub mod closed;
 pub mod codegen;
 pub mod compiler;
+pub mod hash;
 pub mod interpreter;
 pub mod intrinsic;
 pub mod lambda_lift;

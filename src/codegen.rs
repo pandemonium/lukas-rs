@@ -1,10 +1,9 @@
 use fmt::Write;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::{
-    collections::{HashMap, HashSet},
-    fmt, fs, io, path,
-};
+use std::{fmt, fs, io, path};
+
+use crate::hash::{HashMap, HashSet};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -282,24 +281,24 @@ thread_local! {
     /// than an eagerly rebuilt canonical object. Entries are scoped by
     /// `compile_let`; code generation itself is single-threaded.
     static ARRAY_ELEMENT_PLACES: RefCell<HashMap<usize, ArrayElementPlace>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// Record-valued locals split into their canonical words. A whole-value use
     /// rebuilds the record; projections and other flat consumers read the words.
     static FLAT_VALUE_PLACES: RefCell<HashMap<usize, FlatValuePlace>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// Logical closure capture index -> physical range in the flat capture array.
     static CAPTURE_PLACES: RefCell<Vec<CapturePlace>> = RefCell::new(Vec::new());
     /// Saturated `raw_sub` applications in the loop currently being emitted.
     /// Each points at a reusable stack Slice whose lifetime is the loop frame;
     /// heap/return/back-edge barriers materialise it only when it escapes.
     static BORROWED_SLICE_PLACES: RefCell<HashMap<usize, String>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// Loop-invariant immutable byte views whose resolved base pointer has been
     /// snapshotted before the loop. A safepoint may mark the Slice but the
     /// non-moving collector and immutable Slice representation cannot change its
     /// `base`, so byte reads can keep using the snapshot across `gc_poll`.
     static IMMUTABLE_SLICE_BASES: RefCell<HashMap<ImmutableSliceSource, String>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
 }
 
 pub struct Codegen;
@@ -747,7 +746,7 @@ impl lambda_lift::Program {
                 .map(|worker| worker.name.clone())
                 .collect()
         } else {
-            HashSet::new()
+            HashSet::default()
         };
 
         loop {
@@ -926,7 +925,7 @@ impl lambda_lift::Program {
     /// inlining, is what makes those constant-stack.
     fn c_inline_workers(&self) -> HashSet<QualifiedName> {
         if std::env::var_os("MARM_NO_C_INLINE").is_some() {
-            return HashSet::new();
+            return HashSet::default();
         }
 
         fn collect_calls(
@@ -1024,7 +1023,7 @@ impl lambda_lift::Program {
             }
         }
 
-        let mut hot = HashSet::new();
+        let mut hot = HashSet::default();
         for LiftedFunction { code, .. } in &self.functions {
             if self.has_tail_self_call(SelfCall::SelfRef, 1, code) {
                 collect_back_edge_calls(self, SelfCall::SelfRef, 1, code, &mut hot);
@@ -1060,7 +1059,7 @@ impl lambda_lift::Program {
         expression: &Expr,
     ) -> HashMap<usize, String> {
         if std::env::var_os("MARM_NO_BORROWED_SLICES").is_some() {
-            return HashMap::new();
+            return HashMap::default();
         }
 
         fn collect(
@@ -1117,7 +1116,7 @@ impl lambda_lift::Program {
             }
         }
 
-        let mut places = HashMap::new();
+        let mut places = HashMap::default();
         collect(self, target, arity, expression, true, &mut places);
         places
     }
@@ -1171,7 +1170,7 @@ impl lambda_lift::Program {
                         if lambda_lift::Program::immutable_slice_source(
                             argument,
                             &all_parameters_invariant,
-                            &HashMap::new(),
+                            &HashMap::default(),
                         ) != Some(ImmutableSliceSource::Local(index))
                         {
                             invariant[index] = false;
@@ -1400,9 +1399,9 @@ impl lambda_lift::Program {
             return Vec::new();
         }
         let invariant_parameters = self.invariant_loop_parameters(target, arity, expression);
-        let mut sources = HashSet::new();
-        let mut aliases = HashMap::new();
-        let mut seen_aliases = HashMap::new();
+        let mut sources = HashSet::default();
+        let mut aliases = HashMap::default();
+        let mut seen_aliases = HashMap::default();
         collect(
             self,
             expression,
@@ -1447,7 +1446,7 @@ impl lambda_lift::Program {
     fn install_immutable_slice_bases(
         bases: &[ImmutableSliceBase],
     ) -> HashMap<ImmutableSliceSource, String> {
-        let mut places = HashMap::new();
+        let mut places = HashMap::default();
         for base in bases {
             places.insert(base.source, base.name.clone());
             for alias in &base.aliases {
@@ -2570,7 +2569,7 @@ impl lambda_lift::Program {
                     .map(|field| {
                         let field_type = instantiate_type_expression(
                             &field.type_signature.body,
-                            &HashMap::new(),
+                            &HashMap::default(),
                         )?;
                         Some(self.flat_width_on_path(&field_type, on_path))
                     })
@@ -2660,12 +2659,7 @@ impl lambda_lift::Program {
     /// Reading `data_field` straight across -- one word per constructor field -- is
     /// wrong the moment any field is wider than a word: it puts the aggregate's
     /// POINTER where the layout wants its first word, and pads the rest with zeroes.
-    fn sum_splat_leaves(
-        &self,
-        value: &str,
-        layout: &CoproductLayout,
-        width: usize,
-    ) -> Vec<String> {
+    fn sum_splat_leaves(&self, value: &str, layout: &CoproductLayout, width: usize) -> Vec<String> {
         let mut leaves = vec![format!("VInt(data_tag({value}))")];
         for slot in 0..width.saturating_sub(1) {
             let mut arms: Vec<(usize, String)> = Vec::new();
@@ -2678,10 +2672,7 @@ impl lambda_lift::Program {
                             if field_width == 1 {
                                 format!("data_field({value}, {index})")
                             } else {
-                                format!(
-                                    "proj(data_field({value}, {index}), {})",
-                                    slot - offset
-                                )
+                                format!("proj(data_field({value}, {index}), {})", slot - offset)
                             },
                         ));
                         break;
@@ -2694,12 +2685,11 @@ impl lambda_lift::Program {
             leaves.push(if every_variant_agrees {
                 arms[0].1.clone()
             } else {
-                arms.iter().rev().fold(
-                    "((Value){0})".to_string(),
-                    |otherwise, (tag, arm)| {
+                arms.iter()
+                    .rev()
+                    .fold("((Value){0})".to_string(), |otherwise, (tag, arm)| {
                         format!("(data_tag({value}) == {tag} ? {arm} : {otherwise})")
-                    },
-                )
+                    })
             });
         }
         leaves
@@ -2895,7 +2885,7 @@ impl lambda_lift::Program {
             Expr::Record(annotation, sub) => {
                 if let Some(sub_widths) = self.flat_widths(&annotation.type_info.inferred_type) {
                     let mut leaves = Vec::new();
-                    for ((_label, field), w) in sub.fields.iter().zip(sub_widths) {
+                    for ((_, _label, field), w) in sub.fields.iter().zip(sub_widths) {
                         leaves.extend(self.flat_leaves(field, w, prelude));
                     }
                     return leaves;
@@ -3080,7 +3070,7 @@ impl lambda_lift::Program {
                 if record.fields.len() == fields.len() =>
             {
                 let mut leaves = Vec::new();
-                for ((_, field), shape) in record.fields.iter().zip(fields) {
+                for ((_, _, field), shape) in record.fields.iter().zip(fields) {
                     leaves.extend(self.literal_shape_leaves(field, shape, prelude)?);
                 }
                 Some(leaves)
@@ -3089,7 +3079,7 @@ impl lambda_lift::Program {
                 let widths = self.flat_widths(&annotation.type_info.inferred_type)?;
                 (widths.iter().sum::<usize>() == shape.stored_words()).then_some(())?;
                 let mut leaves = Vec::new();
-                for ((_, field), width) in record.fields.iter().zip(widths) {
+                for ((_, _, field), width) in record.fields.iter().zip(widths) {
                     leaves.extend(self.flat_leaves(field, width, prelude));
                 }
                 (leaves.len() == shape.stored_words()).then_some(leaves)
@@ -3249,12 +3239,12 @@ impl lambda_lift::Program {
             // guards this; without the same guard here, `h.Inner.A` through a
             // split local read `offset(Inner) + offset(A)` of the enclosing frame.
             if step + 1 < selectors.len() {
-                let stored = self.flat_widths(&current_type).and_then(|widths| {
-                    match selector {
+                let stored = self
+                    .flat_widths(&current_type)
+                    .and_then(|widths| match selector {
                         ProductElement::Ordinal(index) => widths.get(*index).copied(),
                         _ => None,
-                    }
-                });
+                    });
                 if stored == Some(1)
                     && self
                         .runtime_shape(&next_type, &mut Vec::new())
@@ -3770,7 +3760,7 @@ impl lambda_lift::Program {
                 record
                     .fields
                     .iter()
-                    .map(|(_, field)| self.pattern_runtime_shape(field))
+                    .map(|(_, _, field)| self.pattern_runtime_shape(field))
                     .collect::<Option<Vec<_>>>()?,
             )),
             Pattern::Tuple(_, tuple) => Some(RuntimeShape::Product(
@@ -3800,7 +3790,9 @@ impl lambda_lift::Program {
                         .fields
                         .iter()
                         .zip(fields)
-                        .all(|((_, pattern), shape)| self.array_pattern_supported(pattern, shape))
+                        .all(|((_, _, pattern), shape)| {
+                            self.array_pattern_supported(pattern, shape)
+                        })
             }
             (Pattern::Tuple(_, tuple), RuntimeShape::Product(fields)) => {
                 tuple.elements.len() == fields.len()
@@ -3886,7 +3878,7 @@ impl lambda_lift::Program {
                 if record.fields.len() == fields.len() =>
             {
                 let mut field_offset = offset;
-                for ((_, pattern), shape) in record.fields.iter().zip(fields) {
+                for ((_, _, pattern), shape) in record.fields.iter().zip(fields) {
                     if !self.collect_array_pattern(
                         pattern,
                         array,
@@ -4138,7 +4130,7 @@ impl lambda_lift::Program {
                             (base.to_string(), offset)
                         };
                         let mut field_offset = start;
-                        for ((_label, field), w) in the.fields.iter().zip(widths) {
+                        for ((_, _label, field), w) in the.fields.iter().zip(widths) {
                             self.collect_pattern_flat(
                                 field,
                                 &object,
@@ -4154,7 +4146,7 @@ impl lambda_lift::Program {
                     None => {
                         // Polymorphic record: a boxed record, fields by ordinal.
                         let value = scalar();
-                        for (index, (_label, field)) in the.fields.iter().enumerate() {
+                        for (index, (_, _label, field)) in the.fields.iter().enumerate() {
                             self.collect_pattern_flat(
                                 field,
                                 &format!("proj({value}, {index})"),
@@ -4316,7 +4308,7 @@ impl lambda_lift::Program {
         let widths = self.flat_widths(record_type)?;
         (widths.len() == the.fields.len()).then_some(())?;
         let mut leaves = Vec::new();
-        for ((_label, value), width) in the.fields.iter().zip(&widths) {
+        for ((_, _label, value), width) in the.fields.iter().zip(&widths) {
             leaves.extend(self.flat_leaves(value, *width, prelude));
         }
         (leaves.len() == widths.iter().sum::<usize>()).then_some(leaves)
@@ -4379,7 +4371,7 @@ impl lambda_lift::Program {
             write!(code, "mk_tuple({}", the.fields.len())?;
             true
         };
-        for (_label, value) in &the.fields {
+        for (_, _label, value) in &the.fields {
             if written {
                 write!(code, ", ")?;
             }
@@ -4791,7 +4783,7 @@ impl lambda_lift::Program {
             }
 
             Pattern::Struct(_, the) => {
-                for (index, (_label, field)) in the.fields.iter().enumerate() {
+                for (index, (_, _label, field)) in the.fields.iter().enumerate() {
                     self.collect_pattern(field, &format!("proj({path}, {index})"), tests, binds);
                 }
             }
@@ -5338,7 +5330,7 @@ impl lambda_lift::Program {
             Expr::Record(_, record) => record
                 .fields
                 .iter()
-                .all(|(_, field)| Self::self_references_are_calls(field, arity)),
+                .all(|(_, _, field)| Self::self_references_are_calls(field, arity)),
             Expr::RecordUpdate(_, update) => {
                 Self::self_references_are_calls(&update.base, arity)
                     && update

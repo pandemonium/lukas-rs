@@ -168,26 +168,26 @@ escape_timeout :: Wait := Milliseconds 25
 
 
 (* The CONSOLE_* defines in Console.c. Above the byte range, so a byte can never be
-   mistaken for a status. *)
-console_statuses :: List (Int, Fault) :=
+   mistaken for a status.
+
+   Only the deadline is an answer: `Nope` means "nothing arrived in time", and
+   nothing else. The input ending is permanent -- `Terminal.c` latches it -- so it
+   stops the program rather than being handed back to a caller who could only stop
+   anyway. *)
+console_statuses :: List (Int, Result Fault (Perhaps Int)) :=
   from
-    [ (256, End_Of_Input)
-      (257, Timed_Out)
-      (258, Read_Failed)
+    [ (256, Fault Input_Ended)
+      (257, Return Nope)
+      (258, Fault Read_Failed)
     ]
 
-status_fault :: Int -> Fault := λcode.
-  perhaps Read_Failed id (List.Associative.lookup code console_statuses)
+classify :: Int -> Result Fault (Perhaps Int) := λcode.
+  perhaps (Return (This code)) id (List.Associative.lookup code console_statuses)
 
-classify :: Int -> Result Fault Int := λcode.
-  deconstruct List.Associative.lookup code console_statuses into
-    This fault -> Fault fault
-  | Nope -> Return code
-
-read_byte_within :: Wait -> IO (Result Fault Int) := λwait.
+read_byte_within :: Wait -> IO (Result Fault (Perhaps Int)) := λwait.
   IO.suspend (λ_. classify (raw_read_byte (wait_ms wait)))
 
-read_byte :: IO (Result Fault Int) := read_byte_within Forever
+read_byte :: IO (Result Fault (Perhaps Int)) := read_byte_within Forever
 
 
 (* A terminal can deliver bytes that are not UTF-8: a Latin-1 paste, an odd locale. *)
@@ -348,7 +348,7 @@ read_utf8_character :: Int -> IO Key := λlead.
       else
         let* next = read_byte in
         deconstruct next into
-          Return byte -> gather (remaining - 1) (Cons byte acc)
+          Return (This byte) -> gather (remaining - 1) (Cons byte acc)
         | otherwise -> pure (Unknown (List.reverse acc))
   in
   let start = from [lead] in
@@ -373,7 +373,7 @@ decode_ss3_final :: Char -> Perhaps Key := λfinal.
 read_ss3 :: IO Key :=
   let* next = read_byte_within escape_timeout in
   deconstruct next into
-    Return byte ->
+    Return (This byte) ->
       deconstruct decode_ss3_final (Char.of_byte byte) into
         This key -> pure key
       | Nope -> pure (Unknown (from [ss3_byte; byte]))
@@ -386,7 +386,7 @@ read_csi :: IO Key :=
       else
         let* next = read_byte_within escape_timeout in
         deconstruct next into
-          Return byte ->
+          Return (This byte) ->
             if (byte >= csi_final_low) and (byte <= csi_final_high)
               then
                 let bytes = List.reverse gathered in
@@ -405,7 +405,9 @@ read_escape_sequence :: IO Key :=
     | otherwise -> pure (With Meta (decode_ascii_byte byte))
   in
   let* next = read_byte_within escape_timeout in
-  result (λ_. pure Escape) after next
+  deconstruct next into
+    Return (This byte) -> after byte
+  | otherwise -> pure Escape
 
 
 (* The first byte decides which of three disjoint shapes a keystroke is:
@@ -497,7 +499,7 @@ edit :: Key -> Line_State -> Line_State := λkey (before, after).
 (* A line editor for raw mode, where the driver supplies none. Every key redraws the whole
    line, so the prompt's width is never measured. Assumes one screen row and one column
    per Unicode scalar -- wrong for combining marks and for CJK or emoji. *)
-edit_line :: Echo -> Text -> IO (Result Fault Text) := λecho prompt_text.
+edit_line :: Echo -> Text -> IO (Result Fault (Perhaps Text)) := λecho prompt_text.
   let whole = λ(before, after). List.append (List.reverse before) after in
   let shown = λ(before, after) content.
     deconstruct echo into
@@ -511,20 +513,30 @@ edit_line :: Echo -> Text -> IO (Result Fault Text) := λecho prompt_text.
     let* pressed = next_key_within Forever in
     deconstruct pressed into
       Fault reason -> pure (Fault reason)
-    | Return Enter ->
+    (* A deadline cannot pass here -- `Forever` -- so this cannot arrive. *)
+    | Return Nope -> pure (Return Nope)
+    | Return (This Enter) ->
         let* _ = put "\r\n" in
-        pure (Return (List.concat content))
-    | Return (Ctrl 'D') ->
+        pure (Return (This (List.concat content)))
+    (* Ctrl-D on an empty line cancels this prompt. In raw mode it is byte 0x04 and
+       nothing else -- the end of input arrives as a status, on its own path -- so
+       the two are told apart here rather than guessed at. *)
+    | Return (This (Ctrl 'D')) ->
         deconstruct content into
-          Nil -> pure (Fault End_Of_Input)
+          Nil -> pure (Return Nope)
         | otherwise -> step state
-    | Return key -> step (edit key state)
+    | Return (This key) -> step (edit key state)
   in step (Nil, Nil)
 
 (* Negative `timeout_ms` blocks. *)
-next_key_within :: Wait -> IO (Result Fault Key) := λwait.
+next_key_within :: Wait -> IO (Result Fault (Perhaps Key)) := λwait.
   let* first = read_byte_within wait in
-  traverse decode_keystroke first
+  deconstruct first into
+    Fault reason -> pure (Fault reason)
+  | Return Nope -> pure (Return Nope)
+  | Return (This byte) ->
+      let* key = decode_keystroke byte in
+      pure (Return (This key))
 
 
 in_mode :: ∀α. Terminal_Mode -> Console α -> Console α := λmode action.
@@ -563,7 +575,7 @@ write_control :: Screen_Control -> IO Unit := λcontrol.
 
 (* In COOKED mode the driver does the editing and the prompt is drawn once; in RAW mode
    `edit_line` supplies its own and redraws per key. *)
-prompt_line :: Markup -> IO (Result Fault Text) := λquestion.
+prompt_line :: Markup -> IO (Result Fault (Perhaps Text)) := λquestion.
   let* drawn = rendered question in
   let* mode = IO.suspend (λ_. raw_mode_current ()) in
   if mode >= 0
@@ -572,16 +584,48 @@ prompt_line :: Markup -> IO (Result Fault Text) := λquestion.
       let* _ = put drawn in
       let* raw = IO.suspend (λ_. raw_read_line ()) in
       deconstruct raw into
-        Return bytes -> pure (return_or (λ_. Not_Utf8 bytes) (Text.from_bytes bytes))
-      | Fault code -> pure (Fault (status_fault code))
+        Return bytes ->
+          deconstruct Text.from_bytes bytes into
+            This text -> pure (Return (This text))
+          | Nope -> pure (Fault (Not_Utf8 bytes))
+      (* A zero-length read from the driver. On a terminal that is Ctrl-D cancelling
+         the line; off one there is nothing more coming, ever. `isatty` is the only
+         thing that tells them apart once the driver has done the editing. *)
+      | Fault _ ->
+          let* terminal = input_is_terminal in
+          pure (if terminal then Return Nope else Fault Input_Ended)
 
 (* Raw mode for the duration whatever the caller was in: suppressing the echo IS raw mode. *)
-masked_line :: Markup -> IO (Result Fault Text) := λquestion.
+masked_line :: Markup -> IO (Result Fault (Perhaps Text)) := λquestion.
   let* drawn = rendered question in
   let* entered = change_mode (Enter_Mode Cbreak) in
   let* typed = edit_line Hide_Typing drawn in
   let* _ = if entered then change_mode Leave_Mode else pure false in
   pure typed
+
+(* Out of every raw mode still in force, however many were entered. Depth-counted in
+   `Terminal.c`, and leaving at depth zero is a no-op, so this terminates. *)
+leave_every_mode :: Unit -> IO Unit := λ_.
+  let* mode = IO.suspend (λ_. raw_mode_current ()) in
+  if mode >= 0
+    then
+      let* _ = change_mode Leave_Mode in
+      leave_every_mode ()
+    else pure ()
+
+(* The terminal as it was handed to us: cooked, on the main screen, cursor showing.
+   `Console.execute` runs this however the program ended, because a program that ends
+   badly is exactly the one that did not reach its own brackets.
+
+   `Terminal.c` hangs a termios restore off `atexit` and the fatal signals, which
+   covers a crash -- but only the termios part, and only once the process is dying.
+   The alternate screen and a hidden cursor are this side's to put back. Writing to a
+   file emits nothing (see `control_text`), so a redirected run is unaffected. *)
+restore :: IO Unit :=
+  let* _ = leave_every_mode () in
+  let* _ = write_control (Set_Screen Main_Screen) in
+  let* _ = write_control (Set_Cursor Cursor_Visible) in
+  flush
 
 colour_support :: IO Bool := IO.suspend (λ_. raw_supports_colour ())
 

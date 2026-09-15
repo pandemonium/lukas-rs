@@ -63,6 +63,11 @@ impl<Id> ast::Expr<ParseInfo, Id> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParseInfo {
     pub location: SourceLocation,
+    /// One past the node's last character. A node whose extent nobody recorded --
+    /// anything the parser did not build, and anything built before its children
+    /// were parsed -- has `end == location`, which reads as "somewhere here" and is
+    /// what every position in the tree used to mean.
+    pub end: SourceLocation,
     /// The source file these tokens came from, resolvable via [`crate::source_map`].
     /// Stamped from the file being parsed; `FileId::UNKNOWN` for synthetic nodes.
     pub file: source_map::FileId,
@@ -74,8 +79,36 @@ impl ParseInfo {
     pub fn from_position(location: SourceLocation) -> Self {
         Self {
             location,
+            end: location,
             file: source_map::current(),
         }
+    }
+
+    /// A node that runs from `location` up to (not including) `end`.
+    pub fn spanning(location: SourceLocation, end: SourceLocation) -> Self {
+        Self {
+            location,
+            end,
+            file: source_map::current(),
+        }
+    }
+
+    /// Whether `location` falls inside this node -- start inclusive, end exclusive,
+    /// and a point span holds only itself.
+    pub fn contains(&self, location: SourceLocation) -> bool {
+        let after_start =
+            (self.location.row, self.location.column) <= (location.row, location.column);
+        let before_end = (location.row, location.column) < (self.end.row, self.end.column);
+        after_start && (before_end || self.location == self.end && self.location == location)
+    }
+
+    /// How wide this node is, for choosing the narrowest of several that contain a
+    /// position. Rows count for much more than columns, so a node spanning lines is
+    /// never narrower than one inside a line.
+    pub fn width(&self) -> u64 {
+        let rows = u64::from(self.end.row.saturating_sub(self.location.row));
+        let columns = u64::from(self.end.column) + rows * 100_000;
+        columns.saturating_sub(u64::from(self.location.column))
     }
 }
 
@@ -155,15 +188,21 @@ impl IdentifierPath {
 }
 
 // What about ParseInfo?
+/// A name as written. Shared rather than owned: a compiler copies names
+/// constantly -- every symbol table key, every resolved variable, every
+/// qualified name a substitution passes through -- and copying the characters
+/// each time was one of the larger allocation costs in a check. `Arc` because a
+/// language server holds an elaborated table behind a lock shared with its
+/// message loop.
 #[derive(Debug, Clone, PartialEq, Hash, Eq, PartialOrd, Ord)]
 pub struct Identifier {
-    image: String,
+    image: std::sync::Arc<str>,
 }
 
 impl Identifier {
     pub fn from_str(id: &str) -> Self {
         Self {
-            image: id.to_owned(),
+            image: std::sync::Arc::from(id),
         }
     }
 
@@ -380,6 +419,15 @@ impl<'a> Parser<'a> {
     fn trace(&mut self) -> TraceGuard {
         const REMAINS_COL: usize = 120;
 
+        // Everything below builds ONE trace line and is otherwise pure -- and it
+        // starts by capturing and symbolising a backtrace, per parse function call.
+        // Unwinding, demangling and dyld section lookups were the top self-time
+        // entries in a sampling profile of a stdlib parse; skip the lot unless
+        // someone is actually listening at TRACE.
+        if !tracing::enabled!(tracing::Level::TRACE) {
+            return TraceGuard::enter();
+        }
+
         let depth = stack_depth();
 
         let backtrace = Backtrace::new();
@@ -434,29 +482,49 @@ impl<'a> Parser<'a> {
     /// for. `parser` comes from [`parser_name!`] at the call site.
     fn fault(&self, parser: &'static str) -> ParseError {
         match self.remains() {
-            [found, rest @ ..] => Self::fault_with(parser, found.position, found.kind.clone(), rest),
+            [found, rest @ ..] => Self::fault_with(
+                parser,
+                ParseInfo::spanning(found.position, found.end),
+                found.kind.clone(),
+                rest,
+            ),
 
             // Nothing left to stand on: report at the last token consumed, so the
             // caret still lands in the file instead of at 1:1.
-            [] => Self::fault_with(parser, self.last_position(), TokenKind::End, &[]),
+            [] => Self::fault_with(
+                parser,
+                ParseInfo::from_position(self.last_position()),
+                TokenKind::End,
+                &[],
+            ),
         }
     }
 
     /// A fault at a token already consumed -- for a `match self.consume()?` that
     /// falls through, where the offending token is no longer what comes next.
-    fn fault_at(&self, parser: &'static str, position: SourceLocation, found: TokenKind) -> ParseError {
-        Self::fault_with(parser, position, found, self.remains())
+    fn fault_at(
+        &self,
+        parser: &'static str,
+        position: SourceLocation,
+        found: TokenKind,
+    ) -> ParseError {
+        Self::fault_with(
+            parser,
+            ParseInfo::from_position(position),
+            found,
+            self.remains(),
+        )
     }
 
     fn fault_with(
         parser: &'static str,
-        position: SourceLocation,
+        at: ParseInfo,
         found: TokenKind,
         next: &[Token],
     ) -> ParseError {
         ParseError::Fault {
             parser,
-            at: ParseInfo::from_position(position),
+            at,
             found,
             // By kind, not by `Token`'s `Display`: a row:col on every one of eight
             // consecutive tokens buries the shape of the input, which is the thing
@@ -471,6 +539,23 @@ impl<'a> Parser<'a> {
     }
 
     /// Where the last consumed token sat, for a fault raised at end of input.
+    /// A node reaching from `start` to the end of whatever has been consumed since:
+    /// call it once a production has taken all of its own tokens, and the node knows
+    /// its extent.
+    fn span_from(&self, start: SourceLocation) -> ParseInfo {
+        ParseInfo::spanning(start, self.last_end())
+    }
+
+    /// One past the last *real* token consumed. Layout tokens are skipped: they are
+    /// zero-width marks between lines, and a node does not reach into the next one.
+    fn last_end(&self) -> SourceLocation {
+        self.remains[..self.offset]
+            .iter()
+            .rev()
+            .find(|token| !matches!(token.kind, TokenKind::Layout(..)))
+            .map_or_else(SourceLocation::default, |token| token.end)
+    }
+
     fn last_position(&self) -> SourceLocation {
         self.offset
             .checked_sub(1)
@@ -504,6 +589,7 @@ impl<'a> Parser<'a> {
         if let Token {
             kind: TokenKind::Identifier(id),
             position,
+            ..
         } = token
         {
             let retval = (*position, id.to_owned());
@@ -564,6 +650,64 @@ impl<'a> Parser<'a> {
         Ok(decls)
     }
 
+    /// Parse every declaration in the file, keeping going past one that fails.
+    ///
+    /// A syntax error costs the declaration it is in, not the file: the parser
+    /// resynchronises on the next line that starts in column one -- which is where a
+    /// top-level declaration starts, and is the same boundary the editor's grammar
+    /// uses -- and carries on. What comes back is everything that parsed, and every
+    /// error found on the way.
+    pub fn parse_declaration_list_recovering(
+        &mut self,
+    ) -> (Vec<Declaration<ParseInfo>>, Vec<ParseError>) {
+        let mut declarations = Vec::new();
+        let mut errors = Vec::new();
+
+        loop {
+            while self.peek().is_ok_and(Token::is_newline) {
+                self.advance(1);
+            }
+            match self.peek() {
+                Ok(token) if token.is_end() => break,
+                Err(..) => break,
+                _ => {}
+            }
+
+            let started_at = self.offset;
+            match self.parse_declaration() {
+                Ok(declaration) => declarations.push(declaration),
+                Err(error) => {
+                    errors.push(error);
+                    self.resynchronise(started_at);
+                }
+            }
+
+            // A declaration that consumed nothing would loop forever.
+            if self.offset == started_at {
+                self.advance(1);
+            }
+        }
+
+        (declarations, errors)
+    }
+
+    /// Skip to where the next declaration could start: the first token of a line, at
+    /// the left margin. Never backwards, and never nowhere -- `at_least` is the
+    /// declaration that just failed, so resynchronising always moves past it.
+    fn resynchronise(&mut self, at_least: usize) {
+        self.offset = self.offset.max(at_least + 1);
+
+        while let Some(token) = self.remains().first() {
+            let begins_a_declaration = token.position.column == 1
+                && !matches!(token.kind, TokenKind::Layout(..))
+                && !token.is_end();
+            if begins_a_declaration || token.is_end() {
+                break;
+            }
+            self.advance(1);
+        }
+    }
+
     fn has_declaration_prefix(&self) -> bool {
         matches!(
             self.remains(),
@@ -621,6 +765,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Identifier(name),
                     position,
+                    ..
                 },
                 Token {
                     kind: TokenKind::TypeAssign,
@@ -640,7 +785,7 @@ impl<'a> Parser<'a> {
                 self.advance(4);
 
                 Ok(Declaration::Type(
-                    ParseInfo::from_position(*position),
+                    self.span_from(*position),
                     TypeDeclaration {
                         name: Identifier::from_str(name),
                         type_parameters: self.parse_forall_clause()?,
@@ -657,6 +802,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Identifier(name),
                     position,
+                    ..
                 },
                 Token {
                     kind: TokenKind::TypeAssign,
@@ -668,14 +814,11 @@ impl<'a> Parser<'a> {
                 let type_parameters = self.parse_forall_clause()?;
                 let body = self.parse_block(|parser| parser.parse_type_expression(0))?;
                 Ok(Declaration::Type(
-                    ParseInfo::from_position(*position),
+                    self.span_from(*position),
                     TypeDeclaration {
                         name: Identifier::from_str(name),
                         type_parameters,
-                        declarator: TypeDeclarator::Alias(
-                            ParseInfo::from_position(*position),
-                            body,
-                        ),
+                        declarator: TypeDeclarator::Alias(self.span_from(*position), body),
                         origin: TypeOrigin::UserDefined,
                         opaque: false,
                         confinement: None,
@@ -687,6 +830,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Identifier(name),
                     position,
+                    ..
                 },
                 Token {
                     kind: TokenKind::Assign,
@@ -700,7 +844,7 @@ impl<'a> Parser<'a> {
                 let own_name = IdentifierPath::new(name);
 
                 Ok(Declaration::Value(
-                    ParseInfo::from_position(*position),
+                    self.span_from(*position),
                     ValueDeclaration {
                         name: Identifier::from_str(name),
                         declarator: self.parse_value_declarator(None, own_name)?,
@@ -712,6 +856,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Identifier(name),
                     position,
+                    ..
                 },
                 Token {
                     kind: TokenKind::TypeAscribe,
@@ -730,7 +875,7 @@ impl<'a> Parser<'a> {
                 let own_name = IdentifierPath::new(name);
 
                 Ok(Declaration::Value(
-                    ParseInfo::from_position(*position),
+                    self.span_from(*position),
                     ValueDeclaration {
                         name: Identifier::from_str(name),
                         declarator: self.parse_value_declarator(type_signature, own_name)?,
@@ -742,6 +887,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Identifier(name),
                     position,
+                    ..
                 },
                 Token {
                     kind: TokenKind::TypeAssign,
@@ -753,7 +899,7 @@ impl<'a> Parser<'a> {
                 self.advance(2);
 
                 Ok(Declaration::Type(
-                    ParseInfo::from_position(*position),
+                    self.span_from(*position),
                     TypeDeclaration {
                         name: Identifier::from_str(name),
                         // Move this to TypeDeclarator
@@ -771,6 +917,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Identifier(name),
                     position,
+                    ..
                 },
                 Token {
                     kind: TokenKind::TypeAssign,
@@ -782,7 +929,7 @@ impl<'a> Parser<'a> {
                 self.advance(3);
 
                 Ok(Declaration::Type(
-                    ParseInfo::from_position(*position),
+                    self.span_from(*position),
                     TypeDeclaration {
                         name: Identifier::from_str(name),
                         type_parameters: self.parse_forall_clause()?,
@@ -799,6 +946,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Identifier(name),
                     position,
+                    ..
                 },
                 Token {
                     kind: TokenKind::Colon,
@@ -810,7 +958,7 @@ impl<'a> Parser<'a> {
                 self.advance(3);
 
                 Ok(Declaration::Module(
-                    ParseInfo::from_position(*position),
+                    self.span_from(*position),
                     ModuleDeclaration {
                         name: Identifier::from_str(name),
                         declarator: self.parse_block(|parser| parser.parse_module_declarator())?,
@@ -823,6 +971,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Identifier(name),
                     position,
+                    ..
                 },
                 Token {
                     kind: TokenKind::Period,
@@ -835,7 +984,7 @@ impl<'a> Parser<'a> {
 
                 let name = Identifier::from_str(name);
                 Ok(Declaration::Module(
-                    ParseInfo::from_position(*position),
+                    self.span_from(*position),
                     ModuleDeclaration {
                         name: name.clone(),
                         declarator: ast::ModuleDeclarator::External(name),
@@ -848,6 +997,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Identifier(_),
                     position,
+                    ..
                 },
                 ..,
             ] if t.is_keyword(Keyword::Use) => {
@@ -855,7 +1005,7 @@ impl<'a> Parser<'a> {
                 self.advance(1); // past `use`
                 let path = self.parse_module_path()?;
                 Ok(Declaration::Use(
-                    ParseInfo::from_position(position),
+                    self.span_from(position),
                     UseDeclaration::new(None, path),
                 ))
             }
@@ -865,6 +1015,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Identifier(name),
                     position,
+                    ..
                 },
                 ..,
             ] if t.is_keyword(Keyword::Signature) => {
@@ -883,7 +1034,7 @@ impl<'a> Parser<'a> {
                 };
 
                 Ok(Declaration::Signature(
-                    ParseInfo::from_position(*position),
+                    self.span_from(*position),
                     SignatureDeclaration {
                         name: Identifier::from_str(name),
                         type_parameters,
@@ -915,7 +1066,7 @@ impl<'a> Parser<'a> {
                 let implementation = self.parse_block(|parser| parser.parse_record())?;
 
                 Ok(Declaration::Witness(
-                    ParseInfo::from_position(t.position),
+                    self.span_from(t.position),
                     WitnessDeclaration {
                         type_signature,
                         implementation,
@@ -947,7 +1098,7 @@ impl<'a> Parser<'a> {
                     tracing::trace!("parse_declaration: type signature {type_signature}");
 
                     Ok(Declaration::Foreign(
-                        ParseInfo::from_position(pos),
+                        self.span_from(pos),
                         ForeignDeclaration {
                             name: Identifier::from_str(&id),
                             type_signature,
@@ -955,12 +1106,12 @@ impl<'a> Parser<'a> {
                     ))
                 } else {
                     Ok(Declaration::Type(
-                        ParseInfo::from_position(pos),
+                        self.span_from(pos),
                         TypeDeclaration {
                             name: Identifier::from_str(&id),
                             type_parameters: Vec::new(),
                             declarator: TypeDeclarator::Coproduct(
-                                ParseInfo::from_position(pos),
+                                self.span_from(pos),
                                 CoproductDeclarator {
                                     constructors: Vec::new(),
                                 },
@@ -992,12 +1143,12 @@ impl<'a> Parser<'a> {
                     });
                 }
                 Ok(Declaration::Type(
-                    ParseInfo::from_position(pos),
+                    self.span_from(pos),
                     TypeDeclaration {
                         name: Identifier::from_str(&id),
                         type_parameters: Vec::new(),
                         declarator: TypeDeclarator::Coproduct(
-                            ParseInfo::from_position(pos),
+                            self.span_from(pos),
                             CoproductDeclarator {
                                 constructors: Vec::new(),
                             },
@@ -1077,9 +1228,11 @@ impl<'a> Parser<'a> {
                     self.advance(1);
 
                     let kind = self.parse_kind_specifier()?;
-                    id.map(|(_, image)| TypeVariable::with_kind(Identifier { image }, kind))?
+                    id.map(|(_, image)| {
+                        TypeVariable::with_kind(Identifier::from_str(&image), kind)
+                    })?
                 } else {
-                    id.map(|(_, image)| TypeVariable::star(Identifier { image }))?
+                    id.map(|(_, image)| TypeVariable::star(Identifier::from_str(&image)))?
                 });
             }
 
@@ -1273,10 +1426,12 @@ impl<'a> Parser<'a> {
     fn parse_field_decl(&mut self) -> Result<FieldDeclarator<ParseInfo>> {
         let _t = self.trace();
 
-        let (_, label) = self.identifier()?;
+        let (at, label) = self.identifier()?;
+        let at = self.span_from(at);
         self.expect(TokenKind::TypeAscribe)?;
         let type_signature = self.parse_type_signature()?;
         Ok(FieldDeclarator {
+            at,
             // It could really keep this Identifier instead of cloning it
             name: Identifier::from_str(&label),
             type_signature,
@@ -1301,6 +1456,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Identifier(id),
                     position,
+                    ..
                 },
                 ..,
             ] => self.parse_simple_type_expr_term(id, position),
@@ -1376,7 +1532,7 @@ impl<'a> Parser<'a> {
     ) -> Result<ast::TypeExpression<ParseInfo, IdentifierPath>> {
         let _t = self.trace();
 
-        let parse_info = ParseInfo::from_position(*position);
+        let parse_info = self.span_from(*position);
         if is_lowercase(id) {
             self.advance(1);
             Ok(TypeExpression::Parameter(
@@ -1428,7 +1584,7 @@ impl<'a> Parser<'a> {
                 let rhs = self.parse_type_expression(computed_precedence)?;
                 self.parse_type_expr_infix(
                     TypeExpression::Arrow(
-                        ParseInfo::from_position(position),
+                        self.span_from(position),
                         ArrowTypeExpr {
                             capture: ast::Confinement::fresh(),
                             domain: lhs.into(),
@@ -1454,7 +1610,7 @@ impl<'a> Parser<'a> {
                 };
                 self.parse_type_expr_infix(
                     TypeExpression::ConfinementAscription(
-                        ParseInfo::from_position(position),
+                        self.span_from(position),
                         lhs.into(),
                         confinement,
                     ),
@@ -1474,10 +1630,7 @@ impl<'a> Parser<'a> {
                     elements.push(self.parse_type_expression(operator.precedence())?);
                 }
                 self.parse_type_expr_infix(
-                    TypeExpression::Tuple(
-                        ParseInfo::from_position(position),
-                        TupleTypeExpr(elements),
-                    ),
+                    TypeExpression::Tuple(self.span_from(position), TupleTypeExpr(elements)),
                     context_precedence,
                 )
             }
@@ -1574,7 +1727,7 @@ impl<'a> Parser<'a> {
         let body = self.parse_expression_block()?;
         let body = self.extend_let_body(body, position)?;
         Ok(Expr::Let(
-            ParseInfo::from_position(position),
+            self.span_from(position),
             Binding {
                 binder,
                 operator: binding_operator,
@@ -1634,10 +1787,12 @@ impl<'a> Parser<'a> {
     fn parse_record(&mut self) -> Result<Expr> {
         let _t = self.trace();
 
-        // the `{`
+        // The record starts at its `{`, not at the first thing inside it: a cursor on
+        // the brace is on the record, and a diagnostic about the record should not
+        // point past its own opening.
+        let position = *self.peek()?.location();
         self.advance(1);
         self.strip_layout()?;
-        let position = *self.peek()?.location();
 
         // `{ base: Field := value }` is a record update.  A construction still
         // starts with the field label immediately followed by `:=`.
@@ -1664,18 +1819,15 @@ impl<'a> Parser<'a> {
             Some(base)
         };
 
+        // An update collects paths; a construction collects labelled initializers,
+        // which keep the label's position.
         let mut fields = vec![];
+        let mut initializers = vec![];
         while self.peek()?.kind != TokenKind::RightBrace {
             if base.is_some() {
                 fields.push(self.parse_record_update_field()?);
             } else {
-                let (name, value) = self.parse_field_init()?;
-                fields.push(ast::RecordUpdateField {
-                    path: vec![name],
-                    indices: Vec::new(),
-                    arities: Vec::new(),
-                    value,
-                });
+                initializers.push(self.parse_field_init()?);
             }
             self.strip_layout()?;
             if self.peek()?.kind == TokenKind::Semicolon {
@@ -1686,7 +1838,7 @@ impl<'a> Parser<'a> {
 
         self.expect(TokenKind::RightBrace)?;
 
-        let info = ParseInfo::from_position(position);
+        let info = self.span_from(position);
         Ok(match base {
             Some(base) => Expr::RecordUpdate(
                 info,
@@ -1696,52 +1848,43 @@ impl<'a> Parser<'a> {
                     field_order: Vec::new(),
                 },
             ),
-            None => Expr::Record(
-                info,
-                Record::from_fields(
-                    &fields
-                        .into_iter()
-                        .map(|field| {
-                            (
-                                // One segment: a construction's fields are built as
-                                // `path: vec![name]` in the loop above (an update is
-                                // the branch with a base, and keeps the whole path).
-                                field.path.into_iter().next().expect("one-segment path"),
-                                field.value,
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                ),
-            ),
+            None => Expr::Record(info, Record::from_fields(&initializers)),
         })
     }
 
     fn parse_record_update_field(
         &mut self,
     ) -> Result<ast::RecordUpdateField<ParseInfo, IdentifierPattern<ParseInfo>>> {
-        let (_, first) = self.identifier()?;
+        let (at, first) = self.identifier()?;
         let mut path = vec![Identifier::from_str(&first)];
+        let mut path_at = vec![self.span_from(at)];
         while self.peek()?.kind == TokenKind::Period {
             self.consume()?;
-            let (_, field) = self.identifier()?;
+            let (at, field) = self.identifier()?;
             path.push(Identifier::from_str(&field));
+            path_at.push(self.span_from(at));
         }
         self.expect(TokenKind::Assign)?;
+        // The value may drop onto an indented block, exactly as a declaration's
+        // does: `Field :=` and then the value on the next line.
+        let value = self.parse_block(|parser| parser.parse_expression(0))?;
         Ok(ast::RecordUpdateField {
             path,
+            path_at,
             indices: Vec::new(),
             arities: Vec::new(),
-            value: self.parse_expression(0)?.into(),
+            value: value.into(),
         })
     }
 
     fn parse_array(&mut self) -> Result<Expr> {
         let _t = self.trace();
 
-        // the '['
+        // The array starts at its `[`, for the same reason a record starts at its
+        // brace.
+        let position = *self.peek()?.location();
         self.advance(1);
         self.strip_layout()?;
-        let position = *self.peek()?.location();
 
         let mut elements = Vec::default();
 
@@ -1759,23 +1902,32 @@ impl<'a> Parser<'a> {
         }
 
         self.expect(TokenKind::RightBracket)?;
-        Ok(Expr::Array(
-            ParseInfo::from_position(position),
-            Array { elements },
-        ))
+        Ok(Expr::Array(self.span_from(position), Array { elements }))
     }
 
+    /// A field initializer `Label := value`, with the label's own position: an
+    /// editor asked about a label needs somewhere to point.
     fn parse_field_init(
         &mut self,
-    ) -> Result<(Identifier, Tree<ParseInfo, IdentifierPattern<ParseInfo>>)> {
+    ) -> Result<(
+        ParseInfo,
+        Identifier,
+        Tree<ParseInfo, IdentifierPattern<ParseInfo>>,
+    )> {
         let _t = self.trace();
 
-        let (_, label) = self.identifier()?;
+        let (at, label) = self.identifier()?;
+        let at = self.span_from(at);
         self.expect(TokenKind::Assign)?;
 
-        let expr = self.parse_expression(0)?;
+        // A field's value may drop onto an indented block of its own, the same way
+        // a declaration's may: `Power :=` and then the value on the next line. It
+        // is a block and not merely layout to strip, because what is written there
+        // can consult the indentation it sits at -- a `deconstruct`'s arms line up
+        // under it.
+        let expr = self.parse_block(|parser| parser.parse_expression(0))?;
 
-        Ok((Identifier::from_str(&label), expr.into()))
+        Ok((at, Identifier::from_str(&label), expr.into()))
     }
 
     fn parse_lambda(&mut self) -> Result<Expr> {
@@ -1788,7 +1940,7 @@ impl<'a> Parser<'a> {
         let body = self.parse_block(|parser| parser.parse_sequence())?;
 
         let lambda = params.into_iter().rfold(body, |body, (pos, param)| {
-            let parse_info = ParseInfo::from_position(pos);
+            let parse_info = self.span_from(pos);
             Expr::Lambda(
                 parse_info,
                 Lambda {
@@ -1811,6 +1963,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::LeftParen,
                     position,
+                    ..
                 } => {
                     // (
                     self.advance(1);
@@ -1821,11 +1974,12 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Identifier(id),
                     position,
+                    ..
                 } => {
                     self.advance(1);
                     params.push((
                         position,
-                        Pattern::Bind(ParseInfo::from_position(position), IdentifierPath::new(&id)),
+                        Pattern::Bind(self.span_from(position), IdentifierPath::new(&id)),
                     ));
                 }
 
@@ -1856,7 +2010,8 @@ impl<'a> Parser<'a> {
     fn is_expr_start(&self, t: &TokenKind) -> bool {
         matches!(
             t,
-            TokenKind::Literal(..)
+            TokenKind::Hole
+                | TokenKind::Literal(..)
                 | TokenKind::Identifier(..)
                 | TokenKind::LeftBrace
                 | TokenKind::LeftParen
@@ -1961,8 +2116,44 @@ impl<'a> Parser<'a> {
         match self.remains() {
             [
                 Token {
+                    kind: TokenKind::Hole,
+                    position,
+                    ..
+                },
+                ..,
+            ] => {
+                let position = *position;
+                self.advance(1);
+                let info = self.span_from(position);
+                // Keep the hole's span on the call: native panic lowering uses it
+                // together with the enclosing-term metadata for runtime context.
+                let file = crate::source_map::path_of(info.file)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<unknown>".to_owned());
+                let message = format!(
+                    "Unimplemented hole ??? at {file}:{}:{}",
+                    position.row, position.column
+                );
+                Ok(Expr::Apply(
+                    info,
+                    Apply {
+                        function: Expr::Variable(
+                            info,
+                            IdentifierPattern::from_path(
+                                info,
+                                IdentifierPath::new("Prelude").with_suffix("omg_wtf_bbq"),
+                            ),
+                        )
+                        .into(),
+                        argument: Expr::Constant(info, ast::Literal::Text(message)).into(),
+                    },
+                ))
+            }
+            [
+                Token {
                     kind: TokenKind::Literal(literal),
                     position,
+                    ..
                 },
                 ..,
             ] => {
@@ -1974,6 +2165,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Identifier(id),
                     position,
+                    ..
                 },
                 ..,
             ] => {
@@ -2015,6 +2207,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Keyword(Keyword::Not),
                     position,
+                    ..
                 },
                 ..,
             ] => {
@@ -2024,7 +2217,7 @@ impl<'a> Parser<'a> {
                 // while the looser `and`/`or`/`xor` stay outside (`not a and b` = `(not a) and b`).
                 let position = *position;
                 self.advance(1);
-                let parse_info = ParseInfo::from_position(position);
+                let parse_info = self.span_from(position);
                 let operand = self.parse_expression(Operator::Not.precedence())?;
                 Ok(Expr::Apply(
                     parse_info,
@@ -2043,6 +2236,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Minus,
                     position,
+                    ..
                 },
                 ..,
             ] => {
@@ -2052,7 +2246,7 @@ impl<'a> Parser<'a> {
                 // `-`'s precedence, so `-a * b` = `-(a * b)` and `-a - b` = `(-a) - b`.
                 let position = *position;
                 self.advance(1);
-                let parse_info = ParseInfo::from_position(position);
+                let parse_info = self.span_from(position);
                 let operand = self.parse_expression(Operator::Minus.precedence())?;
                 Ok(Expr::Apply(
                     parse_info,
@@ -2071,6 +2265,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Interpolate(Interpolation::Interlude(prelude)),
                     position,
+                    ..
                 },
                 ..,
             ] => self.parse_interpolated_text(*position, prelude.clone()),
@@ -2277,17 +2472,21 @@ impl<'a> Parser<'a> {
             interpolator.expression(self.parse_expression(0)?);
             // The backtick?
             self.advance(1);
-            match self.consume()? {
+            let segment = self.consume()?.clone();
+            let here = self.last_end();
+            match &segment {
                 Token {
                     kind: TokenKind::Interpolate(Interpolation::Interlude(literal)),
                     position,
-                } => interpolator.literal(ParseInfo::from_position(*position), literal.clone()),
+                    ..
+                } => interpolator.literal(ParseInfo::spanning(*position, here), literal.clone()),
 
                 Token {
                     kind: TokenKind::Interpolate(Interpolation::Epilogue(literal)),
                     position,
+                    ..
                 } => {
-                    let pi = ParseInfo::from_position(*position);
+                    let pi = ParseInfo::spanning(*position, here);
                     interpolator.literal(pi, literal.clone());
                     break Ok(Expr::Interpolate(pi, interpolator));
                 }
@@ -2306,9 +2505,15 @@ impl<'a> Parser<'a> {
 
         let rhs = self.parse_expression(Operator::Juxtaposition.precedence())?;
 
+        // The application reaches from the function to the end of its argument. It
+        // keeps the function's *start*, which is what the tree has always been keyed
+        // on, and gains the extent of the whole call -- which is what a diagnostic
+        // about the call should underline.
+        let at = self.span_from(lhs.parse_info().location);
+
         self.parse_expr_infix(
             Expr::Apply(
-                *lhs.parse_info(),
+                at,
                 ast::Apply {
                     function: lhs.into(),
                     argument: rhs.into(),
@@ -2320,13 +2525,13 @@ impl<'a> Parser<'a> {
 
     fn parse_literal(&mut self, literal: &Literal, position: &SourceLocation) -> Result<Expr> {
         Ok(Expr::Constant(
-            ParseInfo::from_position(*position),
+            self.span_from(*position),
             literal.clone().into(),
         ))
     }
 
     fn parse_variable(&mut self, id: &str, position: &SourceLocation) -> Result<Expr> {
-        let parse_info = ParseInfo::from_position(*position);
+        let parse_info = self.span_from(*position);
         Ok(Expr::Variable(
             parse_info,
             IdentifierPattern::from_atom(parse_info, id),
@@ -2422,10 +2627,7 @@ impl<'a> Parser<'a> {
             elements.push(self.parse_expression(computed_precedence)?.into());
         }
         self.parse_expr_infix(
-            Expr::Tuple(
-                ParseInfo::from_position(operator_position),
-                Tuple { elements },
-            ),
+            Expr::Tuple(self.span_from(operator_position), Tuple { elements }),
             expr_context,
         )
     }
@@ -2478,8 +2680,12 @@ impl<'a> Parser<'a> {
         let _t = self.trace();
 
         let (_, rhs) = self.identifier()?;
+
+        // The path grew, so its extent grows with it: `p.X.Y` is one name written
+        // across three segments, and a cursor in any of them is inside all of it.
+        // (The namer splits this into projections later, each keeping this span.)
         Ok(Expr::Variable(
-            pi,
+            self.span_from(pi.location),
             lhs.with_appended_path_segment(rhs.as_str()),
         ))
     }
@@ -2510,7 +2716,11 @@ impl<'a> Parser<'a> {
         // The Id or Int literal
         self.advance(1);
 
-        let parse_info = *lhs.parse_info();
+        // The projection reaches from its base to the end of the field just read. It
+        // keeps the base's *start*, which is what the tree has always been keyed on
+        // -- `self.Requires.Strength` is two projections at one position -- and gains
+        // the extent of the whole thing, which is what a cursor inside it is inside.
+        let parse_info = self.span_from(lhs.parse_info().location);
         let projection = Projection {
             base: lhs.into(),
             select: rhs,
@@ -2529,12 +2739,12 @@ impl<'a> Parser<'a> {
     ) -> Result<Expr> {
         let _t = self.trace();
 
-        let parse_info = ParseInfo::from_position(*lhs.position());
+        let parse_info = self.span_from(*lhs.position());
         let apply_lhs = Expr::Apply(
             parse_info,
             Apply {
                 function: Expr::Variable(
-                    ParseInfo::from_position(operator_position),
+                    self.span_from(operator_position),
                     IdentifierPattern::from_atom(parse_info, operator.term_name()),
                 )
                 .into(),
@@ -2545,7 +2755,7 @@ impl<'a> Parser<'a> {
         let rhs = self.parse_expression(computed_precedence)?;
         self.parse_expr_infix(
             Expr::Apply(
-                ParseInfo::from_position(*rhs.position()),
+                self.span_from(*rhs.position()),
                 Apply {
                     function: apply_lhs.into(),
                     argument: rhs.into(),
@@ -2615,7 +2825,7 @@ impl<'a> Parser<'a> {
         ) {
             if self.peek()?.is_identifier() {
                 let (pos, id) = self.identifier()?;
-                let pi = ParseInfo::from_position(pos);
+                let pi = self.span_from(pos);
                 arguments.push(if is_lowercase(&id) {
                     TypeExpression::Parameter(pi, Identifier::from_str(&id))
                 } else {
@@ -2629,7 +2839,7 @@ impl<'a> Parser<'a> {
         }
 
         Ok(ConstraintExpression {
-            annotation: ParseInfo::from_position(pos),
+            annotation: self.span_from(pos),
             class: IdentifierPath::new(&id),
             parameters: arguments,
         })
@@ -2680,7 +2890,8 @@ impl<'a> Parser<'a> {
     fn parse_coproduct_constructor(&mut self) -> Result<CoproductConstructor> {
         let _t = self.trace();
 
-        let (_, id) = self.identifier()?;
+        let (at, id) = self.identifier()?;
+        let at = self.span_from(at);
 
         let mut signature = vec![];
 
@@ -2692,6 +2903,7 @@ impl<'a> Parser<'a> {
         }
 
         Ok(CoproductConstructor {
+            at,
             name: Identifier::from_str(&id),
             signature,
         })
@@ -2856,6 +3068,7 @@ impl<'a> Parser<'a> {
                 Token {
                     kind: TokenKind::Literal(literal),
                     position,
+                    ..
                 },
                 ..,
             ] => self.parse_literal_pattern(*position, literal),
@@ -2882,7 +3095,7 @@ impl<'a> Parser<'a> {
                     elements.push(self.parse_pattern_prefix()?);
                 }
                 Ok(Pattern::Tuple(
-                    ParseInfo::from_position(position),
+                    self.span_from(position),
                     TuplePattern { elements },
                 ))
             }
@@ -2912,7 +3125,7 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Pattern::Coproduct(
-            ParseInfo::from_position(pos),
+            self.span_from(pos),
             ConstructorPattern {
                 constructor,
                 arguments,
@@ -2930,7 +3143,7 @@ impl<'a> Parser<'a> {
         // the literal
         self.advance(1);
         Ok(Pattern::Literally(
-            ParseInfo::from_position(position),
+            self.span_from(position),
             literal.clone().into(),
         ))
     }
@@ -2939,10 +3152,7 @@ impl<'a> Parser<'a> {
         let _t = self.trace();
 
         let (pos, id) = self.identifier()?;
-        Ok(Pattern::Bind(
-            ParseInfo::from_position(pos),
-            IdentifierPath::new(&id),
-        ))
+        Ok(Pattern::Bind(self.span_from(pos), IdentifierPath::new(&id)))
     }
 
     fn parse_struct_pattern(&mut self) -> Result<Pattern<ParseInfo, IdentifierPath>> {
@@ -2961,23 +3171,24 @@ impl<'a> Parser<'a> {
 
         self.expect(TokenKind::RightBrace)?;
 
-        fields.sort_by(|t, u| t.0.cmp(&u.0));
+        fields.sort_by(|t, u| t.1.cmp(&u.1));
 
         Ok(Pattern::Struct(
-            ParseInfo::from_position(brace_location),
+            self.span_from(brace_location),
             StructPattern { fields },
         ))
     }
 
     fn parse_struct_pattern_field(
         &mut self,
-    ) -> Result<(Identifier, Pattern<ParseInfo, IdentifierPath>)> {
+    ) -> Result<(ParseInfo, Identifier, Pattern<ParseInfo, IdentifierPath>)> {
         let _t = self.trace();
 
-        let (_pos, label) = self.identifier()?;
+        let (at, label) = self.identifier()?;
+        let at = self.span_from(at);
         self.expect(TokenKind::Colon)?;
         let pattern = self.parse_pattern()?.normalize();
-        Ok((Identifier::from_str(&label), pattern))
+        Ok((at, Identifier::from_str(&label), pattern))
     }
 
     fn parse_if_then_else(&mut self) -> Result<Expr> {
@@ -3004,7 +3215,7 @@ impl<'a> Parser<'a> {
             let alternate = parser.parse_expression_block()?;
 
             Ok(Expr::If(
-                ParseInfo::from_position(position),
+                parser.span_from(position),
                 IfThenElse {
                     predicate: predicate.into(),
                     consequent: consequent.into(),
@@ -3052,7 +3263,7 @@ impl Pattern<ParseInfo, IdentifierPath> {
                 StructPattern {
                     fields: fields
                         .iter()
-                        .map(|(field, pattern)| (field.clone(), pattern.normalize()))
+                        .map(|(at, field, pattern)| (*at, field.clone(), pattern.normalize()))
                         .collect(),
                 },
             ),
@@ -3106,7 +3317,11 @@ impl fmt::Display for ParseInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // File-free by design: this is also printed inside inferred-type dumps.
         // The file is surfaced only on the error path (see `Located`'s `Display`).
-        let Self { location, file: _ } = self;
+        let Self {
+            location,
+            end: _,
+            file: _,
+        } = self;
         write!(f, "{location}")
     }
 }
@@ -3135,6 +3350,119 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A node knows how far it reaches, not only where it began -- which is what
+    /// lets a diagnostic underline the call that failed rather than the name at the
+    /// front of it, and what lets an editor answer about an expression a cursor is
+    /// inside of.
+    #[test]
+    fn a_node_spans_what_it_was_parsed_from() {
+        let source = "start :: Int -> Unit := λ_.\n  print_endline (add 1 2)\n";
+        let characters = source.chars().collect::<Vec<_>>();
+        let mut lexer = LexicalAnalyzer::default();
+        let tokens = lexer.tokenize(&characters);
+        let declarations = Parser::from_tokens(tokens)
+            .parse_declaration_list()
+            .expect("parses");
+
+        // Walk to the outermost application of the body: `print_endline (add 1 2)`.
+        let mut spans = Vec::new();
+        for declaration in &declarations {
+            if let Declaration::Value(_, value) = declaration {
+                value.declarator.body.walk(&mut |node| {
+                    if let Expr::Apply(at, _) = node {
+                        spans.push((at.location, at.end));
+                    }
+                });
+            }
+        }
+
+        let widest = spans
+            .iter()
+            .max_by_key(|(start, end)| end.column - start.column)
+            .expect("an application");
+
+        // `  print_endline (add 1 2)` -- from the `p` (column 3) to just past the
+        // closing paren (column 26).
+        assert_eq!(
+            (widest.0.row, widest.0.column, widest.1.row, widest.1.column),
+            (2, 3, 2, 26),
+            "an application reaches from its function to the end of its argument"
+        );
+    }
+
+    /// `p.X.Y` is not parsed as a projection -- it is one *name*, a dotted path, that
+    /// the namer splits into projections later, each keeping this node's extent. So
+    /// the extent has to cover the whole path: a cursor on any segment is inside the
+    /// expression the path stands for, and an editor that replaced only the segment
+    /// it sat on would write `p.X.deconstruct Y into`.
+    #[test]
+    fn a_dotted_path_spans_all_of_itself() {
+        let source = "f :: Point -> Int := λp.\n  p.X.Y\n";
+        let characters = source.chars().collect::<Vec<_>>();
+        let mut lexer = LexicalAnalyzer::default();
+        let tokens = lexer.tokenize(&characters);
+        let declarations = Parser::from_tokens(tokens)
+            .parse_declaration_list()
+            .expect("parses");
+
+        let mut widest = None;
+        for declaration in &declarations {
+            if let Declaration::Value(_, value) = declaration {
+                value.declarator.body.walk(&mut |node| {
+                    if let Expr::Variable(at, _) = node {
+                        let span = (at.location.column, at.end.column);
+                        if widest.is_none_or(|(_, end)| span.1 > end) {
+                            widest = Some(span);
+                        }
+                    }
+                });
+            }
+        }
+
+        // `  p.X.Y` runs from column 3 to just past the `Y`.
+        assert_eq!(widest, Some((3, 8)), "the path knows how far it reaches");
+    }
+
+    /// A syntax error costs its own declaration and no more: the parser picks up at
+    /// the next one, so a file with two mistakes reports two.
+    #[test]
+    fn parsing_recovers_at_the_next_declaration() {
+        let source = concat!(
+            "first :: Int := 1 +\n",
+            "\n",
+            "second :: Int := 2\n",
+            "\n",
+            "third :: Text := \"ok\" ++\n",
+            "\n",
+            "fourth :: Int := 4\n",
+        );
+        let characters = source.chars().collect::<Vec<_>>();
+        let mut lexer = LexicalAnalyzer::default();
+        let tokens = lexer.tokenize(&characters);
+        let (declarations, errors) =
+            Parser::from_tokens(tokens).parse_declaration_list_recovering();
+
+        assert_eq!(
+            errors.len(),
+            2,
+            "one error per broken declaration: {errors:?}"
+        );
+
+        // What parsed is still there. `second` follows the first mistake and
+        // `fourth` follows the second, so both sides of both errors were recovered.
+        let names = declarations
+            .iter()
+            .filter_map(|declaration| match declaration {
+                Declaration::Value(_, value) => Some(value.name.as_str().to_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            names.contains(&"second".to_owned()) && names.contains(&"fourth".to_owned()),
+            "the declarations after each error still parsed: {names:?}"
+        );
     }
 
     /// Lex and parse a declaration list, expecting it to fail.
@@ -3284,6 +3612,45 @@ g := λr.
         assert_eq!(declarations.len(), 2);
         assert!(declarations[0].to_string().contains(": x :="));
         assert!(declarations[1].to_string().contains("nested.y := 40"));
+    }
+
+    /// A field's value may drop onto an indented block, the same way a
+    /// declaration's may. It is a *block* and not merely layout to be discarded,
+    /// because what is written there consults the indentation it sits at: the arms
+    /// of the `deconstruct` below line up under the field that holds it.
+    #[test]
+    fn parses_a_field_whose_value_opens_a_block() {
+        let source = r#"
+origin :=
+  { X :=
+      2
+    Power :=
+      { Strength := 7
+        Vitality := 9
+      }
+    Chosen := λn.
+      deconstruct n into
+        0 -> 100
+      | _ -> n
+  }
+updated := λr.
+  { r: Depth :=
+      41 + 1
+  }
+"#;
+        let characters = source.chars().collect::<Vec<_>>();
+        let mut lexer = LexicalAnalyzer::default();
+        let tokens = lexer.tokenize(&characters);
+        let mut parser = Parser::from_tokens(tokens);
+
+        let declarations = parser.parse_declaration_list().unwrap();
+        assert_eq!(declarations.len(), 2);
+
+        let record = declarations[0].to_string();
+        for field in ["X: 2", "Power: {", "Strength: 7", "Chosen: λn.", "0 -> 100"] {
+            assert!(record.contains(field), "lost `{field}` from {record}");
+        }
+        assert!(declarations[1].to_string().contains("Depth"));
     }
 }
 

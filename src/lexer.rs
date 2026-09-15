@@ -96,6 +96,7 @@ impl LexicalAnalyzer {
                     self.close_paren();
                     self.emit(1, TokenKind::RightBracket, remains)
                 }
+                ['?', '?', '?', remains @ ..] => self.emit(3, TokenKind::Hole, remains),
                 ['_', remains @ ..] => self.emit(1, TokenKind::Underscore, remains),
                 ['|', remains @ ..] => self.emit(1, TokenKind::Pipe, remains),
                 [';', remains @ ..] => self.emit(1, TokenKind::Semicolon, remains),
@@ -159,8 +160,12 @@ impl LexicalAnalyzer {
         };
 
         let identifier = prefix.iter().collect::<String>();
+        // The width is `prefix`'s, not the `String`'s: columns are counted in
+        // characters everywhere else in this lexer, and `String::len` is bytes. An
+        // identifier holding any non-ASCII character would otherwise push every token
+        // after it on the line to the right of where it is written.
         self.emit(
-            identifier.len() as u32,
+            prefix.len() as u32,
             TokenKind::decode_reserved_words(identifier),
             remains,
         )
@@ -195,30 +200,52 @@ impl LexicalAnalyzer {
     }
 
     fn scan_text_literal<'a>(&mut self, input: &'a [char]) -> &'a [char] {
+        // The opening `"` was taken from the input by the caller without moving the
+        // location: every delimiter consumed here has to be stepped over explicitly,
+        // or everything after it -- and everything *inside* an interpolation splice,
+        // which is tokenised in place -- is reported a column or two to the left.
+        // The literal's own token still starts at the quote.
+        let quote = self.location;
+        self.location.move_right(1);
+
         let (image, consumed, terminator) = Self::scan_text_segment(input);
         let mut content = &input[..consumed];
         let mut remains = &input[consumed..];
 
         match terminator {
             // A plain `"..."` literal (no interpolation), or an unterminated one at EOF.
-            Some('"') => self.emit_text(
+            Some('"') => {
+                let rest = self.emit_text_at(
+                    quote,
+                    content,
+                    TokenKind::Literal(Literal::Text(image)),
+                    &remains[1..],
+                );
+                self.location.move_right(1); // the closing `"`
+                self.close_last_token();
+                rest
+            }
+            None => self.emit_text_at(
+                quote,
                 content,
                 TokenKind::Literal(Literal::Text(image)),
-                &remains[1..],
+                remains,
             ),
-            None => self.emit_text(content, TokenKind::Literal(Literal::Text(image)), remains),
 
             // An interpolation splice: emit the leading text, tokenize the `` `expr` ``,
             // then continue with the following segment (another splice, or the epilogue).
             _ => {
                 let mut image = image;
+                let mut at = quote;
                 loop {
                     // remains starts with the opening `` ` ``.
-                    remains = self.emit_text(
+                    remains = self.emit_text_at(
+                        at,
                         content,
                         TokenKind::Interpolate(Interpolation::Interlude(Literal::Text(image))),
                         &remains[1..],
                     );
+                    self.location.move_right(1); // the `` ` `` opening the splice
 
                     let (quoted_expression, after_expr) =
                         if let Some(end) = remains.iter().position(|&c| c == '`') {
@@ -226,7 +253,12 @@ impl LexicalAnalyzer {
                         } else {
                             (remains, &remains[..0])
                         };
+                    // Tokenised in place, so the splice's tokens carry their real
+                    // positions -- which is what a diagnostic or a hover inside an
+                    // interpolation points at.
                     self.tokenize(quoted_expression);
+                    self.location.move_right(1); // the `` ` `` closing it
+                    at = self.location;
 
                     let (segment, consumed, terminator) = Self::scan_text_segment(after_expr);
                     image = segment;
@@ -238,16 +270,21 @@ impl LexicalAnalyzer {
                         Some('`') => continue,
                         // End of the literal (`"`), or unterminated at EOF: the epilogue.
                         Some('"') => {
-                            break self.emit_text(
+                            let rest = self.emit_text_at(
+                                at,
                                 content,
                                 TokenKind::Interpolate(Interpolation::Epilogue(Literal::Text(
                                     image,
                                 ))),
                                 &remains[1..],
                             );
+                            self.location.move_right(1); // the closing `"`
+                            self.close_last_token();
+                            break rest;
                         }
                         _ => {
-                            break self.emit_text(
+                            break self.emit_text_at(
+                                at,
                                 content,
                                 TokenKind::Interpolate(Interpolation::Epilogue(Literal::Text(
                                     image,
@@ -273,10 +310,19 @@ impl LexicalAnalyzer {
         token_type: TokenKind,
         remains: &'a [char],
     ) -> &'a [char] {
-        self.output.push(Token {
-            kind: token_type,
-            position: self.location,
-        });
+        self.emit_text_at(self.location, content, token_type, remains)
+    }
+
+    /// `emit_text`, for a token whose position is not where its content begins --
+    /// a text literal starts at its quote, an interlude at the quote or backtick
+    /// before it.
+    fn emit_text_at<'a>(
+        &mut self,
+        at: SourceLocation,
+        content: &[char],
+        token_type: TokenKind,
+        remains: &'a [char],
+    ) -> &'a [char] {
         for &c in content {
             if c == '\n' {
                 self.location.new_line();
@@ -284,7 +330,22 @@ impl LexicalAnalyzer {
                 self.location.move_right(1);
             }
         }
+        self.output.push(Token {
+            kind: token_type,
+            position: at,
+            end: self.location,
+        });
         remains
+    }
+
+    /// Take the delimiter just stepped over into the token it closes. A text
+    /// literal is emitted before its closing `"` is consumed -- the caller has to
+    /// step over it -- so without this the literal's extent stops one character
+    /// short of the quote that ends it.
+    fn close_last_token(&mut self) {
+        if let Some(last) = self.output.last_mut() {
+            last.end = self.location;
+        }
     }
 
     fn emit<'a>(&mut self, length: u32, token_type: TokenKind, remains: &'a [char]) -> &'a [char] {
@@ -293,11 +354,13 @@ impl LexicalAnalyzer {
         if let Some(at) = self.layout_position(self.location) {
             self.settle_layout(at);
         }
+        let position = self.location;
+        self.location.move_right(length);
         self.output.push(Token {
             kind: token_type,
-            position: self.location,
+            position,
+            end: self.location,
         });
-        self.location.move_right(length);
         remains
     }
 
@@ -424,11 +487,13 @@ impl LexicalAnalyzer {
                 *last = Token {
                     kind: TokenKind::Layout(indentation),
                     position: location,
+                    end: location,
                 };
             } else {
                 self.output.push(Token {
                     kind: TokenKind::Layout(indentation),
                     position: location,
+                    end: location,
                 });
             }
         }
@@ -591,6 +656,7 @@ pub enum TokenKind {
     RightBrace,     // }
     LeftBracket,    // [
     RightBracket,   // ]
+    Hole,           // ???
     Underscore,     // _
     Pipe,           // |
     DoubleQuote,    // "
@@ -825,7 +891,44 @@ pub enum Keyword {
 }
 
 impl Keyword {
-    fn try_from_identifier(id: &str) -> Option<Self> {
+    /// Spellings that an editor can offer while source is being written.
+    ///
+    /// `lambda` and `forall` are the textual alternatives to `λ` and `∀`. The
+    /// glyphs themselves are intentionally absent: once one has been inserted there
+    /// is nothing left to complete.
+    pub const COMPLETIONS: &[&str] = &[
+        "let",
+        "let*",
+        "let+",
+        "in",
+        "if",
+        "then",
+        "else",
+        "struct",
+        "coproduct",
+        "alias",
+        "module",
+        "use",
+        "lambda",
+        "forall",
+        "deconstruct",
+        "into",
+        "and",
+        "or",
+        "xor",
+        "not",
+        "where",
+        "signature",
+        "witness",
+        "foreign",
+        "opaque",
+        "confined",
+        "unconfined",
+    ];
+
+    /// Whether a word is a keyword rather than a name. The language server asks this
+    /// too: a cursor on `let` is not on a name, however much it looks like one.
+    pub fn try_from_identifier(id: &str) -> Option<Self> {
         match id {
             "let" => Some(Self::Let(BindingOperator::Identity)),
             "in" => Some(Self::In),
@@ -873,6 +976,10 @@ impl Eq for Literal {}
 pub struct Token {
     pub kind: TokenKind,
     pub position: SourceLocation,
+    /// One past the token's last character: where the next one would start if
+    /// nothing separated them. This is what lets a parser hand a node the extent of
+    /// what it parsed rather than only where it began.
+    pub end: SourceLocation,
 }
 
 impl Token {
@@ -952,6 +1059,7 @@ impl fmt::Display for TokenKind {
             Self::LeftBracket => write!(f, "["),
             Self::RightBracket => write!(f, "]"),
             Self::RightBrace => write!(f, "}}"),
+            Self::Hole => write!(f, "???"),
             Self::Underscore => write!(f, "_"),
             Self::Pipe => write!(f, "|"),
             Self::DoubleQuote => write!(f, "\""),
@@ -1120,6 +1228,61 @@ mod tests {
     #[test]
     fn unknown_escape_is_verbatim() {
         assert_eq!(char_literals(r"'\x'"), vec!['x']);
+    }
+
+    /// Everything inside `` `...` `` is tokenised in place, so its tokens have to
+    /// carry their real columns -- a diagnostic, a hover or a jump inside an
+    /// interpolation points at them. The delimiters (`"` and both backticks) are
+    /// consumed from the input without being scanned, so each one has to be stepped
+    /// over by hand; when they were not, everything in the splice was two columns
+    /// to the left.
+    #[test]
+    fn an_interpolated_expression_keeps_its_real_columns() {
+        let source = "  print_endline \"`four`\"\n";
+        let characters = source.chars().collect::<Vec<_>>();
+        let mut lexer = LexicalAnalyzer::default();
+        let tokens = lexer.tokenize(&characters);
+
+        let four = tokens
+            .iter()
+            .find(|token| matches!(&token.kind, TokenKind::Identifier(id) if id == "four"))
+            .expect("the spliced identifier");
+
+        // `  print_endline "` is 17 characters, then the backtick, so `four` is at 19.
+        assert_eq!((four.position.row, four.position.column), (1, 19));
+
+        // And the literal itself is still anchored at its opening quote.
+        let interlude = tokens
+            .iter()
+            .find(|token| matches!(token.kind, TokenKind::Interpolate(..)))
+            .expect("the interlude");
+        assert_eq!(interlude.position.column, 17);
+    }
+
+    /// `String::len` is bytes; a column is a character. An identifier with a
+    /// non-ASCII character in it used to advance the column by its byte length, so
+    /// everything after it on the line was reported to the right of where it is
+    /// written -- diagnostics included.
+    #[test]
+    fn a_wide_identifier_is_one_column_per_character() {
+        let source = "  let l\u{e5}d\u{f6} = double 10 in\n";
+        let characters = source.chars().collect::<Vec<_>>();
+        let mut lexer = LexicalAnalyzer::default();
+        let tokens = lexer.tokenize(&characters);
+
+        let double = tokens
+            .iter()
+            .find(|token| matches!(&token.kind, TokenKind::Identifier(id) if id == "double"))
+            .expect("the identifier after the wide one");
+
+        // In characters, not bytes -- which is the whole point.
+        let byte = source.find("double").expect("`double`");
+        let expected = source[..byte].chars().count() as u32 + 1;
+        assert_eq!(
+            (double.position.row, double.position.column),
+            (1, expected),
+            "two two-byte characters must not move the next token two columns right"
+        );
     }
 
     #[test]

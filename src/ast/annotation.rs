@@ -45,6 +45,7 @@ where
                             .iter()
                             .map(|field| RecordUpdateField {
                                 path: field.path.clone(),
+                                path_at: field.path_at.iter().map(&f).collect(),
                                 indices: field.indices.clone(),
                                 arities: field.arities.clone(),
                                 value: field.value.map_annotation(&f),
@@ -180,7 +181,7 @@ where
             fields: self
                 .fields
                 .iter()
-                .map(|(label, e)| (label.clone(), e.map_annotation(f)))
+                .map(|(at, label, e)| (f(at), label.clone(), e.map_annotation(f)))
                 .collect(),
         }
     }
@@ -521,7 +522,7 @@ where
                     fields: pattern
                         .fields
                         .iter()
-                        .map(|(field, pattern)| (field.clone(), pattern.map_annotation(f)))
+                        .map(|(a, field, pattern)| (f(a), field.clone(), pattern.map_annotation(f)))
                         .collect(),
                 },
             ),

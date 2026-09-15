@@ -87,6 +87,32 @@ traverse_ :: ∀t : *->* m : *->* α β. Foldable t + Monad m |- (α -> m β) ->
   λf.
     fold_right (λx rest. bind (λ_. rest) (f x)) (pure ())
 
+(* `for_each` keeps no answers, so the LAST action can be handed back exactly as
+   it is. `traverse_` cannot: its seed `pure ()` is bound onto the final action,
+   which leaves work pending behind it. For a finite container that is one wasted
+   bind -- but when the action is a loop that reaches `for_each` again, the
+   pending bind is carried into every instruction that follows, and the cost
+   grows with the loop. Folding into a `Perhaps` is what tells the two cases
+   apart: `Nope` means nothing has been folded yet, so this element is the last.
+
+   The container comes FIRST: `t` and `α` are then known before the action is
+   checked, and the action -- the part that wants room -- can be a multi-line
+   lambda at the end of the call. *)
+for_each :: ∀t : *->* m : *->* α. Foldable t + Monad m |- t α -> (α -> m Unit) -> m Unit :=
+  λcontainer f.
+    let sequenced =
+      fold_right
+        (λx rest.
+           deconstruct rest into
+             Nope -> This (f x)
+           | This later -> This (bind (λ_. later) (f x)))
+        Nope
+        container
+    in
+    deconstruct sequenced into
+      This program -> program
+    | Nope -> pure ()
+
 sequence :: ∀t : *->* f : *->* α. Traversable t + Applicative f |- t (f α) -> f (t α) :=
   λtfa.
     traverse id tfa

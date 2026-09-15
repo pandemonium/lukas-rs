@@ -81,9 +81,10 @@ greet :: Console Unit :=
   let* _ = Console.write_line (Markup.paint muted "  Type a name and press Enter (Ctrl-D to skip).") in
   let* typed = Console.prompt (Markup.text "  name> ") in
   deconstruct typed into
-    Return name -> Console.write_line (labelled "you typed" name)
-  | Fault (Not_Utf8 _) -> Console.write_line (Markup.paint alarm "  (that was not UTF-8)")
-  | otherwise -> Console.write_line (Markup.paint alarm "  (input ended)")
+    This name -> Console.write_line (labelled "you typed" name)
+  (* Ctrl-D on an empty line: this prompt was cancelled, and the next one still
+     works. Input that has *ended* never reaches here -- it ends the program. *)
+  | Nope -> Console.write_line (Markup.paint muted "  (skipped)")
 
 
 (* ---------------------------------------------- unbuffered (raw) keystroke input *)
@@ -94,19 +95,21 @@ greet :: Console Unit :=
    and why this is worth having in a library rather than in each program. *)
 
 watch_keys :: Console Unit :=
-  (* Read keys until `q`, describing each one. Recursion, not a loop: `read_key` returns
-     `Nope` at end of input, which is the other way out.
+  (* Read keys until `q`, describing each one. Recursion, not a loop.
+
+     `read_key` hands back a `Key` and nothing else: waiting forever has no deadline
+     to miss, and input that has *ended* ends the program rather than being reported
+     to every caller who could only stop anyway.
 
      Note that a key is MATCHED, not tested with a helper: `Character "q"` is an ordinary
      pattern, so a key-binding table reads like any other `deconstruct`. *)
   let watch = λseen.
     let* pressed = Console.read_key in
     deconstruct pressed into
-      Return (Character "q") -> Console.write_line (labelled "keys seen" "`seen + 1`")
-    | Return key ->
+      Character "q" -> Console.write_line (labelled "keys seen" "`seen + 1`")
+    | key ->
         let* _ = Console.write_line (labelled "key" "`key`") in
         watch (seen + 1)
-    | otherwise -> Console.write_line (Markup.paint muted "  (input ended)")
   in
   let* _ = Console.write_line mempty in
   let* _ = Console.write_line (Markup.paint heading "Unbuffered input") in
@@ -148,9 +151,9 @@ wait_briefly :: Console Unit :=
       else
         let* pressed = Console.read_key_within (Milliseconds 200) in
         deconstruct pressed into
-          Fault Timed_Out -> tick (remaining - 1) (quiet + 1)
-        | Return key -> Console.write_line (labelled "pressed" "`key`")
-        | otherwise -> Console.write_line (Markup.paint muted "  (input ended)")
+          (* The one thing `Nope` means here: the deadline passed, nothing pressed. *)
+          Nope -> tick (remaining - 1) (quiet + 1)
+        | This key -> Console.write_line (labelled "pressed" "`key`")
   in
   let* _ = Console.write_line mempty in
   let* _ = Console.write_line (Markup.paint heading "Waiting with a deadline") in
@@ -172,4 +175,4 @@ tour :: Console Unit :=
   Console.write_line (Markup.paint muted "done")
 
 
-start :: Int -> Unit := λ_. IO.unsafe_run_IO (Console.execute tour)
+start :: Int -> Unit := λ_. IO.unsafe_run_IO (Console.run tour)

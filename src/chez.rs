@@ -333,7 +333,7 @@ impl phase::Expr<Erased> {
 
             ast::Expr::Record(_, the) => {
                 write!(code, "(vector")?;
-                for (_, el) in &the.fields {
+                for (_, _, el) in &the.fields {
                     write!(code, " ")?;
                     el.emit(code)?;
                 }
@@ -648,7 +648,7 @@ impl Pattern<Erased, Identifier> {
                 the.fields
                     .iter()
                     .enumerate()
-                    .rfold(k, |k, (index, (_, arg))| {
+                    .rfold(k, |k, (index, (_, _, arg))| {
                         let binding = Binding::fresh(scrutinee.get_product_element(index));
                         let binder = Staged::Var(binding.binder.clone());
                         arg.stage(binder, k).bind(binding)

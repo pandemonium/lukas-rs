@@ -1,0 +1,26 @@
+use Stdlib.
+
+numbers :: List1 Int :=
+  { Head := 1; Tail := Cons 2 (Cons 3 Nil) }
+
+more :: List1 Int :=
+  { Head := 4; Tail := Cons 5 Nil }
+
+functions :: List1 (Int -> Int) :=
+  { Head := λx. x + 1; Tail := Cons (λx. x * 2) Nil }
+
+show_traversed :: Perhaps (List1 Int) -> Unit := λresult.
+  deconstruct result into
+    This traversed -> print_endline "`traversed`"
+  | Nope           -> print_endline "no"
+
+start :: Int -> Unit := λ_.
+  print_endline "##TC"
+  print_endline "`fmap (λx. x + 1) numbers`"
+  print_endline "`fold_left (λz x. z * 10 + x) 0 numbers`"
+  print_endline "`bind (λx. { Head := x; Tail := Cons (x + 10) Nil }) numbers`"
+  print_endline "`apply functions numbers`"
+  show_traversed (traverse (λx. This (x + 1)) numbers)
+  print_endline "`mappend numbers more`"
+  print_endline "`eq numbers numbers`"
+  print_endline "`eq numbers more`"

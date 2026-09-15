@@ -557,12 +557,17 @@ pub struct CoproductDeclarator<A> {
 
 #[derive(Debug)]
 pub struct CoproductConstructor<A> {
+    /// Where the constructor's own name is written, which is the only place a
+    /// reader can be sent when they ask where `Cons` comes from.
+    pub at: A,
     pub name: parser::Identifier,
     pub signature: Vec<TypeExpression<A, parser::IdentifierPath>>,
 }
 
 #[derive(Debug)]
 pub struct FieldDeclarator<A> {
+    /// Where the field's own name is written.
+    pub at: A,
     pub name: parser::Identifier,
     pub type_signature: TypeSignature<A, parser::IdentifierPath>,
 }
@@ -824,7 +829,10 @@ impl<A, Id> Expr<A, Id> {
                 walk_tree(&binding.body);
             }
             Self::Tuple(_, tuple) => tuple.elements.iter().for_each(&mut walk_tree),
-            Self::Record(_, record) => record.fields.iter().for_each(|(_, value)| walk_tree(value)),
+            Self::Record(_, record) => record
+                .fields
+                .iter()
+                .for_each(|(_, _, value)| walk_tree(value)),
             Self::RecordUpdate(_, update) => {
                 walk_tree(&update.base);
                 update
@@ -930,7 +938,11 @@ impl<A, Id> Expr<A, Id> {
             Expr::Record(a, the) => Expr::Record(
                 a,
                 Record {
-                    fields: the.fields.into_iter().map(|(k, v)| (k, go(v, f))).collect(),
+                    fields: the
+                        .fields
+                        .into_iter()
+                        .map(|(at, k, v)| (at, k, go(v, f)))
+                        .collect(),
                 },
             ),
 
@@ -943,6 +955,7 @@ impl<A, Id> Expr<A, Id> {
                         .into_iter()
                         .map(|field| RecordUpdateField {
                             path: field.path,
+                            path_at: field.path_at,
                             indices: field.indices,
                             arities: field.arities,
                             value: go(field.value, f),
@@ -1068,7 +1081,10 @@ pub struct IfThenElse<A, Id> {
 
 #[derive(Debug, Clone)]
 pub struct Record<A, Id> {
-    pub fields: Vec<(parser::Identifier, Tree<A, Id>)>,
+    /// Each field's label, where the label is written, and its value. The position
+    /// is the label's own: a `Record`'s fields used to be `(name, value)` pairs, and
+    /// a name with no position is a name an editor cannot answer about.
+    pub fields: Vec<(A, parser::Identifier, Tree<A, Id>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1083,6 +1099,9 @@ pub struct RecordUpdate<A, Id> {
 #[derive(Debug, Clone)]
 pub struct RecordUpdateField<A, Id> {
     pub path: Vec<parser::Identifier>,
+    /// Where each segment of `path` is written, alongside it -- as `indices` and
+    /// `arities` are. Empty for an update no one wrote.
+    pub path_at: Vec<A>,
     /// Positional selector and containing-record arity for every path segment;
     /// populated by the typer and empty in parsed/named trees.
     pub indices: Vec<usize>,
@@ -1091,9 +1110,12 @@ pub struct RecordUpdateField<A, Id> {
 }
 
 impl<A, Id> Record<A, Id> {
-    pub fn from_fields(fields: &[(parser::Identifier, Tree<A, Id>)]) -> Self {
+    pub fn from_fields(fields: &[(A, parser::Identifier, Tree<A, Id>)]) -> Self
+    where
+        A: Clone,
+    {
         let mut fields = fields.to_vec();
-        fields.sort_by(|(t, _), (u, _)| t.cmp(u));
+        fields.sort_by(|(_, t, _), (_, u, _)| t.cmp(u));
 
         Self { fields }
     }
@@ -1404,7 +1426,7 @@ where
         let record_rendering = self
             .fields
             .iter()
-            .map(|(label, e)| format!("{label}: {e}"))
+            .map(|(_, label, e)| format!("{label}: {e}"))
             .collect::<Vec<_>>()
             .join("; ");
         write!(f, "{{ {record_rendering} }}")
@@ -1683,6 +1705,7 @@ impl<A> fmt::Display for CoproductConstructor<A> {
 impl<A> fmt::Display for FieldDeclarator<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
+            at: _,
             name,
             type_signature,
         } = self;

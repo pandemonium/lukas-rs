@@ -1,7 +1,6 @@
-use std::{
-    collections::{BTreeSet, HashMap},
-    fmt,
-};
+use std::{collections::BTreeSet, fmt};
+
+use crate::hash::HashMap;
 
 use crate::{
     ast::{self, Literal, Tree, namer},
@@ -60,7 +59,7 @@ impl<A, Id> Pattern<A, Id> {
                     fields: the
                         .fields
                         .into_iter()
-                        .map(|(label, p)| (label, p.map_id(f)))
+                        .map(|(a, label, p)| (a, label, p.map_id(f)))
                         .collect(),
                 },
             ),
@@ -85,7 +84,10 @@ pub struct TuplePattern<A, Id> {
 
 #[derive(Debug, Clone)]
 pub struct StructPattern<A, Id> {
-    pub fields: Vec<(parser::Identifier, Pattern<A, Id>)>,
+    /// Each field's label, where the label is written, and the pattern matched
+    /// against it -- the same triple a record literal's fields carry, for the same
+    /// reason: a label with no position is a label an editor cannot answer about.
+    pub fields: Vec<(A, parser::Identifier, Pattern<A, Id>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -280,11 +282,11 @@ where
         write!(f, "{{ ")?;
 
         let mut fields = fields.iter();
-        if let Some((field, pattern)) = fields.next() {
+        if let Some((_, field, pattern)) = fields.next() {
             write!(f, "{field}: {pattern}")?;
         }
 
-        for (field, pattern) in fields {
+        for (_, field, pattern) in fields {
             write!(f, "; {field}: {pattern}")?;
         }
 

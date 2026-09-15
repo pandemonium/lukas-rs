@@ -87,3 +87,6 @@ bind :: ∀α β. (α -> Perhaps β) -> Perhaps α -> Perhaps β :=
 zip :: ∀α β. Perhaps α -> Perhaps β -> Perhaps (α, β) :=
   let tuple = λa b. a, b in
   liftA2 tuple
+
+or_default :: ∀α. (Unit -> α) -> Perhaps α -> α :=
+  λdefault pa. deconstruct pa into This a -> a | _ -> default ()

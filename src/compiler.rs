@@ -17,7 +17,7 @@ use crate::{
     lexer::LexicalAnalyzer,
     parser::{self, ParseError, ParseInfo, Parsed},
     phase, source_map,
-    typer::TypeError,
+    typer::{Elaborated, TypeError, TypeErrors, Types},
 };
 
 pub type CompilationUnit = ast::CompilationUnit<ParseInfo>;
@@ -27,11 +27,29 @@ pub enum CompilationError {
     #[error("parse error in {}: {error}", .path.display())]
     ParseError { path: PathBuf, error: ParseError },
 
+    /// A file with more than one syntax error in it. The parser resynchronises on
+    /// the next declaration, so one broken line no longer hides the next.
+    #[error("parse error in {}: {}", .path.display(), first(errors))]
+    ParseErrors {
+        path: PathBuf,
+        errors: Vec<ParseError>,
+    },
+
     #[error("name error: {0}")]
     NameError(#[from] Located<NameError>),
 
+    /// Name resolution ran over every declaration and found several. Declarations
+    /// are independent, so one unresolved name does not hide the next.
+    #[error("name error: {}", first_name_error(.0))]
+    NameErrors(Vec<Located<NameError>>),
+
     #[error("type error: {0}")]
     TypeError(#[from] Located<TypeError>),
+
+    /// Elaboration ran to the end and found several. Terms are typed independently,
+    /// so one failing does not hide the next.
+    #[error("type error: {0}")]
+    TypeErrors(#[from] TypeErrors),
 
     #[error("interpretation error: {0}")]
     InterpretationError(#[from] RuntimeError),
@@ -74,6 +92,24 @@ where
 {
     pub parse_info: ParseInfo,
     pub error: Box<E>,
+}
+
+/// The error a terminal shows when a file has several: the first, plus a count.
+fn first(errors: &[ParseError]) -> String {
+    match errors.split_first() {
+        Some((first, [])) => first.to_string(),
+        Some((first, rest)) => format!("{first}\n(and {} more)", rest.len()),
+        None => "parse error".to_owned(),
+    }
+}
+
+/// What a list of name errors says when only one line is available for it.
+fn first_name_error(errors: &[Located<NameError>]) -> String {
+    match errors.split_first() {
+        Some((first, [])) => first.to_string(),
+        Some((first, rest)) => format!("{first}\n(and {} more)", rest.len()),
+        None => "no name errors".to_owned(),
+    }
 }
 
 pub trait LocatedError
@@ -187,7 +223,8 @@ impl Compiler {
         })?;
         let symbols = crate::profile::time("front end: desugar", || symbols.desugar());
         let resolved_symbols =
-            crate::profile::time("front end: resolve names", || symbols.resolve_names())?;
+            crate::profile::time("front end: resolve names", || symbols.resolve_names())
+                .map_err(CompilationError::NameErrors)?;
 
         let dependencies = crate::profile::time("front end: dependency graph", || {
             resolved_symbols.dependency_matrix()
@@ -232,29 +269,98 @@ impl Compiler {
         }
     }
 
-    pub fn typecheck_and_compile(&self, program: CompilationUnit) -> Compilation<()> {
+    /// The whole front end and nothing else: parse the program, resolve its names,
+    /// type-check it. This is what an editor asks for -- there is nothing to emit
+    /// when the question is only "is this program well-formed, and if not, where?"
+    pub fn check(&self) -> Compilation<phase::SymbolTable<Types>> {
+        let program =
+            crate::profile::time("pipeline: parse root", || self.parse_compilation_unit())?;
+        self.check_compilation_unit(program)
+    }
+
+    /// `check` for an already-parsed unit. `typecheck_and_compile` runs this and then
+    /// a back end, so what an editor checks and what the compiler compiles cannot
+    /// drift apart.
+    pub fn check_compilation_unit(
+        &self,
+        program: CompilationUnit,
+    ) -> Compilation<phase::SymbolTable<Types>> {
+        self.check_reusing(program, &Elaborated::default())
+            .map(|(symbols, _)| symbols)
+    }
+
+    /// `check_compilation_unit`, reusing what a previous check of this program
+    /// worked out. `warm` carries a digest of the source text every declaration
+    /// was elaborated from, so this check decides for itself what is still true --
+    /// which after a keystroke is everything but one declaration and its readers.
+    /// Returns what the next check can reuse in turn.
+    pub fn check_reusing(
+        &self,
+        program: CompilationUnit,
+        warm: &Elaborated,
+    ) -> Compilation<(phase::SymbolTable<Types>, Elaborated)> {
         let symbols = crate::profile::time("front end: import modules", || {
             namer::SymbolTable::import_compilation_unit(program)
         })?;
         let symbols = crate::profile::time("front end: desugar", || symbols.desugar());
         let resolved_symbols =
-            crate::profile::time("front end: resolve names", || symbols.resolve_names())?;
+            crate::profile::time("front end: resolve names", || symbols.resolve_names())
+                .map_err(CompilationError::NameErrors)?;
 
         let dependencies = crate::profile::time("front end: dependency graph", || {
             resolved_symbols.dependency_matrix()
         });
 
-        if dependencies.are_sound() {
-            //            let program = compilation
-            //                .elaborate_compilation_unit()?
-            //                .closure_conversion()
-            //                .lambda_lift();
+        if !dependencies.are_sound() {
+            return Err(bad_dependencies(&dependencies));
+        }
 
-            let program = crate::profile::time("type checker: total", || {
-                resolved_symbols.elaborate_compilation_unit()
-            })?
-            .stamp_enclosing_terms();
+        let (symbols, reusable) = crate::profile::time("type checker: total", || {
+            resolved_symbols.elaborate_compilation_unit_reusing(warm)
+        })?;
 
+        Ok((symbols, reusable))
+    }
+
+    /// An editor check which types through unresolved term names as `???` while
+    /// returning their diagnostics. This supplies inferred types for hover and code
+    /// actions without making unresolved names valid in ordinary compilation.
+    pub fn check_reusing_unknown_terms(
+        &self,
+        program: CompilationUnit,
+        warm: &Elaborated,
+    ) -> Compilation<(
+        phase::SymbolTable<Types>,
+        Elaborated,
+        Vec<Located<NameError>>,
+    )> {
+        let symbols = crate::profile::time("front end: import modules", || {
+            namer::SymbolTable::import_compilation_unit(program)
+        })?;
+        let symbols = crate::profile::time("front end: desugar", || symbols.desugar());
+        let (resolved_symbols, name_errors) =
+            crate::profile::time("front end: resolve names", || {
+                symbols.resolve_names_recovering_unknown_terms()
+            })
+            .map_err(CompilationError::NameErrors)?;
+
+        let dependencies = crate::profile::time("front end: dependency graph", || {
+            resolved_symbols.dependency_matrix()
+        });
+        if !dependencies.are_sound() {
+            return Err(bad_dependencies(&dependencies));
+        }
+
+        let (symbols, reusable) = crate::profile::time("type checker: total", || {
+            resolved_symbols.elaborate_compilation_unit_reusing(warm)
+        })?;
+        Ok((symbols, reusable, name_errors))
+    }
+
+    pub fn typecheck_and_compile(&self, program: CompilationUnit) -> Compilation<()> {
+        let program = self.check_compilation_unit(program)?;
+
+        {
             if std::env::var("DUMP_C").is_ok() {
                 // Dependency-resolvable order lives on the pre-closure table;
                 // lambda_lift emits globals in it so eager top-level values are
@@ -341,8 +447,6 @@ impl Compiler {
             }
 
             Ok(())
-        } else {
-            Err(bad_dependencies(&dependencies))
         }
     }
 
@@ -412,10 +516,11 @@ impl Compiler {
 }
 
 fn load_and_parse_module(source_path: PathBuf) -> Compilation<Vec<ast::Declaration<ParseInfo>>> {
+    // Through the source map, so an editor's unsaved buffer stands in for the file.
     let source_text = crate::profile::time_if_slow(
         format!("module read: {}", source_path.display()),
         10.0,
-        || fs::read_to_string(&source_path),
+        || source_map::read(&source_path),
     )?;
     let source = source_text.chars().collect::<Vec<_>>();
 
@@ -439,12 +544,18 @@ fn load_and_parse_module(source_path: PathBuf) -> Compilation<Vec<ast::Declarati
 
         let mut parser = parser::Parser::from_tokens(tokens);
 
-        let declarations = crate::profile::time_if_slow(
+        let (declarations, errors) = crate::profile::time_if_slow(
             format!("module parse: {}", source_path.display()),
             10.0,
-            || parser.parse_declaration_list(),
-        )
-        .map_err(attach)?;
+            || parser.parse_declaration_list_recovering(),
+        );
+
+        if !errors.is_empty() {
+            return Err(CompilationError::ParseErrors {
+                path: source_path.clone(),
+                errors,
+            });
+        }
 
         // A fully-parsed module leaves only the `End` sentinel. Any other leftover
         // token means the declaration loop desynced (usually an unexpected layout

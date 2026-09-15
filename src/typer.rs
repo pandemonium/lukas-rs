@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     hash::{Hash, Hasher},
     marker::PhantomData,
@@ -31,9 +32,39 @@ use crate::{
         },
     },
     compiler::{Located, LocatedError},
+    hash::{HashMap, HashSet},
+    lexer::SourceLocation,
     parser::{self, ParseInfo},
     phase::{self, Phase},
+    source_map::{self, FileId},
 };
+
+/// What one elaboration leaves behind that a later one can start from: the type it
+/// inferred for each free term, the terms it finished elaborating, and a digest of
+/// the source text each declaration was elaborated from.
+///
+/// A compiler run has no use for this -- it elaborates once and exits. A language
+/// server does: it re-checks the same program after every keystroke, and almost
+/// none of it changed. The digests are what makes that decidable per declaration:
+/// see `reusable_symbols`.
+#[derive(Clone, Debug, Default)]
+pub struct Elaborated {
+    terms: HashMap<QualifiedName, TypeScheme>,
+    symbols: HashMap<SymbolName, Symbol<TypeInfo, QualifiedName, Identifier>>,
+    digests: HashMap<SymbolName, u64>,
+}
+
+impl Elaborated {
+    pub fn is_empty(&self) -> bool {
+        self.symbols.is_empty()
+    }
+
+    /// How many terms are carried over -- the number of `type term:` entries a
+    /// warm elaboration does not have to pay for again.
+    pub fn len(&self) -> usize {
+        self.symbols.len()
+    }
+}
 
 pub struct Types;
 
@@ -72,7 +103,7 @@ fn is_generalizable_value<A, Id>(expr: &ast::Expr<A, Id>) -> bool {
             .all(|element| is_generalizable_value(element)),
         ast::Expr::Record(_, Record { fields }) => fields
             .iter()
-            .all(|(_, value)| is_generalizable_value(value)),
+            .all(|(_, _, value)| is_generalizable_value(value)),
         ast::Expr::Inject(_, Injection { arguments, .. }) => arguments
             .iter()
             .all(|argument| is_generalizable_value(argument)),
@@ -177,9 +208,14 @@ impl<A> namer::SymbolTable<A, namer::QualifiedName, namer::Identifier> {
 
 impl phase::SymbolTable<Types> {
     /// Preserve the source-level owner of every expression for runtime diagnostics.
+    ///
+    /// Rewriting a term's annotations rebuilds its whole tree, so a term that was
+    /// carried over from an earlier check -- and stamped then -- is left alone.
     pub fn stamp_enclosing_terms(mut self) -> Self {
         for symbol in self.symbols.values_mut() {
-            if let namer::Symbol::Term(term) = symbol {
+            if let namer::Symbol::Term(term) = symbol
+                && term.body.annotation().enclosing_term.as_ref() != Some(&term.name)
+            {
                 let owner = term.name.clone();
                 term.body = term.body.map_annotation(&|info| {
                     let mut info = info.clone();
@@ -363,7 +399,23 @@ fn classify_self_reference(body: &UntypedExpr, own: &QualifiedName) -> SelfRefer
 }
 
 impl phase::SymbolTable<Named> {
-    pub fn elaborate_compilation_unit(mut self) -> Typing<phase::SymbolTable<Types>> {
+    pub fn elaborate_compilation_unit(self) -> Elaborating<phase::SymbolTable<Types>> {
+        self.elaborate_compilation_unit_reusing(&Elaborated::default())
+            .map(|(symbols, _)| symbols)
+    }
+
+    /// Elaborate, starting from what `warm` already worked out, and hand back what
+    /// the next elaboration could start from in turn.
+    ///
+    /// What is worth carrying is decided per declaration, by comparing the source
+    /// text each symbol was elaborated from against what is there now -- see
+    /// `reusable_symbols`. A compiler run passes an empty `warm` and carries
+    /// nothing; an editor passes the last check's result and carries everything the
+    /// programmer did not touch, which after a keystroke is nearly all of it.
+    pub fn elaborate_compilation_unit_reusing(
+        mut self,
+        warm: &Elaborated,
+    ) -> Elaborating<(phase::SymbolTable<Types>, Elaborated)> {
         crate::profile::time("type checker: check signature cycles", || {
             self.check_supersignature_acyclicity()
         })?;
@@ -383,24 +435,221 @@ impl phase::SymbolTable<Named> {
             self.elaborate_constraints(&mut ctx)
         })?;
 
+        // Everything `warm` already knows that this program still says. A term whose
+        // type is already in the context is skipped by `type_terms`, and its
+        // elaborated body is seeded below.
+        let digests = crate::profile::time("type checker: declaration digests", || {
+            self.declaration_digests()
+        });
+        let carried = crate::profile::time("type checker: carry over", || {
+            self.carry_over(warm, &digests)
+        });
+        for (name, scheme) in &carried.terms {
+            if ctx.terms.lookup_free(name).is_none() {
+                ctx.bind_free_term(name.clone(), scheme.clone());
+            }
+        }
+
         // This runs the term typer core
         let symbols = crate::profile::time("type checker: elaborate terms", || {
-            self.elaborate_terms(&selectors_names.iter().collect::<Vec<_>>(), &mut ctx)
+            self.elaborate_terms(
+                &selectors_names.iter().collect::<Vec<_>>(),
+                &mut ctx,
+                carried.symbols,
+            )
         })?;
 
-        Ok(SymbolTable {
-            module_members: self.module_members,
-            member_modules: self.member_modules,
-            symbols,
-            base_imports: self.base_imports,
-            module_imports: self.module_imports,
-            scope_roots: self.scope_roots,
-            foreign_terms: self.foreign_terms,
-            signatures: self.signatures,
-            witnesses: self.witnesses,
-            constructor_opacity: self.constructor_opacity,
-            member_visibility: self.member_visibility,
-        })
+        // Stamped before the snapshot rather than after the check, so that a symbol
+        // carried into a later elaboration arrives already stamped and that check
+        // does not rebuild its tree to say the same thing again.
+        let elaborated = crate::profile::time("type checker: stamp enclosing terms", || {
+            SymbolTable {
+                declaration_sites: self.declaration_sites,
+                module_members: self.module_members,
+                member_modules: self.member_modules,
+                symbols,
+                base_imports: self.base_imports,
+                module_imports: self.module_imports,
+                scope_roots: self.scope_roots,
+                foreign_terms: self.foreign_terms,
+                signatures: self.signatures,
+                witnesses: self.witnesses,
+                constructor_opacity: self.constructor_opacity,
+                member_visibility: self.member_visibility,
+            }
+            .stamp_enclosing_terms()
+        });
+
+        // Everything, so the next check can pick from all of it. Which parts are
+        // still true is a question for that check, and it has the digests to
+        // answer it with.
+        let reusable_next = crate::profile::time("type checker: snapshot", || Elaborated {
+            terms: ctx.free_terms().clone(),
+            symbols: elaborated.symbols.clone(),
+            digests,
+        });
+
+        Ok((elaborated, reusable_next))
+    }
+
+    /// A digest of the source text every declaration was written as.
+    ///
+    /// The declarations of a file partition it: each one owns the text from where
+    /// it starts to where the next one starts, and whatever comes before the first
+    /// -- the `use` lines, and the layout they sit in -- is folded into all of
+    /// them, because it decides what the names in any of them mean. So every
+    /// character of a file belongs to exactly one declaration's digest, and an edit
+    /// anywhere changes at least one of them.
+    ///
+    /// A declaration the map cannot place -- one the compiler synthesised, with no
+    /// file of its own -- gets no digest. Such a symbol is carried by the module it
+    /// belongs to instead; see `reusable_symbols`.
+    fn declaration_digests(&self) -> HashMap<SymbolName, u64> {
+        use std::hash::{Hash, Hasher};
+
+        let mut by_file: HashMap<FileId, Vec<(&SymbolName, SourceLocation)>> = HashMap::default();
+        for (name, at) in &self.declaration_sites {
+            if at.file != FileId::UNKNOWN {
+                by_file
+                    .entry(at.file)
+                    .or_default()
+                    .push((name, at.location));
+            }
+        }
+
+        let mut digests = HashMap::default();
+        for (file, mut sites) in by_file {
+            sites.sort_by_key(|(_, at)| (at.row, at.column));
+            let first = sites.first().map(|(_, at)| *at);
+            let preamble =
+                source_map::digest_between(file, SourceLocation { row: 1, column: 1 }, first);
+
+            for (index, (name, from)) in sites.iter().enumerate() {
+                let to = sites.get(index + 1).map(|(_, at)| *at);
+                let (Some(preamble), Some(text)) =
+                    (preamble, source_map::digest_between(file, *from, to))
+                else {
+                    continue;
+                };
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                preamble.hash(&mut hasher);
+                text.hash(&mut hasher);
+                digests.insert((*name).clone(), hasher.finish());
+            }
+        }
+
+        digests
+    }
+
+    /// Which of `warm`'s symbols this check may take over instead of elaborating.
+    ///
+    /// A symbol survives three questions. Is its own text unchanged? Is everything
+    /// it depends on unchanged -- transitively, because a type flows along the
+    /// dependency graph? And is the program still made of the same declarations
+    /// answering to the same names?
+    ///
+    /// The last one is coarse on purpose. Adding a declaration can change what a
+    /// name in an untouched declaration *means*: resolution takes the first match
+    /// in a search order, so a new name in a visible module silently wins. Rather
+    /// than work out who could see it, a check that finds the set of declared names
+    /// changed reuses nothing. That is the cost of adding, removing or renaming a
+    /// declaration -- one full check -- and it is not what editing costs.
+    ///
+    /// Instance selection is global in the same way: a new `witness` changes what
+    /// an untouched term elaborates to, and a `signature` changes every witness of
+    /// it. Until that is understood well enough to bound, any change to one of
+    /// those, or to any type declaration, also reuses nothing.
+    fn reusable_symbols(
+        &self,
+        warm: &Elaborated,
+        digests: &HashMap<SymbolName, u64>,
+    ) -> HashSet<SymbolName> {
+        // The same declarations, by name?
+        if digests.len() != warm.digests.len()
+            || digests.keys().any(|name| !warm.digests.contains_key(name))
+        {
+            return HashSet::default();
+        }
+
+        let changed = digests
+            .iter()
+            .filter(|(name, digest)| warm.digests.get(*name) != Some(*digest))
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+
+        // A type, a signature or a witness: elaboration of everything else can turn
+        // on it, so there is nothing to be careful about here that is worth being
+        // clever about.
+        if changed.iter().any(|name| {
+            matches!(name, SymbolName::Type(..))
+                || self.witnesses.contains(name.name())
+                || self.signatures.contains(name.name())
+        }) {
+            return HashSet::default();
+        }
+
+        // Whatever changed, plus everything that reads it, however far away.
+        let dependencies = self.dependency_matrix();
+        let mut dependents: HashMap<&SymbolName, Vec<&SymbolName>> = HashMap::default();
+        for (name, reads) in dependencies.edges() {
+            for read in reads {
+                dependents.entry(read).or_default().push(name);
+            }
+        }
+
+        let mut stale = changed.into_iter().cloned().collect::<HashSet<_>>();
+        let mut frontier = stale.iter().cloned().collect::<Vec<_>>();
+        while let Some(name) = frontier.pop() {
+            for dependent in dependents.get(&name).into_iter().flatten() {
+                if stale.insert((*dependent).clone()) {
+                    frontier.push((*dependent).clone());
+                }
+            }
+        }
+
+        // A module holding a stale declaration also holds whatever the compiler
+        // synthesised from it -- a signature's selectors, a witness's dictionary --
+        // and those have no text of their own to compare.
+        let unsettled = stale
+            .iter()
+            .map(|name| name.name().module.clone())
+            .collect::<HashSet<_>>();
+
+        warm.symbols
+            .keys()
+            .filter(|name| {
+                if digests.contains_key(*name) {
+                    !stale.contains(*name)
+                } else {
+                    !unsettled.contains(&name.name().module)
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The part of a previous elaboration that still applies here.
+    fn carry_over(&self, warm: &Elaborated, digests: &HashMap<SymbolName, u64>) -> Elaborated {
+        if warm.is_empty() {
+            return Elaborated::default();
+        }
+        let reusable = self.reusable_symbols(warm, digests);
+
+        Elaborated {
+            terms: warm
+                .terms
+                .iter()
+                .filter(|(name, _)| reusable.contains(&SymbolName::Term((*name).clone())))
+                .map(|(name, scheme)| (name.clone(), scheme.clone()))
+                .collect(),
+            symbols: warm
+                .symbols
+                .iter()
+                .filter(|(name, _)| reusable.contains(*name))
+                .map(|(name, symbol)| (name.clone(), symbol.clone()))
+                .collect(),
+            digests: HashMap::default(),
+        }
     }
 
     /// The direct supersignatures of `sig` — the class names of its `|-` context,
@@ -424,7 +673,7 @@ impl phase::SymbolTable<Named> {
     /// Reject cyclic supersignature declarations (`A requires B`, `B requires A`)
     /// before any elaboration walks the super-edges.
     fn check_supersignature_acyclicity(&self) -> Typing<()> {
-        let mut done: HashSet<QualifiedName> = HashSet::new();
+        let mut done: HashSet<QualifiedName> = HashSet::default();
         let mut signatures = self.signatures.iter().cloned().collect::<Vec<_>>();
         signatures.sort();
         for sig in &signatures {
@@ -487,7 +736,7 @@ impl phase::SymbolTable<Named> {
             })
             .collect::<Vec<_>>();
         aliases.sort();
-        let mut done = HashSet::new();
+        let mut done = HashSet::default();
         for alias in aliases {
             visit(self, &alias, &mut Vec::new(), &mut done)?;
         }
@@ -523,33 +772,62 @@ impl phase::SymbolTable<Named> {
         &self,
         selector_names: &[&SymbolName],
         ctx: &mut TypingContext,
-    ) -> Typing<HashMap<SymbolName, Symbol<TypeInfo, QualifiedName, Identifier>>> {
-        let mut typed_symbols = HashMap::with_capacity(self.symbols.len());
+        // Already elaborated by a previous run and still valid: `type_terms` skips
+        // these (their types are in `ctx`), and they go straight into the result.
+        carried: HashMap<SymbolName, Symbol<TypeInfo, QualifiedName, Identifier>>,
+    ) -> Elaborating<HashMap<SymbolName, Symbol<TypeInfo, QualifiedName, Identifier>>> {
+        let mut typed_symbols = carried;
+        typed_symbols.reserve(self.symbols.len());
 
-        let witnesses = self.elaborate_witnesses(&ctx)?;
-        let witness_deps = witnesses
-            .dependency_matrix(&ctx.types)
-            .map_err(|e| e.at(ParseInfo::default()))?;
+        let witnesses =
+            crate::profile::time("type checker: witnesses", || self.elaborate_witnesses(&ctx))?;
+        let witness_deps = crate::profile::time("type checker: witness deps", || {
+            witnesses.dependency_matrix(&ctx.types)
+        })
+        .map_err(|e| e.at(ParseInfo::default()))?;
 
-        let mut deps = self.dependency_matrix();
-        deps.merge(witness_deps.map(SymbolName::Term));
+        let mut deps = crate::profile::time("type checker: term deps", || {
+            let mut deps = self.dependency_matrix();
+            deps.merge(witness_deps.map(SymbolName::Term));
+            deps
+        });
 
         let selector_names = selector_names.into_iter().copied().collect::<HashSet<_>>();
 
-        // This types and binds all terms in ctx.terms
-        let mut typed_terms = self.type_terms(
-            &mut typed_symbols,
-            deps.in_resolvable_order()
-                .iter()
-                .copied()
-                .filter(|t| !selector_names.contains(t)),
-            ctx,
-        )?;
+        // This types and binds all terms in ctx.terms. A term that fails is skipped
+        // and the rest are still typed: they were going to be typed anyway, and the
+        // editor wants all of it.
+        let mut failures = Vec::new();
+        let mut typed_terms = crate::profile::time("type checker: term bodies", || {
+            self.type_terms(
+                &mut typed_symbols,
+                deps.in_resolvable_order()
+                    .iter()
+                    .copied()
+                    .filter(|t| !selector_names.contains(t)),
+                ctx,
+                &mut failures,
+            )
+        });
 
-        self.elaborate_signature_type_constructors(ctx)?;
+        crate::profile::time("type checker: signature type constructors", || {
+            self.elaborate_signature_type_constructors(ctx)
+        })?;
 
-        let typed_selectors =
-            self.type_terms(&mut typed_symbols, selector_names.iter().copied(), ctx)?;
+        let typed_selectors = crate::profile::time("type checker: selectors", || {
+            self.type_terms(
+                &mut typed_symbols,
+                selector_names.iter().copied(),
+                ctx,
+                &mut failures,
+            )
+        });
+
+        // Everything that could be typed has been. Discharging constraints over a
+        // table with holes in it says nothing true, so stop here and report.
+        if !failures.is_empty() {
+            return Err(TypeErrors(failures));
+        }
 
         for (term_symbol, typed) in &typed_selectors {
             tracing::trace!("typed selector {} : {}", term_symbol.name, typed.tree);
@@ -557,6 +835,7 @@ impl phase::SymbolTable<Named> {
 
         typed_terms.extend(typed_selectors);
 
+        let _discharge = crate::profile::span("type checker: discharge constraints");
         for (symbol, term) in typed_terms {
             let pi = term.tree.annotation().parse_info;
 
@@ -600,12 +879,16 @@ impl phase::SymbolTable<Named> {
         Ok(typed_symbols)
     }
 
+    /// Type each term in turn, collecting the ones that fail into `failures` rather
+    /// than stopping at the first. Each term is typed against the context, not
+    /// against its neighbours' bodies, so one that fails leaves the others typeable.
     fn type_terms<'a>(
         &self,
         symbols: &mut HashMap<SymbolName, Symbol<TypeInfo, QualifiedName, Identifier>>,
         evaluation_order: impl Iterator<Item = &'a SymbolName>,
         ctx: &mut TypingContext,
-    ) -> Typing<Vec<(&TermSymbol<ParseInfo, QualifiedName, Identifier>, Typed)>> {
+        failures: &mut Vec<Located<TypeError>>,
+    ) -> Vec<(&TermSymbol<ParseInfo, QualifiedName, Identifier>, Typed)> {
         let mut typed_terms = Vec::default();
 
         for name in evaluation_order {
@@ -617,10 +900,10 @@ impl phase::SymbolTable<Named> {
             {
                 //                tracing::trace!("@@@ {} := {:?}", symbol.name, symbol.body);
                 let label = format!("type term: {}", symbol.name);
-                typed_terms.push((
-                    symbol,
-                    crate::profile::time_if_slow(label, 10.0, || self.type_term(symbol, ctx))?,
-                ))
+                match crate::profile::time_if_slow(label, 10.0, || self.type_term(symbol, ctx)) {
+                    Ok(typed) => typed_terms.push((symbol, typed)),
+                    Err(failure) => failures.push(failure),
+                }
             }
 
             if let SymbolName::Type(..) = name
@@ -629,7 +912,7 @@ impl phase::SymbolTable<Named> {
                 symbols.insert(name.clone(), Symbol::Type(symbol.clone()));
             }
         }
-        Ok(typed_terms)
+        typed_terms
     }
 
     fn elaborate_witnesses(&self, ctx: &TypingContext) -> Typing<WitnessEnvironment> {
@@ -931,7 +1214,7 @@ impl phase::SymbolTable<Named> {
     fn lift_constrained_witness_methods(&mut self, ctx: &TypingContext) {
         // Method names whose signature type carries a constraint. Ordinary methods
         // (e.g. `eq`) stay inline so the witness can discharge its own premises.
-        let mut constrained_methods: HashSet<parser::Identifier> = HashSet::new();
+        let mut constrained_methods: HashSet<parser::Identifier> = HashSet::default();
         for signature in &self.signatures {
             if let Some(tc) = ctx.types.lookup(signature)
                 && let TypeDefinition::Signature(sig) = &tc.definition().defining_symbol.definition
@@ -972,7 +1255,7 @@ impl phase::SymbolTable<Named> {
                 },
                 _ => continue,
             };
-            for (field_name, field_body) in &record.fields {
+            for (_, field_name, field_body) in &record.fields {
                 if constrained_methods.contains(field_name) {
                     let lifted_name = QualifiedName::new(
                         witness.module().clone(),
@@ -1020,7 +1303,7 @@ impl phase::SymbolTable<Named> {
                     pi,
                     Identifier::Free(lifted_name.clone().into()),
                 ));
-                for (name, value) in &mut record.fields {
+                for (_, name, value) in &mut record.fields {
                     if *name == field_name {
                         *value = reference.clone();
                     }
@@ -1033,7 +1316,7 @@ impl phase::SymbolTable<Named> {
         for signature in &self.signatures {
             let mut type_constructor = ctx
                 .types
-                .bindings
+                .bindings_mut()
                 .remove(signature)
                 .expect("internal error: constraint name does not match type constructor.");
 
@@ -1063,6 +1346,9 @@ impl phase::SymbolTable<Named> {
                     .supersignatures
                     .iter()
                     .map(|c| FieldSymbol {
+                        // Synthesised from the signature's `|-` context, so it is
+                        // written wherever the constraint is.
+                        declared_at: c.annotation,
                         name: super_field_name(&c.class),
                         type_signature: ast::TypeSignature {
                             universal_quantifiers: Vec::new(),
@@ -1078,7 +1364,7 @@ impl phase::SymbolTable<Named> {
             type_constructor = type_constructor.reelaborate(ctx)?;
 
             ctx.types
-                .bindings
+                .bindings_mut()
                 .insert(signature.clone(), type_constructor);
         }
 
@@ -1366,7 +1652,7 @@ impl phase::SymbolTable<Named> {
                     .unified_with(&inferred, &ctx.types)
                     .map_err(|e| e.at(pi))?;
                 declared.underlying = declared.underlying.apply(&Substitutions::with_confinements(
-                    capture_solution.confinements.clone(),
+                    (*capture_solution.confinements).clone(),
                 ));
                 let declared_variables = declared.underlying.variables();
                 declared.quantifiers = declared
@@ -1577,7 +1863,7 @@ fn project_super_evidence(base: Expr, path: &[(usize, Type)]) -> Expr {
 /// record it ultimately builds, returning its fields for mutation.
 fn witness_record_fields_mut(
     tree: &mut Expr,
-) -> Option<&mut Vec<(parser::Identifier, std::rc::Rc<Expr>)>> {
+) -> Option<&mut Vec<(TypeInfo, parser::Identifier, std::rc::Rc<Expr>)>> {
     match tree {
         Expr::Record(_, record) => Some(&mut record.fields),
         Expr::Ascription(_, a) => {
@@ -1912,7 +2198,7 @@ fn resolve_constraints(
         );
     }
 
-    let mut evidence = HashMap::new();
+    let mut evidence = HashMap::default();
 
     // `add_dictionary_parameter_slot` truly prepends: the last constraint added
     // becomes argument #1. Add in reverse scheme order so the finished lambda and
@@ -1997,7 +2283,11 @@ fn resolve_constraints(
         let mut super_fields = Vec::with_capacity(super_obligations.len());
         for (field, constraint) in &super_obligations {
             let dictionary = witnesses.resolve_witness(constraint, &ctx.types, &evidence)?;
-            super_fields.push((field.clone(), std::rc::Rc::new(dictionary)));
+            super_fields.push((
+                dictionary.type_info().clone(),
+                field.clone(),
+                std::rc::Rc::new(dictionary),
+            ));
         }
         if let Some(fields) = witness_record_fields_mut(&mut tree) {
             fields.extend(super_fields);
@@ -2005,7 +2295,7 @@ fn resolve_constraints(
             // TYPE, which sorts fields by name (`RecordType::from_fields`). Project
             // selectors read by that sorted ordinal, so keep the value in the same
             // order.
-            fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+            fields.sort_by(|(_, a, _), (_, b, _)| a.cmp(b));
         }
     }
 
@@ -2142,7 +2432,7 @@ fn elaborate_constraint_method_placeholders(
     // member), not the bare member. Otherwise an unrelated module function that
     // merely shares a method's name -- e.g. `State.bind` vs the `Monad` method
     // `bind` -- would be clobbered into the class selector.
-    let mut constraint_signatures: HashMap<QualifiedName, &Constraint> = HashMap::new();
+    let mut constraint_signatures: HashMap<QualifiedName, &Constraint> = HashMap::default();
 
     for c in evidence.iter() {
         let signature = c.signature(&ctx.types).expect("expr.typed");
@@ -2640,6 +2930,38 @@ impl fmt::Display for Specialization {
 
 pub type Typing<A = Typed> = Result<A, Located<TypeError>>;
 
+/// Every type error a compilation unit found, not just the one that stopped it.
+///
+/// Terms are elaborated in dependency order and each is typed on its own, so a term
+/// that fails costs the compilation that term and nothing else -- there is no reason
+/// for an editor to show one error at a time when the next is already known. A single
+/// error converts into this, so every `?` inside elaboration still reads as it did.
+#[derive(Debug)]
+pub struct TypeErrors(pub Vec<Located<TypeError>>);
+
+impl From<Located<TypeError>> for TypeErrors {
+    fn from(error: Located<TypeError>) -> Self {
+        Self(vec![error])
+    }
+}
+
+impl std::error::Error for TypeErrors {}
+
+impl fmt::Display for TypeErrors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The first is the one a terminal shows; the rest are counted, so a compile
+        // that found six problems does not print six screens by default.
+        match self.0.split_first() {
+            Some((first, [])) => write!(f, "{first}"),
+            Some((first, rest)) => write!(f, "{first}\n(and {} more)", rest.len()),
+            None => write!(f, "type error"),
+        }
+    }
+}
+
+/// Elaborating a whole compilation unit: many errors, or none.
+pub type Elaborating<A> = Result<A, TypeErrors>;
+
 #[derive(Debug, Clone)]
 pub struct TypeInfo {
     pub parse_info: ParseInfo,
@@ -2919,6 +3241,11 @@ impl RecordType {
 
     pub fn shape(&self) -> RecordShape {
         RecordShape(self.0.iter().map(|(l, _)| l.clone()).collect())
+    }
+
+    /// The fields, in the sorted order a record type stores them.
+    pub fn fields(&self) -> &[(parser::Identifier, Type)] {
+        self.0.as_slice()
     }
 
     fn apply(&self, subs: &Substitutions) -> Self {
@@ -4177,7 +4504,7 @@ impl TypeScheme {
             subst.remove(q);
         }
         for q in &self.confinement_quantifiers {
-            subst.confinements.remove(q);
+            Rc::make_mut(&mut subst.confinements).remove(q);
         }
         Self {
             quantifiers: self.quantifiers.clone(),
@@ -4204,8 +4531,8 @@ impl TypeScheme {
             })
             .collect::<Vec<_>>();
         Substitutions {
-            types,
-            confinements,
+            types: Rc::new(types),
+            confinements: Rc::new(confinements),
         }
     }
 
@@ -4227,7 +4554,7 @@ impl TypeScheme {
             .unified_with(inferred, &ctx.types)
             .map_err(|e| e.at(pi))?;
 
-        let mut witnessed = HashSet::new();
+        let mut witnessed = HashSet::default();
         for (_, fresh) in quantifiers.iter() {
             match fresh.apply(&reconciliation) {
                 Type::Variable(v) if witnessed.insert(v.clone()) => {}
@@ -4273,6 +4600,80 @@ impl TypeScheme {
             .difference(&self.confinement_quantifiers)
             .copied()
             .collect()
+    }
+}
+
+/// Every variable a substitution would have to bind to change anything in some
+/// collection of types -- a scheme, a constructor, a whole environment.
+///
+/// Environments are large and substitutions are small. Checking one program
+/// applied a substitution to the terms in scope four million times and changed
+/// nothing at all: every scheme was closed, and every application deep-copied it
+/// anyway. Asking this question first turns that into a handful of lookups and a
+/// shared pointer. It is conservative in the safe direction -- a variable listed
+/// here that is not really reachable costs a rebuild that changes nothing, while
+/// the reverse would lose a substitution.
+#[derive(Debug, Clone, Default)]
+struct Mentions {
+    types: HashSet<MetaVariable>,
+    confinements: BTreeSet<u32>,
+}
+
+impl Mentions {
+    fn of_type(ty: &Type) -> Self {
+        Self {
+            types: ty.variables(),
+            confinements: ty.confinement_variables(),
+        }
+    }
+
+    /// What `TypeScheme::apply` walks -- the underlying type and the constraints --
+    /// minus the variables the scheme binds, which `apply` removes from the
+    /// substitution before it starts.
+    fn of_scheme(scheme: &TypeScheme) -> Self {
+        let mut mentions = Self::of_type(&scheme.underlying);
+        for constraint in &scheme.constraints.0 {
+            mentions.absorb(Self::of_type(&constraint.constraint_type));
+        }
+        for quantifier in &scheme.quantifiers {
+            mentions.types.remove(quantifier);
+        }
+        for quantifier in &scheme.confinement_quantifiers {
+            mentions.confinements.remove(quantifier);
+        }
+        mentions
+    }
+
+    fn of_structure(structure: &TypeStructure) -> Self {
+        match structure {
+            TypeStructure::Monotype(ty) => Self::of_type(ty),
+            TypeStructure::PolyRecord(record) => {
+                record
+                    .0
+                    .iter()
+                    .fold(Self::default(), |mut mentions, (_, scheme)| {
+                        mentions.absorb(Self::of_scheme(scheme));
+                        mentions
+                    })
+            }
+        }
+    }
+
+    fn absorb(&mut self, other: Self) {
+        self.types.extend(other.types);
+        self.confinements.extend(other.confinements);
+    }
+
+    /// Whether `subs` binds any of these variables. A substitution replaces only
+    /// what its domain names, so if it binds none of them it is the identity on
+    /// everything they came from.
+    fn touched_by(&self, subs: &Substitutions) -> bool {
+        subs.iter()
+            .any(|(variable, _)| self.types.contains(variable))
+            || subs
+                .confinements
+                .keys()
+                .any(|variable| self.confinements.contains(variable))
     }
 }
 
@@ -4329,10 +4730,17 @@ impl Ord for MetaVariable {
 }
 
 //pub struct Substitutions(Vec<(TypeParamter, Type)>);
+/// Shared, not copied. Inference clones substitutions constantly -- typing one
+/// stdlib term made 710,510 clones copying 5.4 million bindings between them, against
+/// 3,904 compositions pushing 35,239 -- and every one of those bindings is a `Type`
+/// tree and a `MetaVariable` carrying a `Kind` tree. Behind `Rc` a clone is two
+/// refcount bumps; the copying that remains happens in `compose`, which has to build
+/// a new substitution anyway, and in `remove`, which copies only when the bindings
+/// are actually shared.
 #[derive(Debug, Default, Clone)]
 pub struct Substitutions {
-    types: Vec<(MetaVariable, Type)>,
-    confinements: BTreeMap<u32, Confinement>,
+    types: Rc<Vec<(MetaVariable, Type)>>,
+    confinements: Rc<BTreeMap<u32, Confinement>>,
 }
 
 impl Substitutions {
@@ -4395,25 +4803,34 @@ impl Substitutions {
             .collect();
 
         Substitutions {
-            types: out,
-            confinements,
+            types: Rc::new(out),
+            confinements: Rc::new(confinements),
         }
     }
 
     fn with_confinements(confinements: BTreeMap<u32, Confinement>) -> Self {
         Self {
-            types: Vec::new(),
-            confinements,
+            types: Rc::default(),
+            confinements: Rc::new(confinements),
         }
     }
 
     fn remove(&mut self, param: &MetaVariable) {
-        self.types.retain(|(tp, ..)| param != tp);
+        Rc::make_mut(&mut self.types).retain(|(tp, ..)| param != tp);
         if let Some(confinement) = param.kind().confinement() {
+            let confinements = Rc::make_mut(&mut self.confinements);
             for variable in confinement.variables() {
-                self.confinements.remove(&variable);
+                confinements.remove(&variable);
             }
         }
+    }
+}
+
+impl Deref for Substitutions {
+    type Target = [(MetaVariable, Type)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.types
     }
 }
 
@@ -4437,27 +4854,63 @@ impl fmt::Display for Substitutions {
 impl From<Vec<(MetaVariable, Type)>> for Substitutions {
     fn from(value: Vec<(MetaVariable, Type)>) -> Self {
         Self {
-            types: value,
-            confinements: BTreeMap::new(),
+            types: Rc::new(value),
+            confinements: Rc::default(),
         }
     }
 }
 
-impl Deref for Substitutions {
-    type Target = [(MetaVariable, Type)];
-
-    fn deref(&self) -> &Self::Target {
-        &self.types
-    }
-}
-
+/// The types of the terms in scope: the local stack, addressed by de Bruijn
+/// level, and every free (module-level) name.
+///
+/// `free` is shared rather than owned. It holds every term of the program and its
+/// library -- hundreds of schemes -- and a substitution can only change the ones
+/// that are still open, which after generalization is almost none. `mentions` is
+/// what makes that decision cheap.
 #[derive(Debug, Clone, Default)]
 pub struct TermEnvironment {
     bound: Vec<TypeScheme>,
-    free: HashMap<namer::QualifiedName, TypeScheme>,
+    free: Rc<HashMap<namer::QualifiedName, TypeScheme>>,
+    mentions: Rc<Mentions>,
 }
 
 impl TermEnvironment {
+    /// Bind a free term, remembering what it mentions. The set only grows: a
+    /// variable left in it after the scheme that mentioned it is gone costs at
+    /// worst a rebuild that changes nothing.
+    fn bind_free(&mut self, name: namer::QualifiedName, scheme: TypeScheme) -> Option<TypeScheme> {
+        Rc::make_mut(&mut self.mentions).absorb(Mentions::of_scheme(&scheme));
+        Rc::make_mut(&mut self.free).insert(name, scheme)
+    }
+
+    fn unbind_free(&mut self, name: &namer::QualifiedName) {
+        Rc::make_mut(&mut self.free).remove(name);
+    }
+
+    /// The free terms after `subs`, shared unchanged when it cannot reach them.
+    fn substituted_free(
+        &self,
+        subs: &Substitutions,
+    ) -> (Rc<HashMap<namer::QualifiedName, TypeScheme>>, Rc<Mentions>) {
+        if !self.mentions.touched_by(subs) {
+            return (self.free.clone(), self.mentions.clone());
+        }
+
+        let free = self
+            .free
+            .iter()
+            .map(|(name, scheme)| (name.clone(), scheme.apply(subs)))
+            .collect::<HashMap<_, _>>();
+        let mentions = free
+            .values()
+            .fold(Mentions::default(), |mut mentions, scheme| {
+                mentions.absorb(Mentions::of_scheme(scheme));
+                mentions
+            });
+
+        (Rc::new(free), Rc::new(mentions))
+    }
+
     pub fn lookup_free(&self, term: &namer::QualifiedName) -> Option<&TypeScheme> {
         self.free.get(term)
     }
@@ -4494,7 +4947,7 @@ impl TermEnvironment {
 
 impl phase::StructPattern<Named> {
     fn shape(&self) -> RecordShape {
-        RecordShape(self.fields.iter().map(|(l, ..)| l.clone()).collect())
+        RecordShape(self.fields.iter().map(|(_, l, ..)| l.clone()).collect())
     }
 }
 
@@ -4587,15 +5040,43 @@ impl CoproductIndex {
 
 #[derive(Debug, Clone, Default)]
 pub struct TypeEnvironment {
-    bindings: HashMap<namer::QualifiedName, TypeConstructor>,
+    bindings: Rc<HashMap<namer::QualifiedName, TypeConstructor>>,
+    /// What the bindings mention, computed on demand and dropped by any mutation
+    /// of them. See `Mentions`: a substitution that binds none of these variables
+    /// leaves every constructor alone, so the map is shared rather than rebuilt.
+    mentions: RefCell<Option<Rc<Mentions>>>,
     // Is this the best datatype for this?
-    record_shapes: RecordShapeIndex,
-    coproduct_constructors: CoproductIndex,
+    record_shapes: Rc<RecordShapeIndex>,
+    coproduct_constructors: Rc<CoproductIndex>,
 }
 
 impl TypeEnvironment {
     fn bind(&mut self, name: namer::QualifiedName, tc: TypeConstructor) {
-        self.bindings.insert(name, tc);
+        self.bindings_mut().insert(name, tc);
+    }
+
+    /// The bindings, to change. Whatever the caller does to them, what they
+    /// mention is no longer known.
+    fn bindings_mut(&mut self) -> &mut HashMap<namer::QualifiedName, TypeConstructor> {
+        *self.mentions.borrow_mut() = None;
+        Rc::make_mut(&mut self.bindings)
+    }
+
+    fn mentions(&self) -> Rc<Mentions> {
+        let known = self.mentions.borrow().clone();
+        known.unwrap_or_else(|| {
+            let mentions = Rc::new(self.bindings.values().fold(
+                Mentions::default(),
+                |mut mentions, constructor| {
+                    if let TypeConstructor::Elaborated(constructor) = constructor {
+                        mentions.absorb(Mentions::of_structure(&constructor.structure));
+                    }
+                    mentions
+                },
+            ));
+            *self.mentions.borrow_mut() = Some(mentions.clone());
+            mentions
+        })
     }
 
     pub fn lookup(&self, name: &namer::QualifiedName) -> Option<&TypeConstructor> {
@@ -4603,7 +5084,7 @@ impl TypeEnvironment {
     }
 
     pub fn lookup_mut(&mut self, name: &namer::QualifiedName) -> Option<&mut TypeConstructor> {
-        self.bindings.get_mut(name)
+        self.bindings_mut().get_mut(name)
     }
 
     fn normalize_alias(&self, ty: &Type) -> Result<Option<Type>, TypeError> {
@@ -4710,12 +5191,18 @@ impl TypeEnvironment {
     }
 
     fn apply(&self, subs: &Substitutions) -> Self {
+        if !self.mentions().touched_by(subs) {
+            return self.clone();
+        }
+
         Self {
-            bindings: self
-                .bindings
-                .iter()
-                .map(|(id, tc)| (id.clone(), tc.apply(subs)))
-                .collect(),
+            bindings: Rc::new(
+                self.bindings
+                    .iter()
+                    .map(|(id, tc)| (id.clone(), tc.apply(subs)))
+                    .collect(),
+            ),
+            mentions: RefCell::new(None),
             record_shapes: self.record_shapes.clone(),
             coproduct_constructors: self.coproduct_constructors.clone(),
         }
@@ -4850,11 +5337,13 @@ impl TypingContext {
 
     // Why isn't this fucker &mut self?
     pub fn apply(&self, subs: &Substitutions) -> Self {
+        let (free, mentions) = self.terms.substituted_free(subs);
         Self {
             types: self.types.apply(subs),
             terms: TermEnvironment {
                 bound: Self::substitute_bound(&self.terms.bound, subs),
-                free: Self::substitute_free(&self.terms.free, subs),
+                free,
+                mentions,
             },
         }
     }
@@ -4868,20 +5357,10 @@ impl TypingContext {
         terms.iter().map(|ty| ty.apply(subst)).collect()
     }
 
-    fn substitute_free(
-        terms: &HashMap<namer::QualifiedName, TypeScheme>,
-        subs: &Substitutions,
-    ) -> HashMap<namer::QualifiedName, TypeScheme> {
-        terms
-            .iter()
-            .map(|(k, v)| (k.clone(), v.apply(subs)))
-            .collect()
-    }
-
     fn elaborate_type_constructors(&mut self) -> Typing<()> {
         let alt_ctx = self.clone();
 
-        for constructor in self.types.bindings.values_mut() {
+        for constructor in self.types.bindings_mut().values_mut() {
             // This means that the elaboration phase does not
             // see its own results
             constructor.elaborate(&alt_ctx)?;
@@ -4890,14 +5369,14 @@ impl TypingContext {
         for constructor in self.types.bindings.values() {
             if let TypeConstructor::Elaborated(constructor) = constructor {
                 match &constructor.structure {
-                    TypeStructure::PolyRecord(record_type) => self
-                        .types
-                        .record_shapes
-                        .insert(record_type.shape(), constructor.definition.name.clone()),
+                    TypeStructure::PolyRecord(record_type) => {
+                        Rc::make_mut(&mut self.types.record_shapes)
+                            .insert(record_type.shape(), constructor.definition.name.clone())
+                    }
 
                     TypeStructure::Monotype(Type::Coproduct(coproduct)) => {
                         for (constructor_name, _) in &coproduct.0 {
-                            self.types.coproduct_constructors.insert(
+                            Rc::make_mut(&mut self.types.coproduct_constructors).insert(
                                 constructor_name.clone(),
                                 constructor.definition.name.clone(),
                             );
@@ -4916,8 +5395,13 @@ impl TypingContext {
         self.types.bind(name, constructor);
     }
 
+    /// Every free term's inferred type, for carrying an elaboration forward.
+    pub fn free_terms(&self) -> &HashMap<namer::QualifiedName, TypeScheme> {
+        &self.terms.free
+    }
+
     pub fn bind_free_term(&mut self, name: namer::QualifiedName, scheme: TypeScheme) {
-        self.terms.free.insert(name, scheme);
+        self.terms.bind_free(name, scheme);
     }
 
     pub fn bind_term(&mut self, name: Identifier, scheme: TypeScheme) {
@@ -4951,12 +5435,12 @@ impl TypingContext {
             }
 
             namer::Identifier::Free(id) => {
-                let previous = self.terms.free.insert(*id.clone(), scheme);
+                let previous = self.terms.bind_free(*id.clone(), scheme);
                 let v = block(self);
                 if let Some(previous) = previous {
-                    self.terms.free.insert(*id, previous);
+                    self.terms.bind_free(*id, previous);
                 } else {
-                    self.terms.free.remove(&id);
+                    self.terms.unbind_free(&id);
                 }
                 v
             }
@@ -5097,11 +5581,11 @@ impl TypingContext {
                         |ctx| {
                             let typed_body = ctx.check_expr(codomain, &rec.lambda.body)?;
 
-                            let body = typed_body.tree.apply(&typed_body.substitutions);
                             let actual_capture = ctx.lambda_capture_confinement(
                                 &rec.lambda.parameter,
                                 Some(&rec.own_name),
-                                &body,
+                                &typed_body.tree,
+                                &typed_body.substitutions,
                             )?;
                             let expected_capture =
                                 capture.apply(&typed_body.substitutions.confinements);
@@ -5122,7 +5606,7 @@ impl TypingContext {
                                         own_name: rec.own_name.clone(),
                                         lambda: Lambda {
                                             parameter: rec.lambda.parameter.clone(),
-                                            body: body.apply(&substitutions).into(),
+                                            body: typed_body.tree.apply(&substitutions).into(),
                                         },
                                     },
                                 ),
@@ -5159,9 +5643,12 @@ impl TypingContext {
                 |ctx| {
                     let body = ctx.check_expr(codomain, &lambda.body)?;
 
-                    let typed_body = body.tree.apply(&body.substitutions);
-                    let actual_capture =
-                        ctx.lambda_capture_confinement(&lambda.parameter, None, &typed_body)?;
+                    let actual_capture = ctx.lambda_capture_confinement(
+                        &lambda.parameter,
+                        None,
+                        &body.tree,
+                        &body.substitutions,
+                    )?;
                     let expected_capture = capture.apply(&body.substitutions.confinements);
                     let capture_substitutions = expected_capture
                         .unify(&actual_capture.joined)
@@ -5178,7 +5665,7 @@ impl TypingContext {
                             type_info,
                             Lambda {
                                 parameter: lambda.parameter.clone(),
-                                body: typed_body.apply(&substitutions).into(),
+                                body: body.tree.apply(&substitutions).into(),
                             },
                         ),
                     ))
@@ -5220,7 +5707,11 @@ impl TypingContext {
                 let mut expected_types = Vec::with_capacity(record_type.len());
 
                 if record.fields.len() != record_type.len() {
-                    let lhs = record.fields.iter().map(|(l, _)| l).collect::<HashSet<_>>();
+                    let lhs = record
+                        .fields
+                        .iter()
+                        .map(|(_, l, _)| l)
+                        .collect::<HashSet<_>>();
                     let rhs = record_type.fields().map(|(l, _)| l).collect::<HashSet<_>>();
 
                     let missing_bindings = rhs.difference(&lhs);
@@ -5232,12 +5723,12 @@ impl TypingContext {
                     .at(pi))?;
                 }
 
-                for ((name, expr), (_, expected_scheme)) in
+                for ((label_at, name, expr), (_, expected_scheme)) in
                     record.fields.iter().zip(record_type.fields())
                 {
                     let expected_field_type = expected_scheme.instantiate();
                     let typed = self.check_expr(&expected_field_type.underlying, expr)?;
-                    expected_types.push((name.clone(), expected_field_type.underlying));
+                    expected_types.push((name.clone(), expected_field_type.underlying.clone()));
                     subst = subst.compose(&typed.substitutions);
 
                     // A method whose signature carries its own constraint (e.g.
@@ -5250,7 +5741,11 @@ impl TypingContext {
                     if expected_field_type.constraints.is_empty() {
                         constraints = constraints.union(typed.constraints.apply(&subst));
                     }
-                    typed_fields.push((name.clone(), typed.tree.into()));
+                    typed_fields.push((
+                        label_at.with_inferred_type(expected_field_type.underlying.clone()),
+                        name.clone(),
+                        typed.tree.into(),
+                    ));
                 }
 
                 // This is wrong - it must be a spine
@@ -5328,6 +5823,7 @@ impl TypingContext {
             let mut current = base_type.clone();
             let mut indices = Vec::with_capacity(field.path.len());
             let mut arities = Vec::with_capacity(field.path.len());
+            let mut segment_types = Vec::with_capacity(field.path.len());
             for name in &field.path {
                 let structure = self
                     .expand_type_constructor(pi, &current.apply(&substitutions))?
@@ -5349,6 +5845,8 @@ impl TypingContext {
                 indices.push(index);
                 arities.push(record.len());
                 current = scheme.instantiate().underlying;
+                // What this segment selects, for the label's own annotation.
+                segment_types.push(current.clone());
             }
 
             let typed = self.check_expr(&current.apply(&substitutions), &field.value)?;
@@ -5358,6 +5856,14 @@ impl TypingContext {
                 .union(typed.constraints.apply(&substitutions));
             typed_fields.push(ast::RecordUpdateField {
                 path: field.path.clone(),
+                // The label positions come through unchanged; they are where the
+                // programmer wrote each segment, whatever the typer worked out.
+                path_at: field
+                    .path_at
+                    .iter()
+                    .zip(&segment_types)
+                    .map(|(at, selected)| at.with_inferred_type(selected.clone()))
+                    .collect(),
                 indices,
                 arities,
                 value: typed.tree.into(),
@@ -6030,7 +6536,7 @@ impl TypingContext {
                 let mut arguments = Vec::with_capacity(record.len());
                 let mut substitutions = Substitutions::default();
 
-                for ((pattern_field, pattern), (scrutinee_field, scrutinee)) in
+                for ((label_at, pattern_field, pattern), (scrutinee_field, scrutinee)) in
                     (pattern.fields).iter().zip(record.fields())
                 {
                     if pattern_field != scrutinee_field {
@@ -6041,9 +6547,13 @@ impl TypingContext {
                         .at(*pi))?;
                     }
 
-                    let (subst, pattern) =
-                        self.check_pattern(pattern, bindings, &scrutinee.instantiate().underlying)?;
-                    arguments.push((pattern_field.clone(), pattern));
+                    let field_type = scrutinee.instantiate().underlying;
+                    let (subst, pattern) = self.check_pattern(pattern, bindings, &field_type)?;
+                    arguments.push((
+                        label_at.with_inferred_type(field_type),
+                        pattern_field.clone(),
+                        pattern,
+                    ));
                     substitutions = substitutions.compose(&subst);
                 }
 
@@ -6207,9 +6717,9 @@ impl TypingContext {
         let mut fields = Vec::with_capacity(record.fields.len());
         let mut constraints = ConstraintSet::default();
 
-        for (label, initializer) in &record.fields {
+        for (label_at, label, initializer) in &record.fields {
             let typed_field = self.infer_expr(initializer)?;
-            fields.push((label, typed_field.tree));
+            fields.push((*label_at, label, typed_field.tree));
             substitutions = substitutions.compose(&typed_field.substitutions);
             constraints = constraints
                 .apply(&substitutions)
@@ -6218,16 +6728,26 @@ impl TypingContext {
 
         let fields = fields
             .iter()
-            .map(|(label, e)| ((*label).clone(), e.apply(&substitutions).into()))
+            .map(|(label_at, label, e)| {
+                let value: Tree<TypeInfo, namer::Identifier> = e.apply(&substitutions).into();
+                let field_type = value.type_info().inferred_type.clone();
+                (
+                    label_at.with_inferred_type(field_type),
+                    (*label).clone(),
+                    value,
+                )
+            })
             .collect::<Vec<_>>();
 
         let record_type = RecordType::from_fields(
             &fields
                 .iter()
                 .map(
-                    |(label, e): &(parser::Identifier, Tree<TypeInfo, namer::Identifier>)| {
-                        (label.clone(), e.type_info().inferred_type.clone())
-                    },
+                    |(_, label, e): &(
+                        TypeInfo,
+                        parser::Identifier,
+                        Tree<TypeInfo, namer::Identifier>,
+                    )| { (label.clone(), e.type_info().inferred_type.clone()) },
                 )
                 .collect::<Vec<_>>(),
         );
@@ -6268,7 +6788,7 @@ impl TypingContext {
 
         tracing::trace!("base {base_type} expanded {expanded_base_type}");
 
-        for (k, v) in &self.types.bindings {
+        for (k, v) in self.types.bindings.iter() {
             tracing::trace!("{k} is {v}");
         }
 
@@ -6508,7 +7028,7 @@ impl TypingContext {
 
                         let substitutions = typed.substitutions.compose(&s_codomain);
                         let tree = typed.tree.apply(&substitutions);
-                        let actual_capture = ctx.lambda_capture_confinement(
+                        let actual_capture = ctx.lambda_capture_confinement_of(
                             &rec_lambda.lambda.parameter,
                             Some(&rec_lambda.own_name),
                             &tree,
@@ -6799,10 +7319,7 @@ impl TypingContext {
         // itself be explained further, it is the leaf we are looking for.
         let step = |label: String, field: &Type| -> Option<(Vec<String>, Type)> {
             confined(field).then(|| match self.confinement_path(field, pi, fuel - 1) {
-                Some((rest, leaf)) => (
-                    std::iter::once(label.clone()).chain(rest).collect(),
-                    leaf,
-                ),
+                Some((rest, leaf)) => (std::iter::once(label.clone()).chain(rest).collect(), leaf),
                 None => (vec![label], field.clone()),
             })
         };
@@ -6812,9 +7329,9 @@ impl TypingContext {
             // A declared record expands to its field schemes rather than a
             // structural record type.
             Ok(Some(TypeStructure::PolyRecord(record))) => {
-                return record.fields().find_map(|(name, scheme)| {
-                    step(name.to_string(), &scheme.underlying)
-                });
+                return record
+                    .fields()
+                    .find_map(|(name, scheme)| step(name.to_string(), &scheme.underlying));
             }
             _ => return None,
         };
@@ -6862,11 +7379,7 @@ impl TypingContext {
         {
             let pi = argument.annotation().parse_info;
             return TypeError::ConfinementRequirement {
-                path: ConfinementPath(self.confinement_path(
-                    &ty,
-                    pi,
-                    Self::CONFINEMENT_PATH_DEPTH,
-                )),
+                path: ConfinementPath(self.confinement_path(&ty, pi, Self::CONFINEMENT_PATH_DEPTH)),
                 ty,
                 actual,
                 required,
@@ -6884,14 +7397,12 @@ impl TypingContext {
             }
             let (parameter, body, own) = match expression {
                 Expr::Lambda(_, lambda) => (&lambda.parameter, &lambda.body, None),
-                Expr::RecursiveLambda(_, rec) => (
-                    &rec.lambda.parameter,
-                    &rec.lambda.body,
-                    Some(&rec.own_name),
-                ),
+                Expr::RecursiveLambda(_, rec) => {
+                    (&rec.lambda.parameter, &rec.lambda.body, Some(&rec.own_name))
+                }
                 _ => return,
             };
-            if let Ok(captures) = self.lambda_capture_confinement(parameter, own, body) {
+            if let Ok(captures) = self.lambda_capture_confinement_of(parameter, own, body) {
                 blamed = captures.confined().cloned();
             }
         });
@@ -6909,11 +7420,27 @@ impl TypingContext {
         }
     }
 
+    /// `lambda_capture_confinement` for a body that already carries its
+    /// substitution -- one that had to be built for other reasons anyway.
+    fn lambda_capture_confinement_of(
+        &self,
+        parameter: &namer::Identifier,
+        ignored_capture: Option<&namer::Identifier>,
+        body: &phase::Expr<Types>,
+    ) -> Typing<CaptureConfinement> {
+        self.lambda_capture_confinement(parameter, ignored_capture, body, &Substitutions::default())
+    }
+
+    /// `subs` is applied to the captured variables' types as they are read, rather
+    /// than to the body beforehand. The walk visits every node but only a handful
+    /// are captures, so substituting the whole tree to feed this was rebuilding
+    /// thousands of annotations to look at a few.
     fn lambda_capture_confinement(
         &self,
         parameter: &namer::Identifier,
         ignored_capture: Option<&namer::Identifier>,
         body: &phase::Expr<Types>,
+        subs: &Substitutions,
     ) -> Typing<CaptureConfinement> {
         let namer::Identifier::Bound(parameter_level) = parameter else {
             return Err(TypeError::InternalAssertion(
@@ -6935,7 +7462,7 @@ impl TypingContext {
                     namer::Identifier::Free(_) => false,
                 };
                 if is_capture && ignored_capture != Some(identifier) {
-                    captures.push((type_info.parse_info, type_info.inferred_type.clone()));
+                    captures.push((type_info.parse_info, type_info.inferred_type.apply(subs)));
                 }
             }
         });
@@ -6946,9 +7473,9 @@ impl TypingContext {
                 ty.kind(&self.types)
                     .map_err(|error| error.at(parse_info))
                     .and_then(|kind| {
-                        kind.confinement().cloned().ok_or_else(|| {
-                            TypeError::ExpectedMonotypeKind { kind }.at(parse_info)
-                        })
+                        kind.confinement()
+                            .cloned()
+                            .ok_or_else(|| TypeError::ExpectedMonotypeKind { kind }.at(parse_info))
                     })
                     .map(|confinement| Capture {
                         parse_info,
@@ -6997,7 +7524,7 @@ impl TypingContext {
                 substitutions = substitutions.compose(&unify_subs);
 
                 let body = body.apply(&substitutions);
-                let capture = ctx.lambda_capture_confinement(&lambda.parameter, None, &body)?;
+                let capture = ctx.lambda_capture_confinement_of(&lambda.parameter, None, &body)?;
 
                 let inferred_type = Type::Arrow {
                     capture: capture.joined,
@@ -7134,7 +7661,25 @@ impl TypingContext {
     }
 
     fn infer_binding(&mut self, pi: ParseInfo, binding: &phase::Binding<Named>) -> Typing {
-        let typed_bound = self.infer_expr(&binding.bound)?;
+        let before_bound = self.clone();
+        let typed_bound = match self.infer_expr(&binding.bound) {
+            Ok(typed) => typed,
+            Err(error)
+                if !is_generalizable_value(binding.bound.as_ref())
+                    && matches!(*error.error, TypeError::AmbiguousRecordProjection { .. }) =>
+            {
+                // An expansive binding is monomorphic, so its uses in the body and
+                // its definition share one type. Infer the body first when an
+                // overloaded record field is the only thing preventing the
+                // definition from being inferred: a later, unique projection can
+                // then fix the base (`x.Defense` followed by `x.Hit_Points`).
+                // Restore the context because inference is allowed to substitute it
+                // before discovering the ambiguity.
+                *self = before_bound;
+                return self.infer_monomorphic_binding_from_body(pi, binding);
+            }
+            Err(error) => return Err(error),
+        };
         let mut ctx1 = self.apply(&typed_bound.substitutions);
 
         let bound_type = typed_bound.as_constrained_type().generalize(&ctx1);
@@ -7196,6 +7741,44 @@ impl TypingContext {
                 ),
             ))
         })
+    }
+
+    fn infer_monomorphic_binding_from_body(
+        &mut self,
+        pi: ParseInfo,
+        binding: &phase::Binding<Named>,
+    ) -> Typing {
+        let bound_type = Type::fresh();
+        let typed_body = self.bind_term_and_then(
+            binding.binder.clone(),
+            TypeScheme::from_constant(bound_type.clone()),
+            |ctx| ctx.infer_expr(&binding.body),
+        )?;
+
+        let mut bound_ctx = self.apply(&typed_body.substitutions);
+        let typed_bound =
+            bound_ctx.check_expr(&bound_type.apply(&typed_body.substitutions), &binding.bound)?;
+        let substitutions = typed_body.substitutions.compose(&typed_bound.substitutions);
+        let constraints = typed_bound
+            .constraints
+            .apply(&substitutions)
+            .union(typed_body.constraints.apply(&substitutions));
+        let bound = typed_bound.tree.apply(&substitutions);
+        let body = typed_body.tree.apply(&substitutions);
+
+        Ok(Typed::computed(
+            substitutions,
+            constraints,
+            Expr::Let(
+                pi.with_inferred_type(body.type_info().inferred_type.clone()),
+                Binding {
+                    binder: binding.binder.clone(),
+                    operator: binding.operator,
+                    bound: bound.into(),
+                    body: body.into(),
+                },
+            ),
+        ))
     }
 
     #[instrument]
@@ -7326,10 +7909,14 @@ impl phase::Pattern<Types> {
     fn denotation(&self) -> Denotation {
         match self {
             Pattern::Coproduct(_, pattern) => {
-                Denotation::Structured(Shape::Coproduct(HashMap::from([(
-                    pattern.constructor.try_as_free().cloned().expect("this is what I get for having constructor be namer::Identifier when it ought to be a QualifiedName"),
-                    pattern.arguments.iter().map(|p| p.denotation()).collect(),
-                )])))
+                Denotation::Structured(Shape::Coproduct(
+                    [(
+                        pattern.constructor.try_as_free().cloned().expect("this is what I get for having constructor be namer::Identifier when it ought to be a QualifiedName"),
+                        pattern.arguments.iter().map(|p| p.denotation()).collect(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ))
             }
 
             Pattern::Tuple(_, pattern) => Denotation::Structured(Shape::Tuple(
@@ -7340,7 +7927,7 @@ impl phase::Pattern<Types> {
                 pattern
                     .fields
                     .iter()
-                    .map(|(field, pattern)| (field.clone(), pattern.denotation()))
+                    .map(|(_, field, pattern)| (field.clone(), pattern.denotation()))
                     .collect(),
             )),
 
@@ -7389,7 +7976,7 @@ impl phase::Pattern<Types> {
                     fields: pattern
                         .fields
                         .into_iter()
-                        .map(|(field, pattern)| (field, pattern.map_binders(f)))
+                        .map(|(at, field, pattern)| (at, field, pattern.map_binders(f)))
                         .collect(),
                 },
             ),
@@ -7443,7 +8030,11 @@ fn missing_witnesses(
     // Nothing left to discriminate on: a surviving row covers this branch, and an
     // empty matrix means nothing does.
     if columns.is_empty() {
-        return Ok(if matrix.is_empty() { vec![vec![]] } else { vec![] });
+        return Ok(if matrix.is_empty() {
+            vec![vec![]]
+        } else {
+            vec![]
+        });
     }
     if matrix.is_empty() {
         return Ok(vec![vec!["_".to_owned(); columns.len()]]);
@@ -7672,12 +8263,10 @@ impl MatchSpace {
             .map(|clause| vec![clause.normalize()])
             .collect();
 
-        Ok(
-            missing_witnesses(&matrix, &[scrutinee.clone()], pi, ctx)?
-                .into_iter()
-                .map(|mut witness| witness.pop().unwrap_or_else(|| "_".to_owned()))
-                .collect(),
-        )
+        Ok(missing_witnesses(&matrix, &[scrutinee.clone()], pi, ctx)?
+            .into_iter()
+            .map(|mut witness| witness.pop().unwrap_or_else(|| "_".to_owned()))
+            .collect())
     }
 
     // Record one clause and report whether it is reachable.
@@ -7965,6 +8554,47 @@ mod confinement_kind_tests {
     use crate::ast::namer::ConstructorSymbol;
     use crate::ast::{ApplyTypeExpr, TypeVariable};
 
+    /// Which of two bindings for the same variable answers a lookup? `substitution`
+    /// scans backwards, so it is the LAST one written -- the earlier entries are the
+    /// dead ones. Pinned here because `compose` relies on it: it appends `self`'s
+    /// bindings after `rhs`'s images, which is what makes `self` win.
+    #[test]
+    fn the_last_binding_of_a_variable_is_the_one_that_answers() {
+        let variable = MetaVariable::fresh();
+        let first = Type::fresh();
+        let second = Type::fresh();
+
+        let subs = Substitutions::from(vec![
+            (variable.clone(), first.clone()),
+            (variable.clone(), second.clone()),
+        ]);
+
+        assert_eq!(subs.substitution(&variable), Some(&second));
+        assert_ne!(subs.substitution(&variable), Some(&first));
+    }
+
+    /// And so, composing two substitutions that both bind one variable, the receiver
+    /// wins -- not the argument, and not the composed image of the argument.
+    #[test]
+    fn composing_lets_the_receiver_win_a_variable_both_sides_bind() {
+        let variable = MetaVariable::fresh();
+        let mine = Type::fresh();
+        let theirs = Type::fresh();
+
+        let receiver = Substitutions::from(vec![(variable.clone(), mine.clone())]);
+        let argument = Substitutions::from(vec![(variable.clone(), theirs.clone())]);
+
+        let composed = receiver.compose(&argument);
+
+        assert_eq!(composed.substitution(&variable), Some(&mine));
+        // The argument's binding is still present, just shadowed by the later one.
+        assert!(
+            composed
+                .iter()
+                .any(|(bound, image)| bound == &variable && image == &theirs)
+        );
+    }
+
     fn name(member: &str) -> QualifiedName {
         QualifiedName::new(parser::IdentifierPath::new("Test"), member)
     }
@@ -8019,10 +8649,12 @@ mod confinement_kind_tests {
                     type_parameters: vec![list_parameter],
                     constructors: vec![
                         ConstructorSymbol {
+                            declared_at: ParseInfo::default(),
                             name: name("Empty"),
                             signature: vec![],
                         },
                         ConstructorSymbol {
+                            declared_at: ParseInfo::default(),
                             name: name("Cons"),
                             signature: vec![
                                 TypeExpression::Parameter(pi, parser::Identifier::from_str("a")),
@@ -8044,6 +8676,7 @@ mod confinement_kind_tests {
                     name: mutable_name.clone(),
                     type_parameters: vec![mutable_parameter],
                     constructors: vec![ConstructorSymbol {
+                        declared_at: ParseInfo::default(),
                         name: name("Mutable"),
                         signature: vec![TypeExpression::Constructor(pi, raw_name)],
                     }],
@@ -8114,14 +8747,14 @@ mod confinement_kind_tests {
 
         assert_eq!(
             context
-                .lambda_capture_confinement(&Identifier::Bound(1), None, &body)
+                .lambda_capture_confinement_of(&Identifier::Bound(1), None, &body)
                 .unwrap()
                 .joined,
             Confinement::Confined
         );
         assert_eq!(
             context
-                .lambda_capture_confinement(&Identifier::Bound(0), None, &body)
+                .lambda_capture_confinement_of(&Identifier::Bound(0), None, &body)
                 .unwrap()
                 .joined,
             Confinement::Unconfined
@@ -8153,7 +8786,7 @@ mod confinement_kind_tests {
         );
 
         let error = expression
-            .synthesize_type(&HashMap::new(), &context)
+            .synthesize_type(&HashMap::default(), &context)
             .unwrap_err()
             .to_string();
         assert!(

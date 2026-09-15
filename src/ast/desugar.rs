@@ -198,7 +198,7 @@ impl phase::Expr<Parsed> {
                     fields: the
                         .fields
                         .into_iter()
-                        .map(|(label, e)| (label, Self::recurse(e)))
+                        .map(|(at, label, e)| (at, label, Self::recurse(e)))
                         .collect(),
                 },
             ),
@@ -211,6 +211,7 @@ impl phase::Expr<Parsed> {
                         .into_iter()
                         .map(|field| ast::RecordUpdateField {
                             path: field.path,
+                            path_at: field.path_at,
                             indices: field.indices,
                             arities: field.arities,
                             value: Self::recurse(field.value),
@@ -360,6 +361,7 @@ impl phase::SymbolTable<Parsed> {
     // This way I could probably remove the annoying TermSymbol::body
     pub fn desugar_expressions(&self) -> phase::SymbolTable<Desugared> {
         SymbolTable {
+            declaration_sites: self.declaration_sites.clone(),
             module_members: self.module_members.clone(),
             member_modules: self.member_modules.clone(),
             symbols: self

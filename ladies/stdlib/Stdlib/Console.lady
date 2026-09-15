@@ -42,9 +42,9 @@ Console_F ::= ∀β.
     Write Markup β
   | Screen Screen_Control β
   | Mode Mode_Change (Bool -> β)
-  | Read_Key Wait (Result Fault Key -> β)
-  | Read_Line Markup (Result Fault Text -> β)
-  | Read_Line_Masked Markup (Result Fault Text -> β)
+  | Read_Key Wait (Perhaps Key -> β)
+  | Read_Line Markup (Perhaps Text -> β)
+  | Read_Line_Masked Markup (Perhaps Text -> β)
   | Query_Colour (Bool -> β)
   | Query_Terminal (Bool -> β)
   | Query_Size (Perhaps (Int, Int) -> β)
@@ -110,10 +110,18 @@ Colour_Mode ::= Coloured | Monochrome
 
 Wait ::= Forever | Milliseconds Int
 
+(* Why a console program stopped early. None of these is something a caller can act
+   on, so none of them is in a return type: they end the program, and `execute`
+   hands the reason to whoever ran it.
+
+   `Input_Ended` is here rather than in a read's answer because it is *permanent* --
+   `Terminal.c` latches it, so no later read will ever succeed. A caller that could
+   see it could only stop, and one that retried would spin without even blocking.
+   Ctrl-D is NOT this: it is a person cancelling one prompt, they can type at the
+   next one, and it is a `Nope` from the read that asked. *)
 Fault ::=
-    End_Of_Input
+    Input_Ended
   | Read_Failed
-  | Timed_Out
   | Not_Utf8 Bytes
 
 Modifier ::= Shift | Control | Meta
@@ -142,6 +150,9 @@ Key ::=
   | With Modifier Key
   | Unknown (List Int)
 
+module Key:
+  uncharacter :: Key -> Perhaps Text :=
+    λkey. deconstruct key into Character text -> This text | _ -> Nope
 
 witness Semigroup Style :=
   { mappend := λ(Make_Style earlier) (Make_Style later).
@@ -261,7 +272,7 @@ write_line :: Markup -> Console Unit := λmarkup.
   let* _ = write markup in
   new_line
 
-say :: Text -> Console Unit := λbody. write_line (Markup.text body)
+write_plain_line :: Text -> Console Unit := λbody. write_line (Markup.text body)
 
 lines :: List Markup -> Console Unit := traverse_ write_line
 
@@ -327,22 +338,46 @@ with_cursor_hidden :: ∀α. Console α -> Console α := λaction.
 
 (* --------------------------------------------------------------------- input *)
 
-(* One keystroke. In cooked mode the driver holds the line until Enter. *)
-read_key :: Console (Result Fault Key) := read_key_within Forever
+(* One keystroke. Waiting `Forever` has no deadline to miss and the end of input
+   ends the program, so there is no second answer to give. In cooked mode the driver
+   holds the line until Enter. *)
+read_key :: Console Key :=
+  (* A `deconstruct` arm, not `perhaps`: arguments are evaluated whether they are
+     used or not, so a default of `omg_wtf_bbq` would abort the moment this
+     definition was initialised -- which is at the start of every program that loads
+     the standard library. *)
+  fmap
+    (λanswer.
+       deconstruct answer into
+         This key -> key
+       | Nope -> omg_wtf_bbq "Console.read_key: a wait with no deadline timed out")
+    (read_key_within Forever)
 
-(* One keystroke, or `Timed_Out`. The decoder's own 25ms escape framing is separate. *)
-read_key_within :: Wait -> Console (Result Fault Key) := λwait.
+(* One keystroke, or `Nope` if the deadline passed with nothing pressed -- which is
+   the only thing `Nope` means here. The decoder's own 25ms escape framing is
+   separate. *)
+read_key_within :: Wait -> Console (Perhaps Key) := λwait.
   lift_free (Read_Key wait id)
 
-(* A prompt, then a line, terminator excluded. `Return ""` is a bare Enter, not a closed
-   pipe. *)
-prompt :: Markup -> Console (Result Fault Text) := λquestion.
+(* A prompt, then a line, terminator excluded.
+
+   `This ""` is a bare Enter. `Nope` is the person cancelling: Ctrl-D on an empty
+   line. It says nothing about the next prompt, so asking again is fine -- unlike
+   the input *ending*, which stops the program (see `Fault`). *)
+prompt :: Markup -> Console (Perhaps Text) := λquestion.
   lift_free (Read_Line question id)
 
-read_line :: Console (Result Fault Text) := prompt mempty
+read_line :: Console (Perhaps Text) := prompt mempty
+
+(* The line, or `otherwise` if the person ended input instead of typing one. *)
+read_line_or :: Text -> Console Text := λotherwise.
+  prompt_or otherwise mempty
+
+prompt_or :: Text -> Markup -> Console Text := λotherwise question.
+  fmap (perhaps otherwise id) (prompt question)
 
 (* A line read with nothing painted: a password prompt. *)
-read_masked_line :: Markup -> Console (Result Fault Text) := λquestion.
+read_masked_line :: Markup -> Console (Perhaps Text) := λquestion.
   lift_free (Read_Line_Masked question id)
 
 
@@ -351,7 +386,7 @@ read_masked_line :: Markup -> Console (Result Fault Text) := λquestion.
 (* Run an arbitrary `IO` action inside a console program:
 
        let* text = Console.lift_io (Files.read_file "notes.txt") in
-       Console.say text
+       Console.write_plain_line text
 
    A lifted action is opaque -- only `execute` can run it. *)
 lift_io :: ∀α. IO α -> Console α := λaction. lift_free (Lift action)
@@ -362,45 +397,83 @@ lift_io :: ∀α. IO α -> Console α := λaction. lift_free (Lift action)
 (* `Console ~> IO`: one instruction at a time, each response fed to the continuation waiting
    for it. *)
 
-execute :: ∀α. Console α -> IO α := λprogram.
+(* What a fault means, in words -- the two of them are the terminal failing, and a
+   program that stops for one should say so rather than vanish. *)
+describe_fault :: Fault -> Text := λreason.
+  deconstruct reason into
+    Input_Ended -> "the input ended"
+  | Read_Failed -> "could not read from the terminal"
+  | Not_Utf8 _ -> "the input was not valid UTF-8"
+
+(* A whole console program, run: this is what a `start` wants. Faults are reported
+   rather than returned, because the alternative is dropping one on the floor -- and
+   a program that stops for a reason nobody printed looks like a program that did
+   nothing. *)
+run :: ∀α. Console α -> IO Unit := λprogram.
+  let* outcome = execute program in
+  deconstruct outcome into
+    Return _ -> pure ()
+  (* Running out of input is how a piped program ends, not a complaint. *)
+  | Fault Input_Ended -> pure ()
+  | Fault reason -> IO.output "console: `describe_fault reason`"
+
+(* The terminal goes back however this ended: a program stopped by a `Fault` never
+   reaches its own `in_raw_mode` and `in_alternate_screen` brackets, and leaving
+   either one set wrecks the shell the user comes back to. *)
+execute :: ∀α. Console α -> IO (Result Fault α) := λprogram.
+  let* outcome = interpret program in
+  let* _ = Terminal.restore in
+  pure outcome
+
+(* A read that fails ends the program: `Read_Failed` and `Not_Utf8` are the terminal
+   breaking, and there has never been anything for a caller to do about either. The
+   ordinary outcomes -- no more input, the wait ran out -- are a `Nope` handed to the
+   continuation like any other answer. *)
+interpret :: ∀α. Console α -> IO (Result Fault α) := λprogram.
   deconstruct program into
     (* Reached once per program, however deeply bound. *)
     Pure value ->
       let* _ = Terminal.flush in
-      pure value
+      pure (Return value)
   | Step instruction ->
       deconstruct instruction into
         Write markup next ->
           let* _ = Terminal.write_markup markup in
-          execute next
+          interpret next
       | Screen control next ->
           let* _ = Terminal.write_control control in
-          execute next
+          interpret next
       | Mode change receive ->
           let* entered = Terminal.change_mode change in
-          execute (receive entered)
+          interpret (receive entered)
       (* Output is stdio-buffered; a read is the moment it must be on screen. *)
       | Read_Key wait receive ->
           let* _ = Terminal.flush in
           let* pressed = Terminal.next_key_within wait in
-          execute (receive pressed)
+          deconstruct pressed into
+            Fault reason -> pure (Fault reason)
+          | Return answer -> interpret (receive answer)
       | Read_Line question receive ->
           let* _ = Terminal.flush in
           let* typed = Terminal.prompt_line question in
-          execute (receive typed)
+          deconstruct typed into
+            Fault reason -> pure (Fault reason)
+          | Return answer -> interpret (receive answer)
       | Read_Line_Masked question receive ->
           let* _ = Terminal.flush in
           let* typed = Terminal.masked_line question in
-          execute (receive typed)
+          deconstruct typed into
+            Fault reason -> pure (Fault reason)
+          | Return answer -> interpret (receive answer)
       | Query_Colour receive ->
           let* coloured = Terminal.colour_support in
-          execute (receive coloured)
+          interpret (receive coloured)
       | Query_Terminal receive ->
           let* terminal = Terminal.input_is_terminal in
-          execute (receive terminal)
+          interpret (receive terminal)
       | Query_Size receive ->
           let* measured = Terminal.window_size in
-          execute (receive measured)
+          interpret (receive measured)
       | Lift action ->
           let* next = action in
-          execute next
+          interpret next

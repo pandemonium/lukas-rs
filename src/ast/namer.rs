@@ -1,5 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    cell::RefCell,
+    collections::VecDeque,
     fmt,
     hash::{DefaultHasher, Hash, Hasher},
     iter,
@@ -23,6 +24,7 @@ use crate::{
     },
     builtin,
     compiler::{Compilation, Compiler, Located, LocatedError},
+    hash::{HashMap, HashSet},
     parser::{self, IdentifierPath, ParseInfo, Parsed},
     phase::{self, Phase},
     typer::{BaseType, display_list},
@@ -113,7 +115,7 @@ impl<A> ast::Expr<A, Identifier> {
             }
 
             Self::Record(_, record) => {
-                for (_, init) in &record.fields {
+                for (_, _, init) in &record.fields {
                     init.gather_free_variables(free)
                 }
             }
@@ -389,6 +391,11 @@ where
         self.unsatisfied().is_empty()
     }
 
+    /// Every node with what it reads.
+    pub fn edges(&self) -> impl Iterator<Item = (&Id, &[Id])> {
+        self.graph.iter().map(|(node, reads)| (node, &reads[..]))
+    }
+
     pub fn in_resolvable_order(&self) -> Vec<&Id> {
         let mut resolved = Vec::with_capacity(self.graph.len());
 
@@ -408,8 +415,19 @@ where
             .collect::<Vec<_>>();
         // Deterministic order: the resolved sequence drives type-checking order and
         // hence fresh-variable allocation, so HashMap iteration order here must not
-        // leak into the result.
-        graph.sort_by_key(|(node, _)| node.to_string());
+        // leak into the result. Cached, because rendering a name allocates and
+        // `sort_by_key` would render each one on every comparison.
+        graph.sort_by_cached_key(|(node, _)| node.to_string());
+
+        // Which nodes wait on a given one, by position in `graph`. Without it,
+        // resolving a node means asking every node in the program whether it was
+        // waiting -- a scan per symbol, over a table of thousands of symbols.
+        let mut dependents: HashMap<&Id, Vec<usize>> = HashMap::default();
+        for (index, (_, edges)) in graph.iter().enumerate() {
+            for edge in edges {
+                dependents.entry(*edge).or_default().push(index);
+            }
+        }
 
         let mut in_degrees = graph
             .iter()
@@ -475,10 +493,12 @@ where
 
             resolved.push(independent);
 
-            for (node, edges) in &mut graph {
-                if edges.remove(independent)
-                    && let Some(count) = in_degrees.get_mut(node)
-                {
+            // Ascending index, so the frontier is filled in the same order the
+            // whole-graph scan filled it: `dependents` was built by walking
+            // `graph` in order.
+            for index in dependents.get(independent).into_iter().flatten() {
+                let (node, _) = graph[*index];
+                if let Some(count) = in_degrees.get_mut(node) {
                     *count = count.saturating_sub(1);
                     if *count == 0 {
                         if self.witnesses.contains(node) {
@@ -546,6 +566,7 @@ impl RecordDeclarator<ParseInfo> {
                 .fields
                 .iter()
                 .map(|decl| FieldSymbol {
+                    declared_at: decl.at,
                     name: decl.name.clone(),
                     type_signature: decl.type_signature.clone(),
                 })
@@ -653,6 +674,31 @@ pub struct SymbolTable<A, GlobalName, LocalId> {
     /// absence means `Access::Anywhere`. Currently populated for `foreign` term
     /// and type declarations, which are private to their declaring module.
     pub member_visibility: HashMap<SymbolName, Access>,
+
+    /// Where each symbol was declared -- the position of the declaration itself,
+    /// which is not recoverable from the symbol: a term's body is annotated with
+    /// the position of the *body*, a line or more below the name on a definition
+    /// that wraps. Kept beside the symbols so that "go to definition" lands on the
+    /// name rather than near it.
+    pub declaration_sites: HashMap<SymbolName, ParseInfo>,
+}
+
+thread_local! {
+    /// The answer `active_imports` gives, per scope, for the duration of one
+    /// name-resolution pass.
+    ///
+    /// Every name in a module asks the same question, and answering it copies a
+    /// list of module paths -- for a program that opens the standard library,
+    /// dozens of them, thousands of times over. The answer depends only on the
+    /// `use` declarations, which are fixed before resolution starts and cannot
+    /// change while it runs; `resolve_names` empties this at the door.
+    static ACTIVE_IMPORTS: RefCell<HashMap<IdentifierPath, Rc<Vec<IdentifierPath>>>> =
+        RefCell::new(HashMap::default());
+
+    /// Name errors which an editor check is deliberately typing through. Ordinary
+    /// compilation leaves this as `None`, and therefore remains strict.
+    static RECOVERED_UNKNOWN_NAMES: RefCell<Option<Vec<Located<NameError>>>> =
+        const { RefCell::new(None) };
 }
 
 impl<A, GlobalName, LocalId> SymbolTable<A, GlobalName, LocalId> {
@@ -660,7 +706,11 @@ impl<A, GlobalName, LocalId> SymbolTable<A, GlobalName, LocalId> {
     /// opens of `scope` and of the modules enclosing it in the same file (up to and
     /// including its file root), then the global `base_imports`. This is the local
     /// namespace configuration -- a `use` in an unrelated file never appears here.
-    fn active_imports(&self, scope: &IdentifierPath) -> Vec<IdentifierPath> {
+    fn active_imports(&self, scope: &IdentifierPath) -> Rc<Vec<IdentifierPath>> {
+        if let Some(known) = ACTIVE_IMPORTS.with_borrow(|memo| memo.get(scope).cloned()) {
+            return known;
+        }
+
         let mut opens = Vec::new();
         for module in prefix_chain(scope) {
             if let Some(local) = self.module_imports.get(&module) {
@@ -683,6 +733,9 @@ impl<A, GlobalName, LocalId> SymbolTable<A, GlobalName, LocalId> {
             result.push(open);
         }
         result.extend(self.base_imports.iter().rev().cloned());
+
+        let result = Rc::new(result);
+        ACTIVE_IMPORTS.with_borrow_mut(|memo| memo.insert(scope.clone(), result.clone()));
         result
     }
 }
@@ -693,6 +746,7 @@ impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
             module_members: HashMap::default(),
             member_modules: HashMap::default(),
             symbols: HashMap::default(),
+            declaration_sites: HashMap::default(),
             base_imports: Vec::default(),
             module_imports: HashMap::default(),
             scope_roots: HashSet::default(),
@@ -723,7 +777,8 @@ impl phase::SymbolTable<Desugared> {
 
         let parents = prefix_chain(semantic_scope);
 
-        let search_order = parents.chain(self.active_imports(semantic_scope));
+        let imports = self.active_imports(semantic_scope);
+        let search_order = parents.chain(imports.iter().cloned());
 
         let resolved = search_order
             .filter(|m| search_space.contains(m))
@@ -806,8 +861,8 @@ impl phase::SymbolTable<Desugared> {
             .get(&member)
             .ok_or_else(|| NameError::UnknownMember(member).at(pi))?;
 
-        let mut search_order =
-            prefix_chain(semantic_scope).chain(self.active_imports(semantic_scope));
+        let imports = self.active_imports(semantic_scope);
+        let mut search_order = prefix_chain(semantic_scope).chain(imports.iter().cloned());
 
         let resolved = search_order
             .find_map(|m| {
@@ -940,6 +995,7 @@ impl phase::SymbolTable<Parsed> {
                         .constructors
                         .iter()
                         .map(|decl| ConstructorSymbol {
+                            declared_at: decl.at,
                             name: QualifiedName::new(module_path.clone(), decl.name.as_str()),
                             signature: decl.signature.clone(),
                         })
@@ -998,6 +1054,13 @@ impl phase::SymbolTable<Parsed> {
                 }
             };
         }
+    }
+
+    /// Record where a declaration was written. First one wins: a name declared
+    /// twice is an error the namer reports elsewhere, and the first is the one a
+    /// reader means.
+    fn declare_at(&mut self, name: SymbolName, at: ParseInfo) {
+        self.declaration_sites.entry(name).or_insert(at);
     }
 
     pub fn add_value_declaration(
@@ -1060,25 +1123,59 @@ impl phase::SymbolTable<Parsed> {
     ) -> Compilation<()> {
         for decl in declarations {
             match decl {
-                Declaration::Value(_, decl) => self.add_value_declaration(&module_path, decl),
+                Declaration::Value(at, decl) => {
+                    self.declare_at(
+                        SymbolName::Term(QualifiedName::new(
+                            module_path.clone(),
+                            decl.name.as_str(),
+                        )),
+                        at,
+                    );
+                    self.add_value_declaration(&module_path, decl)
+                }
 
                 Declaration::Module(_, decl) => {
                     self.add_module_declaration(&module_path, dir, decl, compiler, loaded)?
                 }
 
-                Declaration::Type(_, decl) => self.add_type_declaration(&module_path, decl),
+                Declaration::Type(at, decl) => {
+                    self.declare_at(
+                        SymbolName::Type(QualifiedName::new(
+                            module_path.clone(),
+                            decl.name.as_str(),
+                        )),
+                        at,
+                    );
+                    self.add_type_declaration(&module_path, decl)
+                }
 
                 Declaration::Use(pi, decl) => {
                     self.add_use_declaration(compiler, &module_path, pi, decl, loaded)?
                 }
 
-                Declaration::Signature(_, decl) => {
+                Declaration::Signature(at, decl) => {
+                    self.declare_at(
+                        SymbolName::Type(QualifiedName::new(
+                            module_path.clone(),
+                            decl.name.as_str(),
+                        )),
+                        at,
+                    );
                     self.add_signature_declaration(&module_path, decl)
                 }
 
-                Declaration::Witness(_, decl) => self.add_witness_declaration(&module_path, decl),
+                Declaration::Witness(at, decl) => {
+                    self.add_witness_declaration(&module_path, at, decl)
+                }
 
-                Declaration::Foreign(_, decl) => {
+                Declaration::Foreign(at, decl) => {
+                    self.declare_at(
+                        SymbolName::Term(QualifiedName::new(
+                            module_path.clone(),
+                            decl.name.as_str(),
+                        )),
+                        at,
+                    );
                     self.add_module_term_member(module_path.clone(), decl.name.clone());
                     // A `foreign` function is an unsafe backend primitive, private
                     // to its declaring module: callers reach it only through the
@@ -1101,12 +1198,17 @@ impl phase::SymbolTable<Parsed> {
     fn add_witness_declaration(
         &mut self,
         module_path: &IdentifierPath,
+        at: ParseInfo,
         decl: ast::WitnessDeclaration<ParseInfo>,
     ) {
         let decl_name = fresh_name("witness_", &decl.type_signature.to_string());
 
         // These must be indexed by type signature
         let name = QualifiedName::new(module_path.clone(), &decl_name);
+        // A witness has no name a reader could jump to -- it is named by its type
+        // signature -- but it is still a declaration written somewhere, and a
+        // check that reuses work has to know when that text changed.
+        self.declare_at(SymbolName::Term(name.clone()), at);
         self.add_module_term_member(
             module_path.clone(),
             parser::Identifier::from_str(&decl_name),
@@ -1223,8 +1325,9 @@ impl phase::SymbolTable<Parsed> {
         path: &IdentifierPath,
         scope: &IdentifierPath,
     ) -> Option<IdentifierPath> {
+        let imports = self.active_imports(scope);
         prefix_chain(scope)
-            .chain(self.active_imports(scope))
+            .chain(imports.iter().cloned())
             .find_map(|base| {
                 let candidate = IdentifierPath {
                     head: base.head.clone(),
@@ -1299,7 +1402,7 @@ impl phase::SymbolTable<Parsed> {
         }
 
         let root = IdentifierPath::new(program.root_module.name.as_str());
-        let mut loaded = HashSet::from([root.clone()]);
+        let mut loaded = HashSet::from_iter([root.clone()]);
 
         // `Root` is a file scope root, and the always-imported primordial `Prelude` is a
         // GLOBAL open (a base import), not a `use` in `Root` -- otherwise library files,
@@ -1485,6 +1588,8 @@ pub struct SignatureSymbol<GlobalName> {
 
 #[derive(Debug, Clone)]
 pub struct FieldSymbol<GlobalName> {
+    /// Where the field's label is written, in its record's declaration.
+    pub declared_at: ParseInfo,
     pub name: parser::Identifier,
     pub type_signature: ast::TypeSignature<ParseInfo, GlobalName>,
 }
@@ -1498,6 +1603,8 @@ pub struct CoproductSymbol<GlobalName> {
 
 #[derive(Debug, Clone)]
 pub struct ConstructorSymbol<GlobalName> {
+    /// Where the constructor is written, in its type's declaration.
+    pub declared_at: ParseInfo,
     pub name: QualifiedName,
     pub signature: Vec<ast::TypeExpression<ParseInfo, GlobalName>>,
 }
@@ -1837,6 +1944,7 @@ impl phase::Expr<Desugared> {
                         .map(|field| {
                             Ok(ast::RecordUpdateField {
                                 path: field.path.clone(),
+                                path_at: field.path_at.clone(),
                                 indices: field.indices.clone(),
                                 arities: field.arities.clone(),
                                 value: field.value.resolve(names, symbols, semantic_scope)?.into(),
@@ -1912,7 +2020,36 @@ fn resolve_name(
     } else if let Some(path) = symbols.resolve_free_term_name(identifier_path, semantic_scope) {
         Ok(path.into_projection(pi))
     } else {
-        Err(NameError::UnknownName(identifier_path.clone()).at(pi))
+        let recovered = RECOVERED_UNKNOWN_NAMES.with_borrow_mut(|errors| {
+            let Some(errors) = errors.as_mut() else {
+                return false;
+            };
+            errors.push(NameError::UnknownName(identifier_path.clone()).at(pi));
+            true
+        });
+
+        if !recovered {
+            return Err(NameError::UnknownName(identifier_path.clone()).at(pi));
+        }
+
+        // `???` has exactly this shape. Resolving an unknown term to the same
+        // polymorphic panic lets elaboration infer what the missing name would have
+        // to be, while the collected NameError still keeps the program invalid.
+        let panic_name = IdentifierPath::new("Prelude").with_suffix("omg_wtf_bbq");
+        let Some(panic) = symbols.resolve_free_term_name(&panic_name, semantic_scope) else {
+            return Err(NameError::UnknownName(identifier_path.clone()).at(pi));
+        };
+        Ok(Expr::Apply(
+            pi,
+            Apply {
+                function: panic.into_projection(pi).into(),
+                argument: Expr::Constant(
+                    pi,
+                    ast::Literal::Text(format!("Unknown name `{identifier_path}`")),
+                )
+                .into(),
+            },
+        ))
     }
 }
 
@@ -2027,9 +2164,9 @@ impl phase::Record<Desugared> {
             fields: self
                 .fields
                 .iter()
-                .map(|(label, e)| {
+                .map(|(at, label, e)| {
                     e.resolve(names, symbols, semantic_scope)
-                        .map(|e| (label.clone(), e.into()))
+                        .map(|e| (*at, label.clone(), e.into()))
                 })
                 .collect::<Naming<_>>()?,
         })
@@ -2242,7 +2379,7 @@ impl phase::MatchClause<Desugared> {
         names.mark();
 
         let clause = MatchClause {
-            pattern: pattern.resolve(names, symbols, semantic_scope),
+            pattern: pattern.resolve(names, symbols, semantic_scope)?,
             consequent: consequent.resolve(names, symbols, semantic_scope)?.into(),
         };
 
@@ -2252,20 +2389,26 @@ impl phase::MatchClause<Desugared> {
 }
 
 impl phase::Pattern<Desugared> {
+    /// A constructor written in a pattern is a *use* of it, and one that does not
+    /// resolve is an ordinary unknown name -- not a compiler bug. It used to
+    /// `expect`, so a misspelt constructor in a `deconstruct` arm took the whole
+    /// compiler down with `resolve: Timed_Out` rather than saying where and what.
     fn resolve(
         &self,
         names: &mut DeBruijn,
         symbols: &ParserSymbolTable,
         semantic_scope: &IdentifierPath,
-    ) -> phase::Pattern<Named> {
+    ) -> Naming<phase::Pattern<Named>> {
         match self {
-            Pattern::Coproduct(a, pattern) => Pattern::Coproduct(
+            Pattern::Coproduct(a, pattern) => Ok(Pattern::Coproduct(
                 *a,
                 ConstructorPattern {
                     constructor: Identifier::Free(
                         symbols
                             .resolve_free_term_name(&pattern.constructor, semantic_scope)
-                            .expect(&format!("resolve: {}", &pattern.constructor))
+                            .ok_or_else(|| {
+                                NameError::UnknownName(pattern.constructor.clone()).at(*a)
+                            })?
                             .into_qualified_name()
                             .into(),
                     ),
@@ -2273,46 +2416,45 @@ impl phase::Pattern<Desugared> {
                         .arguments
                         .iter()
                         .map(|arg| arg.resolve(names, symbols, semantic_scope))
-                        .collect(),
+                        .collect::<Naming<_>>()?,
                 },
-            ),
+            )),
 
-            Pattern::Tuple(a, pattern) => Pattern::Tuple(
+            Pattern::Tuple(a, pattern) => Ok(Pattern::Tuple(
                 *a,
                 TuplePattern {
                     elements: pattern
                         .elements
                         .iter()
                         .map(|p| p.resolve(names, symbols, semantic_scope))
-                        .collect(),
+                        .collect::<Naming<_>>()?,
                 },
-            ),
+            )),
 
-            Pattern::Struct(a, pattern) => Pattern::Struct(
+            Pattern::Struct(a, pattern) => Ok(Pattern::Struct(
                 *a,
                 StructPattern {
                     fields: pattern
                         .fields
                         .iter()
-                        .map(|(field, pattern)| {
-                            (
+                        .map(|(at, field, pattern)| {
+                            Ok((
+                                *at,
                                 field.clone(),
-                                pattern.resolve(names, symbols, semantic_scope),
-                            )
+                                pattern.resolve(names, symbols, semantic_scope)?,
+                            ))
                         })
-                        .collect(),
+                        .collect::<Naming<_>>()?,
                 },
-            ),
+            )),
 
-            Pattern::Literally(a, pattern) => Pattern::Literally(*a, pattern.clone()),
+            Pattern::Literally(a, pattern) => Ok(Pattern::Literally(*a, pattern.clone())),
 
             Pattern::Bind(a, pattern) => {
                 if let Some(id) = pattern.try_as_simple() {
-                    Pattern::Bind(*a, Identifier::Bound(names.bind(id)))
+                    Ok(Pattern::Bind(*a, Identifier::Bound(names.bind(id))))
                 } else {
-                    panic!(
-                        "Parser erroneously accepted a pathed identifier for recursive function name"
-                    )
+                    Err(NameError::BadBinderName(pattern.clone()).at(*a))
                 }
             }
         }
@@ -2323,32 +2465,85 @@ impl phase::SymbolTable<Desugared> {
     // Move to namer.rs
     // This does not need the symbols in any particular order, so long as all
     // modules are known
-    pub fn resolve_names(self) -> Naming<phase::SymbolTable<Named>> {
+    /// Resolve every declaration, and report every one that could not be.
+    ///
+    /// Declarations are independent: a name that does not resolve in one says
+    /// nothing about the next, so stopping at the first hid every other mistake --
+    /// and *which* one you were told about was whichever the symbol map happened to
+    /// iterate to first. Resolution within a declaration still stops at its first
+    /// bad name, which is what keeps this to one error per thing broken rather than
+    /// one per mention.
+    pub fn resolve_names(self) -> Result<phase::SymbolTable<Named>, Vec<Located<NameError>>> {
+        ACTIVE_IMPORTS.with_borrow_mut(HashMap::clear);
+
+        let mut failures = Vec::new();
+
+        let mut symbols = HashMap::default();
+        for (id, symbol) in &self.symbols {
+            // Where to say it happened when the name itself carries no position --
+            // a type signature's names do not. The declaration it was written in is
+            // the nearest true thing, and it is the line a reader would look at.
+            let site = self
+                .declaration_sites
+                .get(id)
+                .copied()
+                // A constructor is declared by its *type*, and has no site of its
+                // own -- but its body was synthesised at the position the type was
+                // written, which is the same place a reader would look.
+                .or_else(|| match symbol {
+                    Symbol::Term(term) => Some(*term.body.annotation()),
+                    Symbol::Type(..) => None,
+                })
+                .unwrap_or_default();
+            match self.rename_symbol(site, symbol) {
+                Ok(renamed) => {
+                    symbols.insert(id.clone(), renamed);
+                }
+                Err(failure) => failures.push(failure),
+            }
+        }
+
+        let mut foreign_terms = Vec::new();
+        for foreign in &self.foreign_terms {
+            let site = self
+                .declaration_sites
+                .get(&SymbolName::Term(foreign.name.clone()))
+                .copied()
+                .unwrap_or_default();
+            match foreign
+                .type_signature
+                .resolve_names(&self, site, &foreign.name.module)
+            {
+                Ok(type_signature) => foreign_terms.push(ForeignTerm {
+                    name: foreign.name.clone(),
+                    type_signature,
+                }),
+                Err(failure) => failures.push(failure),
+            }
+        }
+
+        if !failures.is_empty() {
+            // In the order they are written, so the first one read is the first one
+            // to fix -- symbols come out of a map in no order at all. Twice in one
+            // place is one mistake.
+            failures.sort_by_key(|failure| {
+                let at = failure.parse_info;
+                (at.file, at.location.row, at.location.column)
+            });
+            failures.dedup_by(|left, right| {
+                left.parse_info.file == right.parse_info.file
+                    && left.parse_info.location == right.parse_info.location
+                    && left.error.to_string() == right.error.to_string()
+            });
+            return Err(failures);
+        }
+
         Ok(SymbolTable {
+            declaration_sites: self.declaration_sites.clone(),
             module_members: self.module_members.clone(),
             member_modules: self.member_modules.clone(),
-            symbols: self
-                .symbols
-                .iter()
-                .map(|(id, symbol)| {
-                    // Bad with ParseInfo::default() but I guess I need location
-                    // per Identifier really.
-                    self.rename_symbol(ParseInfo::default(), symbol)
-                        .map(|symbol| (id.clone(), symbol))
-                })
-                .collect::<Naming<_>>()?,
-            foreign_terms: self
-                .foreign_terms
-                .iter()
-                .map(|e| {
-                    e.type_signature
-                        .resolve_names(&self, ParseInfo::default(), &e.name.module)
-                        .map(|type_signature| ForeignTerm {
-                            name: e.name.clone(),
-                            type_signature,
-                        })
-                })
-                .collect::<Naming<_>>()?,
+            symbols,
+            foreign_terms,
             base_imports: self.base_imports,
             module_imports: self.module_imports,
             scope_roots: self.scope_roots,
@@ -2357,6 +2552,35 @@ impl phase::SymbolTable<Desugared> {
             constructor_opacity: self.constructor_opacity.clone(),
             member_visibility: self.member_visibility.clone(),
         })
+    }
+
+    /// Resolve names for an editor check, retaining unknown term names as typed
+    /// placeholders. Unknown types, modules, private names and malformed binders
+    /// still stop resolution because there is no sound expression to substitute
+    /// for them.
+    pub fn resolve_names_recovering_unknown_terms(
+        self,
+    ) -> Result<(phase::SymbolTable<Named>, Vec<Located<NameError>>), Vec<Located<NameError>>> {
+        RECOVERED_UNKNOWN_NAMES.with_borrow_mut(|slot| {
+            *slot = Some(Vec::new());
+        });
+
+        let resolved = self.resolve_names();
+        let mut recovered = RECOVERED_UNKNOWN_NAMES
+            .with_borrow_mut(Option::take)
+            .unwrap_or_default();
+
+        match resolved {
+            Ok(symbols) => {
+                sort_name_errors(&mut recovered);
+                Ok((symbols, recovered))
+            }
+            Err(mut failures) => {
+                failures.append(&mut recovered);
+                sort_name_errors(&mut failures);
+                Err(failures)
+            }
+        }
     }
 
     fn rename_symbol(
@@ -2406,6 +2630,7 @@ impl phase::SymbolTable<Desugared> {
                                         .type_signature
                                         .resolve_names(self, pi, semantic_scope)
                                         .map(|te| FieldSymbol {
+                                            declared_at: field.declared_at,
                                             name: field.name.clone(),
                                             type_signature: te,
                                         })
@@ -2452,6 +2677,7 @@ impl phase::SymbolTable<Desugared> {
                                         .map(|ty| ty.resolve_names(self, pi, semantic_scope))
                                         .collect::<Naming<_>>()
                                         .map(|signature| ConstructorSymbol {
+                                            declared_at: symbol.declared_at,
                                             name: symbol.name.clone(),
                                             signature,
                                         })
@@ -2495,6 +2721,18 @@ impl phase::SymbolTable<Desugared> {
             })),
         }
     }
+}
+
+fn sort_name_errors(failures: &mut Vec<Located<NameError>>) {
+    failures.sort_by_key(|failure| {
+        let at = failure.parse_info;
+        (at.file, at.location.row, at.location.column)
+    });
+    failures.dedup_by(|left, right| {
+        left.parse_info.file == right.parse_info.file
+            && left.parse_info.location == right.parse_info.location
+            && left.error.to_string() == right.error.to_string()
+    });
 }
 
 impl fmt::Display for ModuleMember {

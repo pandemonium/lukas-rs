@@ -1,9 +1,10 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
     fmt,
     rc::{Rc, Weak},
 };
+
+use crate::hash::HashMap;
 
 use crate::{
     ast::{
@@ -268,7 +269,7 @@ enum AndThen {
     },
 
     EvalRecordField {
-        input: Rc<Vec<(parser::Identifier, Tree)>>,
+        input: Rc<Vec<(Erased, parser::Identifier, Tree)>>,
         output: Vec<Val>,
         environment: Env,
         k: Box<AndThen>,
@@ -532,7 +533,7 @@ fn and_then(value: Val, k: AndThen) -> Suspension {
 
             if output.len() < input.len() {
                 Suspension::Suspend(Suspended::Eval {
-                    expression: Rc::clone(&input[output.len()].1),
+                    expression: Rc::clone(&input[output.len()].2),
                     environment: environment.shared(),
                     k: AndThen::EvalRecordField {
                         input,
@@ -844,7 +845,7 @@ impl Expr {
             ),
 
             Self::Record(_, the) => Suspension::eval_and(
-                &the.fields[0].1,
+                &the.fields[0].2,
                 environment.shared(),
                 AndThen::EvalRecordField {
                     input: Rc::new(the.fields.clone()),

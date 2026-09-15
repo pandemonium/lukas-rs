@@ -17,11 +17,9 @@
 //! The top-level inliner (the enabler that actually exposes these redexes on the
 //! monadic byte path) is a follow-on; see the note.
 
-use std::{
-    cell::Cell,
-    collections::{HashMap, HashSet},
-    rc::Rc,
-};
+use std::{cell::Cell, rc::Rc};
+
+use crate::hash::{HashMap, HashSet};
 
 use crate::{
     ast::{
@@ -98,6 +96,7 @@ impl phase::SymbolTable<Types> {
         }
         let Self {
             symbols,
+            declaration_sites,
             module_members,
             member_modules,
             base_imports,
@@ -200,6 +199,7 @@ impl phase::SymbolTable<Types> {
 
         Self {
             symbols,
+            declaration_sites,
             module_members,
             member_modules,
             base_imports,
@@ -442,7 +442,7 @@ fn leaf_safe_terms(
 /// whose fusion leaks.
 fn is_closure_free<A>(body: &Expr<A, Identifier>) -> bool {
     match peel_binders(body) {
-        Expr::Record(_, record) => record.fields.iter().all(|(_, v)| is_closure_free(v)),
+        Expr::Record(_, record) => record.fields.iter().all(|(_, _, v)| is_closure_free(v)),
         Expr::Tuple(_, tuple) => tuple.elements.iter().all(|e| is_closure_free(e)),
         other => has_no_closure(other),
     }
@@ -812,7 +812,7 @@ fn reaches_self(
     start: &QualifiedName,
     dependencies: &HashMap<QualifiedName, HashSet<QualifiedName>>,
 ) -> bool {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     let mut stack: Vec<&QualifiedName> = dependencies
         .get(start)
         .into_iter()
@@ -870,7 +870,7 @@ pub(crate) fn children<A, Id>(expr: &Expr<A, Id>) -> Vec<&Tree<A, Id>> {
         Expr::Apply(_, Apply { function, argument }) => vec![function, argument],
         Expr::Let(_, Binding { bound, body, .. }) => vec![bound, body],
         Expr::Tuple(_, Tuple { elements }) => elements.iter().collect(),
-        Expr::Record(_, Record { fields }) => fields.iter().map(|(_, v)| v).collect(),
+        Expr::Record(_, Record { fields }) => fields.iter().map(|(_, _, v)| v).collect(),
         Expr::RecordUpdate(_, update) => {
             let mut children = vec![&update.base];
             children.extend(update.fields.iter().map(|field| &field.value));
@@ -1066,7 +1066,7 @@ impl Inliner<'_> {
                 Record {
                     fields: fields
                         .iter()
-                        .map(|(k, v)| (k.clone(), go(v, depth)))
+                        .map(|(at, k, v)| (at.clone(), k.clone(), go(v, depth)))
                         .collect(),
                 },
             ),
@@ -1079,6 +1079,7 @@ impl Inliner<'_> {
                         .iter()
                         .map(|field| RecordUpdateField {
                             path: field.path.clone(),
+                            path_at: field.path_at.clone(),
                             indices: field.indices.clone(),
                             arities: field.arities.clone(),
                             value: go(&field.value, depth),
@@ -1244,7 +1245,7 @@ fn inline_type_substitutions(template: &Type, concrete: &Type) -> Option<Substit
         arity
     }
 
-    let mut bindings = HashMap::new();
+    let mut bindings = HashMap::default();
     if match_pattern(template, concrete, &mut bindings).is_some() {
         return Some(bindings.into_iter().collect::<Vec<_>>().into());
     }
@@ -1263,7 +1264,7 @@ fn inline_type_substitutions(template: &Type, concrete: &Type) -> Option<Substit
         };
         source = codomain;
     }
-    let mut bindings = HashMap::new();
+    let mut bindings = HashMap::default();
     match_pattern(source, concrete, &mut bindings)?;
     Some(bindings.into_iter().collect::<Vec<_>>().into())
 }
@@ -1281,7 +1282,7 @@ fn pattern_binder_count<A>(pattern: &Pattern<A, Identifier>) -> usize {
             elements.iter().map(pattern_binder_count).sum()
         }
         Pattern::Struct(_, StructPattern { fields }) => {
-            fields.iter().map(|(_, p)| pattern_binder_count(p)).sum()
+            fields.iter().map(|(_, _, p)| pattern_binder_count(p)).sum()
         }
     }
 }
@@ -1302,7 +1303,7 @@ fn pattern_min_level<A>(pattern: &Pattern<A, Identifier>) -> Option<usize> {
         }
         Pattern::Struct(_, StructPattern { fields }) => fields
             .iter()
-            .filter_map(|(_, p)| pattern_min_level(p))
+            .filter_map(|(_, _, p)| pattern_min_level(p))
             .min(),
     }
 }
@@ -1811,7 +1812,7 @@ where
             Record {
                 fields: fields
                     .iter()
-                    .map(|(k, v)| (k.clone(), go(v, depth)))
+                    .map(|(at, k, v)| (at.clone(), k.clone(), go(v, depth)))
                     .collect(),
             },
         ),
@@ -1824,6 +1825,7 @@ where
                     .iter()
                     .map(|field| RecordUpdateField {
                         path: field.path.clone(),
+                        path_at: field.path_at.clone(),
                         indices: field.indices.clone(),
                         arities: field.arities.clone(),
                         value: go(&field.value, depth),
@@ -2072,7 +2074,7 @@ where
         }
 
         (Expr::Record(_, Record { fields }), ProductElement::Name(name)) => {
-            let position = fields.iter().position(|(label, _)| label == name)?;
+            let position = fields.iter().position(|(_, label, _)| label == name)?;
             project_field(fields, position)
         }
 
@@ -2090,14 +2092,14 @@ where
 }
 
 fn project_field<A>(
-    fields: &[(crate::parser::Identifier, Tree<A, Identifier>)],
+    fields: &[(A, crate::parser::Identifier, Tree<A, Identifier>)],
     position: usize,
 ) -> Option<Expr<A, Identifier>>
 where
     A: Clone,
 {
-    let values = fields.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>();
-    siblings_are_values(&values, position).then(|| Rc::unwrap_or_clone(fields[position].1.clone()))
+    let values = fields.iter().map(|(_, _, v)| v.clone()).collect::<Vec<_>>();
+    siblings_are_values(&values, position).then(|| Rc::unwrap_or_clone(fields[position].2.clone()))
 }
 
 fn siblings_are_values<A>(elements: &[Tree<A, Identifier>], keep: usize) -> bool {
@@ -2117,7 +2119,7 @@ fn is_value<A>(expr: &Expr<A, Identifier>) -> bool {
         | Expr::RecursiveLambda(..)
         | Expr::InvokeBridge(..) => true,
         Expr::Tuple(_, Tuple { elements }) => elements.iter().all(|e| is_value(e)),
-        Expr::Record(_, Record { fields }) => fields.iter().all(|(_, v)| is_value(v)),
+        Expr::Record(_, Record { fields }) => fields.iter().all(|(_, _, v)| is_value(v)),
         Expr::Inject(_, Injection { arguments, .. }) => arguments.iter().all(|e| is_value(e)),
         // A `let` binding a value inside a value is itself pure and terminating -- this
         // is what lets projection-of-literal see past a dictionary super-field that is
@@ -2382,8 +2384,8 @@ where
             }
             let mut values = Vec::with_capacity(fields.len());
             let mut patterns = Vec::with_capacity(fields.len());
-            for (name, field_pattern) in fields {
-                let value = record.fields.iter().find(|(n, _)| n == name)?.1.clone();
+            for (_, name, field_pattern) in fields {
+                let value = record.fields.iter().find(|(_, n, _)| n == name)?.2.clone();
                 values.push(value);
                 patterns.push(field_pattern.clone());
             }
@@ -2626,7 +2628,10 @@ where
         Expr::Record(a, Record { fields }) => Expr::Record(
             a.clone(),
             Record {
-                fields: fields.iter().map(|(k, v)| (k.clone(), go(v))).collect(),
+                fields: fields
+                    .iter()
+                    .map(|(at, k, v)| (at.clone(), k.clone(), go(v)))
+                    .collect(),
             },
         ),
         Expr::RecordUpdate(a, update) => Expr::RecordUpdate(
@@ -2638,6 +2643,7 @@ where
                     .iter()
                     .map(|field| RecordUpdateField {
                         path: field.path.clone(),
+                        path_at: field.path_at.clone(),
                         indices: field.indices.clone(),
                         arities: field.arities.clone(),
                         value: go(&field.value),
@@ -2794,7 +2800,7 @@ where
             StructPattern {
                 fields: fields
                     .iter()
-                    .map(|(label, p)| (label.clone(), walk_pattern(p, on_binder)))
+                    .map(|(at, label, p)| (at.clone(), label.clone(), walk_pattern(p, on_binder)))
                     .collect(),
             },
         ),
@@ -3207,7 +3213,7 @@ impl DeforestCtx<'_> {
                 Record {
                     fields: fields
                         .iter()
-                        .map(|(k, v)| (k.clone(), go(v, depth)))
+                        .map(|(at, k, v)| (at.clone(), k.clone(), go(v, depth)))
                         .collect(),
                 },
             ),
@@ -3220,6 +3226,7 @@ impl DeforestCtx<'_> {
                         .iter()
                         .map(|field| RecordUpdateField {
                             path: field.path.clone(),
+                            path_at: field.path_at.clone(),
                             indices: field.indices.clone(),
                             arities: field.arities.clone(),
                             value: go(&field.value, depth),
@@ -3372,7 +3379,7 @@ impl DeforestCtx<'_> {
                             true,
                             depth + 1,
                             self.strict_inlinables,
-                            &mut HashSet::new(),
+                            &mut HashSet::default(),
                         )
                 } else {
                     false
@@ -3615,6 +3622,7 @@ impl phase::SymbolTable<Types> {
         }
         let Self {
             symbols,
+            declaration_sites,
             module_members,
             member_modules,
             base_imports,
@@ -3680,6 +3688,7 @@ impl phase::SymbolTable<Types> {
         let Some(template) = terms.iter().find_map(|(_, body)| find_any_marker(body)) else {
             return Self {
                 symbols,
+                declaration_sites,
                 module_members,
                 member_modules,
                 base_imports,
@@ -3713,7 +3722,7 @@ impl phase::SymbolTable<Types> {
                         let body = Rc::unwrap_or_clone(ctx.map_markers(
                             &Rc::new(body),
                             0,
-                            &HashSet::new(),
+                            &HashSet::default(),
                         ));
                         Symbol::Term(TermSymbol {
                             name,
@@ -3729,6 +3738,7 @@ impl phase::SymbolTable<Types> {
 
         Self {
             symbols,
+            declaration_sites,
             module_members,
             member_modules,
             base_imports,
@@ -3979,8 +3989,8 @@ mod tests {
             0,
             false,
             0,
-            &Inlinables::new(),
-            &mut HashSet::new(),
+            &Inlinables::default(),
+            &mut HashSet::default(),
         ));
 
         let escaped = Expr::Tuple(
@@ -4014,8 +4024,8 @@ mod tests {
             0,
             false,
             0,
-            &Inlinables::new(),
-            &mut HashSet::new(),
+            &Inlinables::default(),
+            &mut HashSet::default(),
         ));
     }
 

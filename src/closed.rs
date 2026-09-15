@@ -1,4 +1,6 @@
-use std::{collections::HashMap, fmt, rc::Rc};
+use std::{fmt, rc::Rc};
+
+use crate::hash::HashMap;
 
 use crate::{
     ast::{
@@ -28,7 +30,7 @@ type Tree<Id> = ast::Tree<CaptureInfo, Id>;
 
 impl phase::SymbolTable<Types> {
     pub fn closure_conversion(self) -> phase::SymbolTable<Closed> {
-        let mut symbols = HashMap::with_capacity(self.symbols.len());
+        let mut symbols = HashMap::with_capacity_and_hasher(self.symbols.len(), Default::default());
 
         for t in self.symbols {
             let (name, symbol) = match t {
@@ -48,6 +50,7 @@ impl phase::SymbolTable<Types> {
 
         SymbolTable {
             symbols,
+            declaration_sites: self.declaration_sites,
             module_members: self.module_members,
             member_modules: self.member_modules,
             base_imports: self.base_imports,
@@ -297,8 +300,9 @@ impl phase::Pattern<Types> {
                     fields: the
                         .fields
                         .into_iter()
-                        .map(|(label, e)| {
+                        .map(|(at, label, e)| {
                             (
+                                at.empty_capture(),
                                 label,
                                 e.rewrite_tree(lambda_level, is_recursive, capture_map),
                             )
@@ -445,7 +449,13 @@ impl phase::Expr<Types> {
                     fields: the
                         .fields
                         .into_iter()
-                        .map(|(label, e)| (label, Self::go(e, lambda_level, is_recursive, layout)))
+                        .map(|(at, label, e)| {
+                            (
+                                at.empty_capture(),
+                                label,
+                                Self::go(e, lambda_level, is_recursive, layout),
+                            )
+                        })
                         .collect(),
                 },
             ),
@@ -459,6 +469,11 @@ impl phase::Expr<Types> {
                         .into_iter()
                         .map(|field| ast::RecordUpdateField {
                             path: field.path,
+                            path_at: field
+                                .path_at
+                                .into_iter()
+                                .map(TypeInfo::empty_capture)
+                                .collect(),
                             indices: field.indices,
                             arities: field.arities,
                             value: Self::go(field.value, lambda_level, is_recursive, layout),

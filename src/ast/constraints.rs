@@ -1,7 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-};
+use std::fmt;
+
+use crate::hash::{HashMap, HashSet};
 
 use crate::{
     ast::{

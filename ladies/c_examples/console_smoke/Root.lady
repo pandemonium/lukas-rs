@@ -52,10 +52,10 @@ start :: Int -> Unit := λ_.
         control sequences and a redirected log must not receive them, and `write`
         decides colour for itself -- so what comes out here is the text and nothing
         else, no escapes whatsoever. *)
-     Console.execute
+     Console.run
        (let* _ = Console.clear in
-        let* _ = Console.in_alternate_screen (Console.say "inside the alternate screen") in
+        let* _ = Console.in_alternate_screen (Console.write_plain_line "inside the alternate screen") in
         let* _ = Console.write_line (Markup.paint (Style.fg Magenta) "written through Console.write") in
         let* colour = Console.supports_colour in
         let* tty = Console.is_tty in
-        Console.say "supports_colour=`colour` is_tty=`tty`"))
+        Console.write_plain_line "supports_colour=`colour` is_tty=`tty`"))

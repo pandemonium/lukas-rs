@@ -95,7 +95,7 @@ impl Expr {
             Self::Record(_, the) => Ok(Val::Product(
                 the.fields
                     .iter()
-                    .map(|(_, e)| e.reduce(env))
+                    .map(|(_, _, e)| e.reduce(env))
                     .collect::<Interpretation<_>>()?,
             )),
 
@@ -252,7 +252,7 @@ impl Pattern<Erased, namer::Identifier> {
                 for (pattern, scrutinee) in pattern
                     .fields
                     .iter()
-                    .map(|(_, pattern)| pattern)
+                    .map(|(_, _, pattern)| pattern)
                     .zip(field_values)
                 {
                     bindings.extend(pattern.deconstruct(scrutinee)?);

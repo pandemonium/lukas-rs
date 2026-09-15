@@ -2,6 +2,87 @@ use Stdlib.Control.Enumerator.
 
 List ::= ∀α. Nil | Cons α (List α)
 
+List1 ::= ∀α. { Head :: α; Tail :: List α }
+
+module List1:
+  try_from_list :: ∀α. List α -> Perhaps (List1 α) := λxs.
+    deconstruct xs into
+      Nil       -> Nope
+    | Cons x xs -> This ({ Head := x; Tail := xs })
+
+  to_list :: ∀α. List1 α -> List α := λxs.
+    Cons xs.Head xs.Tail
+
+  singleton :: ∀α. α -> List1 α := λx.
+    { Head := x; Tail := Nil }
+
+  map :: ∀α β. (α -> β) -> List1 α -> List1 β := λf xs.
+    { Head := f xs.Head; Tail := List.map f xs.Tail }
+
+  fold_right :: ∀z α. (α -> z -> z) -> z -> List1 α -> z := λf z xs.
+    f xs.Head (List.fold_right f z xs.Tail)
+
+  fold_left :: ∀z α. (z -> α -> z) -> z -> List1 α -> z := λf z xs.
+    List.fold_left f (f z xs.Head) xs.Tail
+
+  append :: ∀α. List1 α -> List1 α -> List1 α := λxs ys.
+    { Head := xs.Head
+      Tail := List.append xs.Tail (to_list ys)
+    }
+
+  bind :: ∀α β. (α -> List1 β) -> List1 α -> List1 β := λf xs.
+    let first = f xs.Head in
+    { Head := first.Head
+      Tail := List.append first.Tail (List.bind (compose to_list f) xs.Tail)
+    }
+
+  traverse1 :: ∀f : *->* α β. Applicative f |- (α -> f β) -> List1 α -> f (List1 β) := λf xs.
+    liftA2
+      (λhead tail. { Head := head; Tail := tail })
+      (f xs.Head)
+      (traverse f xs.Tail)
+
+  display1 :: ∀α. Display α |- List1 α -> Text := λxs.
+    "`xs.Head`; `xs.Tail`"
+
+  equal :: ∀α. Eq α |- List1 α -> List1 α -> Bool := λxs ys.
+    eq xs.Head ys.Head and eq xs.Tail ys.Tail
+
+witness Functor List1 :=
+  { fmap := List1.map
+  }
+
+witness Foldable List1 :=
+  { fold_right := List1.fold_right
+    fold_left  := List1.fold_left
+  }
+
+witness Applicative List1 :=
+  { pure  := List1.singleton
+    apply := λfunctions arguments.
+      List1.bind (λf. List1.map f arguments) functions
+  }
+
+witness Monad List1 :=
+  { bind := List1.bind
+  }
+
+witness Traversable List1 :=
+  { traverse := List1.traverse1
+  }
+
+witness ∀α. Semigroup (List1 α) :=
+  { mappend := List1.append
+  }
+
+witness ∀α. Display α |- Display (List1 α) :=
+  { display := List1.display1
+  }
+
+witness ∀α. Eq α |- Eq (List1 α) :=
+  { eq := List1.equal
+  }
+
 witness ∀α. Enumerator α (List α) :=
   { size_hint := λ_. Nope
     next := λxs.
@@ -83,6 +164,9 @@ witness ∀α. Eq α |- Eq (List α) :=
 
 empty :: ∀α. List α := Nil
 
+is_empty :: ∀α. List α -> Bool :=
+  λxs. deconstruct xs into Nil -> true | _ -> false
+
 head :: ∀α. List α -> Perhaps α :=
   λxs. deconstruct xs into Cons a tail -> This a | otherwise -> Nope
 
@@ -156,7 +240,14 @@ concat :: List Text -> Text := λxs.
 
 singleton :: ∀α. α -> List α := λa. Cons a Nil
 
-choose :: ∀α. (α -> Bool) -> List α -> (Perhaps α, List α) := λε list.
+find_first :: ∀α. (α -> Bool) -> List α -> Perhaps α := λp xs.
+  deconstruct xs into
+    Nil -> Perhaps.empty
+  | Cons x xs ->
+    if p x then This x
+    else find_first p xs
+
+remove_first_if :: ∀α. (α -> Bool) -> List α -> (Perhaps α, List α) := λε list.
   let loop = λprefix suffix.
     deconstruct suffix into
       Cons x suffix ->
@@ -165,7 +256,7 @@ choose :: ∀α. (α -> Bool) -> List α -> (Perhaps α, List α) := λε list.
     | Nil -> Nope, list
   in loop Nil list
 
-pick :: ∀α. Int -> List α -> (Perhaps α, List α) := λindex list.
+remove :: ∀α. Int -> List α -> (Perhaps α, List α) := λindex list.
   let loop = λi prefix suffix.
     deconstruct suffix into
       Cons x suffix ->

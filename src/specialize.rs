@@ -9,7 +9,7 @@
 //! dead dict parameter is left in place (no de Bruijn renumbering) and threaded,
 //! unused. On by default; opt out with `MARM_SPECIALIZE` set to `0`/`off`/`no`/`false`.
 
-use std::collections::{HashMap, HashSet};
+use crate::hash::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
@@ -126,7 +126,7 @@ impl phase::SymbolTable<Types> {
         }
 
         // Mint (or reuse) a clone per (f, w) under a deterministic name.
-        let mut specs: HashMap<(QualifiedName, QualifiedName), QualifiedName> = HashMap::new();
+        let mut specs: HashMap<(QualifiedName, QualifiedName), QualifiedName> = HashMap::default();
         let mut fresh = Vec::new();
         for (f, w) in &pairs {
             let clone_qn = QualifiedName::new(
@@ -176,7 +176,7 @@ impl phase::SymbolTable<Types> {
                 }
             }
 
-            let mut layout_specs = HashMap::new();
+            let mut layout_specs = HashMap::default();
             let mut layout_fresh = Vec::new();
             for (function, dict_types) in layout_pairs {
                 let clone_qn = QualifiedName::new(
@@ -254,7 +254,7 @@ fn stable_hash(value: &impl Hash) -> u64 {
 
 fn layout_substitutions(slots: &[LayoutSlot], concrete: &[Type]) -> Option<Substitutions> {
     (slots.len() == concrete.len()).then_some(())?;
-    let mut bindings = HashMap::new();
+    let mut bindings = HashMap::default();
     for (slot, concrete) in slots.iter().zip(concrete) {
         match_type_pattern(&slot.template, concrete, &mut bindings)?;
     }
@@ -599,7 +599,7 @@ fn layout_call_substitutions(
     let source_arguments = arguments.get(constraint_arity..)?;
     (source_arguments.len() == source_arity).then_some(())?;
 
-    let mut bindings = HashMap::new();
+    let mut bindings = HashMap::default();
     for argument in source_arguments {
         let Type::Arrow {
             domain, codomain, ..

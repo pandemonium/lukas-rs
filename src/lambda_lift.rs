@@ -1,10 +1,11 @@
 use std::{
     cell::Cell,
-    collections::{HashMap, HashSet},
     fmt,
     rc::Rc,
     sync::atomic::{AtomicU32, Ordering},
 };
+
+use crate::hash::{HashMap, HashSet};
 
 use crate::{
     ast::{

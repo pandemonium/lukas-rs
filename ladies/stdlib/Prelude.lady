@@ -23,6 +23,12 @@ fst :: ∀α β. (α, β) -> α := λ(a, _). a
 
 snd :: ∀α β. (α, β) -> β := λ(_, b). b
 
+uncurry3 :: ∀α β γ δ. (α -> β -> γ -> δ) -> ((α, β, γ) -> δ) :=
+  λf. λ(a, b, c). f a b c
+
+abs :: Int -> Int := λx.
+  if x < 0 then -x else x
+
 signature From ::= ∀α β.
   { from :: α -> β
   }
