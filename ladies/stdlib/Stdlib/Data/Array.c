@@ -3,7 +3,7 @@
 /// Array functions
 ///
 /// A readonly `Array` is built flat too (by `mk_flat_array_from` for a `[...]`
-/// literal -- the only source), so access strides the same flat backing as
+/// literal, or by the shaped constructors below), so access strides the same flat backing as
 /// `Mutable_Array`: `raw_get` boxes the element back out to canonical form.
 FOREIGN_DECL(int64_t, Root_Stdlib_Data_Array_Array_raw_len, Value, arr, {
   return (int64_t)flat_array_count(arr);
@@ -14,6 +14,26 @@ FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Array_raw_get, Value, arr, int64_t, i
   } else {
     return perhaps_nope();
   }
+})
+
+FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Array_raw_generate_shaped, Value, dict, int64_t, length, Value, mk_element, {
+  int64_t *entries = (int64_t *)as_ptr(proj(dict, 0));
+  size_t slen = (size_t)entries[0];
+  bool has_sum = false;
+  for (size_t i = 1; i <= slen; i++) has_sum |= entries[i] < 0;
+  if (!has_sum) return flat_generate(length, mk_element);
+  return flat_generate_shaped(length, mk_element, entries + 1, slen);
+})
+
+FOREIGN_DECL(Value, Root_Stdlib_Data_Array_Array_raw_from_enumerator_shaped, Value, dict, int64_t, length, Value, enumeration, Value, next, {
+  int64_t *entries = (int64_t *)as_ptr(proj(dict, 0));
+  size_t slen = (size_t)entries[0];
+  bool has_sum = false;
+  for (size_t i = 1; i <= slen; i++) has_sum |= entries[i] < 0;
+  if (!has_sum)
+    return flat_from_enumerator(length, enumeration, next);
+  return flat_from_enumerator_shaped(length, enumeration, next,
+                                     entries + 1, slen);
 })
 
 

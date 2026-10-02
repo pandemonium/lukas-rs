@@ -6,6 +6,7 @@ module Text.
 module Random.
 module Json.
 module Threading.
+module Browser.
 (* module Files. *)
 module Console.
 

@@ -253,12 +253,12 @@ case "$BACKEND" in
       # shellcheck disable=SC2086
       wasm_environment=web
       [ "$PROFILE" = wasm-node ] && wasm_environment=node
-      if ! "$EMCC" -std=c23 -DMARMELADE_SINGLE_THREADED=1 \
+      if ! "$EMCC" -std=c23 -D_POSIX_C_SOURCE=200809L -DMARMELADE_SINGLE_THREADED=1 \
         -DMARMELADE_WASM=1 -I"$C_DIR" \
         $WASM_CFLAGS --no-entry \
         -sMODULARIZE=1 -sEXPORT_ES6=1 \
         -sEXPORT_NAME=createMarmeladeModule \
-        -sEXPORTED_FUNCTIONS=_marmelade_start \
+        -sEXPORTED_FUNCTIONS=_marmelade_start,_malloc,_free \
         -sENVIRONMENT="$wasm_environment" -sALLOW_MEMORY_GROWTH=1 \
         -o "$MODULE_JS" "$@"; then
         die "$PROFILE WebAssembly compilation failed"
@@ -272,6 +272,7 @@ case "$BACKEND" in
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Marmelade</title>
+<main id="app"></main>
 <pre id="output"></pre>
 <script type="module">
   import createMarmeladeModule from "./marmelade.mjs";

@@ -6708,7 +6708,10 @@ impl TypingContext {
             ))
         } else {
             Ok(Typed::constant(Expr::Array(
-                pi.with_inferred_type(Type::Array(Type::fresh().into())),
+                pi.with_inferred_type(Type::application(
+                    Type::Constructor(QualifiedName::builtin("Array")),
+                    Type::fresh(),
+                )),
                 Array { elements: vec![] },
             )))
         }

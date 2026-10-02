@@ -61,6 +61,49 @@ to `build/<program>/requirements-<profile>.txt`. For an explicit native target t
 differs from the current machine, set `CC` to the appropriate cross compiler. The
 Scheme backend keeps its existing behavior and does not read or enforce this model.
 
+## Browser applications
+
+`Stdlib.Browser` supplies an opaque model-view-action API. An `Action model α`
+sequences synchronous and asynchronous browser operations through ordinary `let*`;
+there is no separate task type or await operation. `Model.put` and `Model.modify`
+mark the view dirty. The runtime redraws when the action completes or suspends on an
+asynchronous operation, batching consecutive synchronous changes. Bind
+`Browser.yield` to redraw and explicitly return control to the browser sooner.
+Redraws reconcile the new `Hyper_Text` tree with the live DOM, preserving matching
+nodes and applying only changed text, attributes, and children.
+
+```lady
+init :: Action Model Unit :=
+  let* saved = Local_Storage.get "draft" in
+  Model.modify (restore saved)
+
+update :: Message -> Action Model Unit := λmessage.
+  deconstruct message into
+    Save text ->
+      let* _ = Model.modify (set_text text) in
+      Local_Storage.set "draft" text
+
+view :: Model -> Hyper_Text Message := λmodel.
+  Html.input
+    [ Attribute.value model.Text
+      Attribute.on_input Save
+    ]
+```
+
+The public effect modules currently include `Local_Storage`, `Fetch`, and
+`Web_Socket`. Their operations all return `Action`; applications cannot inspect or
+interpret the action representation. `Html` constructors produce `Hyper_Text message`
+values from arrays of attributes and child nodes, retain typed click and input
+messages, and build DOM nodes without HTML-string interpolation.
+
+The Todo example exercises typed events, intermediate model rendering, and local
+storage:
+
+```sh
+./compile-lady.sh --backend native --profile wasm-browser \
+  ladies/browser_examples/todo
+```
+
 This is a summary of all the things that work currently.
 
 ```List ::= ∀α. Nil | Cons α (List α)

@@ -3,9 +3,21 @@ use Stdlib.Control.Enumerator.
 module Array:
   foreign raw_len :: ∀α. Array α -> Int
   foreign raw_get :: ∀α. Array α -> Int -> Perhaps α
+  foreign raw_generate_shaped :: ∀α. Memory_Layout α |- Int -> (Int -> α) -> Array α
+  foreign raw_from_enumerator_shaped :: ∀α enumeration. Memory_Layout α |- Int -> enumeration -> (enumeration -> Perhaps ((Int, α), enumeration)) -> Array α
 
   length :: ∀α. Array α -> Int := raw_len
   get :: ∀α. Array α -> Int -> Perhaps α := raw_get
+
+  generate :: ∀α. Memory_Layout α |- Int -> (Int -> α) -> Array α :=
+    raw_generate_shaped
+
+  from_enumerator :: ∀α enumeration. Memory_Layout α + Enumerator α enumeration |- Indexed_Enumerator α enumeration -> Array α :=
+    λenumerator.
+      raw_from_enumerator_shaped
+        (Indexed_Enumerator.size enumerator)
+        enumerator
+        Indexed_Enumerator.advance
 
 
 foreign Raw_Mutable_Array
