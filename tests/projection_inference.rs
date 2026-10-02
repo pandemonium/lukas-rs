@@ -26,6 +26,10 @@ start :: Int -> IO Int := λ_.
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: dir.clone(),
         backend: Backend::Native,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: Some(dir.join("projection.c")),
     }
     .compiler_main()
@@ -58,6 +62,10 @@ start :: Int -> Unit := λ_. ()
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: dir.clone(),
         backend: Backend::Native,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: None,
     }
     .check()

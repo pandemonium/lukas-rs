@@ -10,16 +10,16 @@ use Stdlib.IO.
 
 foreign Raw_Mmap
 
-foreign raw_mmap_open   :: Text -> Result Int Raw_Mmap
-foreign raw_mmap_close  :: Raw_Mmap -> Unit
-foreign raw_mmap_len    :: Raw_Mmap -> Int
-foreign raw_mmap_get_u8 :: Raw_Mmap -> Int -> Int
-foreign raw_mmap_closed :: Raw_Mmap -> Bool
-foreign raw_mmap_slice  :: Raw_Mmap -> Int -> Int -> Result Int Bytes
-foreign raw_mmap_read   :: Raw_Mmap -> Int -> Int -> Result Int Bytes
+foreign [ MMap ] raw_mmap_open   :: Text -> Result Int Raw_Mmap
+foreign [ MMap ] raw_mmap_close  :: Raw_Mmap -> Unit
+foreign [ MMap ] raw_mmap_len    :: Raw_Mmap -> Int
+foreign [ MMap ] raw_mmap_get_u8 :: Raw_Mmap -> Int -> Int
+foreign [ MMap ] raw_mmap_closed :: Raw_Mmap -> Bool
+foreign [ MMap ] raw_mmap_slice  :: Raw_Mmap -> Int -> Int -> Result Int Bytes
+foreign [ MMap ] raw_mmap_read   :: Raw_Mmap -> Int -> Int -> Result Int Bytes
 foreign raw_move_range  :: Buffer -> Int -> Int -> Result Int Bytes
 foreign raw_copy_range  :: Buffer -> Int -> Int -> Result Int Bytes
-foreign raw_write_file  :: Bytes -> Text -> Int
+foreign [ File_System ] raw_write_file :: Bytes -> Text -> Int
 
 (* Reconsider this. *)
 Mmap_Error   ::= Mmap_io Int

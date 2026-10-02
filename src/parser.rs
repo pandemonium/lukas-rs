@@ -271,6 +271,18 @@ pub enum ParseError {
     #[error("{position}: confinement modifiers apply to foreign types, not foreign terms")]
     ConfinementModifierOnForeignTerm { position: SourceLocation },
 
+    #[error("{position}: a requirement set cannot be empty; omit `[]` instead")]
+    EmptyRequirementSet { position: SourceLocation },
+
+    #[error("{position}: duplicate requirement `{requirement}`")]
+    DuplicateRequirement {
+        position: SourceLocation,
+        requirement: IdentifierPath,
+    },
+
+    #[error("{position}: requirement sets apply to foreign values, not foreign types")]
+    RequirementSetOnForeignType { position: SourceLocation },
+
     #[error(
         "{position}: unexpected input; the parser stopped here with tokens left over.\n\
          A declaration above likely failed to parse, or the layout desynced (a stray \
@@ -1078,6 +1090,8 @@ impl<'a> Parser<'a> {
                 // foreign
                 self.advance(1);
 
+                let requirements = self.parse_requirement_set()?;
+
                 let (pos, id) = self.identifier()?;
 
                 if matches!(
@@ -1090,7 +1104,7 @@ impl<'a> Parser<'a> {
                         ..
                     ]
                 ) {
-                    // foreign function: `foreign <id> :: <signature>`
+                    // foreign value: `foreign [ <requirements> ] <id> :: <signature>`
                     self.expect(TokenKind::TypeAscribe)?;
 
                     let type_signature = self.parse_type_signature()?;
@@ -1101,10 +1115,14 @@ impl<'a> Parser<'a> {
                         self.span_from(pos),
                         ForeignDeclaration {
                             name: Identifier::from_str(&id),
+                            requirements,
                             type_signature,
                         },
                     ))
                 } else {
+                    if !requirements.is_empty() {
+                        return Err(ParseError::RequirementSetOnForeignType { position: pos });
+                    }
                     Ok(Declaration::Type(
                         self.span_from(pos),
                         TypeDeclaration {
@@ -1161,6 +1179,66 @@ impl<'a> Parser<'a> {
             }
 
             _ => Err(self.fault(parser_name!())),
+        }
+    }
+
+    /// Parse the optional capability set in
+    /// `foreign [ Browser; Dom ] document_title :: Unit -> Text`.
+    ///
+    /// This syntax is deliberately confined to foreign *values*. The caller
+    /// diagnoses a following foreign type after it has seen whether `::` exists.
+    fn parse_requirement_set(&mut self) -> Result<Vec<ast::Requirement<ParseInfo>>> {
+        if self.peek()?.kind != TokenKind::LeftBracket {
+            return Ok(Vec::new());
+        }
+
+        let opening = *self.consume()?.location();
+        self.strip_layout()?;
+        if self.peek()?.kind == TokenKind::RightBracket {
+            return Err(ParseError::EmptyRequirementSet { position: opening });
+        }
+
+        let mut requirements = Vec::<ast::Requirement<ParseInfo>>::new();
+        loop {
+            let position = *self.peek()?.location();
+            let name = self.parse_identifier_path()?;
+            if requirements
+                .iter()
+                .any(|requirement| requirement.name == name)
+            {
+                return Err(ParseError::DuplicateRequirement {
+                    position,
+                    requirement: name,
+                });
+            }
+            requirements.push(ast::Requirement {
+                annotation: self.span_from(position),
+                name,
+            });
+
+            self.strip_layout()?;
+            match self.peek()?.kind {
+                TokenKind::RightBracket => {
+                    self.advance(1);
+                    return Ok(requirements);
+                }
+                TokenKind::Semicolon => {
+                    self.advance(1);
+                    self.strip_layout()?;
+                    // A semicolon separates two requirements; it is not a
+                    // trailing delimiter.
+                    if self.peek()?.kind == TokenKind::RightBracket {
+                        return Err(self.fault(parser_name!()));
+                    }
+                }
+                _ => {
+                    return Err(ParseError::Expected {
+                        expected: TokenKind::RightBracket,
+                        found: self.peek()?.kind.clone(),
+                        position: *self.peek()?.location(),
+                    });
+                }
+            }
         }
     }
 
@@ -3545,6 +3623,62 @@ mod tests {
         Parser::from_tokens(tokens)
             .parse_declaration_list()
             .expect_err("expected this source to fail to parse")
+    }
+
+    #[test]
+    fn parses_requirements_on_foreign_values() {
+        let source = concat!(
+            "foreign [ Browser; Platform.Dom ] document_title :: Unit -> Text\n",
+            "foreign parse_int :: Text -> Int\n",
+        );
+        let characters = source.chars().collect::<Vec<_>>();
+        let mut lexer = LexicalAnalyzer::default();
+        let tokens = lexer.tokenize(&characters);
+        let declarations = Parser::from_tokens(tokens)
+            .parse_declaration_list()
+            .expect("foreign values parse");
+
+        let Declaration::Foreign(_, document_title) = &declarations[0] else {
+            panic!("expected a foreign value");
+        };
+        assert_eq!(
+            document_title
+                .requirements
+                .iter()
+                .map(|requirement| requirement.name.to_string())
+                .collect::<Vec<_>>(),
+            ["Browser", "Platform.Dom"]
+        );
+        assert_eq!(
+            declarations[0].to_string(),
+            "foreign [ Browser; Platform.Dom ] document_title :: (Unit -> Text)"
+        );
+
+        let Declaration::Foreign(_, parse_int) = &declarations[1] else {
+            panic!("expected a foreign value");
+        };
+        assert!(parse_int.requirements.is_empty());
+    }
+
+    #[test]
+    fn rejects_empty_or_duplicate_requirement_sets() {
+        assert!(matches!(
+            parse_failure("foreign [] now :: Unit -> Int\n"),
+            ParseError::EmptyRequirementSet { .. }
+        ));
+        assert!(matches!(
+            parse_failure("foreign [ Timer; Timer ] now :: Unit -> Int\n"),
+            ParseError::DuplicateRequirement { requirement, .. }
+                if requirement == IdentifierPath::new("Timer")
+        ));
+    }
+
+    #[test]
+    fn rejects_requirements_on_foreign_types() {
+        assert!(matches!(
+            parse_failure("foreign [ MMap ] Raw_Mmap\n"),
+            ParseError::RequirementSetOnForeignType { .. }
+        ));
     }
 
     #[test]

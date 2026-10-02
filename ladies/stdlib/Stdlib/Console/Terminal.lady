@@ -10,17 +10,17 @@ use Stdlib.Control.
 use Stdlib.Console.
 
 
-foreign raw_write          :: Text -> Unit
-foreign raw_flush          :: Unit -> Unit
-foreign raw_read_byte      :: Int -> Int
-foreign raw_read_line      :: Unit -> Result Int Bytes
-foreign raw_mode_enter     :: Int -> Int
-foreign raw_mode_leave     :: Unit -> Unit
-foreign raw_mode_current   :: Unit -> Int
-foreign raw_is_output_tty  :: Unit -> Bool
-foreign raw_is_tty         :: Unit -> Bool
-foreign raw_supports_colour :: Unit -> Bool
-foreign raw_window_size    :: Unit -> Perhaps (Int, Int)
+foreign [ Terminal ] raw_write           :: Text -> Unit
+foreign [ Terminal ] raw_flush           :: Unit -> Unit
+foreign [ Terminal ] raw_read_byte       :: Int -> Int
+foreign [ Terminal ] raw_read_line       :: Unit -> Result Int Bytes
+foreign [ Terminal ] raw_mode_enter      :: Int -> Int
+foreign [ Terminal ] raw_mode_leave      :: Unit -> Unit
+foreign [ Terminal ] raw_mode_current    :: Unit -> Int
+foreign [ Terminal ] raw_is_output_tty   :: Unit -> Bool
+foreign [ Terminal ] raw_is_tty          :: Unit -> Bool
+foreign [ Terminal ] raw_supports_colour :: Unit -> Bool
+foreign [ Terminal ] raw_window_size     :: Unit -> Perhaps (Int, Int)
 
 
 (* ------------------------------------------------- wire bytes, as the protocols spell them *)

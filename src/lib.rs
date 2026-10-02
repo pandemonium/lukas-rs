@@ -13,6 +13,7 @@ pub mod lexer;
 pub mod parser;
 pub mod phase;
 pub mod profile;
+pub mod requirements;
 pub mod simplify;
 pub mod source_map;
 pub mod specialize;

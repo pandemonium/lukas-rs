@@ -3,19 +3,29 @@ set -eu
 
 usage() {
   cat >&2 <<USAGE
-usage: $0 [--backend native|scheme] <source-directory>
+usage: $0 [--backend native|scheme] [--profile <target>] <source-directory>
 
 Compiles a Marmelade/Lady source directory containing Root.lady.
 
 Options:
   --backend native   Generate C and link a native executable (default)
   --backend scheme   Generate Scheme and build a Chez Scheme boot file
+  --profile host            Build a process for the current host (default)
+  --profile native-macos    Build a macOS process
+  --profile native-linux    Build a Linux process
+  --profile native-windows  Build a Windows process
+  --profile wasm-node       Build an ES module and Wasm binary for Node
+  --profile wasm-browser    Build an ES module and Wasm binary for a browser
   -h, --help         Show this help
 
 Environment:
   LADY_LIBRARY       Standard-library directory
   CC                 C compiler for the native backend (default: clang)
   CFLAGS             Additional native compiler flags (default: -O2)
+  EMCC               Emscripten compiler for Wasm profiles (default: emcc)
+  EM_CACHE           Emscripten cache (default: build/emscripten-cache)
+  WASM_CFLAGS        Additional Emscripten flags (default: -O2 -flto)
+  LADY_CAPABILITIES  Provider model (default: <library>/capabilities.conf)
   SCHEME_BIN         Chez Scheme executable for the Scheme backend
   PETITE_BIN         Chez Petite executable for the Scheme backend
   PETITE_BOOT        Path to petite.boot for the Scheme backend
@@ -36,6 +46,7 @@ shell_quote() {
 }
 
 BACKEND="${LADY_BACKEND:-native}"
+PROFILE="${LADY_PROFILE:-host}"
 SOURCE_PATH=""
 
 while [ "$#" -gt 0 ]; do
@@ -47,6 +58,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --backend=*)
       BACKEND=${1#--backend=}
+      shift
+      ;;
+    --profile)
+      [ "$#" -ge 2 ] || usage
+      PROFILE=$2
+      shift 2
+      ;;
+    --profile=*)
+      PROFILE=${1#--profile=}
       shift
       ;;
     -h|--help)
@@ -64,6 +84,9 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$SOURCE_PATH" ] || usage
+
+# Compatibility with the original two-profile spelling.
+[ "$PROFILE" = browser ] && PROFILE=wasm-browser
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
@@ -108,26 +131,67 @@ run_mc() {
 
 case "$BACKEND" in
   native)
+    CAPABILITY_MODEL=${LADY_CAPABILITIES:-"$LADY_LIBRARY/capabilities.conf"}
+    [ -f "$CAPABILITY_MODEL" ] || die "capability model does not exist: $CAPABILITY_MODEL"
+    CAPABILITY_MODEL=$(CDPATH= cd -- "$(dirname -- "$CAPABILITY_MODEL")" && pwd)/$(basename -- "$CAPABILITY_MODEL")
+
+    case "$PROFILE" in
+      host|native-macos|native-linux|native-windows|wasm-node|wasm-browser) ;;
+      *) die "unknown native profile: $PROFILE" ;;
+    esac
+
+    if [ "$PROFILE" = wasm-browser ] || [ "$PROFILE" = wasm-node ]; then
+      if [ "$PROFILE" = wasm-browser ]; then
+        WASM_DIR="$BUILD_DIR/browser"
+      else
+        WASM_DIR="$BUILD_DIR/node"
+      fi
+      mkdir -p "$WASM_DIR"
+      ROOT_C="$WASM_DIR/root.generated.c"
+    else
     # Keep generated C beside Root.lady. The leading dot prevents the ordinary
     # "$SOURCE_PATH"/*.c glob below from treating it as a foreign implementation.
-    ROOT_C="$SOURCE_PATH/.${NAME}.generated.c"
+      ROOT_C="$SOURCE_PATH/.${NAME}.generated.c"
+    fi
     # A fixed name, so one .gitignore rule covers every program's binary rather
     # than one rule per directory name.
-    BIN="$SOURCE_PATH/exe"
+    if [ "$PROFILE" = host ]; then
+      BIN="$SOURCE_PATH/exe"
+    else
+      mkdir -p "$BUILD_DIR/$PROFILE"
+      BIN="$BUILD_DIR/$PROFILE/exe"
+    fi
     C_SOURCE_LIST="$BUILD_DIR/native-c-sources.txt"
-    CC=${CC:-clang}
-    # The one definition of the native flags, shared with the test panel.
-    . "$C_DIR/cflags.sh"
+    PROVIDER_PLAN="$BUILD_DIR/providers-$PROFILE.txt"
+    REQUIREMENTS_REPORT="$BUILD_DIR/requirements-$PROFILE.txt"
+    if [ "$PROFILE" != wasm-browser ] && [ "$PROFILE" != wasm-node ]; then
+      cc_was_set=${CC+x}
+      CC=${CC:-clang}
+      # The one definition of the native flags, shared with the test panel.
+      . "$C_DIR/cflags.sh"
+      command -v "$CC" >/dev/null 2>&1 \
+        || die "C compiler not found: $CC"
+      host_target=unknown
+      case "$(uname -s)" in
+        Darwin) host_target=native-macos ;;
+        Linux) host_target=native-linux ;;
+        MINGW*|MSYS*|CYGWIN*|Windows_NT) host_target=native-windows ;;
+      esac
+      if [ "$PROFILE" != host ] && [ "$PROFILE" != "$host_target" ] && [ -z "$cc_was_set" ]; then
+        die "$PROFILE is a cross target on this machine; set CC to an appropriate cross compiler"
+      fi
+    fi
 
-    command -v "$CC" >/dev/null 2>&1 \
-      || die "C compiler not found: $CC"
-
-    rm -f "$ROOT_C"
+    rm -f "$ROOT_C" "$PROVIDER_PLAN" "$REQUIREMENTS_REPORT"
 
     if ! run_mc \
       --library "$LADY_LIBRARY" \
       --source "$SOURCE_PATH" \
       --backend native \
+      --profile "$PROFILE" \
+      --capabilities "$CAPABILITY_MODEL" \
+      --provider-plan "$PROVIDER_PLAN" \
+      --requirements-report "$REQUIREMENTS_REPORT" \
       -o "$ROOT_C"; then
       die "the host compiler failed while generating C"
     fi
@@ -135,8 +199,8 @@ case "$BACKEND" in
     [ -s "$ROOT_C" ] || die "the host compiler did not produce C: $ROOT_C"
 
     # Collect companion C implementations from both the source module and the
-    # complete standard-library tree. Hidden generated files are not matched
-    # by this glob.
+    # complete standard-library tree. Provider-owned sources are omitted below
+    # and only the selected ones are added back from the provider plan.
     : > "$C_SOURCE_LIST"
 
     for foreign_c in "$SOURCE_PATH"/*.c; do
@@ -147,24 +211,119 @@ case "$BACKEND" in
 
     set -- "$C_DIR/runtime.c" "$C_DIR/gc.c"
     while IFS= read -r foreign_c || [ -n "$foreign_c" ]; do
-      [ -n "$foreign_c" ] && set -- "$@" "$foreign_c"
+      if [ -n "$foreign_c" ]; then
+        if grep -Fqx "managed-source $foreign_c" "$PROVIDER_PLAN"; then
+          continue
+        fi
+        if { [ "$PROFILE" = wasm-browser ] || [ "$PROFILE" = wasm-node ]; } \
+          && [ "${foreign_c#"$LADY_LIBRARY"/}" != "$foreign_c" ]; then
+          relative=${foreign_c#"$LADY_LIBRARY"/}
+          module=${relative%.c}
+          mangled=$(printf '%s' "$module" | tr '/.' '__')
+          prefix="Root_${mangled}_"
+          if ! grep -q "$prefix" "$ROOT_C"; then
+            continue
+          fi
+        fi
+        set -- "$@" "$foreign_c"
+      fi
     done < "$C_SOURCE_LIST"
     set -- "$@" "$ROOT_C"
 
-    # CFLAGS is intentionally word-split, matching normal compiler-variable
-    # behavior in build scripts.
-    # shellcheck disable=SC2086
-    if ! "$CC" $CSTD -I"$C_DIR" $CFLAGS -o "$BIN" "$@"; then
-      die "native C compilation failed"
-    fi
+    while IFS=' ' read -r kind value || [ -n "$kind" ]; do
+      case "$kind" in
+        define) set -- "$@" "-D$value=1" ;;
+        source) set -- "$@" "$value" ;;
+      esac
+    done < "$PROVIDER_PLAN"
 
-    echo "generated C:"
-    echo "  $ROOT_C"
-    echo "built native executable:"
-    echo "  $BIN"
+    if [ "$PROFILE" = wasm-browser ] || [ "$PROFILE" = wasm-node ]; then
+      EMCC=${EMCC:-emcc}
+      EM_CACHE=${EM_CACHE:-"$ROOT_DIR/build/emscripten-cache"}
+      export EM_CACHE
+      WASM_CFLAGS=${WASM_CFLAGS:--O2 -flto}
+      MODULE_JS="$WASM_DIR/marmelade.mjs"
+      MODULE_WASM="$WASM_DIR/marmelade.wasm"
+
+      command -v "$EMCC" >/dev/null 2>&1 \
+        || die "Emscripten compiler not found: $EMCC"
+
+      # WASM_CFLAGS is intentionally word-split, matching normal compiler-variable
+      # behavior in build scripts.
+      # shellcheck disable=SC2086
+      wasm_environment=web
+      [ "$PROFILE" = wasm-node ] && wasm_environment=node
+      if ! "$EMCC" -std=c23 -DMARMELADE_SINGLE_THREADED=1 \
+        -DMARMELADE_WASM=1 -I"$C_DIR" \
+        $WASM_CFLAGS --no-entry \
+        -sMODULARIZE=1 -sEXPORT_ES6=1 \
+        -sEXPORT_NAME=createMarmeladeModule \
+        -sEXPORTED_FUNCTIONS=_marmelade_start \
+        -sENVIRONMENT="$wasm_environment" -sALLOW_MEMORY_GROWTH=1 \
+        -o "$MODULE_JS" "$@"; then
+        die "$PROFILE WebAssembly compilation failed"
+      fi
+
+      if [ "$PROFILE" = wasm-browser ]; then
+        INDEX_HTML="$WASM_DIR/index.html"
+        cat > "$INDEX_HTML" <<'EOF_HTML'
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Marmelade</title>
+<pre id="output"></pre>
+<script type="module">
+  import createMarmeladeModule from "./marmelade.mjs";
+
+  const output = document.querySelector("#output");
+  const write = line => output.append(`${line}\n`);
+  const marmelade = await createMarmeladeModule({ print: write, printErr: write });
+  marmelade._marmelade_start();
+</script>
+</html>
+EOF_HTML
+      else
+        NODE_RUNNER="$WASM_DIR/run.mjs"
+        cat > "$NODE_RUNNER" <<'EOF_NODE'
+import createMarmeladeModule from "./marmelade.mjs";
+
+const marmelade = await createMarmeladeModule();
+marmelade._marmelade_start();
+EOF_NODE
+      fi
+
+      [ -s "$MODULE_JS" ] || die "Emscripten did not produce: $MODULE_JS"
+      [ -s "$MODULE_WASM" ] || die "Emscripten did not produce: $MODULE_WASM"
+
+      echo "generated $PROFILE module:"
+      echo "  $MODULE_JS"
+      echo "  $MODULE_WASM"
+      if [ "$PROFILE" = wasm-browser ]; then
+        echo "browser entry page:"
+        echo "  $INDEX_HTML"
+      else
+        echo "Node entry module:"
+        echo "  $NODE_RUNNER"
+      fi
+    else
+      # CFLAGS is intentionally word-split, matching normal compiler-variable
+      # behavior in build scripts.
+      # shellcheck disable=SC2086
+      if ! "$CC" $CSTD -I"$C_DIR" $CFLAGS -o "$BIN" "$@"; then
+        die "native C compilation failed"
+      fi
+
+      echo "generated C:"
+      echo "  $ROOT_C"
+      echo "built native executable:"
+      echo "  $BIN"
+    fi
     ;;
 
   scheme)
+    [ "$PROFILE" = host ] \
+      || die "the Scheme backend only supports the host profile"
     RUNTIME_SLS="$SCHEME_DIR/runtime.sls"
     STARTUP_SS="$SCHEME_DIR/startup.ss"
     ROOT_SS="$BUILD_DIR/root.ss"

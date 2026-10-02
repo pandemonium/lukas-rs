@@ -14,6 +14,10 @@ fn compiler_for(test_name: &str, source: &str) -> Compiler {
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: dir,
         backend: compiler::Backend::Native,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: None,
     }
 }

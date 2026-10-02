@@ -13,7 +13,7 @@ signature Hashable ::= ∀α.
 (* A time-based seed source for the default hasher. Coarse and predictable: *)
 (* enough to vary the seed per map, but NOT a defence against a deliberate    *)
 (* HashDoS attacker -- that needs an OS CSPRNG seed and a keyed-PRF mix.      *)
-foreign now_millis :: Unit -> Int
+foreign [ Timer ] now_millis :: Unit -> Int
 
 Simple_Hasher ::=
   { Value :: Int

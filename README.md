@@ -2,6 +2,65 @@ Marmelade is a functional programming language in the spirit of the ML family.
 
 It supports System F with algebraic data types. Has pattern matching and string interpolation. It is actively developed and at this point I am adding type class support.
 
+## Native-backend targets and capabilities
+
+Foreign values state the capability they consume at the implementation boundary:
+
+```lady
+foreign [ Browser; Dom ] document_title :: Unit -> Text
+foreign [ Socket ] connect :: Text -> Int -> Connection
+```
+
+Ordinary Marmelade values have no annotation. The compiler infers their requirements
+transitively, starting at `Root.start`, and rejects a build before C emission when a
+reachable requirement has no provider for the selected target. Unreachable foreign
+values do not constrain an application.
+
+The native backend has five explicit targets in addition to the current-host alias:
+
+| Profile | Platform root | Output |
+| --- | --- | --- |
+| `host` | current macOS, Linux, or Windows host | native process |
+| `native-macos` | `Native_MacOS` | native process |
+| `native-linux` | `Native_Linux` | native process |
+| `native-windows` | `Native_Windows` | native process |
+| `wasm-node` | `Wasm_Node` | Emscripten ES module and Wasm |
+| `wasm-browser` | `Wasm_Browser` | Emscripten ES module, Wasm, and page |
+
+For example:
+
+```sh
+./compile-lady.sh --backend native --profile wasm-browser \
+  ladies/examples/01_literals_and_operators
+
+./compile-lady.sh --backend native --profile wasm-node \
+  ladies/examples/01_literals_and_operators
+node build/01_literals_and_operators/node/run.mjs
+```
+
+Browser output is written to `build/<program>/browser/`. Serve that directory over
+HTTP and open `index.html`. The generated module exports `_marmelade_start`; the
+page connects standard output to a `<pre>` and calls the entry point. Node output is
+written to `build/<program>/node/` and includes `run.mjs`. Wasm builds are currently
+single-threaded.
+
+The provider graph lives in `ladies/stdlib/capabilities.conf`. Consumers name
+capabilities such as `Timer`, `Fetch`, `Socket`, and `Web_Socket`. Each provider says
+which capability it implements, which other capabilities or platform root it needs,
+and which C definitions or implementation sources the build must use. Multiple
+providers are alternatives, while the requirements of one provider are all required:
+
+```text
+provider Browser_Web_Socket provides Web_Socket requires Browser defines MARM_PROVIDER_WEB_SOCKET_BROWSER
+provider Socket_Web_Socket provides Web_Socket requires Socket,Timer defines MARM_PROVIDER_WEB_SOCKET_SOCKET
+```
+
+Set `LADY_CAPABILITIES` to use another graph. Each build writes its selected providers
+to `build/<program>/providers-<profile>.txt` and the inferred per-symbol requirements
+to `build/<program>/requirements-<profile>.txt`. For an explicit native target that
+differs from the current machine, set `CC` to the appropriate cross compiler. The
+Scheme backend keeps its existing behavior and does not read or enforce this model.
+
 This is a summary of all the things that work currently.
 
 ```List ::= ∀α. Nil | Cons α (List α)

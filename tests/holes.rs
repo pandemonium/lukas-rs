@@ -16,6 +16,10 @@ fn holes_fit_values_functions_and_arguments() {
         library_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ladies/stdlib"),
         source_path: directory.clone(),
         backend: Backend::Scheme,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: None,
     };
     source_map::reset();

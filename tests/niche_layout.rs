@@ -9,6 +9,10 @@ fn perhaps_uses_zero_niche_and_nested_perhaps_falls_back_to_a_tag() {
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: PathBuf::from("ladies/lang/13_flat_sum_arrays"),
         backend: Backend::Native,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: Some(output.clone()),
     }
     .compiler_main()
@@ -31,16 +35,18 @@ fn perhaps_uses_zero_niche_and_nested_perhaps_falls_back_to_a_tag() {
         generated.contains("(int64_t[]){-1, 1, 2, 0, 1, -2, 0, 1, 0, 1, 0}, 11"),
         "nested Perhaps did not preserve Nope versus This Nope"
     );
-    // Once the record is ground, its Perhaps Int field also uses a one-word niche.
-    // Together with Pair's two words and Text's one, the record is four words wide
-    // under the outer Perhaps. The record is splatted, so all four are leaves --
-    // but the first is the field's own niche word, where zero spells `Nope`, so the
-    // outer niche must skip it and take Pair's `X` at offset 1. This is the same
-    // rule the `Occupied` case below asserts for a constructor payload; taking
-    // offset 0 here made `This { Maybe := Nope, .. }` read back as `Nope`.
+    // Complex has a fixed five-word canonical record ABI but a four-word ground
+    // packed layout. Nested inside Perhaps it cannot use the top-level record ABI
+    // adapter, so it remains one boxed leaf. The outer Perhaps can use the nonzero
+    // record pointer as its niche without confusing `This { Maybe := Nope, .. }`
+    // with its own `Nope`.
+    let complex_initializer = generated
+        .lines()
+        .find(|line| line.contains("Root_complex_values ="))
+        .expect("the Complex array initializer");
     assert!(
-        generated.contains("(int64_t[]){-2, 0, 1, 1, 1, 4, 0, 0, 0, 0}, 10"),
-        "the outer niche took a word its record payload can legitimately zero"
+        complex_initializer.contains("(int64_t[]){-2, 0, 1, 0, 1, 0}, 6"),
+        "the nested ABI-mismatched record was not kept boxed: {complex_initializer}"
     );
     // Occupied has three constructor arguments. Its first is itself niche-encoded,
     // so zero is valid there; selection must continue and use the Text at offset 1.
@@ -82,6 +88,10 @@ start := λ_. step { State := Idle; Score := 1 }
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: dir,
         backend: Backend::Native,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: Some(output.clone()),
     }
     .compiler_main()

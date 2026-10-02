@@ -762,6 +762,10 @@ impl<A, TypeId, ValueId> Default for SymbolTable<A, TypeId, ValueId> {
 #[derive(Debug, Clone)]
 pub struct ForeignTerm<GlobalName> {
     pub name: QualifiedName,
+    /// Surface capability names are retained until the capability namespace and
+    /// provider information model resolve them. Keeping them here ensures every
+    /// later compiler phase sees the declaration metadata in the meantime.
+    pub requirements: Vec<ast::Requirement<ParseInfo>>,
     pub type_signature: TypeSignature<ParseInfo, GlobalName>,
 }
 
@@ -1231,6 +1235,7 @@ impl phase::SymbolTable<Parsed> {
     ) {
         self.foreign_terms.push(ForeignTerm {
             name: QualifiedName::new(module_path.clone(), decl.name.as_str()),
+            requirements: decl.requirements,
             type_signature: decl.type_signature,
         });
     }
@@ -2516,6 +2521,7 @@ impl phase::SymbolTable<Desugared> {
             {
                 Ok(type_signature) => foreign_terms.push(ForeignTerm {
                     name: foreign.name.clone(),
+                    requirements: foreign.requirements.clone(),
                     type_signature,
                 }),
                 Err(failure) => failures.push(failure),

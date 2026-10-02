@@ -1,7 +1,9 @@
 #include "gc.h"
 
 #include <assert.h>
+#ifndef MARMELADE_SINGLE_THREADED
 #include <pthread.h>
+#endif
 #include <stdatomic.h>
 #include <setjmp.h>
 #include <stddef.h>
@@ -17,6 +19,39 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten/stack.h>
+#endif
+
+// WebAssembly builds currently execute one Marmelade mutator on the JavaScript
+// thread. Keep the collector's synchronization structure intact while compiling
+// its locks and condition variables away, so a browser module does not require
+// WebAssembly threads, SharedArrayBuffer, or cross-origin isolation merely to run.
+#ifdef MARMELADE_SINGLE_THREADED
+typedef unsigned char MarmMutex;
+typedef unsigned char MarmCond;
+#define MARM_MUTEX_INITIALIZER 0
+#define MARM_COND_INITIALIZER 0
+static inline void marm_mutex_lock(MarmMutex *mutex) { (void)mutex; }
+static inline void marm_mutex_unlock(MarmMutex *mutex) { (void)mutex; }
+static inline void marm_cond_signal(MarmCond *condition) { (void)condition; }
+static inline void marm_cond_broadcast(MarmCond *condition) { (void)condition; }
+static inline void marm_cond_wait(MarmCond *condition, MarmMutex *mutex) {
+    (void)condition;
+    (void)mutex;
+}
+#else
+typedef pthread_mutex_t MarmMutex;
+typedef pthread_cond_t MarmCond;
+#define MARM_MUTEX_INITIALIZER PTHREAD_MUTEX_INITIALIZER
+#define MARM_COND_INITIALIZER PTHREAD_COND_INITIALIZER
+#define marm_mutex_lock pthread_mutex_lock
+#define marm_mutex_unlock pthread_mutex_unlock
+#define marm_cond_signal pthread_cond_signal
+#define marm_cond_broadcast pthread_cond_broadcast
+#define marm_cond_wait pthread_cond_wait
+#endif
 
 // Keep the thousands of inlined allocation fast paths from spilling their live
 // registers around the shared slow-path call.  Clang's preserve_most convention
@@ -239,10 +274,14 @@ static thread_local ThreadCtx *self = NULL;
 // thread handing its roots to the collector must publish those too -- the collector
 // spills its own with `_setjmp`, but it cannot reach anyone else's. Cheaper than
 // `setjmp`, which on Darwin also saves the signal mask via a syscall.
+#if defined(__aarch64__)
 #define GC_SPILL_REGISTERS()                                                          \
     __asm__ volatile("" ::: "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26",   \
                             "x27", "x28", "d8", "d9", "d10", "d11", "d12", "d13",     \
                             "d14", "d15", "memory")
+#else
+#define GC_SPILL_REGISTERS() __asm__ volatile("" ::: "memory")
+#endif
 
 // Where the collector must start scanning this thread's stack -- the STACK POINTER,
 // not `__builtin_frame_address(0)`. The two are not interchangeable: AArch64 clang
@@ -258,6 +297,8 @@ static thread_local ThreadCtx *self = NULL;
 #elif defined(__x86_64__)
 #define GC_STACK_TOP()                                                                \
     ({ void *__sp; __asm__ volatile("movq %%rsp, %0" : "=r"(__sp)); __sp; })
+#elif defined(__EMSCRIPTEN__)
+#define GC_STACK_TOP() ((void *)emscripten_stack_get_current())
 #else
 #define GC_STACK_TOP() __builtin_frame_address(0)
 #endif
@@ -271,13 +312,13 @@ static thread_local ThreadCtx *self = NULL;
 #define GC_CACHE_LINE 64
 static ThreadCtx *gc_threads[GC_MAX_THREADS];
 static size_t gc_thread_count = 0;
-static pthread_mutex_t gc_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+static MarmMutex gc_registry_lock = MARM_MUTEX_INITIALIZER;
 
 // Guards the genuinely shared allocator state: the block list and its recyclable
 // links, the pointer sets, and the large-object list. Everything else a mutator
 // touches while allocating is its own cursor. Never held across `gc_reserve`, so a
 // collection can never be triggered from inside it.
-static pthread_mutex_t gc_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
+static MarmMutex gc_alloc_lock = MARM_MUTEX_INITIALIZER;
 
 // Roots that live outside both the emitted global table and any thread's stack.
 // A spawned thread's action and its eventual result are the motivating case: the
@@ -287,24 +328,24 @@ static pthread_mutex_t gc_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
 #define GC_MAX_PINS 4096
 static Value *gc_pins[GC_MAX_PINS];
 static size_t gc_pin_count = 0;
-static pthread_mutex_t gc_pin_lock = PTHREAD_MUTEX_INITIALIZER;
+static MarmMutex gc_pin_lock = MARM_MUTEX_INITIALIZER;
 
 void gc_pin(Value *slot) {
     *slot = gc_escape_borrowed(*slot);
-    pthread_mutex_lock(&gc_pin_lock);
+    marm_mutex_lock(&gc_pin_lock);
     if (gc_pin_count == GC_MAX_PINS) {
         fprintf(stderr, "marmelade: more than %d pinned roots\n", GC_MAX_PINS);
         abort();
     }
     gc_pins[gc_pin_count++] = slot;
-    pthread_mutex_unlock(&gc_pin_lock);
+    marm_mutex_unlock(&gc_pin_lock);
 }
 
 void gc_unpin(Value *slot) {
-    pthread_mutex_lock(&gc_pin_lock);
+    marm_mutex_lock(&gc_pin_lock);
     for (size_t i = 0; i < gc_pin_count; i++)
         if (gc_pins[i] == slot) { gc_pins[i] = gc_pins[--gc_pin_count]; break; }
-    pthread_mutex_unlock(&gc_pin_lock);
+    marm_mutex_unlock(&gc_pin_lock);
 }
 
 // Bytes SETTLED by all threads since the last collection -- finished runs and
@@ -335,9 +376,9 @@ static _Atomic size_t ix_total_bytes = 0;
 // Mutators only ever READ the flag. If each cleared it on seeing it, the first
 // thread to notice would clear it and the rest would sail past.
 static atomic_bool gc_pending = false;
-static pthread_mutex_t gc_stw_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t gc_stw_resume = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t gc_stw_parked = PTHREAD_COND_INITIALIZER;
+static MarmMutex gc_stw_lock = MARM_MUTEX_INITIALIZER;
+static MarmCond gc_stw_resume = MARM_COND_INITIALIZER;
+static MarmCond gc_stw_parked = MARM_COND_INITIALIZER;
 static size_t gc_parked = 0;     // threads parked, or in a no-heap foreign region
 // Read-mostly after gc_init.  Declared with the rendezvous state because the hot
 // poll-side parking path records its sleep directly when diagnostics are enabled.
@@ -353,20 +394,20 @@ typedef enum { THREAD_RUNNING, THREAD_PARKED, THREAD_FOREIGN } ThreadState;
 static void gc_park(void) {
     double parked_t0 = gc_timing ? now() : 0.0;
     GC_SPILL_REGISTERS();
-    pthread_mutex_lock(&gc_stw_lock);
+    marm_mutex_lock(&gc_stw_lock);
     self->state = THREAD_PARKED;
     self->stack_top = GC_STACK_TOP(); // where the collector scans from (see GC_STACK_TOP)
     gc_parked++;
-    pthread_cond_signal(&gc_stw_parked);
+    marm_cond_signal(&gc_stw_parked);
     while (atomic_load_explicit(&gc_pending, memory_order_acquire))
-        pthread_cond_wait(&gc_stw_resume, &gc_stw_lock);
+        marm_cond_wait(&gc_stw_resume, &gc_stw_lock);
     if (gc_timing)
         atomic_fetch_add_explicit(
             &gc_stw_parked_ns,
             (unsigned long long)((now() - parked_t0) * 1e9), memory_order_relaxed);
     gc_parked--;
     self->state = THREAD_RUNNING;
-    pthread_mutex_unlock(&gc_stw_lock);
+    marm_mutex_unlock(&gc_stw_lock);
 
     // The collection rebuilt `ix_recycle`, so any run held from the previous epoch
     // is gone; take a fresh one on the next allocation. The privately-held spares go
@@ -397,23 +438,23 @@ void gc_poll(void) {
 // time wants `gc_poll` in its loop instead (notes/threading.md 3.2).
 void enter_blocking_call(void) {
     GC_SPILL_REGISTERS();
-    pthread_mutex_lock(&gc_stw_lock);
+    marm_mutex_lock(&gc_stw_lock);
     self->stack_top = GC_STACK_TOP();
     self->state = THREAD_FOREIGN;
     gc_parked++;
-    pthread_cond_signal(&gc_stw_parked);
-    pthread_mutex_unlock(&gc_stw_lock);
+    marm_cond_signal(&gc_stw_parked);
+    marm_mutex_unlock(&gc_stw_lock);
 }
 
 // On the way out, wait for any collection already in flight: it is tracing against
 // a snapshot that assumes this thread is not running.
 void leave_blocking_call(void) {
-    pthread_mutex_lock(&gc_stw_lock);
+    marm_mutex_lock(&gc_stw_lock);
     while (atomic_load_explicit(&gc_pending, memory_order_acquire))
-        pthread_cond_wait(&gc_stw_resume, &gc_stw_lock);
+        marm_cond_wait(&gc_stw_resume, &gc_stw_lock);
     gc_parked--;
     self->state = THREAD_RUNNING;
-    pthread_mutex_unlock(&gc_stw_lock);
+    marm_mutex_unlock(&gc_stw_lock);
 }
 
 
@@ -499,13 +540,13 @@ static size_t gc_mmaps_len = 0, gc_mmaps_cap = 0;
 // Called from `mk_mmap` on whatever thread mapped the file, so it takes the
 // allocator lock like the other shared-list append.
 static void mmap_track(GcHeader *h) {
-    pthread_mutex_lock(&gc_alloc_lock);
+    marm_mutex_lock(&gc_alloc_lock);
     if (gc_mmaps_len == gc_mmaps_cap) {
         gc_mmaps_cap = gc_mmaps_cap ? gc_mmaps_cap * 2 : 8;
         gc_mmaps = realloc(gc_mmaps, gc_mmaps_cap * sizeof *gc_mmaps);
     }
     gc_mmaps[gc_mmaps_len++] = h;
-    pthread_mutex_unlock(&gc_alloc_lock);
+    marm_mutex_unlock(&gc_alloc_lock);
 }
 
 // Unmap every mapping whose handle this collection proved unreachable. Runs after
@@ -680,7 +721,11 @@ static void alloc_record(ObjKind kind, size_t total) {
 
 static double now(void) {
     struct timespec ts;
+#ifdef __EMSCRIPTEN__
+    timespec_get(&ts, TIME_UTC);
+#else
     clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
@@ -917,7 +962,7 @@ static void sweep_large(bool major, size_t *young_live, size_t *old_live) {
 // With one registered thread it is a flag set and cleared, no waiting.
 static bool gc_stop_the_world(void) {
     double stw_t0 = gc_timing ? now() : 0.0;
-    pthread_mutex_lock(&gc_stw_lock);
+    marm_mutex_lock(&gc_stw_lock);
     if (atomic_load_explicit(&gc_pending, memory_order_acquire)) {
         // Someone else is collecting. Park here rather than queueing to collect
         // again: this is exactly what a poll would have done.
@@ -925,16 +970,16 @@ static bool gc_stop_the_world(void) {
         self->state = THREAD_PARKED;
         self->stack_top = GC_STACK_TOP();
         gc_parked++;
-        pthread_cond_signal(&gc_stw_parked);
+        marm_cond_signal(&gc_stw_parked);
         while (atomic_load_explicit(&gc_pending, memory_order_acquire))
-            pthread_cond_wait(&gc_stw_resume, &gc_stw_lock);
+            marm_cond_wait(&gc_stw_resume, &gc_stw_lock);
         if (gc_timing)
             atomic_fetch_add_explicit(
                 &gc_stw_parked_ns,
                 (unsigned long long)((now() - stw_t0) * 1e9), memory_order_relaxed);
         gc_parked--;
         self->state = THREAD_RUNNING;
-        pthread_mutex_unlock(&gc_stw_lock);
+        marm_mutex_unlock(&gc_stw_lock);
         self->ix_cur = NULL; self->ix_ptr = 0; self->ix_limit = 0; self->ix_run = 0;
         self->ix_spare = NULL; // relisted by the reclaim; see gc_park
         return false;
@@ -942,8 +987,8 @@ static bool gc_stop_the_world(void) {
     atomic_store_explicit(&gc_pending, true, memory_order_release);
     // A thread in a no-heap foreign region counts as parked: it cannot touch the
     // heap, and it published its stack top on the way in.
-    while (gc_parked + 1 < gc_thread_count) pthread_cond_wait(&gc_stw_parked, &gc_stw_lock);
-    pthread_mutex_unlock(&gc_stw_lock);
+    while (gc_parked + 1 < gc_thread_count) marm_cond_wait(&gc_stw_parked, &gc_stw_lock);
+    marm_mutex_unlock(&gc_stw_lock);
     if (gc_timing)
         atomic_fetch_add_explicit(
             &gc_stw_rendezvous_ns,
@@ -953,10 +998,10 @@ static bool gc_stop_the_world(void) {
 
 static void gc_resume_mutators(void) {
     double resume_t0 = gc_timing ? now() : 0.0;
-    pthread_mutex_lock(&gc_stw_lock);
+    marm_mutex_lock(&gc_stw_lock);
     atomic_store_explicit(&gc_pending, false, memory_order_release);
-    pthread_cond_broadcast(&gc_stw_resume);
-    pthread_mutex_unlock(&gc_stw_lock);
+    marm_cond_broadcast(&gc_stw_resume);
+    marm_mutex_unlock(&gc_stw_lock);
     if (gc_timing)
         atomic_fetch_add_explicit(
             &gc_stw_resume_ns,
@@ -986,9 +1031,14 @@ static void gc_run(bool major) {
     // into `regs`, which we then scan conservatively (a live pointer may sit only in a
     // register). There is no matching `longjmp`, so the return value is intentionally
     // discarded -- the `(void)` cast documents that and quiets unused-return linters.
-    // `_setjmp` rather than `setjmp`: on Darwin the latter also saves the signal mask
-    // via `sigprocmask`, a syscall this has no use for.
+    // `_setjmp` rather than `setjmp` on hosts: on Darwin the latter also saves the
+    // signal mask via `sigprocmask`, a syscall this has no use for. Emscripten only
+    // exposes the standard spelling.
+#ifdef __EMSCRIPTEN__
+    (void)setjmp(regs);
+#else
     (void)_setjmp(regs); // NOLINT(bugprone-unused-return-value): spill-only, no longjmp
+#endif
     // The collector scans ITSELF from its stack pointer, not from `&regs`. `_setjmp`
     // captures the registers as they stand *here*, by which point this function's own
     // calls (`gc_stop_the_world`, `now`, `ix_reset_lines`) may already have overwritten
@@ -1015,7 +1065,7 @@ static void gc_run(bool major) {
     // thread scans itself from the frame it is standing in; any other thread is
     // scanned from where it parked. With one thread this is the old single scan.
     scan_words(&regs, (char *)&regs + sizeof regs);
-    pthread_mutex_lock(&gc_registry_lock);
+    marm_mutex_lock(&gc_registry_lock);
     for (size_t i = 0; i < gc_thread_count; i++) {
         ThreadCtx *ctx = gc_threads[i];
         void *top = ctx == self ? stack_top : ctx->stack_top;
@@ -1029,7 +1079,7 @@ static void gc_run(bool major) {
         }
         scan_words(top, ctx->stack_bottom);
     }
-    pthread_mutex_unlock(&gc_registry_lock);
+    marm_mutex_unlock(&gc_registry_lock);
 
     // Write-barrier roots. A minor skips each old container itself, so trace its
     // mutable children directly and enqueue any young objects they reference.
@@ -1220,10 +1270,10 @@ void *gc_alloc_slow(size_t total, ObjKind kind) {
         if (total > IX_MAX_ALLOC) {                 // large: malloc, shared large path
             assert(total - sizeof(GcHeader) <= UINT32_MAX); // body is uint32 (see GcHeader)
             h = malloc(total);
-            pthread_mutex_lock(&gc_alloc_lock);
+            marm_mutex_lock(&gc_alloc_lock);
             ps_insert(&large_set, (uintptr_t)BODY(h));
             large_push(h);
-            pthread_mutex_unlock(&gc_alloc_lock);
+            marm_mutex_unlock(&gc_alloc_lock);
             // A large object never enters a run, so it is counted here; everything
             // else is counted when its run is left, into `ix_total_bytes`.
             self->ix_bytes += total;
@@ -1256,7 +1306,7 @@ void *gc_alloc_slow(size_t total, ObjKind kind) {
                 // acquisition -- one lock per 32 KiB is a million acquisitions on this
                 // workload, and every thread wants one at once.
                 if (!self->ix_spare) {
-                    pthread_mutex_lock(&gc_alloc_lock);
+                    marm_mutex_lock(&gc_alloc_lock);
                     for (int k = 0; k < IX_BATCH && ix_recycle; k++) {
                         IxBlock *b = ix_recycle;
                         ix_recycle = b->rnext;
@@ -1269,7 +1319,7 @@ void *gc_alloc_slow(size_t total, ObjKind kind) {
                             b->rnext = self->ix_spare;
                             self->ix_spare = b;
                         }
-                    pthread_mutex_unlock(&gc_alloc_lock);
+                    marm_mutex_unlock(&gc_alloc_lock);
                 }
                 self->ix_cur = self->ix_spare;
                 self->ix_spare = self->ix_spare->rnext;
@@ -1288,7 +1338,7 @@ void *gc_alloc_slow(size_t total, ObjKind kind) {
         // Slab collector (non-default): every allocation lands here.
         // The slab allocator (MARM_GC=slab) keeps all of its state shared, so the
         // whole path is under the lock rather than just an acquisition step.
-        pthread_mutex_lock(&gc_alloc_lock);
+        marm_mutex_lock(&gc_alloc_lock);
         if (total <= SMALL_MAX) {
             size_t c = (total + 15) / 16;
             if (!free_list[c]) grow_class(c);
@@ -1302,7 +1352,7 @@ void *gc_alloc_slow(size_t total, ObjKind kind) {
             ps_insert(&large_set, (uintptr_t)BODY(h));
             large_push(h);
         }
-        pthread_mutex_unlock(&gc_alloc_lock);
+        marm_mutex_unlock(&gc_alloc_lock);
         gc_young_bytes += total;
         gc_total_bytes += total;
     }
@@ -1533,19 +1583,19 @@ void gc_register_thread(void *stack_bottom) {
     // leaving it waiting forever. Keep the rendezvous lock through insertion;
     // otherwise a collection can start in the gap after the wait and observe a
     // newly registered thread with no published stack top.
-    pthread_mutex_lock(&gc_stw_lock);
+    marm_mutex_lock(&gc_stw_lock);
     while (atomic_load_explicit(&gc_pending, memory_order_acquire))
-        pthread_cond_wait(&gc_stw_resume, &gc_stw_lock);
-    pthread_mutex_lock(&gc_registry_lock);
+        marm_cond_wait(&gc_stw_resume, &gc_stw_lock);
+    marm_mutex_lock(&gc_registry_lock);
     if (gc_thread_count == GC_MAX_THREADS) {
         fprintf(stderr, "marmelade: more than %d threads\n", GC_MAX_THREADS);
         abort();
     }
     gc_threads[gc_thread_count++] = ctx;
     if (gc_thread_count > gc_threads_hwm) gc_threads_hwm = gc_thread_count;
-    pthread_mutex_unlock(&gc_registry_lock);
+    marm_mutex_unlock(&gc_registry_lock);
     self = ctx;
-    pthread_mutex_unlock(&gc_stw_lock);
+    marm_mutex_unlock(&gc_stw_lock);
 }
 
 void gc_unregister_thread(void) {
@@ -1553,17 +1603,17 @@ void gc_unregister_thread(void) {
     // Leaving satisfies a waiting collector just as parking would: it is one fewer
     // thread to wait for. Take the rendezvous lock across the removal and signal,
     // or a collector already counting heads waits for a thread that has gone.
-    pthread_mutex_lock(&gc_stw_lock);
-    pthread_mutex_lock(&gc_registry_lock);
+    marm_mutex_lock(&gc_stw_lock);
+    marm_mutex_lock(&gc_registry_lock);
     for (size_t i = 0; i < gc_thread_count; i++) {
         if (gc_threads[i] == self) {
             gc_threads[i] = gc_threads[--gc_thread_count];
             break;
         }
     }
-    pthread_mutex_unlock(&gc_registry_lock);
-    pthread_cond_signal(&gc_stw_parked);
-    pthread_mutex_unlock(&gc_stw_lock);
+    marm_mutex_unlock(&gc_registry_lock);
+    marm_cond_signal(&gc_stw_parked);
+    marm_mutex_unlock(&gc_stw_lock);
     free(self->rem);
     free(self);
     self = NULL;
@@ -1571,6 +1621,9 @@ void gc_unregister_thread(void) {
 
 void gc_init(void *stack_bottom) {
     gc_started = now();
+#ifdef __EMSCRIPTEN__
+    stack_bottom = (void *)emscripten_stack_get_base();
+#endif
     gc_register_thread(stack_bottom);
     // Generation sizes are tunable (in KiB) for experimentation/benchmarking.
     const char *nursery = getenv("MARM_NURSERY");
@@ -1598,6 +1651,13 @@ void gc_init(void *stack_bottom) {
     gc_major_at = gc_major_floor;
     if (getenv("MARM_NOGEN")) gc_generational = false;
     if (getenv("MARM_NOGC")) gc_disabled = true;
+#ifdef MARMELADE_WASM
+    // WebAssembly locals live on the VM's hidden value stack and cannot be found
+    // by a conservative scan of linear memory. Browser entry wrappers therefore
+    // collect after user code returns, when managed state is in precise globals.
+    // Disable allocation-triggered collections inside a Marmelade call.
+    gc_disabled = true;
+#endif
     const char *which = getenv("MARM_GC");
     if (which && strcmp(which, "slab") == 0) gc_immix = false;
     if (which && strcmp(which, "immix") == 0) gc_immix = true;
@@ -1756,6 +1816,9 @@ Value mk_tuple_uninit(size_t len) {
 // It occupies exactly the payload width: the nullary value is all zeroes and the
 // payload value is representation-transparent.
 #define SHAPE_NICHE_SUM (-2)
+// Adapter between a nominal record's fixed canonical ABI and its fully-ground
+// packed-array layout. Encoding: `[-3, nfields, abi-shape, packed-shape, ...]`.
+#define SHAPE_ABI_RECORD (-3)
 
 // Number of int64 entries the shape node at `i` spans (pre-order). A variant node
 // `[m, ...]` shares the product/leaf span logic (span of `[0]` and of an empty
@@ -1768,6 +1831,14 @@ static size_t shape_span(const int64_t *shape, size_t i) {
         return span;
     }
     if (node == SHAPE_NICHE_SUM) return 4 + shape_span(shape, i + 4);
+    if (node == SHAPE_ABI_RECORD) {
+        size_t span = 2, c = i + 2;
+        for (int64_t field = 0; field < shape[i + 1]; field++) {
+            size_t abi = shape_span(shape, c); c += abi; span += abi;
+            size_t packed = shape_span(shape, c); c += packed; span += packed;
+        }
+        return span;
+    }
     int64_t nv = shape[i + 2]; // sum: [SHAPE_SUM, pad, nvariants] then each variant node
     size_t span = 3, c = i + 3;
     for (int64_t k = 0; k < nv; k++) { size_t s = shape_span(shape, c); c += s; span += s; }
@@ -1803,6 +1874,7 @@ static size_t build_shape(Value v, int64_t *shape, size_t *slen, int depth, bool
 }
 
 static size_t shape_leaves(const int64_t *shape, size_t *i);
+static Value unflatten(const int64_t *shape, size_t *si, const Value *src, size_t *sri);
 
 // Pack `v`'s leaves into `dest` in shape order (advancing both cursors). A sum
 // node writes [tag, active variant's leaves, zero-padding to the union payload];
@@ -1838,6 +1910,25 @@ static void flatten(Value v, const int64_t *shape, size_t *si, Value *dest, size
                 flatten(data_field(v, (size_t)i), shape, &payload_i, dest, di);
         }
         *si = end_i;
+        return;
+    }
+    if (node == SHAPE_ABI_RECORD) {
+        size_t node_i = *si;
+        int64_t field_count = shape[node_i + 1];
+        size_t cursor = node_i + 2;
+        size_t source_word = 0;
+        Tuple *record = as_tuple(v);
+        for (int64_t field_index = 0; field_index < field_count; field_index++) {
+            size_t abi_i = cursor;
+            size_t packed_i = abi_i + shape_span(shape, abi_i);
+            size_t packed_end = packed_i + shape_span(shape, packed_i);
+            size_t read_i = source_word;
+            Value field = unflatten(shape, &abi_i, record->elems, &read_i);
+            flatten(field, shape, &packed_i, dest, di);
+            source_word = read_i;
+            cursor = packed_end;
+        }
+        *si = node_i + shape_span(shape, node_i);
         return;
     }
     // sum: `v` is a Data (tag in the header, fields inline).
@@ -1897,6 +1988,35 @@ static Value unflatten(const int64_t *shape, size_t *si, const Value *src, size_
             out = mk_data_inline(VInt((int64_t)payload_tag), (size_t)field_count, fields);
         }
         *sri = payload0 + words;
+        *si = node_i + shape_span(shape, node_i);
+        return out;
+    }
+    if (node == SHAPE_ABI_RECORD) {
+        size_t node_i = *si;
+        int64_t field_count = shape[node_i + 1];
+        size_t cursor = node_i + 2;
+        size_t abi_words = 0;
+        for (int64_t field_index = 0; field_index < field_count; field_index++) {
+            size_t count_i = cursor;
+            abi_words += shape_leaves(shape, &count_i);
+            cursor += shape_span(shape, cursor);
+            cursor += shape_span(shape, cursor);
+        }
+
+        size_t body = sizeof(Tuple) + abi_words * sizeof(Value);
+        Tuple *record = gc_new(body, OBJ_TUPLE);
+        memset(record->elems, 0, abi_words * sizeof(Value));
+        Value out = VObject(record);
+        cursor = node_i + 2;
+        size_t destination_word = 0;
+        for (int64_t field_index = 0; field_index < field_count; field_index++) {
+            size_t abi_i = cursor;
+            size_t packed_i = abi_i + shape_span(shape, abi_i);
+            size_t packed_end = packed_i + shape_span(shape, packed_i);
+            Value field = unflatten(shape, &packed_i, src, sri);
+            flatten(field, shape, &abi_i, as_tuple(out)->elems, &destination_word);
+            cursor = packed_end;
+        }
         *si = node_i + shape_span(shape, node_i);
         return out;
     }
@@ -2135,6 +2255,19 @@ static size_t shape_leaves(const int64_t *shape, size_t *i) {
     if (node == SHAPE_NICHE_SUM) {
         *i += 4;
         return shape_leaves(shape, i);
+    }
+    if (node == SHAPE_ABI_RECORD) {
+        int64_t field_count = shape[*i + 1];
+        size_t cursor = *i + 2;
+        size_t words = 0;
+        for (int64_t field_index = 0; field_index < field_count; field_index++) {
+            cursor += shape_span(shape, cursor); // canonical ABI side is not stored
+            size_t packed_i = cursor;
+            words += shape_leaves(shape, &packed_i);
+            cursor = packed_i;
+        }
+        *i = cursor;
+        return words;
     }
     size_t pad = (size_t)shape[*i + 1];
     *i += shape_span(shape, *i);

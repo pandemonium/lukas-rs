@@ -26,6 +26,16 @@ use crate::{
     typer::{BaseType, Type, TypeInfo, memory_layout_evidence_name},
 };
 
+/// The C-level entry point required by the environment that will link the
+/// generated translation unit. This is narrower than the compiler's execution
+/// profile: code generation only needs to know how control enters the program.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CEntryPoint {
+    #[default]
+    Process,
+    Wasm,
+}
+
 /// What a worker's own recursive call looks like, for tail-call loopification. A top-level
 /// `Worker` names itself by its global name; a lifted (recursive) lambda names itself through
 /// `self` (`Identifier::SelfRef`).
@@ -1475,6 +1485,10 @@ impl lambda_lift::Program {
     // runs the program's `start` entry point. Builtin definitions are omitted --
     // the runtime (`c/runtime.c`) provides them.
     pub fn generate_code(&self, out: &mut CodeBuffer) -> fmt::Result {
+        self.generate_code_for(out, CEntryPoint::Process)
+    }
+
+    pub fn generate_code_for(&self, out: &mut CodeBuffer, entry_point: CEntryPoint) -> fmt::Result {
         let c_inline_workers = self.c_inline_workers();
         let allocating = self.allocation_summaries();
         writeln!(out, "#include \"runtime.h\"")?;
@@ -1812,7 +1826,15 @@ impl lambda_lift::Program {
             root_names.len()
         )?;
 
-        writeln!(out, "int main(void) {{")?;
+        match entry_point {
+            CEntryPoint::Process => writeln!(out, "int main(void) {{")?,
+            CEntryPoint::Wasm => {
+                writeln!(out, "static bool marmelade_started = false;")?;
+                writeln!(out, "void marmelade_start(void) {{")?;
+                writeln!(out, "  if (marmelade_started) return;")?;
+                writeln!(out, "  marmelade_started = true;")?;
+            }
+        }
         writeln!(out, "  int gc_anchor;")?;
         writeln!(out, "  gc_init(&gc_anchor);")?;
         writeln!(out, "  runtime_init();")?;
@@ -1831,7 +1853,18 @@ impl lambda_lift::Program {
                 writeln!(out, ";")?;
             }
         }
-        writeln!(out, "  return 0;\n}}")?;
+        match entry_point {
+            CEntryPoint::Process => writeln!(out, "  return 0;\n}}")?,
+            CEntryPoint::Wasm => {
+                // Emscripten cannot expose pointers held in Wasm locals to a
+                // conservative collector. Once the program call has returned,
+                // persistent state is in the precise global-root table and a full
+                // collection is sound. Future Wasm event wrappers use the same
+                // boundary discipline.
+                writeln!(out, "  gc_collect();")?;
+                writeln!(out, "}}")?;
+            }
+        }
         Ok(())
     }
 
@@ -1945,10 +1978,93 @@ impl lambda_lift::Program {
         if std::env::var_os("MARM_NOFLAT").is_some() || !element.variables().is_empty() {
             return None;
         }
+        if let Some(shape) = self.flat_array_record_adapter_shape(element) {
+            return (shape.len() <= FLAT_MAX_SHAPE).then_some(shape);
+        }
         let result = self.runtime_shape(element, &mut Vec::new());
         let mut encoded = Vec::new();
         result.shape.encode(&mut encoded);
         (encoded.len() <= FLAT_MAX_SHAPE).then_some(encoded)
+    }
+
+    /// A nominal polymorphic record has a fixed canonical ABI, while a packed
+    /// array instantiates its fields and may use a narrower/wider ground layout.
+    /// Encode both sides at that boundary. `SHAPE_ABI_RECORD` is interpreted by
+    /// the runtime as pairs of `(canonical field shape, packed field shape)`.
+    fn flat_array_record_adapter_shape(&self, element: &Type) -> Option<Vec<i64>> {
+        let (name, arguments) = match element {
+            Type::Constructor(name) => (name, Vec::new()),
+            Type::Apply { .. } => applied_type(element)?,
+            _ => return None,
+        };
+        let TypeDefinition::Record(record) = self.type_definitions.get(name)? else {
+            return None;
+        };
+        let bindings = record
+            .type_parameters
+            .iter()
+            .zip(arguments)
+            .map(|(parameter, argument)| (parameter.name.clone(), argument))
+            .collect::<HashMap<_, _>>();
+        let mut fields = record.fields.iter().collect::<Vec<_>>();
+        fields.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+        let abi_widths = self.flat_widths(element)?;
+        if fields.len() != abi_widths.len() {
+            return None;
+        }
+
+        let mut pairs = Vec::with_capacity(fields.len());
+        let mut differs = false;
+        for (field, abi_width) in fields.into_iter().zip(abi_widths) {
+            let field_type = instantiate_type_expression(&field.type_signature.body, &bindings)?;
+            let packed = self.runtime_shape(&field_type, &mut Vec::new()).shape;
+            let abi = Self::record_abi_field_shape(abi_width, &packed);
+            differs |= abi != packed;
+            pairs.push((abi, packed));
+        }
+        if !differs {
+            return None;
+        }
+
+        let mut encoded = vec![-3, pairs.len() as i64];
+        for (abi, packed) in pairs {
+            abi.encode(&mut encoded);
+            packed.encode(&mut encoded);
+        }
+        Some(encoded)
+    }
+
+    fn record_abi_field_shape(abi_width: usize, packed: &RuntimeShape) -> RuntimeShape {
+        if abi_width == 1 {
+            // A one-word field in the fixed record ABI is the canonical value
+            // itself. Its ground instantiation can also occupy one packed word,
+            // but a one-word product or niche sum has a different representation.
+            RuntimeShape::Leaf
+        } else if abi_width == packed.stored_words() {
+            packed.clone()
+        } else {
+            match packed {
+                // A niche is a packed-layout choice. The fixed record ABI retains
+                // the ordinary tag word and union payload.
+                RuntimeShape::NicheSum {
+                    niche_tag,
+                    payload_tag,
+                    payload_fields,
+                    ..
+                } => {
+                    let variant_count = 1 + (*niche_tag).max(*payload_tag);
+                    let mut variants = vec![Vec::new(); variant_count];
+                    variants[*payload_tag] = payload_fields.clone();
+                    debug_assert!(variants[*niche_tag].is_empty());
+                    RuntimeShape::Sum {
+                        payload_words: abi_width - 1,
+                        variants,
+                    }
+                }
+                // Wider fixed fields are emitted as canonical flat words.
+                _ => RuntimeShape::Product(vec![RuntimeShape::Leaf; abi_width]),
+            }
+        }
     }
 
     fn runtime_shape(&self, ty: &Type, on_path: &mut Vec<Type>) -> ShapeResult {
@@ -2239,6 +2355,17 @@ impl lambda_lift::Program {
                     .map(|child| child.shape)
                     .collect::<Vec<_>>();
 
+                // A record nested in another shaped value cannot use the
+                // top-level ABI adapter. If its fixed canonical field layout
+                // differs from its ground packed layout, keep the record as one
+                // boxed leaf. Describing the packed shape here would make
+                // `flatten` read the canonical tuple with the wrong offsets.
+                let abi_differs = self.flat_widths(&instantiated).is_some_and(|widths| {
+                    widths.iter().zip(&children).any(|(width, packed)| {
+                        Self::record_abi_field_shape(*width, packed) != *packed
+                    })
+                });
+
                 // `compile_record` itself splats a record whenever any nested field
                 // is wider than one word. A shaped array must then describe that
                 // canonical value as the already-flat tuple it actually is;
@@ -2248,17 +2375,24 @@ impl lambda_lift::Program {
                     .flat_widths(&instantiated)
                     .is_some_and(|widths| widths.iter().any(|width| *width > 1));
 
-                ShapeResult {
-                    reaches_enclosing_type,
-                    shape: RuntimeShape::Product(if splatted {
-                        let mut words = Vec::new();
-                        for child in children {
-                            child.splat_words(&mut words);
-                        }
-                        words
-                    } else {
-                        children
-                    }),
+                if abi_differs {
+                    ShapeResult {
+                        reaches_enclosing_type: false,
+                        shape: RuntimeShape::Leaf,
+                    }
+                } else {
+                    ShapeResult {
+                        reaches_enclosing_type,
+                        shape: RuntimeShape::Product(if splatted {
+                            let mut words = Vec::new();
+                            for child in children {
+                                child.splat_words(&mut words);
+                            }
+                            words
+                        } else {
+                            children
+                        }),
+                    }
                 }
             }
             TypeDefinition::Coproduct(coproduct) => {
@@ -4922,7 +5056,16 @@ impl lambda_lift::Program {
                     args[2].annotation().type_info.inferred_type,
                 );
             }
-            if ground {
+            // A nominal record can have a fixed canonical ABI that differs from
+            // its fully-ground packed-array shape.  In that case the runtime
+            // array shape carries an ABI adapter; let `flat_array_set` apply it.
+            // Projecting the packed width directly from the canonical value
+            // would read beyond (or otherwise misinterpret) the record body.
+            if ground
+                && self
+                    .flat_array_record_adapter_shape(&args[2].annotation().type_info.inferred_type)
+                    .is_none()
+            {
                 let shape = self
                     .runtime_shape(
                         &args[2].annotation().type_info.inferred_type,

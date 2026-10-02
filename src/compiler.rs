@@ -9,14 +9,14 @@ use crate::{
         namer::{self, NameError},
     },
     chez,
-    codegen::CodeBuffer,
+    codegen::{CEntryPoint, CodeBuffer},
     interpreter::{
         self, Environment, Literal, RuntimeError,
         cek::{Env, Globals, Val},
     },
     lexer::LexicalAnalyzer,
     parser::{self, ParseError, ParseInfo, Parsed},
-    phase, source_map,
+    phase, requirements, source_map,
     typer::{Elaborated, TypeError, TypeErrors, Types},
 };
 
@@ -71,6 +71,21 @@ pub enum CompilationError {
 
     #[error("cannot load module `{name}`: no source file found at {}", .path.display())]
     MissingModule { name: String, path: PathBuf },
+
+    #[error("the {profile:?} execution profile is not supported by the {backend:?} backend")]
+    UnsupportedExecutionProfile {
+        backend: Backend,
+        profile: ExecutionProfile,
+    },
+
+    #[error("requirements cannot be satisfied for {platform}:\n{report}")]
+    UnsatisfiedRequirements {
+        platform: requirements::Platform,
+        report: String,
+    },
+
+    #[error("cannot load capability model `{path}`: {message}", path = .path.display())]
+    CapabilityModel { path: PathBuf, message: String },
 }
 
 /// Format the unresolved edges of a dependency graph into an error naming which
@@ -153,8 +168,54 @@ pub enum Backend {
     /// Emit Chez Scheme source (the default).
     #[default]
     Scheme,
-    /// Emit C source, compiled to a native binary downstream (see `c/`).
+    /// Emit C source. The execution profile determines the downstream environment.
     Native,
+}
+
+/// The environment the generated program is intended to execute in.
+///
+/// This is deliberately independent of [`Backend`]: the native backend emits C,
+/// which can later be compiled for more than one execution environment. `Host`
+/// preserves the process-oriented runtime and entry point used before profiles
+/// were introduced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ExecutionProfile {
+    #[default]
+    Host,
+    #[value(name = "native-macos")]
+    NativeMacOS,
+    #[value(name = "native-linux")]
+    NativeLinux,
+    #[value(name = "native-windows")]
+    NativeWindows,
+    #[value(name = "wasm-node")]
+    WasmNode,
+    /// Run as a WebAssembly module loaded by a browser. `browser` remains an
+    /// accepted compatibility spelling for the original two-profile interface.
+    #[value(name = "wasm-browser", alias = "browser")]
+    WasmBrowser,
+}
+
+impl ExecutionProfile {
+    pub const fn platform(self) -> requirements::Platform {
+        match self {
+            Self::Host => requirements::Platform::current_native(),
+            Self::NativeMacOS => requirements::Platform::NativeMacOS,
+            Self::NativeLinux => requirements::Platform::NativeLinux,
+            Self::NativeWindows => requirements::Platform::NativeWindows,
+            Self::WasmNode => requirements::Platform::WasmNode,
+            Self::WasmBrowser => requirements::Platform::WasmBrowser,
+        }
+    }
+
+    pub const fn entry_point(self) -> CEntryPoint {
+        match self {
+            Self::Host | Self::NativeMacOS | Self::NativeLinux | Self::NativeWindows => {
+                CEntryPoint::Process
+            }
+            Self::WasmNode | Self::WasmBrowser => CEntryPoint::Wasm,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -168,9 +229,115 @@ pub struct Compiler {
     #[arg(long = "backend", value_enum, default_value_t = Backend::Scheme)]
     pub backend: Backend,
 
+    /// Select the generated program's execution environment independently of its backend.
+    #[arg(
+        long = "profile",
+        value_enum,
+        default_value_t = ExecutionProfile::Host
+    )]
+    pub profile: ExecutionProfile,
+
+    /// Provider graph used by the native backend. Defaults to
+    /// `<library>/capabilities.conf`.
+    #[arg(long = "capabilities")]
+    pub capability_config: Option<PathBuf>,
+
+    /// Write the concrete providers, C defines, and provider-owned sources chosen
+    /// for this build. The native build driver consumes this plan.
+    #[arg(long = "provider-plan")]
+    pub provider_plan: Option<PathBuf>,
+
+    /// Write inferred requirements for every symbol that has any.
+    #[arg(long = "requirements-report")]
+    pub requirements_report: Option<PathBuf>,
+
     /// Where to write the emitted source; prints to stdout if omitted.
     #[arg(long = "output", short = 'o')]
     pub output_file: Option<PathBuf>,
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+
+    #[test]
+    fn command_line_defaults_preserve_the_existing_host_configuration() {
+        let compiler = Compiler::try_parse_from([
+            "mc",
+            "--library",
+            "ladies/stdlib",
+            "--source",
+            "ladies/examples/01_literals_and_operators",
+        ])
+        .expect("the existing command line should remain valid");
+
+        assert_eq!(compiler.backend, Backend::Scheme);
+        assert_eq!(compiler.profile, ExecutionProfile::Host);
+    }
+
+    #[test]
+    fn backend_and_execution_profile_are_independent_arguments() {
+        let compiler = Compiler::try_parse_from([
+            "mc",
+            "--library",
+            "ladies/stdlib",
+            "--source",
+            "ladies/examples/01_literals_and_operators",
+            "--backend",
+            "native",
+            "--profile",
+            "host",
+        ])
+        .expect("backend and execution profile should parse together");
+
+        assert_eq!(compiler.backend, Backend::Native);
+        assert_eq!(compiler.profile, ExecutionProfile::Host);
+    }
+
+    #[test]
+    fn browser_execution_profile_is_available_to_the_native_backend() {
+        let compiler = Compiler::try_parse_from([
+            "mc",
+            "--library",
+            "ladies/stdlib",
+            "--source",
+            "ladies/examples/01_literals_and_operators",
+            "--backend",
+            "native",
+            "--profile",
+            "browser",
+        ])
+        .expect("the browser execution profile should parse");
+
+        assert_eq!(compiler.backend, Backend::Native);
+        assert_eq!(compiler.profile, ExecutionProfile::WasmBrowser);
+    }
+
+    #[test]
+    fn every_explicit_native_target_profile_parses() {
+        for (spelling, expected) in [
+            ("native-macos", ExecutionProfile::NativeMacOS),
+            ("native-linux", ExecutionProfile::NativeLinux),
+            ("native-windows", ExecutionProfile::NativeWindows),
+            ("wasm-node", ExecutionProfile::WasmNode),
+            ("wasm-browser", ExecutionProfile::WasmBrowser),
+        ] {
+            let compiler = Compiler::try_parse_from([
+                "mc",
+                "--library",
+                "ladies/stdlib",
+                "--source",
+                "ladies/examples/01_literals_and_operators",
+                "--backend",
+                "native",
+                "--profile",
+                spelling,
+            ])
+            .unwrap_or_else(|error| panic!("profile {spelling} did not parse: {error}"));
+
+            assert_eq!(compiler.profile, expected);
+        }
+    }
 }
 
 impl Compiler {
@@ -359,6 +526,11 @@ impl Compiler {
 
     pub fn typecheck_and_compile(&self, program: CompilationUnit) -> Compilation<()> {
         let program = self.check_compilation_unit(program)?;
+        // Chez retains its existing foreign-link model. Capability providers are
+        // native-backend build inputs and deliberately do not constrain Scheme.
+        if self.backend == Backend::Native {
+            self.validate_requirements(&program)?;
+        }
         // Lower the surface panic while its source annotation is intact. This is a
         // front-end-to-back-end boundary operation: every emitter must receive the
         // same explicit diagnostic arguments, rather than relying on a particular
@@ -384,14 +556,14 @@ impl Compiler {
                     .lambda_lift(&order);
                 eprintln!("======== LAMBDA-LIFT IR ========\n{lifted}");
                 let mut c = CodeBuffer::default();
-                let _ = lifted.generate_code(&mut c);
+                let _ = lifted.generate_code_for(&mut c, self.profile.entry_point());
                 eprintln!("======== GENERATED C ========\n{c}");
                 return Ok(());
             }
 
             let mut code = CodeBuffer::default();
-            match self.backend {
-                Backend::Scheme => {
+            match (self.backend, self.profile) {
+                (Backend::Scheme, ExecutionProfile::Host) => {
                     // Each module that declares foreign functions gets its `<Module>.ss`
                     // implementation resolved (source-dir first, then --library) and spliced
                     // into the emitted Scheme.
@@ -412,7 +584,13 @@ impl Compiler {
                         program.emit_scheme_code(&mut code, &foreign_files)
                     })?;
                 }
-                Backend::Native => {
+                (Backend::Scheme, profile) => {
+                    return Err(CompilationError::UnsupportedExecutionProfile {
+                        backend: self.backend,
+                        profile,
+                    });
+                }
+                (Backend::Native, profile) => {
                     // C has no closures: convert them away and lambda-lift before
                     // emitting. Dependency-resolvable order lives on the pre-closure
                     // table, so eager top-level values initialise after what they read.
@@ -441,8 +619,10 @@ impl Compiler {
                     let lifted = crate::profile::time("codegen: lambda lift", || {
                         program.lambda_lift(&order)
                     });
-                    crate::profile::time("codegen: emit C", || lifted.generate_code(&mut code))
-                        .map_err(io::Error::other)?;
+                    crate::profile::time("codegen: emit C", || {
+                        lifted.generate_code_for(&mut code, profile.entry_point())
+                    })
+                    .map_err(io::Error::other)?;
                 }
             }
 
@@ -454,6 +634,58 @@ impl Compiler {
 
             Ok(())
         }
+    }
+
+    fn validate_requirements(&self, program: &phase::SymbolTable<Types>) -> Compilation<()> {
+        let platform = self.profile.platform();
+        let model_path = self
+            .capability_config
+            .clone()
+            .unwrap_or_else(|| self.library_path.join("capabilities.conf"));
+        let model = requirements::CapabilityModel::load(&model_path).map_err(|error| {
+            CompilationError::CapabilityModel {
+                path: model_path,
+                message: error.to_string(),
+            }
+        })?;
+        let analysis = requirements::infer(program, requirements::root_entry());
+        if let Some(path) = &self.requirements_report {
+            analysis.write_report(path)?;
+        }
+        let required = analysis
+            .entry_traces
+            .iter()
+            .map(|trace| trace.requirement.clone())
+            .collect::<Vec<_>>();
+        let resolution = model.resolve(required, platform);
+
+        if !resolution.is_satisfied() {
+            let report = analysis
+                .entry_traces
+                .iter()
+                .filter_map(|trace| {
+                    let failure = model
+                        .resolve([trace.requirement.clone()], platform)
+                        .unsatisfied
+                        .into_iter()
+                        .next()?;
+                    let path = trace
+                        .path
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" -> ");
+                    Some(format!("  {failure}\n    required through {path}"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(CompilationError::UnsatisfiedRequirements { platform, report });
+        }
+
+        if let Some(path) = &self.provider_plan {
+            resolution.write_plan(path)?;
+        }
+        Ok(())
     }
 
     pub fn load_module_declarations(

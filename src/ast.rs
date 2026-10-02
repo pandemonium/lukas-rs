@@ -112,7 +112,17 @@ pub struct WitnessDeclaration<A> {
 #[derive(Debug)]
 pub struct ForeignDeclaration<A> {
     pub name: parser::Identifier,
+    /// Capabilities required to use this bodyless value. Ordinary Marmelade
+    /// values infer their requirements from their bodies; a foreign value has no
+    /// body, so its declaration is the irreducible source of this information.
+    pub requirements: Vec<Requirement<A>>,
     pub type_signature: TypeSignature<A, parser::IdentifierPath>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requirement<A> {
+    pub annotation: A,
+    pub name: parser::IdentifierPath,
 }
 
 #[derive(Debug)]
@@ -1502,7 +1512,24 @@ where
             Self::Use(_, decl) => write!(f, "use {decl}"),
             Self::Signature(_, decl) => write!(f, "constraint {decl}"),
             Self::Witness(_, decl) => write!(f, "witness {decl}"),
-            Self::Foreign(_, decl) => write!(f, "foreign {}::{}", decl.name, decl.type_signature),
+            Self::Foreign(_, decl) => {
+                write!(f, "foreign ")?;
+                if !decl.requirements.is_empty() {
+                    write!(
+                        f,
+                        "[ {} ] ",
+                        display_list(
+                            "; ",
+                            &decl
+                                .requirements
+                                .iter()
+                                .map(|requirement| &requirement.name)
+                                .collect::<Vec<_>>()
+                        )
+                    )?;
+                }
+                write!(f, "{} :: {}", decl.name, decl.type_signature)
+            }
         }
     }
 }

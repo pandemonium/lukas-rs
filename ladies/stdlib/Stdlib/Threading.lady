@@ -20,9 +20,9 @@ opaque Thread ::= ∀α. Make_Thread_Handle Int
 unconfined opaque Work_Queue ::= Make_Work_Queue Int
 
 module Work_Queue:
-  foreign raw_new  :: Int -> Int
-  foreign raw_next :: Int -> Int
-  foreign raw_free :: Int -> Unit
+  foreign [ Threads ] raw_new  :: Int -> Int
+  foreign [ Threads ] raw_next :: Int -> Int
+  foreign [ Threads ] raw_free :: Int -> Unit
 
   new :: Int -> IO Work_Queue :=
     λunits. IO.suspend (λ_. Make_Work_Queue (raw_new units))
@@ -35,8 +35,8 @@ module Work_Queue:
     λ(Make_Work_Queue handle). IO.suspend (λ_. raw_free handle)
 
 module Thread:
-  foreign raw_spawn :: ∀α. (Unit -> α) -> Int
-  foreign raw_join  :: ∀α. Int -> α
+  foreign [ Threads ] raw_spawn :: ∀α. (Unit -> α) -> Int
+  foreign [ Threads ] raw_join  :: ∀α. Int -> α
 
   spawn :: ∀α. (IO α) : unconfined -> IO (Thread α) :=
     λ(Suspend thunk). IO.suspend (λ_. Make_Thread_Handle (raw_spawn thunk))

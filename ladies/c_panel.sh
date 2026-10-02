@@ -86,17 +86,17 @@ for dir in "$ROOT_DIR"/ladies/"$PANEL"/*/; do
       kill -9 "$killer_pid" 2>/dev/null
       wait "$killer_pid" 2>/dev/null
 
+      has_sentinel=false
+      grep -q '^##TC$' "$work/out" && has_sentinel=true
       prog="$(sed -n '/^##TC$/,$p' "$work/out" | sed '1d')"
 
       if [ "$rc" -eq 137 ]; then
         status="CRASH"
+      elif $has_sentinel && [ -f "$dir/expected" ]; then
+        exp="$(cat "$dir/expected")"
+        [ "$prog" = "$exp" ] && status="ok" || status="MISMATCH"
       elif [ -n "$prog" ]; then
-        if [ -f "$dir/expected" ]; then
-          exp="$(cat "$dir/expected")"
-          [ "$prog" = "$exp" ] && status="ok" || status="MISMATCH"
-        else
-          status="no-expected"
-        fi
+        status="no-expected"
       else
         status="no-output"
       fi

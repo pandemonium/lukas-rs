@@ -85,6 +85,10 @@ start := λ_. hot 2 0
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: dir,
         backend: Backend::Native,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: Some(output.clone()),
     }
     .compiler_main()

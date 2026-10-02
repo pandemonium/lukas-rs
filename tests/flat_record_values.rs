@@ -28,6 +28,10 @@ start :: Int -> Int := λn.
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: dir,
         backend: Backend::Native,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: Some(output.clone()),
     }
     .compiler_main()
@@ -92,6 +96,10 @@ start := λ_.
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: dir,
         backend: Backend::Native,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: Some(output.clone()),
     }
     .compiler_main()
@@ -128,6 +136,10 @@ start := λn.
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: dir,
         backend: Backend::Native,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: Some(output.clone()),
     }
     .compiler_main()
@@ -187,6 +199,10 @@ start :: Int -> Int := λdestination.
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: dir,
         backend: Backend::Native,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: Some(output.clone()),
     }
     .compiler_main()
@@ -212,5 +228,52 @@ start :: Int -> Int := λdestination.
     assert!(
         !command_reader.contains("mk_data_inline"),
         "{command_reader}"
+    );
+}
+
+#[test]
+fn an_abi_mismatched_record_nested_in_a_shaped_sum_stays_boxed() {
+    let dir = std::env::temp_dir().join("lukas_nested_record_array_abi");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("Root.lady"),
+        r#"use Stdlib.
+use Stdlib.Data.
+use Stdlib.Data.Array.
+
+Pair ::= { X :: Int; Y :: Int }
+Complex ::= { Maybe :: Perhaps Int; Pair :: Pair; Title :: Text }
+
+values :: Array (Perhaps Complex) :=
+  [ Nope
+    This { Maybe := Nope; Pair := { X := 4; Y := 5 }; Title := "deep" }
+  ]
+
+start :: Int -> Unit := λ_.
+  deconstruct Array.get values 1 into
+    This (This value) -> print_endline value.Title
+  | otherwise -> print_endline "empty"
+"#,
+    )
+    .unwrap();
+
+    let output = dir.join("program.c");
+    Compiler {
+        library_path: PathBuf::from("ladies/stdlib"),
+        source_path: dir,
+        backend: Backend::Native,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
+        output_file: Some(output.clone()),
+    }
+    .compiler_main()
+    .expect("native code generation");
+
+    let generated = fs::read_to_string(output).expect("generated C source");
+    assert!(
+        generated.contains("(int64_t[]){-2, 0, 1, 0, 1, 0}, 6)"),
+        "the nested Complex record was not retained as the boxed payload of Perhaps"
     );
 }

@@ -18,6 +18,10 @@ fn compiler(source: &str) -> Compiler {
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: PathBuf::from(source),
         backend: Backend::Scheme,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: None,
     }
 }

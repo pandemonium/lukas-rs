@@ -14,6 +14,10 @@ fn compiler_for(test_name: &str, source: &str) -> Compiler {
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: dir,
         backend: Backend::Native,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: None,
     }
 }
@@ -142,6 +146,10 @@ fn mutable_array_deep_update_is_one_load_and_one_store_at_the_leaf_offset() {
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: PathBuf::from("ladies/lang/15_mutable_record_updates"),
         backend: Backend::Native,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: Some(output.clone()),
     };
     compiler.compiler_main().expect("native code generation");
@@ -309,8 +317,10 @@ start :: Int -> Unit := λ_.
     let generated = fs::read_to_string(output).expect("generated C source");
 
     assert!(
-        generated.contains("{6, 5, 0, 0, 0, 0, 0}"),
-        "Entry Text was not represented as one niche key plus four inline Stats words"
+        generated.contains(
+            "{24, -3, 2, -1, 1, 2, 0, 1, 0, -2, 0, 1, 0, 1, 0, 4, 0, 0, 0, 0, 4, 0, 0, 0, 0}"
+        ),
+        "Entry Text did not adapt its fixed six-word ABI to one niche key plus four inline Stats words"
     );
 
     let hot_function = generated
@@ -337,6 +347,10 @@ start :: Int -> Unit := λ_.
     assert!(
         !hot_function.contains("raw_get_unchecked_worker"),
         "the complete Entry was reconstructed by an array read: {hot_function}"
+    );
+    assert!(
+        hot_function.contains("raw_set_unchecked_worker"),
+        "the initial Entry store bypassed the canonical-to-packed ABI adapter: {hot_function}"
     );
     assert_eq!(
         occupied_update.matches("flat_array_get_word").count(),
@@ -379,6 +393,10 @@ fn generic_record_update_fuses_when_the_selected_offset_is_fixed() {
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: PathBuf::from("ladies/lang/13_flat_sum_arrays"),
         backend: Backend::Native,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: Some(output.clone()),
     };
     compiler.compiler_main().expect("native code generation");

@@ -8,6 +8,9 @@ fn main() {
     let compiler = compiler::Compiler::parse();
     match compiler.compiler_main() {
         Ok(..) => (),
-        Err(e) => println!("$$$$ {e}"),
+        Err(error) => {
+            eprintln!("$$$$ {error}");
+            std::process::exit(1);
+        }
     }
 }

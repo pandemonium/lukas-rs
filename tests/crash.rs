@@ -25,6 +25,10 @@ start :: Int -> Unit := λ_.
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: dir.clone(),
         backend: Backend::Native,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: Some(output.clone()),
     }
     .compiler_main()
@@ -68,6 +72,10 @@ start :: Int -> Unit := λ_.
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: dir.clone(),
         backend: Backend::Native,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: Some(output.clone()),
     }
     .compiler_main()
@@ -113,6 +121,10 @@ fn scheme_crash_carries_surface_function_and_exact_call_site() {
         library_path: PathBuf::from("ladies/stdlib"),
         source_path: dir.clone(),
         backend: Backend::Scheme,
+        profile: lukas::compiler::ExecutionProfile::Host,
+        capability_config: None,
+        provider_plan: None,
+        requirements_report: None,
         output_file: Some(output.clone()),
     };
 
