@@ -7,3 +7,6 @@ ladies/benchmarks/billions/city-temperatures.txt
 
 # Native executables built beside a program's Root.lady by compile-lady.sh.
 exe
+
+# The Zed extension crate builds beside its manifest.
+editors/zed/target

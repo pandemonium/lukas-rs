@@ -1,3 +1,11 @@
+[workspace]
+# The language server lives in its own crate so the compiler keeps its five
+# dependencies: nothing in `lukas` should have to build serde to compile a program.
+members = ["lsp"]
+# The Zed extension is a wasm component built against Zed's own API, not part of
+# this workspace's host build.
+exclude = ["editors/zed"]
+
 [package]
 name = "lukas"
 version = "0.1.0"

@@ -441,7 +441,7 @@ destination :: IO Destination :=
     else pure File
 
 markup_chunks_text :: Colour_Mode -> Markup -> Text := λmode markup.
-  List.concat (markup_chunks mode (Make_Style Nil) markup Nil)
+  List.concat_texts (markup_chunks mode (Make_Style Nil) markup Nil)
 
 (* ------------------------------------------------------- the interpreters
 
@@ -503,7 +503,7 @@ edit_line :: Echo -> Text -> IO (Result Fault (Perhaps Text)) := λecho prompt_t
   let whole = λ(before, after). List.append (List.reverse before) after in
   let shown = λ(before, after) content.
     deconstruct echo into
-      Show_Typing -> "`List.concat content``erase_to_end``cursor_left (List.length after)`"
+      Show_Typing -> "`List.concat_texts content``erase_to_end``cursor_left (List.length after)`"
     | Hide_Typing -> erase_to_end
   in
   let step = λ(before, after).
@@ -517,7 +517,7 @@ edit_line :: Echo -> Text -> IO (Result Fault (Perhaps Text)) := λecho prompt_t
     | Return Nope -> pure (Return Nope)
     | Return (This Enter) ->
         let* _ = put "\r\n" in
-        pure (Return (This (List.concat content)))
+        pure (Return (This (List.concat_texts content)))
     (* Ctrl-D on an empty line cancels this prompt. In raw mode it is byte 0x04 and
        nothing else -- the end of input arrives as a status, on its own path -- so
        the two are told apart here rather than guessed at. *)

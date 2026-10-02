@@ -47,7 +47,7 @@ module Mutable_Array:
 
   (* Pure escape hatch for implementing a larger atomic IO operation. Callers must *)
   (* ensure the result does not outlive the surrounding operation or race a write.  *)
-  unsafe_get_unchecked :: ∀α. Mutable_Array α -> Int -> α := λ(Mutable array) index.
+  unsafe_get_unchecked :: ∀α. Memory_Layout α |- Mutable_Array α -> Int -> α := λ(Mutable array) index.
     raw_get_unchecked array index
 
   (* The caller proves that `index` is in bounds and that this slot contains the *)

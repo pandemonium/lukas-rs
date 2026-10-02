@@ -1769,9 +1769,8 @@ fn super_obligations(
     head: &Type,
     ctx: &TypingContext,
 ) -> Result<Vec<(parser::Identifier, Constraint)>, TypeError> {
-    let class = match head {
-        Type::Apply { .. } | Type::Constructor(..) => head.applied_name(),
-        _ => return Ok(Vec::new()),
+    let Some(class) = head.try_applied_name() else {
+        return Ok(Vec::new());
     };
     let Some(tc) = ctx.types.lookup(class) else {
         return Ok(Vec::new());
@@ -3166,12 +3165,16 @@ pub struct Constraint {
 }
 
 impl Type {
-    fn applied_name(&self) -> &QualifiedName {
+    fn try_applied_name(&self) -> Option<&QualifiedName> {
         match self {
-            Type::Apply { constructor, .. } => constructor.applied_name(),
-            Type::Constructor(name) => name,
-            otherwise => panic!("{otherwise}"),
+            Type::Apply { constructor, .. } => constructor.try_applied_name(),
+            Type::Constructor(name) => Some(name),
+            _ => None,
         }
+    }
+
+    fn applied_name(&self) -> &QualifiedName {
+        self.try_applied_name().unwrap_or_else(|| panic!("{self}"))
     }
 }
 
@@ -8553,6 +8556,21 @@ mod confinement_kind_tests {
     use super::*;
     use crate::ast::namer::ConstructorSymbol;
     use crate::ast::{ApplyTypeExpr, TypeVariable};
+
+    #[test]
+    fn variable_headed_application_has_no_super_obligations() {
+        let constructor = Type::Variable(MetaVariable::fresh_with_kind(Kind::Arrow(
+            Kind::star().into(),
+            Kind::star().into(),
+        )));
+        let application = Type::application(constructor, Type::fresh());
+
+        assert!(
+            super_obligations(&application, &TypingContext::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     /// Which of two bindings for the same variable answers a lookup? `substitution`
     /// scans backwards, so it is the LAST one written -- the earlier entries are the

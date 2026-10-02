@@ -359,6 +359,12 @@ impl Compiler {
 
     pub fn typecheck_and_compile(&self, program: CompilationUnit) -> Compilation<()> {
         let program = self.check_compilation_unit(program)?;
+        // Lower the surface panic while its source annotation is intact. This is a
+        // front-end-to-back-end boundary operation: every emitter must receive the
+        // same explicit diagnostic arguments, rather than relying on a particular
+        // back end to recover them after its own transformations.
+        let program =
+            crate::profile::time("codegen: panic sites", || program.materialize_panic_sites());
 
         {
             if std::env::var("DUMP_C").is_ok() {

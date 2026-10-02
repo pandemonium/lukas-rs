@@ -23,16 +23,16 @@ use crate::hash::{HashMap, HashSet};
 
 use crate::{
     ast::{
-        Apply, Array, Binding, Deconstruct, Expr, IfThenElse, Injection, Interpolate, Lambda,
-        Literal, ProductElement, Projection, Record, RecordUpdate, RecordUpdateField, Segment,
-        SelfReferential, Sequence, Tree, Tuple, TypeAscription,
+        Apply, Array, Binding, Confinement, Deconstruct, Expr, IfThenElse, Injection, Interpolate,
+        Lambda, Literal, ProductElement, Projection, Record, RecordUpdate, RecordUpdateField,
+        Segment, SelfReferential, Sequence, Tree, Tuple, TypeAscription,
         namer::{Identifier, QualifiedName, Symbol, TermSymbol},
         pattern::{ConstructorPattern, MatchClause, Pattern, StructPattern, TuplePattern},
     },
     intrinsic::{self, IntrinsicOperation},
     lexer::BindingOperator,
     phase,
-    typer::{MetaVariable, Substitutable, Substitutions, Type, TypeInfo, Types},
+    typer::{BaseType, MetaVariable, Substitutable, Substitutions, Type, TypeInfo, Types},
 };
 
 /// Largest term body (in AST nodes) the inliner will unfold. Combinators, method
@@ -87,6 +87,21 @@ const INLINE_FUEL: usize = 200_000;
 const MAX_ROUNDS: usize = 24;
 
 impl phase::SymbolTable<Types> {
+    /// Replace each surface `omg_wtf_bbq message` with its private five-argument
+    /// worker while the exact source annotation is still present. Optimisation is
+    /// then free to inline, beta-reduce and force IO around the call: the diagnostic
+    /// data is ordinary literal data in the tree and cannot be replaced by a
+    /// synthetic node's unknown location.
+    pub fn materialize_panic_sites(mut self) -> Self {
+        for symbol in self.symbols.values_mut() {
+            let Symbol::Term(term) = symbol else {
+                continue;
+            };
+            term.body = term.body.clone().map(&mut materialize_panic_site);
+        }
+        self
+    }
+
     /// Simplify every term body in place. Types, foreign terms and all the
     /// bookkeeping tables are carried through untouched.
     pub fn simplify(self) -> Self {
@@ -212,6 +227,88 @@ impl phase::SymbolTable<Types> {
             member_visibility,
         }
     }
+}
+
+fn materialize_panic_site(expr: Expr<TypeInfo, Identifier>) -> Expr<TypeInfo, Identifier> {
+    let Expr::Apply(call_info, apply) = expr else {
+        return expr;
+    };
+    let Expr::Variable(_, Identifier::Free(name)) = &*apply.function else {
+        return Expr::Apply(call_info, apply);
+    };
+    if !intrinsic::term(name)
+        .is_some_and(|semantics| semantics.operation == IntrinsicOperation::Panic)
+    {
+        return Expr::Apply(call_info, apply);
+    }
+
+    let function = call_info
+        .enclosing_term
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "<unknown>".to_owned());
+    let file = crate::source_map::path_of(call_info.parse_info.file)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<unknown>".to_owned());
+
+    let result = call_info.inferred_type.clone();
+    let domains = [
+        Type::Base(BaseType::Text),
+        Type::Base(BaseType::Text),
+        Type::Base(BaseType::Int),
+        Type::Base(BaseType::Int),
+        Type::Base(BaseType::Text),
+    ];
+    let arrow = |from: usize| {
+        domains[from..]
+            .iter()
+            .rev()
+            .fold(result.clone(), |codomain, domain| Type::Arrow {
+                capture: Confinement::Unconfined,
+                domain: Box::new(domain.clone()),
+                codomain: Box::new(codomain),
+            })
+    };
+    let info = |inferred_type| TypeInfo {
+        parse_info: call_info.parse_info,
+        inferred_type,
+        enclosing_term: call_info.enclosing_term.clone(),
+    };
+
+    let arguments = [
+        Rc::new(Expr::Constant(
+            info(domains[0].clone()),
+            Literal::Text(function),
+        )),
+        Rc::new(Expr::Constant(
+            info(domains[1].clone()),
+            Literal::Text(file),
+        )),
+        Rc::new(Expr::Constant(
+            info(domains[2].clone()),
+            Literal::Int(i64::from(call_info.parse_info.location.row)),
+        )),
+        Rc::new(Expr::Constant(
+            info(domains[3].clone()),
+            Literal::Int(i64::from(call_info.parse_info.location.column)),
+        )),
+        apply.argument,
+    ];
+
+    let mut lowered = Expr::Variable(
+        info(arrow(0)),
+        Identifier::Free(Box::new(intrinsic::raw_panic_name())),
+    );
+    for (index, argument) in arguments.into_iter().enumerate() {
+        lowered = Expr::Apply(
+            info(arrow(index + 1)),
+            Apply {
+                function: Rc::new(lowered),
+                argument,
+            },
+        );
+    }
+    lowered
 }
 
 /// Alternate inlining and local reduction to a fixpoint. Each round the inliner

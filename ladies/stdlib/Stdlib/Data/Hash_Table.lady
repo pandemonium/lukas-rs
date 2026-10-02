@@ -69,15 +69,15 @@ Hash_Table ::= ∀α β.
   }
 
 module Hash_Table:
-  make :: ∀α β h. Eq α + Hashable α + Hash_Stream h + Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- Int -> h -> IO (Hash_Table α β) :=
+  make :: ∀α β h. Eq α + Hashable α + Hash_Stream h |- Int -> h -> IO (Hash_Table α β) :=
     λcapacity initial.
-      let* raw = Raw_Table.make capacity in
+      let* raw = Raw_Table.make (buckets_for_capacity capacity) in
       pure { Raw        := raw
         Hash_Key   := hash_with initial
         Keys_Equal := eq
       }
 
-  with_random_seed :: ∀α β h. Eq α + Hashable α + Hash_Stream h + Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- Int -> (Int -> h) -> IO (Hash_Table α β) :=
+  with_random_seed :: ∀α β h. Eq α + Hashable α + Hash_Stream h |- Int -> (Int -> h) -> IO (Hash_Table α β) :=
     λcapacity make_hash_stream.
       let* seed = IO.suspend (λ_. now_millis ()) in
       make capacity (make_hash_stream seed)
@@ -86,12 +86,36 @@ module Hash_Table:
   (* hasher -- the single place a concrete algorithm is chosen (as Rust's          *)
   (* `HashMap::new` commits to `RandomState`). Swap `Simple_Hasher.make` for a      *)
   (* strong keyed hasher's constructor once one exists; nothing else changes.       *)
-  make_default :: ∀α β. Eq α + Hashable α + Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- Int -> IO (Hash_Table α β) :=
+  make_default :: ∀α β. Eq α + Hashable α |- Int -> IO (Hash_Table α β) :=
     λcapacity.
       with_random_seed capacity Simple_Hasher.make
 
-  (* fold_m insead and let f compute in IO? *)
-  fold :: ∀α β z. Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- (z -> (α, β) -> z) -> z -> Hash_Table α β -> IO z := λf z table.
+  buckets_for_capacity :: Int -> Int := λcount.
+    if count <= 7 then 8
+    else ((count + 6) / 7) * 8
+
+  from_array :: ∀α β. Eq α + Hashable α |- Array (α, β) -> IO (Hash_Table α β) := λarray.
+    let capacity = Array.length array in
+    let* map = Hash_Table.make_default capacity in
+    let loop = λi.
+      if i < capacity then
+        let key, value =
+           (* We need an unsafe_get *)
+           Array.get array i
+        |> Perhaps.expect "within bounds"
+        in
+        let* _ = insert key value map in loop (1 + i)
+      else pure ()
+    in
+    let* _ = loop 0 in
+    pure map
+
+  from_list :: ∀α β. Eq α + Hashable α |- List (α, β) -> IO (Hash_Table α β) := λlist.
+    let* map = make_default 8 in
+    let* _ = traverse_ (λ(key, value). insert key value map) list in
+    pure map
+
+  fold :: ∀α β z. (z -> (α, β) -> z) -> z -> Hash_Table α β -> IO z := λf z table.
     let* state = Mutable_Array.get_unchecked table.Raw.State 0 in
     let length = Mutable_Array.length state.Controls in
 
@@ -107,7 +131,7 @@ module Hash_Table:
       else pure acc
     in fold_entries 0 z
 
-  to_list :: ∀α β. Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- Hash_Table α β -> IO (List (α, β)) :=
+  to_list :: ∀α β. Hash_Table α β -> IO (List (α, β)) :=
     fold (λz kv. Cons kv z) List.empty
 
   modify_with :: ∀α β. (β -> β -> β) -> α -> β -> Hash_Table α β -> IO Unit := λcombine key value table.
@@ -135,7 +159,7 @@ module Hash_Table:
   modify :: ∀α β. Semigroup β |- α -> β -> Hash_Table α β -> IO Unit :=
     modify_with mappend
 
-  insert :: ∀α β. Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- α -> β -> Hash_Table α β -> IO (Perhaps β) := λkey value table.
+  insert :: ∀α β. α -> β -> Hash_Table α β -> IO (Perhaps β) := λkey value table.
     let hash = table.Hash_Key key in
     let* found = Raw_Table.find hash (λ({ Key: existing_key; Value: _ }). table.Keys_Equal key existing_key) table.Raw in
 
@@ -161,7 +185,7 @@ module Hash_Table:
         pure Perhaps.empty
 
   (* Wtf is this doing?! *)
-  lookup :: ∀α β. Memory_Layout (Perhaps (Raw_Table.Table_Entry α β)) |- α -> Hash_Table α β -> IO (Perhaps β) := λkey table.
+  lookup :: ∀α β. α -> Hash_Table α β -> IO (Perhaps β) := λkey table.
     let hash = table.Hash_Key key in
     IO.suspend (λ_.
       let found = IO.unsafe_run_IO (Raw_Table.find hash (λ({ Key: existing_key; Value: _ }). table.Keys_Equal key existing_key) table.Raw) in
@@ -178,7 +202,7 @@ module Hash_Table:
     }
 
   module Raw_Table:
-    make :: ∀α β. Memory_Layout (Perhaps (Table_Entry α β)) |- Int -> IO (Raw_Table α β) := λcapacity.
+    make :: ∀α β. Int -> IO (Raw_Table α β) := λcapacity.
       let capacity1 = if capacity < 8 then 8 else capacity in
       let* controls = Mutable_Array.generate capacity1 (λ_. Empty) in
       let* entries = Mutable_Array.generate capacity1 (λ_. Nope) in
@@ -238,7 +262,7 @@ module Hash_Table:
       let offset = (probe * (probe + 1)) / 2 in
       positive_mod (hash + offset) capacity
 
-    find :: ∀α β. Memory_Layout (Perhaps (Table_Entry α β)) |- Int -> (Table_Entry α β -> Bool) -> Raw_Table α β -> IO (Perhaps Int) :=
+    find :: ∀α β. Int -> (Table_Entry α β -> Bool) -> Raw_Table α β -> IO (Perhaps Int) :=
       λhash matches table.
         IO.suspend (λ_.
           let state = Mutable_Array.unsafe_get_unchecked table.State 0 in
@@ -288,7 +312,7 @@ module Hash_Table:
 
       in loop 0 Perhaps.empty
 
-    insert_no_grow :: ∀α β. Memory_Layout (Perhaps (Table_Entry α β)) |- Int -> Table_Entry α β -> Raw_Table α β -> IO Unit :=
+    insert_no_grow :: ∀α β. Int -> Table_Entry α β -> Raw_Table α β -> IO Unit :=
       λhash entry table.
         let* state = Mutable_Array.get_unchecked table.State 0 in
         let* index = find_insert_slot hash table in
@@ -302,7 +326,7 @@ module Hash_Table:
             (Raw_State.after_insert state)
         in pure ()
 
-    rehash :: ∀α β. Memory_Layout (Perhaps (Table_Entry α β)) |- (α -> Int) -> Int -> Raw_Table α β -> IO Unit :=
+    rehash :: ∀α β. (α -> Int) -> Int -> Raw_Table α β -> IO Unit :=
       λhash_key new_capacity table.
         let* old_state = Mutable_Array.get_unchecked table.State 0 in
         let* new_table = Raw_Table.make new_capacity in
@@ -334,7 +358,7 @@ module Hash_Table:
               new_state
           in pure ()
 
-    reserve :: ∀α β. Memory_Layout (Perhaps (Table_Entry α β)) |- (α -> Int) -> Int -> Raw_Table α β -> IO Unit :=
+    reserve :: ∀α β. (α -> Int) -> Int -> Raw_Table α β -> IO Unit :=
       λhash_key additional table.
         let* state = Mutable_Array.get_unchecked table.State 0 in
         if state.Growth_Left >= additional then

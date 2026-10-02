@@ -31,3 +31,35 @@ start :: Int -> IO Int := λ_.
     .compiler_main()
     .expect("the action fixes `state` to First before typing state.Length");
 }
+
+#[test]
+fn later_expression_disambiguates_projection_in_a_monomorphic_let() {
+    let dir = std::env::temp_dir().join("lukas_projection_inference_monomorphic_let");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("Root.lady"),
+        r#"use Stdlib.
+
+Monster ::= { Defense :: Int; Hit_Points :: Int }
+Armor ::= { Defense :: Int; Block_Chance :: Int }
+
+score :: Perhaps Monster -> Int := λmaybe.
+  let score_monster = λmonster.
+    let defense = 0 + monster.Defense in
+    monster.Hit_Points - defense
+  in perhaps 0 score_monster maybe
+
+start :: Int -> Unit := λ_. ()
+"#,
+    )
+    .unwrap();
+
+    Compiler {
+        library_path: PathBuf::from("ladies/stdlib"),
+        source_path: dir.clone(),
+        backend: Backend::Native,
+        output_file: None,
+    }
+    .check()
+    .expect("the later `Hit_Points` projection fixes the earlier `Defense` base to Monster");
+}

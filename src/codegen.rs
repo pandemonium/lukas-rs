@@ -23,7 +23,7 @@ use crate::{
         self, ChainWorker, ClosureInfo, CoproductLayout, LiftedFunction, TopLevelBinding, Worker,
     },
     phase,
-    typer::{BaseType, Type, memory_layout_evidence_name},
+    typer::{BaseType, Type, TypeInfo, memory_layout_evidence_name},
 };
 
 /// What a worker's own recursive call looks like, for tail-call loopification. A top-level
@@ -260,7 +260,6 @@ struct FlatValuePlace {
 struct CapturePlace {
     offset: usize,
     width: usize,
-    ty: Type,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -2513,11 +2512,7 @@ impl lambda_lift::Program {
             .iter()
             .map(|info| {
                 let width = self.flat_record_width(&info.inferred_type);
-                let place = CapturePlace {
-                    offset,
-                    width,
-                    ty: info.inferred_type.clone(),
-                };
+                let place = CapturePlace { offset, width };
                 offset += width;
                 place
             })
@@ -2557,50 +2552,17 @@ impl lambda_lift::Program {
             return None;
         }
         match ty {
-            Type::Constructor(name) => {
-                let TypeDefinition::Record(record) = self.type_definitions.get(name)? else {
-                    return None;
-                };
-                on_path.push(ty.clone());
-                let mut fields = record.fields.iter().collect::<Vec<_>>();
-                fields.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
-                let widths = fields
-                    .into_iter()
-                    .map(|field| {
-                        let field_type = instantiate_type_expression(
-                            &field.type_signature.body,
-                            &HashMap::default(),
-                        )?;
-                        Some(self.flat_width_on_path(&field_type, on_path))
-                    })
-                    .collect::<Option<Vec<_>>>();
-                on_path.pop();
-                widths
-            }
+            // A nominal record has one ABI for every instantiation. In particular,
+            // a field declared as a type parameter occupies one boxed word even when
+            // a caller supplies a ground sum whose own inline width is larger. Generic
+            // producers and consumers otherwise disagree about all following offsets,
+            // and projecting the parameter yields the sum's raw tag instead of its
+            // boxed value. `record_layouts` was computed from the declaration with
+            // exactly this fixed-layout rule, so it is the authority here.
+            Type::Constructor(name) => self.record_layouts.get(name).cloned(),
             Type::Apply { .. } => {
-                let (name, arguments) = applied_type(ty)?;
-                let TypeDefinition::Record(record) = self.type_definitions.get(&name)? else {
-                    return None;
-                };
-                let bindings = record
-                    .type_parameters
-                    .iter()
-                    .zip(arguments)
-                    .map(|(parameter, argument)| (parameter.name.clone(), argument))
-                    .collect::<HashMap<_, _>>();
-                on_path.push(ty.clone());
-                let mut fields = record.fields.iter().collect::<Vec<_>>();
-                fields.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
-                let widths = fields
-                    .into_iter()
-                    .map(|field| {
-                        let field_type =
-                            instantiate_type_expression(&field.type_signature.body, &bindings)?;
-                        Some(self.flat_width_on_path(&field_type, on_path))
-                    })
-                    .collect::<Option<Vec<_>>>();
-                on_path.pop();
-                widths
+                let (name, _) = applied_type(ty)?;
+                self.record_layouts.get(&name).cloned()
             }
             Type::Tuple(tuple) => Some(
                 tuple
@@ -3224,34 +3186,30 @@ impl lambda_lift::Program {
     fn flat_value_region(
         &self,
         projection: &phase::Projection<Closed>,
-    ) -> Option<(Vec<String>, usize, Type, RuntimeShape)> {
+    ) -> Option<(Vec<String>, usize, usize, Type, RuntimeShape)> {
         let (root, selectors) = projection_root_and_selectors(projection);
         let words = self.flat_words_for(root)?;
         let mut current_type = root.annotation().type_info.inferred_type.clone();
         let mut offset = 0;
+        let mut width = words.len();
         for (step, selector) in selectors.iter().enumerate() {
-            let (next_type, field_offset) =
-                self.runtime_projection_field(&current_type, selector)?;
-            // A field kept in ONE word whose own value needs more is a POINTER to a
-            // separate object, so offsets cannot be accumulated across it -- the words
-            // on the far side are not in this region at all. Give up and let
-            // `flat_place` compile the dereference as a new base. `flat_place` already
-            // guards this; without the same guard here, `h.Inner.A` through a
-            // split local read `offset(Inner) + offset(A)` of the enclosing frame.
+            let ProductElement::Ordinal(index) = selector else {
+                return None;
+            };
+            let widths = self.flat_widths(&current_type)?;
+            let (next_type, _) = self.runtime_projection_field(&current_type, selector)?;
+            let field_offset = widths[..*index].iter().sum::<usize>();
+            width = *widths.get(*index)?;
+            // A product field kept in ONE word is a POINTER to a separate object, so
+            // offsets cannot be accumulated across it -- even when that product itself
+            // contains only one word. The latter still has a `mk_tuple1` box; treating
+            // its parent's slot as the field inside that box turns `outer.Inner.Value`
+            // into `outer.Inner` and hands the record object to consumers expecting
+            // `Value`. Give up and let `flat_place` compile the dereference as a new
+            // base. `flat_place` already guards this; without the same guard here,
+            // projections through split locals/captures cross a boxed field boundary.
             if step + 1 < selectors.len() {
-                let stored = self
-                    .flat_widths(&current_type)
-                    .and_then(|widths| match selector {
-                        ProductElement::Ordinal(index) => widths.get(*index).copied(),
-                        _ => None,
-                    });
-                if stored == Some(1)
-                    && self
-                        .runtime_shape(&next_type, &mut Vec::new())
-                        .shape
-                        .stored_words()
-                        > 1
-                {
+                if width == 1 && self.flat_widths(&next_type).is_some() {
                     return None;
                 }
             }
@@ -3259,12 +3217,7 @@ impl lambda_lift::Program {
             current_type = next_type;
         }
         let shape = self.runtime_shape(&current_type, &mut Vec::new()).shape;
-        (offset + shape.stored_words() <= words.len()).then_some((
-            words,
-            offset,
-            current_type,
-            shape,
-        ))
+        (offset + width <= words.len()).then_some((words, offset, width, current_type, shape))
     }
 
     // Resolve a projection into a flat record to `(base, offset, width)`: the C
@@ -4516,8 +4469,17 @@ impl lambda_lift::Program {
         // out a whole inlined sub-aggregate copies it out to a fresh object -- a
         // record/tuple to a tuple, an inlined sum to a boxed constructor.
         if self.flat_records_enabled() {
-            if let Some((words, offset, selected_type, shape)) = self.flat_value_region(the) {
-                if matches!(shape, RuntimeShape::Leaf) {
+            if let Some((words, offset, width, selected_type, shape)) = self.flat_value_region(the)
+            {
+                // A one-word field is stored in canonical form. In particular, a
+                // one-field record occupies one pointer word; rebuilding it with
+                // `mk_tuple1` would add a second, spurious box.
+                if width == 1 {
+                    if let Some(decoded) =
+                        self.decode_one_word_niche(&words[offset], &selected_type)
+                    {
+                        return write!(code, "{decoded}");
+                    }
                     return write!(code, "{}", words[offset]);
                 }
                 if shape.stored_words() == 1
@@ -4530,7 +4492,7 @@ impl lambda_lift::Program {
                     return write!(
                         code,
                         "{}",
-                        Self::tuple_from_words(&words[offset..offset + shape.stored_words()])
+                        Self::tuple_from_words(&words[offset..offset + width])
                     );
                 }
             }
@@ -4834,8 +4796,15 @@ impl lambda_lift::Program {
     ) -> fmt::Result {
         // Flatten the application spine into (head, args-in-order).
         let mut args: Vec<&Expr> = vec![&the.argument];
+        // Keep the annotations of the application nodes as well. Optimisation may
+        // wrap an original surface call in synthetic applications (for example
+        // when forcing an inlined IO action), whose annotations deliberately have
+        // no source file. For diagnostics we want the innermost real application:
+        // that is the call written by the programmer.
+        let mut application_infos = vec![&annotation.type_info];
         let mut head: &Expr = &the.function;
-        while let Expr::Apply(_, inner) = head {
+        while let Expr::Apply(inner_annotation, inner) = head {
+            application_infos.push(&inner_annotation.type_info);
             args.push(&inner.argument);
             head = &inner.function;
         }
@@ -4863,16 +4832,34 @@ impl lambda_lift::Program {
 
         // `omg_wtf_bbq` deliberately keeps the ordinary surface type `Text -> a`.
         // Its private foreign worker has extra diagnostic parameters; inject them
-        // here, after all transformations, from metadata carried by the call node.
-        if args.len() == 1
-            && self.intrinsic_for_expr(head).is_some_and(|semantics| {
-                matches!(
-                    semantics.operation,
-                    IntrinsicOperation::Panic | IntrinsicOperation::RawPanic
-                )
-            })
+        // here, after all transformations. Since the result is bottom, a source
+        // call may legally be over-applied (`omg_wtf_bbq "bad" x`): the first
+        // application never returns, so later arguments are unreachable and must
+        // not prevent recognition of the panic boundary.
+        if !args.is_empty()
+            && self
+                .intrinsic_for_expr(head)
+                .is_some_and(|semantics| semantics.operation == IntrinsicOperation::Panic)
         {
-            let info = &annotation.type_info;
+            let has_source =
+                |info: &&TypeInfo| crate::source_map::path_of(info.parse_info.file).is_some();
+            let head_info = &head.annotation().type_info;
+            let message_info = &args[0].annotation().type_info;
+            let info = application_infos
+                .into_iter()
+                // The vector is outermost-to-innermost. Prefer the innermost
+                // surviving surface call, then the panic identifier/message,
+                // which retain their source annotations when a surrounding node
+                // was synthesised by simplification or IO deforestation.
+                .rev()
+                .find(has_source)
+                .or_else(|| {
+                    crate::source_map::path_of(head_info.parse_info.file).map(|_| head_info)
+                })
+                .or_else(|| {
+                    crate::source_map::path_of(message_info.parse_info.file).map(|_| message_info)
+                })
+                .unwrap_or(&annotation.type_info);
             let function = info
                 .enclosing_term
                 .as_ref()
@@ -4891,6 +4878,25 @@ impl lambda_lift::Program {
                 info.parse_info.location.column,
             )?;
             self.compile_expr(args[0], code)?;
+            return write!(code, ")");
+        }
+
+        // Materialised surface panics use the private five-argument worker. If
+        // bottom polymorphism leaves further applications on the spine, call the
+        // nonreturning worker at its saturation point; evaluating later arguments
+        // would be both unnecessary and contrary to curried evaluation order.
+        if args.len() >= 5
+            && self
+                .intrinsic_for_expr(head)
+                .is_some_and(|semantics| semantics.operation == IntrinsicOperation::RawPanic)
+        {
+            write!(code, "{}_worker(", c_name(&raw_panic_name()))?;
+            for (index, argument) in args.iter().take(5).enumerate() {
+                if index > 0 {
+                    write!(code, ", ")?;
+                }
+                self.compile_expr(argument, code)?;
+            }
             return write!(code, ")");
         }
 
@@ -5137,28 +5143,15 @@ impl lambda_lift::Program {
                 continue;
             }
 
-            let shape = self.runtime_shape(&place.ty, &mut Vec::new()).shape;
             let mut prelude = Vec::new();
-            let leaves = self
-                .literal_shape_leaves(element, &shape, &mut prelude)
-                .filter(|leaves| leaves.len() == place.width)
-                .unwrap_or_else(|| {
-                    // `runtime_shape` and the frame layout can disagree about how deep
-                    // the inlining goes -- a record nested in a record is one pointer to
-                    // the frame (`place.width`) and fully spliced to the shape. The FRAME
-                    // is the authority here: the object was built by `compile_record`
-                    // from the same widths, so it has exactly `place.width` slots.
-                    // Evaluate once and take them.
-                    prelude.clear();
-                    let temp = format!("_cw{}", MATCH_ID.fetch_add(1, Ordering::Relaxed));
-                    prelude.push(format!(
-                        "Value {temp} = {};",
-                        self.compile_to_string(element)
-                    ));
-                    (0..place.width)
-                        .map(|word| format!("proj({temp}, {word})"))
-                        .collect()
-                });
+            // Closure frames use the same capped flat-record layout as ordinary
+            // record objects. The array runtime shape is deliberately deeper and
+            // cannot describe these slots: a one-field nested record is one boxed
+            // pointer here, while an array element recursively packs its field.
+            let leaves = self.flat_leaves(element, place.width, &mut prelude);
+            if leaves.len() != place.width {
+                return Err(fmt::Error);
+            }
             for binding in prelude {
                 write!(code, "{binding} ")?;
             }

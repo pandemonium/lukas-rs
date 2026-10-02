@@ -15,7 +15,11 @@ id :: ∀α. α -> α := λx. x
 
 flip :: ∀α β r. (α -> β -> r) -> β -> α -> r := λf b a. f a b
 
+pipe_forward :: ∀α β. α -> (α -> β) -> β := λx f. f x
+
 compose :: ∀α β γ. (β -> γ) -> (α -> β) -> α -> γ := λg f a. g (f a)
+
+compose_forward :: ∀α β γ. (α -> β) -> (β -> γ) -> α -> γ := λf g a. g (f a)
 
 const :: ∀α β. α -> β -> α := λa _. a
 
@@ -35,6 +39,10 @@ signature From ::= ∀α β.
 
 signature Default :: ∀α.
   { default_value :: α
+  }
+
+witness Default Unit :=
+  { default_value := ()
   }
 
 module Default:

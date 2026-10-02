@@ -1,0 +1,11 @@
+[package]
+name = "lady-lsp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lsp-server = "0.10.0"
+lsp-types = "0.97.0"
+lukas = { path = ".." }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"

@@ -61,11 +61,15 @@ impl LexicalAnalyzer {
                 [':', ':', remains @ ..] => self.emit(2, TokenKind::TypeAscribe, remains),
                 ['-', '>', remains @ ..] => self.emit(2, TokenKind::Arrow, remains),
                 ['|', '-', remains @ ..] => self.emit(2, TokenKind::TypeConstraint, remains),
+                ['|', '>', remains @ ..] => self.emit(2, TokenKind::PipeForward, remains),
 
+                ['>', '>', remains @ ..] => self.emit(2, TokenKind::ComposeForward, remains),
                 ['>', '=', remains @ ..] => self.emit(2, TokenKind::Gte, remains),
                 ['<', '=', remains @ ..] => self.emit(2, TokenKind::Lte, remains),
                 ['>', remains @ ..] => self.emit(1, TokenKind::Gt, remains),
                 ['<', remains @ ..] => self.emit(1, TokenKind::Lt, remains),
+
+                ['∘', remains @ ..] => self.emit(1, TokenKind::ComposeBackward, remains),
 
                 ['=', remains @ ..] => self.emit(1, TokenKind::Equals, remains),
                 [',', remains @ ..] => self.emit(1, TokenKind::Comma, remains),
@@ -643,36 +647,39 @@ impl Default for SourceLocation {
 // What does this hierarchy buy me?
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenKind {
-    Equals,         // =
-    TypeAssign,     // ::=
-    TypeAscribe,    // ::
-    TypeConstraint, // |-
-    Assign,         // :=
-    Arrow,          // ->
-    Comma,          // ,
-    LeftParen,      // (
-    RightParen,     // )
-    LeftBrace,      // {
-    RightBrace,     // }
-    LeftBracket,    // [
-    RightBracket,   // ]
-    Hole,           // ???
-    Underscore,     // _
-    Pipe,           // |
-    DoubleQuote,    // "
-    SingleQuote,    // '
-    Colon,          // :
-    Semicolon,      // ;
-    Period,         // .
-    Plus,           // +
-    Minus,          // -
-    Star,           // *
-    Slash,          // /
-    Percent,        // %
-    Gte,            // >=
-    Lte,            // <=
-    Gt,             // >
-    Lt,             // <
+    Equals,          // =
+    TypeAssign,      // ::=
+    TypeAscribe,     // ::
+    TypeConstraint,  // |-
+    PipeForward,     // |>
+    ComposeForward,  // >>
+    ComposeBackward, // ∘
+    Assign,          // :=
+    Arrow,           // ->
+    Comma,           // ,
+    LeftParen,       // (
+    RightParen,      // )
+    LeftBrace,       // {
+    RightBrace,      // }
+    LeftBracket,     // [
+    RightBracket,    // ]
+    Hole,            // ???
+    Underscore,      // _
+    Pipe,            // |
+    DoubleQuote,     // "
+    SingleQuote,     // '
+    Colon,           // :
+    Semicolon,       // ;
+    Period,          // .
+    Plus,            // +
+    Minus,           // -
+    Star,            // *
+    Slash,           // /
+    Percent,         // %
+    Gte,             // >=
+    Lte,             // <=
+    Gt,              // >
+    Lt,              // <
 
     Identifier(String),
 
@@ -707,6 +714,10 @@ pub enum Interpolation {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Operator {
+    PipeForward,
+    ComposeForward,
+    ComposeBackward,
+
     Plus,
     Minus,
     Times,
@@ -741,6 +752,9 @@ impl Operator {
     pub const fn try_from(token: &TokenKind) -> Option<Self> {
         match token {
             TokenKind::Equals => Some(Self::Equals),
+            TokenKind::PipeForward => Some(Self::PipeForward),
+            TokenKind::ComposeForward => Some(Self::ComposeForward),
+            TokenKind::ComposeBackward => Some(Self::ComposeBackward),
             TokenKind::Plus => Some(Self::Plus),
             TokenKind::Minus => Some(Self::Minus),
             TokenKind::Star => Some(Self::Times),
@@ -762,13 +776,15 @@ impl Operator {
     }
 
     pub const fn is_right_associative(&self) -> bool {
-        matches!(self, Self::Tuple)
+        matches!(self, Self::ComposeBackward)
     }
 
     pub const fn precedence(&self) -> usize {
         match self {
             Self::Select => 26,
             Self::Juxtaposition => 25,
+
+            Self::ComposeForward | Self::ComposeBackward => 20,
 
             Self::Times | Self::Division | Self::Modulo => 16,
             Self::Plus | Self::Minus => 15,
@@ -782,22 +798,17 @@ impl Operator {
             Self::Xor | Self::Or => 10,
 
             Self::Ascribe => 8,
-        }
-    }
-
-    // The precedence an operator must strictly beat to bind here -- its own precedence, minus
-    // one for a right-associative operator so its RHS can rebind at the same level.
-    pub const fn binding_precedence(&self) -> usize {
-        if self.is_right_associative() {
-            self.precedence() - 1
-        } else {
-            self.precedence()
+            Self::PipeForward => 7,
         }
     }
 
     pub const fn name(&self) -> &str {
         // These mappings are highly dubious
         match self {
+            Self::PipeForward => "|>",
+            Self::ComposeForward => ">>",
+            Self::ComposeBackward => "∘",
+
             Self::Plus => "+",
             Self::Minus => "-",
             Self::Times => "*",
@@ -830,6 +841,9 @@ impl Operator {
     /// every other operator still resolves to the like-named builtin.
     pub const fn term_name(&self) -> &str {
         match self {
+            Self::PipeForward => "pipe_forward",
+            Self::ComposeForward => "compose_forward",
+            Self::ComposeBackward => "compose",
             Self::Lt => "lt",
             Self::Gt => "gt",
             Self::Lte => "lte",
@@ -1050,6 +1064,9 @@ impl fmt::Display for TokenKind {
             Self::TypeAssign => write!(f, "::="),
             Self::TypeAscribe => write!(f, "::"),
             Self::TypeConstraint => write!(f, "|-"),
+            Self::PipeForward => write!(f, "|>"),
+            Self::ComposeForward => write!(f, ">>"),
+            Self::ComposeBackward => write!(f, "∘"),
             Self::Assign => write!(f, ":="),
             Self::Arrow => write!(f, "->"),
             Self::Comma => write!(f, ","),
@@ -1118,6 +1135,10 @@ impl fmt::Display for Interpolation {
 impl fmt::Display for Operator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PipeForward => write!(f, "|>"),
+            Self::ComposeForward => write!(f, ">>"),
+            Self::ComposeBackward => write!(f, "∘"),
+
             Self::Plus => write!(f, "+"),
             Self::Minus => write!(f, "-"),
             Self::Times => write!(f, "*"),
@@ -1190,6 +1211,31 @@ impl fmt::Display for BindingOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_pipeline_and_composition_operators() {
+        let input = "x |> f >> g ∘ h".chars().collect::<Vec<_>>();
+        let mut lexer = LexicalAnalyzer::default();
+        let kinds = lexer
+            .tokenize(&input)
+            .iter()
+            .filter(|token| !token.is_layout() && !token.is_end())
+            .map(|token| token.kind.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Identifier("x".to_owned()),
+                TokenKind::PipeForward,
+                TokenKind::Identifier("f".to_owned()),
+                TokenKind::ComposeForward,
+                TokenKind::Identifier("g".to_owned()),
+                TokenKind::ComposeBackward,
+                TokenKind::Identifier("h".to_owned()),
+            ]
+        );
+    }
 
     fn char_literals(source: &str) -> Vec<char> {
         let input: Vec<char> = source.chars().collect();

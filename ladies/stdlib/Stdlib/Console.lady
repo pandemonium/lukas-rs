@@ -39,8 +39,8 @@ Screen_Control ::=
 
 (* `β` is the rest of the program; each instruction names the type it hands to it. *)
 Console_F ::= ∀β.
-    Write Markup β
-  | Screen Screen_Control β
+    Write Markup (Unit -> β)
+  | Screen Screen_Control (Unit -> β)
   | Mode Mode_Change (Bool -> β)
   | Read_Key Wait (Perhaps Key -> β)
   | Read_Line Markup (Perhaps Text -> β)
@@ -53,8 +53,8 @@ Console_F ::= ∀β.
 witness Functor Console_F :=
   { fmap := λg instruction.
       deconstruct instruction into
-        Write markup next -> Write markup (g next)
-      | Screen control next -> Screen control (g next)
+        Write markup next -> Write markup (compose g next)
+      | Screen control next -> Screen control (compose g next)
       | Mode change receive -> Mode change (compose g receive)
       | Read_Key wait receive -> Read_Key wait (compose g receive)
       | Read_Line question receive -> Read_Line question (compose g receive)
@@ -150,10 +150,6 @@ Key ::=
   | With Modifier Key
   | Unknown (List Int)
 
-module Key:
-  uncharacter :: Key -> Perhaps Text :=
-    λkey. deconstruct key into Character text -> This text | _ -> Nope
-
 witness Semigroup Style :=
   { mappend := λ(Make_Style earlier) (Make_Style later).
       Make_Style (List.append earlier later)
@@ -218,7 +214,7 @@ module Markup:
 
   (* `Monochrome` drops every escape -- the same markup, for a pipe or a log. *)
   render :: Colour_Mode -> Markup -> Text := λmode markup.
-    List.concat (Terminal.markup_chunks mode Style.plain markup Nil)
+    List.concat_texts (Terminal.markup_chunks mode Style.plain markup Nil)
 
 
 module Key:
@@ -263,10 +259,10 @@ module Key:
 
 (* -------------------------------------------------------------------- output *)
 
-write :: Markup -> Console Unit := λmarkup. lift_free (Write markup ())
+write :: Markup -> Console Unit := λmarkup. lift_free (Write markup (λ_. ()))
 
 (* Not a character: see `Screen_Control`. *)
-new_line :: Console Unit := lift_free (Screen New_Line ())
+new_line :: Console Unit := lift_free (Screen New_Line (λ_. ()))
 
 write_line :: Markup -> Console Unit := λmarkup.
   let* _ = write markup in
@@ -274,22 +270,24 @@ write_line :: Markup -> Console Unit := λmarkup.
 
 write_plain_line :: Text -> Console Unit := λbody. write_line (Markup.text body)
 
+write_plain :: Text -> Console Unit := λbody. write (Markup.text body)
+
 lines :: List Markup -> Console Unit := traverse_ write_line
 
 
 (* ------------------------------------------------------------- screen control *)
 
-move_to :: Int -> Int -> Console Unit := λrow column.
-  lift_free (Screen (Move_To row column) ())
+locate :: Int -> Int -> Console Unit := λrow column.
+  lift_free (Screen (Move_To row column) (λ_. ()))
 
-home :: Console Unit := move_to 1 1
+home :: Console Unit := locate 1 1
 
-erase_line :: Console Unit := lift_free (Screen Erase_Line ())
+erase_line :: Console Unit := lift_free (Screen Erase_Line (λ_. ()))
 
-erase_screen :: Console Unit := lift_free (Screen Erase_Screen ())
+erase_screen :: Console Unit := lift_free (Screen Erase_Screen (λ_. ()))
 
 at :: Int -> Int -> Markup -> Console Unit := λrow column content.
-  let* _ = move_to row column in
+  let* _ = locate row column in
   write content
 
 (* Erase and home the cursor: start a frame. *)
@@ -307,7 +305,15 @@ supports_colour :: Console Bool := lift_free (Query_Colour id)
 is_tty :: Console Bool := lift_free (Query_Terminal id)
 
 (* Columns and rows, or `Nope` where there is no terminal to measure. *)
-size :: Console (Perhaps (Int, Int)) := lift_free (Query_Size id)
+
+Console_Size ::=
+  { Rows    :: Int
+    Columns :: Int
+  }
+
+size :: Console (Perhaps Console_Size) :=
+  let+ size = lift_free (Query_Size id) in
+  fmap (λ(columns, rows). { Rows := rows; Columns := columns } :: Console_Size) size
 
 
 (* ------------------------------------------------------------- terminal mode *)
@@ -324,15 +330,15 @@ in_full_raw_mode :: ∀α. Console α -> Console α := Terminal.in_mode Raw
 
 (* Bracketed for the same reason: leaving either one set wrecks the terminal. *)
 in_alternate_screen :: ∀α. Console α -> Console α := λaction.
-  let* _ = lift_free (Screen (Set_Screen Alternate_Screen) ()) in
+  let* _ = lift_free (Screen (Set_Screen Alternate_Screen) (λ_. ())) in
   let* result = action in
-  let* _ = lift_free (Screen (Set_Screen Main_Screen) ()) in
+  let* _ = lift_free (Screen (Set_Screen Main_Screen) (λ_. ())) in
   pure result
 
 with_cursor_hidden :: ∀α. Console α -> Console α := λaction.
-  let* _ = lift_free (Screen (Set_Cursor Cursor_Hidden) ()) in
+  let* _ = lift_free (Screen (Set_Cursor Cursor_Hidden) (λ_. ())) in
   let* result = action in
-  let* _ = lift_free (Screen (Set_Cursor Cursor_Visible) ()) in
+  let* _ = lift_free (Screen (Set_Cursor Cursor_Visible) (λ_. ())) in
   pure result
 
 
@@ -439,10 +445,10 @@ interpret :: ∀α. Console α -> IO (Result Fault α) := λprogram.
       deconstruct instruction into
         Write markup next ->
           let* _ = Terminal.write_markup markup in
-          interpret next
+          interpret (next ())
       | Screen control next ->
           let* _ = Terminal.write_control control in
-          interpret next
+          interpret (next ())
       | Mode change receive ->
           let* entered = Terminal.change_mode change in
           interpret (receive entered)

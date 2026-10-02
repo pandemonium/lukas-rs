@@ -1,3 +1,7 @@
+module State.
+module Enumerator.
+module Loop.
+
 signature Semigroup ::= ∀α.
   { mappend :: α -> α -> α
   }
@@ -76,16 +80,25 @@ witness ∀m : *->* e. Monad m |- Monad (ExceptT m e) :=
       MkExceptT (bind (result (λe. pure (Fault e)) (λa. ExceptT.run (k a))) ma)
   }
 
-fold_map :: ∀t : *->* α m. Monoid m + Foldable t |- (α -> m) -> t α -> m := λf.
-  fold_right (compose mappend f) mempty
+fold_map :: ∀t : *->* α m. Monoid m + Foldable t |- (α -> m) -> t α -> m :=
+  λf. fold_right (compose mappend f) mempty
 
 signature Traversable ::= ∀t : *->*. Functor t + Foldable t |-
   { traverse :: ∀f : *->* α β. Applicative f |- (α -> f β) -> t α -> f (t β)
   }
 
 traverse_ :: ∀t : *->* m : *->* α β. Foldable t + Monad m |- (α -> m β) -> t α -> m Unit :=
-  λf.
-    fold_right (λx rest. bind (λ_. rest) (f x)) (pure ())
+  λf. fold_right (λx rest. bind (λ_. rest) (f x)) (pure ())
+
+repeat :: ∀m : *->* α. Monad m |- Int -> m α -> m Unit :=
+  λcount ma. repeat_with_index count (λ_. ma)
+
+repeat_with_index :: ∀m : *->* α. Monad m |- Int -> (Int -> m α) -> m Unit := λcount f.
+  let loop = λi.
+    if i < count
+    then let* _ = (f i) in loop (1 + i)
+    else pure ()
+  in loop 0
 
 (* `for_each` keeps no answers, so the LAST action can be handed back exactly as
    it is. `traverse_` cannot: its seed `pure ()` is bound onto the final action,
@@ -114,8 +127,7 @@ for_each :: ∀t : *->* m : *->* α. Foldable t + Monad m |- t α -> (α -> m Un
     | Nope -> pure ()
 
 sequence :: ∀t : *->* f : *->* α. Traversable t + Applicative f |- t (f α) -> f (t α) :=
-  λtfa.
-    traverse id tfa
+    traverse id
 
 mconcat :: ∀α. Monoid α |- List α -> α :=
   fold_right mappend mempty
@@ -150,7 +162,3 @@ witness ∀f : *->*. Functor f |- Monad (Free f) :=
 
 lift_free :: ∀f : *->* α. Functor f |- f α -> Free f α := λlayer.
   Step (fmap Pure layer)
-
-
-module State.
-module Enumerator.

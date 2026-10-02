@@ -52,10 +52,8 @@ fn perhaps_uses_zero_niche_and_nested_perhaps_falls_back_to_a_tag() {
 
 #[test]
 fn record_mediated_recursive_sum_does_not_overflow_layout_analysis() {
-    let dir = std::env::temp_dir().join(format!(
-        "lukas_recursive_sum_layout_{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("lukas_recursive_sum_layout_{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join("Root.lady"),

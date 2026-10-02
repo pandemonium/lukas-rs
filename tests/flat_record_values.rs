@@ -103,3 +103,114 @@ start := λ_.
         "projection did not dereference the boxed Large field: {generated}"
     );
 }
+
+#[test]
+fn captured_projection_stops_at_a_boxed_one_field_record() {
+    let dir = std::env::temp_dir().join("lukas_flat_one_field_record_boundary");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("Root.lady"),
+        r#"Inner ::= { Value :: Int }
+Outer ::= { Extra :: Int; Inner :: Inner }
+
+read_later :: Outer -> (Unit -> Int) := λouter.
+  λ_. outer.Inner.Value
+
+start := λn.
+  let outer = { Extra := n; Inner := { Value := n + 1 } } in
+  read_later outer ()
+"#,
+    )
+    .unwrap();
+
+    let output = dir.join("program.c");
+    Compiler {
+        library_path: PathBuf::from("ladies/stdlib"),
+        source_path: dir,
+        backend: Backend::Native,
+        output_file: Some(output.clone()),
+    }
+    .compiler_main()
+    .expect("native code generation");
+
+    let generated = fs::read_to_string(output).expect("generated C source");
+    let reader = generated
+        .split("\n\n")
+        .find(|function| {
+            function.starts_with("Value Root_lambda_")
+                && function.contains("proj(env_get(self, 1), 0)")
+        })
+        .expect("the boxed Inner projection was not found");
+    assert_eq!(reader.matches("proj(").count(), 1, "{reader}");
+
+    let creator = generated
+        .split("\n\n")
+        .find(|function| {
+            function.starts_with("Value Root_lambda_")
+                && function.contains("mk_closure_d2")
+                && function.contains("Value _fr")
+        })
+        .expect("the closure capturing Outer was not found");
+    assert_eq!(creator.matches("proj(").count(), 2, "{creator}");
+    assert!(!creator.contains("proj(proj("), "{creator}");
+}
+
+#[test]
+fn polymorphic_record_field_keeps_one_word_at_ground_sum_instantiation() {
+    let dir = std::env::temp_dir().join("lukas_polymorphic_record_sum_field");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("Root.lady"),
+        r#"Command ::= Travel Int | Stay
+
+Item ::= ∀α.
+  { Command :: α
+    Label   :: Int
+  }
+
+build_item :: Int -> Item Command := λdestination.
+  { Command := Travel destination; Label := 7 }
+
+command :: ∀α. Item α -> α := λitem.
+  item.Command
+
+start :: Int -> Int := λdestination.
+  deconstruct command (build_item destination) into
+    Travel destination -> destination
+  | Stay               -> 0
+"#,
+    )
+    .unwrap();
+
+    let output = dir.join("program.c");
+    Compiler {
+        library_path: PathBuf::from("ladies/stdlib"),
+        source_path: dir,
+        backend: Backend::Native,
+        output_file: Some(output.clone()),
+    }
+    .compiler_main()
+    .expect("native code generation");
+
+    let generated = fs::read_to_string(output).expect("generated C source");
+    let item_builder = generated
+        .split("\n\n")
+        .find(|function| function.starts_with("Value Root_build_item_worker"))
+        .expect("the concrete Item builder was not emitted");
+    assert!(item_builder.contains("mk_tuple2("), "{item_builder}");
+    assert!(
+        !item_builder.contains("data_tag") && !item_builder.contains("mk_tuple(3,"),
+        "the concrete sum was inlined into Item's polymorphic field: {item_builder}"
+    );
+
+    let command_reader = generated
+        .split("\n\n")
+        .find(|function| {
+            function.starts_with("Value Root_command_worker") && function.contains("proj(l0, 0)")
+        })
+        .expect("the generic Item.Command projection was not emitted");
+    assert!(
+        !command_reader.contains("mk_data_inline"),
+        "{command_reader}"
+    );
+}

@@ -1,4 +1,4 @@
-witness ∀α. Default α |- Default (Perhaps α) :=
+witness ∀α. Default (Perhaps α) :=
   { default_value := Perhaps.empty
   }
 
@@ -90,3 +90,8 @@ zip :: ∀α β. Perhaps α -> Perhaps β -> Perhaps (α, β) :=
 
 or_default :: ∀α. (Unit -> α) -> Perhaps α -> α :=
   λdefault pa. deconstruct pa into This a -> a | _ -> default ()
+
+expect :: ∀α. Text -> Perhaps α -> α := λexpectation pa.
+  deconstruct pa into
+    Nope -> omg_wtf_bbq "`expectation`"
+  | This x -> x

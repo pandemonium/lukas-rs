@@ -438,4 +438,3 @@ start := λ_. 0
 
     accepts("repeated_self_recursive_splice", source);
 }
-

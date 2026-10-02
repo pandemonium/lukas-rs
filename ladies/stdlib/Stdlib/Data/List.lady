@@ -91,6 +91,10 @@ witness ∀α. Enumerator α (List α) :=
       | Cons element remains -> This (element, remains)
   }
 
+witness ∀α. Default (List α) :=
+  { default_value := List.empty
+  }
+
 indexed_sized :: ∀α. Int -> List α -> Indexed_Enumerator α (List α) := λsize xs.
   Make_Indexed_Enumerator Increasing xs 0 size
 
@@ -173,6 +177,12 @@ head :: ∀α. List α -> Perhaps α :=
 tail :: ∀α. List α -> List α :=
   λxs. deconstruct xs into Cons a tail -> tail | tail -> tail
 
+last :: ∀α. List α -> Perhaps α := λxs.
+  deconstruct xs into
+    Nil        -> Nope
+  | Cons x Nil -> This x
+  | Cons x xs  -> last xs
+
 fold_right :: ∀z α. (α -> z -> z) -> z -> List α -> z :=
   λf z xs.
     deconstruct xs into
@@ -202,6 +212,13 @@ zip :: ∀α β. List α -> List β -> List (α, β) := λxs ys.
     Cons x xs, Cons y ys -> Cons (x, y) (zip xs ys)
   | otherwise            -> Nil
 
+zip_with_index :: ∀α. List α -> List (α, Int) :=
+  let loop = λi acc.
+    deconstruct acc into
+      Nil -> Nil
+    | Cons x xs -> Cons (x, i) (loop (1 + i) xs)
+  in loop 0
+
 unfold :: ∀α s. (s -> Perhaps (α, s)) -> s -> List α := λstep seed.
   deconstruct step seed into
     Nope -> Nil
@@ -214,7 +231,7 @@ reverse :: ∀α. List α -> List α :=
   fold_left (λz a. Cons a z) Nil
 
 length :: ∀α. List α -> Int :=
-  fold_right (λa z. 1 + z) 0
+  fold_left (λz _. 1 + z) 0
 
 count :: ∀α. (α -> Bool) -> List α -> Int :=
   λp. fold_left (λz x. if p x then 1 + z else z) 0
@@ -233,19 +250,30 @@ tabulate :: ∀α. Int -> (Int -> α) -> List α :=
         else loop (i - 1) (Cons (f i) xs)
     in loop (c - 1) Nil
 
-concat :: List Text -> Text := λxs.
+concat_texts :: List Text -> Text := λxs.
   deconstruct xs into
-    Cons t tail -> "`t``concat tail`"
+    Cons t tail -> "`t``concat_texts tail`"
   | Nil -> ""
+
+concat_perhaps :: ∀α. List (Perhaps α) -> List α :=
+  bind from
 
 singleton :: ∀α. α -> List α := λa. Cons a Nil
 
-find_first :: ∀α. (α -> Bool) -> List α -> Perhaps α := λp xs.
+find :: ∀α. (α -> Bool) -> List α -> Perhaps α := λp xs.
   deconstruct xs into
     Nil -> Perhaps.empty
   | Cons x xs ->
     if p x then This x
-    else find_first p xs
+    else find p xs
+
+find_map :: ∀α β. (α -> Perhaps β) -> List α -> Perhaps β := λp xs.
+  deconstruct xs into
+    Nil -> Perhaps.empty
+  | Cons x xs ->
+    deconstruct p x into
+      Nope -> find_map p xs
+    | otherwise -> otherwise
 
 remove_first_if :: ∀α. (α -> Bool) -> List α -> (Perhaps α, List α) := λε list.
   let loop = λprefix suffix.
@@ -268,7 +296,7 @@ remove :: ∀α. Int -> List α -> (Perhaps α, List α) := λindex list.
 text :: ∀α. Display α |- Text -> List α -> Text := λseparator list.
   deconstruct list into
     Cons x xs ->
-      let tail = concat (map (λy. "`separator``y`") xs) in
+      let tail = concat_texts (map (λy. "`separator``y`") xs) in
       "`x``tail`"
   | Nil -> ""
 

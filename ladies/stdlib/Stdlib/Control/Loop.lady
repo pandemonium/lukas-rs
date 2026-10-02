@@ -1,0 +1,26 @@
+signature Iterative ::= ∀m : *->*. Monad m |-
+  { do :: ∀s α. (s -> m (Step s α)) -> s -> m α
+  }
+
+witness ∀f : *->*. Functor f |- Iterative (Free f) :=
+  { do := λadvance.
+      let loop = λprogram.
+        deconstruct program into
+          Pure (Continue state)   -> loop (advance state)
+        | Pure (Break result) -> Pure result
+        | Step layer          -> Step (fmap loop layer)
+      in loop ∘ advance
+  }
+
+Step ::= ∀s α.
+  Continue s
+| Break α
+
+continue :: ∀m : *->* s α. Applicative m |- s -> m (Step s α) :=
+  pure ∘ Continue
+
+break :: ∀m : *->* s α. Applicative m |- α -> m (Step s α) :=
+  pure ∘ Break
+
+stop :: ∀m : *->* s. Applicative m |- m (Step s Unit) :=
+  break ()

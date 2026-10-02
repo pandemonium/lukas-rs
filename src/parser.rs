@@ -2315,6 +2315,34 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// Recognise an infix operator which continues on the following laid-out line.
+    ///
+    /// Keep this separate from precedence: the ordinary infix parser only accepts an
+    /// operator which outranks its current context, while the tuple parser also needs
+    /// to see another comma at the *same* precedence so it can extend one flat tuple.
+    /// The boolean says that the layout token opened an indentation level which the
+    /// caller must balance after parsing the continuation.
+    fn laid_out_infix(
+        &self,
+        expr_context: ExpressionContext,
+    ) -> Option<(Operator, SourceLocation, bool)> {
+        let [layout, operator_token, operand, ..] = self.remains() else {
+            return None;
+        };
+
+        let is_continuation_layout =
+            layout.is_dedent() || layout.is_newline() || layout.is_indent();
+        if !is_continuation_layout
+            || operator_token.location().column >= expr_context.anchor_column
+            || !Self::is_expr_prefix(&operand.kind)
+        {
+            return None;
+        }
+
+        Operator::try_from(&operator_token.kind)
+            .map(|operator| (operator, *operator_token.location(), layout.is_indent()))
+    }
+
     // All infices must be right of lhs.
     fn parse_expr_infix(&mut self, lhs: Expr, expr_context: ExpressionContext) -> Result<Expr> {
         let _t = self.trace();
@@ -2350,57 +2378,24 @@ impl<'a> Parser<'a> {
 
         let is_terminal = |t| terminals.contains(t);
 
+        if let Some((operator, operator_position, borrowed_indent)) =
+            self.laid_out_infix(expr_context)
+            && operator.precedence() > expr_context.precedence
+        {
+            self.advance(2); // the layout token and the operator
+
+            if !borrowed_indent {
+                return self.parse_operator(lhs, operator, operator_position, expr_context);
+            }
+
+            let folded = self.parse_operator(lhs, operator, operator_position, expr_context)?;
+            if self.peek()?.is_dedent() {
+                self.advance(1); // balance the borrowed Indent
+            }
+            return self.parse_expr_infix(folded, expr_context);
+        }
+
         match self.remains() {
-            // A binary operator on a laid-out following line continuing this expression: the
-            // operator hangs to the *left* of the expression's leftmost leaf (`anchor_column`)
-            // and it outranks the current precedence. An operator can never begin a statement or
-            // declaration, so a leading operator hanging left of the anchor is unambiguously a
-            // continuation. (The narrower "operand aligns under the anchor" is the common case --
-            // the operand always sits right of the operator, so operand-at-anchor implies
-            // operator-left-of-anchor -- but a parenthesized operand's leading `(` sits one
-            // column left of its own leaf, so we key off the operator, not the operand.) The
-            // leading layout token is either a `Newline` (a further continuation at the same
-            // level -- balance-neutral) or a `Dedent` (which would otherwise close the block;
-            // `parse_block` tolerates the borrow). Take it and the operator, and fold via
-            // `parse_operator` so precedence climbing places the operator at the right level.
-            [layout, operator_token, operand, ..]
-                if (layout.is_dedent() || layout.is_newline())
-                    && operator_token.location().column < expr_context.anchor_column
-                    && Self::is_expr_prefix(&operand.kind)
-                    && let Some(operator) = Operator::try_from(&operator_token.kind)
-                    && operator.binding_precedence() > expr_context.precedence =>
-            {
-                let operator_position = *operator_token.location();
-                self.advance(2); // the layout token and the operator
-                self.parse_operator(lhs, operator, operator_position, expr_context)
-            }
-
-            // The same legal continuation (operator hangs left of the anchor leaf), but arriving
-            // `Indent`-led rather than Dedent/Newline-led: this happens when the operator, though
-            // left of the leaf, is still *right of the enclosing block's level* -- e.g. a
-            // continuation inside an `if` branch, whose block level sits at the branch keyword.
-            // The very same `operator.column < anchor_column` test keeps this to the legal
-            // hangs-left form and rejects an operator indented *past* the leaf. The borrowed
-            // `Indent` opens a fresh level the lexer closes with a matching `Dedent`; fold the
-            // continuation, then swallow that `Dedent` so the enclosing block's Indent/Dedent
-            // count stays balanced (locally -- no global counter). A `Dedent` already consumed as
-            // a further continuation leaves nothing to balance, hence the `is_dedent` guard.
-            [layout, operator_token, operand, ..]
-                if layout.is_indent()
-                    && operator_token.location().column < expr_context.anchor_column
-                    && Self::is_expr_prefix(&operand.kind)
-                    && let Some(operator) = Operator::try_from(&operator_token.kind)
-                    && operator.binding_precedence() > expr_context.precedence =>
-            {
-                let operator_position = *operator_token.location();
-                self.advance(2); // the Indent and the operator
-                let folded = self.parse_operator(lhs, operator, operator_position, expr_context)?;
-                if self.peek()?.is_dedent() {
-                    self.advance(1); // balance the borrowed Indent
-                }
-                self.parse_expr_infix(folded, expr_context)
-            }
-
             [t, ..] if t.is_dedent() && t.location().is_same_block(&lhs.parse_info().location) => {
                 // Ded, paired with this:
                 // self.advance(1); //the indent
@@ -2553,7 +2548,7 @@ impl<'a> Parser<'a> {
             operator.precedence()
         };
 
-        if computed_precedence > expr_context.precedence {
+        if operator.precedence() > expr_context.precedence {
             match operator {
                 Operator::Ascribe => {
                     let type_signature = self
@@ -2618,13 +2613,35 @@ impl<'a> Parser<'a> {
         // flat tuple, each element parsed just tight enough that a `,` ends it (`computed_precedence`
         // is below tuple level). A parenthesised group arrives as one complete prefix and so counts
         // as a single element -- which is what keeps `1, (2, 3)` distinct from the flat `1, 2, 3`.
-        let mut elements = vec![
-            lhs.into(),
-            self.parse_expression(computed_precedence)?.into(),
-        ];
-        while matches!(self.peek()?.kind, TokenKind::Comma) {
-            self.advance(1); // the `,`
-            elements.push(self.parse_expression(computed_precedence)?.into());
+        let first_rhs = self.parse_expression(computed_precedence)?;
+        let mut last_anchor_column = first_rhs.parse_info().location.column;
+        let mut elements = vec![lhs.into(), first_rhs.into()];
+
+        loop {
+            let borrowed_indent = if matches!(self.peek()?.kind, TokenKind::Comma) {
+                self.advance(1); // the `,`
+                false
+            } else {
+                let element_context = ExpressionContext {
+                    precedence: computed_precedence,
+                    anchor_column: last_anchor_column,
+                };
+                let Some((Operator::Tuple, _operator_position, borrowed_indent)) =
+                    self.laid_out_infix(element_context)
+                else {
+                    break;
+                };
+                self.advance(2); // the layout token and the `,`
+                borrowed_indent
+            };
+
+            let element = self.parse_expression(computed_precedence)?;
+            last_anchor_column = element.parse_info().location.column;
+            elements.push(element.into());
+
+            if borrowed_indent && self.peek()?.is_dedent() {
+                self.advance(1); // balance the borrowed Indent
+            }
         }
         self.parse_expr_infix(
             Expr::Tuple(self.span_from(operator_position), Tuple { elements }),
@@ -3330,6 +3347,61 @@ impl fmt::Display for ParseInfo {
 mod tests {
     use super::*;
     use crate::lexer::LexicalAnalyzer;
+
+    fn parsed_value_bodies(source: &str) -> Vec<String> {
+        let characters = source.chars().collect::<Vec<_>>();
+        let mut lexer = LexicalAnalyzer::default();
+        let tokens = lexer.tokenize(&characters);
+        Parser::from_tokens(tokens)
+            .parse_declaration_list()
+            .expect("parses")
+            .iter()
+            .filter_map(|declaration| match declaration {
+                Declaration::Value(_, value) => Some(value.declarator.body.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pipeline_and_composition_have_their_intended_associativity() {
+        let bodies = parsed_value_bodies(
+            "pipe := x |> f |> g\nforward := f >> g >> h\nbackward := f ∘ g ∘ h\n",
+        );
+
+        assert_eq!(
+            bodies,
+            vec![
+                "((pipe_forward ((pipe_forward x) f)) g)",
+                "((compose_forward ((compose_forward f) g)) h)",
+                "((compose f) ((compose g) h))",
+            ]
+        );
+    }
+
+    #[test]
+    fn pipeline_and_composition_rhs_align_under_their_first_operand() {
+        let bodies = parsed_value_bodies(
+            "result :=\n     input\n  |> decode\n  |> render\npipeline :=\n     decode\n  >> validate\n  >> render\ncomposition :=\n    render\n  ∘ validate\n  ∘ decode\n",
+        );
+
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies[0].contains("pipe_forward"));
+        assert!(bodies[1].contains("compose_forward"));
+        assert!(bodies[2].contains("compose"));
+    }
+
+    #[test]
+    fn leading_commas_extend_one_flat_tuple() {
+        let bodies = parsed_value_bodies(
+            "flat :=\n     first\n  , second\n  , third\nnested :=\n     (first, second)\n  , third\n",
+        );
+
+        assert_eq!(
+            bodies,
+            vec!["(first, second, third)", "((first, second), third)"]
+        );
+    }
 
     #[test]
     fn malformed_constraint_separator_reports_expected_assignment() {
