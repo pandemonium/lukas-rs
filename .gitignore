@@ -10,3 +10,4 @@ exe
 
 # The Zed extension crate builds beside its manifest.
 editors/zed/target
+ladies/benchmarks/billions/city-temperatures-10M.txt

@@ -20,6 +20,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Ordinary object pointers and compiler-created borrowed pointers share the
+// low three bits of a Value word with the immediate/borrowed tags below. Every
+// address passed to VObject, VBorrowed, or VBorrowedTuple must therefore obey
+// this alignment on every target, including wasm32 where pointer-only structs
+// otherwise have four-byte alignment.
+#define MARM_VALUE_ALIGNMENT 8
+
 // Generated workers selected by the compiler's loop-hotness and size analysis.
 // Keep this an attribute rather than C `inline`: workers have ordinary external
 // linkage because closure descriptors and companion translation units may name
@@ -113,21 +120,26 @@ struct Value {
 // The single immediate tag bit: an odd word is an immediate, an even word a pointer.
 #define IMM_TAG 1u
 
-// The per-FUNCTION part of a closure: `code`, `worker`, and `arity` are identical
+// The per-FUNCTION part of a closure: its entries and `arity` are identical
 // for every closure of a given lifted function, so codegen emits ONE static
 // descriptor (in .rodata) that all its closures point at, instead of re-storing all
-// three (24 B) in each heap closure. `code` is the single-stage entry; `worker` is
+// them in each heap closure. `code` is the single-stage entry; `worker` is
 // the uncurried fast-path entry for a curried chain of `arity` stages (NULL, arity 1,
 // for an ordinary single-stage closure), letting a saturated `apply_n` skip the
-// intermediate currying-stage closures.
+// intermediate currying-stage closures. `owned_last_worker` is an optional entry
+// which may consume an exclusively owned final tuple argument.
+// `owned_last_data_worker` additionally accepts an exclusive recursive data node
+// that a structurally eligible callback may reuse for a constructor result.
 typedef struct ClosureDesc {
     Value (*code)(Value self, Value arg);
     Value (*worker)(Value self, Value *args);
     size_t arity;
+    Value (*owned_last_worker)(Value self, Value *args);
+    Value (*owned_last_data_worker)(Value self, Value *args, Value owned_data);
 } ClosureDesc;
 
 struct Closure {
-    const ClosureDesc *desc; // shared static {code, worker, arity}; per-function, not per-closure
+    const ClosureDesc *desc; // shared static descriptor; per-function, not per-closure
     // The captured values are stored *inline* here (a "flat" closure) rather than in
     // a separate environment tuple: one heap object per closure, and `env_get` is a
     // single load. The capture count is recovered from the GC header's body size
@@ -170,7 +182,8 @@ Value mk_float(double x);
 int64_t now_millis(void);
 
 // Value constructors. Immediates pack into the word; a text literal becomes an
-// owned heap string; `VObject` just carries the (already 8-aligned) body pointer.
+// owned heap string; `VObject` just carries an already MARM_VALUE_ALIGNMENT-
+// aligned body pointer.
 static inline Value VInt(int64_t x)     { return (Value){((uint64_t)x << 1) | IMM_TAG}; }
 static inline Value VText(const char *s){ return mk_text(s); }
 static inline Value VBool(bool x)       { return (Value){((uint64_t)(x ? 1u : 0u) << 1) | IMM_TAG}; }
@@ -179,16 +192,31 @@ static inline Value VUnit_(void)        { return (Value){IMM_TAG}; }
 #define VUnit() (VUnit_())
 static inline Value VObject(void *p)    { return (Value){(uint64_t)(uintptr_t)p}; }
 // A borrowed object is valid only while its compiler-owned stack slot is live.
-// Bit 1 is available because heap/stack object bodies are 8-aligned and every
-// immediate has bit 0 set. Heap escape barriers materialise these values before
-// storing them; pointer decoders erase the representation-only tag.
-#define BORROWED_TAG UINT64_C(2)
-static inline bool is_borrowed(Value v) { return (v.w & 3u) == BORROWED_TAG; }
+// Bits 1 and 2 are available because heap/static/stack object bodies obey
+// MARM_VALUE_ALIGNMENT and every immediate has bit 0 set. Heap escape barriers
+// materialise these values before storing them; pointer decoders erase the
+// representation-only tags.
+#define BORROWED_SLICE_TAG UINT64_C(2)
+#define BORROWED_TUPLE_TAG UINT64_C(4)
+#define BORROWED_MASK UINT64_C(6)
+_Static_assert((MARM_VALUE_ALIGNMENT & (MARM_VALUE_ALIGNMENT - 1)) == 0,
+               "Value pointer alignment must be a power of two");
+_Static_assert(MARM_VALUE_ALIGNMENT > BORROWED_MASK,
+               "Value pointer alignment must reserve every tag bit");
+static inline bool is_borrowed(Value v) {
+    return !(v.w & IMM_TAG) && (v.w & BORROWED_MASK);
+}
+static inline bool is_borrowed_tuple(Value v) {
+    return (v.w & 7u) == BORROWED_TUPLE_TAG;
+}
 static inline Value VBorrowed(void *p) {
-    return (Value){(uint64_t)(uintptr_t)p | BORROWED_TAG};
+    return (Value){(uint64_t)(uintptr_t)p | BORROWED_SLICE_TAG};
+}
+static inline Value VBorrowedTuple(void *p) {
+    return (Value){(uint64_t)(uintptr_t)p | BORROWED_TUPLE_TAG};
 }
 static inline uintptr_t pointer_word(Value v) {
-    return (uintptr_t)(v.w & ~BORROWED_TAG);
+    return (uintptr_t)(v.w & ~BORROWED_MASK);
 }
 // A Float is a pointer to a heap-boxed double (OBJ_FLOAT); it can never be immediate.
 static inline Value VFloat(double x)    { return mk_float(x); }
@@ -309,6 +337,33 @@ static inline Value apply_n(Value f, size_t n, Value *args) {
         r = apply(r, args[i]);
     }
     return r;
+}
+
+// Ownership-aware form used when the final argument is an exclusive tuple and
+// the call returns the same tuple type. A specialized worker can update it
+// directly. The fallback preserves the same ABI and copies the ordinary result
+// into the owned box, so callers may continue propagating ownership safely.
+Value reuse_owned_tuple_from(Value owned, Value result);
+static inline Value apply_n_owned_last(Value f, size_t n, Value *args) {
+    const ClosureDesc *d = as_closure(f)->desc;
+    if (d->owned_last_worker && d->arity == n) {
+        return d->owned_last_worker(f, args);
+    }
+    Value owned = args[n - 1];
+    return reuse_owned_tuple_from(owned, apply_n(f, n, args));
+}
+
+// Ownership-aware binary callback entry. In addition to the owned final product
+// argument, the caller offers one recursive data node as storage for a nested
+// constructor result. Closures without that general capability retain product
+// ownership and use their ordinary computation.
+static inline Value apply_n_owned_last_data(Value f, size_t n, Value *args,
+                                            Value owned_data) {
+    const ClosureDesc *d = as_closure(f)->desc;
+    if (d->owned_last_data_worker && d->arity == n) {
+        return d->owned_last_data_worker(f, args, owned_data);
+    }
+    return apply_n_owned_last(f, n, args);
 }
 
 // i-th element of a tuple value (also used for record ordinals).

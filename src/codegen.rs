@@ -285,6 +285,34 @@ struct ImmutableSliceBase {
     aliases: Vec<ImmutableSliceSource>,
 }
 
+/// A call to a structurally defined recursive spine transformation whose
+/// callback reconstructs the same constructor with the accumulated spine in its
+/// recursive field. With exclusive input, the transformation is pointer reversal.
+struct OwnedSpineRebuild<'a> {
+    input: &'a Expr,
+    seed: &'a Expr,
+    step_constructor: &'a QualifiedName,
+    end_constructor: &'a QualifiedName,
+    next_field: usize,
+}
+
+#[derive(Clone)]
+struct OwnedRecursiveEliminator {
+    product_parameter: usize,
+    input_parameter: usize,
+    combine_parameter: usize,
+    combine_call: usize,
+}
+
+#[derive(Clone)]
+struct OwnedProductDataStep {
+    product_arity: usize,
+    product_returns: Vec<usize>,
+    data_return: usize,
+    data_arity: usize,
+    data_product_field: usize,
+}
+
 thread_local! {
     /// Lexical locals whose value is represented by a packed array element rather
     /// than an eagerly rebuilt canonical object. Entries are scoped by
@@ -307,6 +335,77 @@ thread_local! {
     /// non-moving collector and immutable Slice representation cannot change its
     /// `base`, so byte reads can keep using the snapshot across `gc_poll`.
     static IMMUTABLE_SLICE_BASES: RefCell<HashMap<ImmutableSliceSource, String>> =
+        RefCell::new(HashMap::default());
+    /// Constructor-spine values whose complete reachable spine is exclusively
+    /// owned by the current expression. This is deliberately lexical: ownership
+    /// is installed for an owned worker parameter, a fresh let, or the recursive
+    /// field/whole-value bind of a match on an owned scrutinee, then restored.
+    static OWNED_SPINE_LOCALS: RefCell<HashSet<usize>> = RefCell::new(HashSet::default());
+    /// Direct workers proven to return a freshly allocated recursive constructor
+    /// spine on every path (or its nullary terminator).
+    static FRESH_SPINE_WORKERS: RefCell<HashSet<QualifiedName>> = RefCell::new(HashSet::default());
+    /// Unary wrappers which can consume an exclusive argument through a
+    /// structurally defined recursive spine reconstruction.
+    static OWNED_REBUILD_WORKER_VARIANTS: RefCell<HashSet<QualifiedName>> =
+        RefCell::new(HashSet::default());
+    /// Curried-chain heads with a two-argument step whose second argument is
+    /// destructured once and replaced by a tuple of the same arity.
+    static OWNED_TUPLE_STEP_WORKERS: RefCell<HashMap<QualifiedName, usize>> =
+        RefCell::new(HashMap::default());
+    /// Binary product-transforming closures which can also place one recursive
+    /// data result into caller-provided storage.
+    static OWNED_PRODUCT_DATA_STEP_WORKERS: RefCell<HashMap<QualifiedName, OwnedProductDataStep>> =
+        RefCell::new(HashMap::default());
+    /// Exact tuple-expression nodes which become in-place replacements while an
+    /// owned step-worker variant is emitted: expression address -> (local, arity).
+    static OWNED_TUPLE_RETURNS: RefCell<HashMap<usize, (usize, usize)>> =
+        RefCell::new(HashMap::default());
+    /// Tuple-valued locals exclusively owned by the current worker variant.
+    static OWNED_TUPLE_LOCALS: RefCell<HashSet<usize>> = RefCell::new(HashSet::default());
+    /// Fresh tuple literals represented by tuple-shaped storage in the current C
+    /// stack frame.  Their existing `Value` ABI is preserved, but no heap object
+    /// is needed while an ownership-preserving call updates and returns them.
+    static VIRTUAL_TUPLE_LITERALS: RefCell<HashMap<usize, String>> =
+        RefCell::new(HashMap::default());
+    /// Top-level workers with a parameter whose ownership can flow through every
+    /// result path. The value lists eligible parameter indices.
+    static OWNED_TUPLE_WORKER_VARIANTS: RefCell<HashMap<QualifiedName, Vec<usize>>> =
+        RefCell::new(HashMap::default());
+    /// Recursive constructor-producing workers with an input spine that can be
+    /// overwritten when the caller owns it. The parameter indices are selected
+    /// structurally; no source constructor or function name is involved.
+    static OWNED_DATA_WORKER_VARIANTS: RefCell<HashMap<QualifiedName, Vec<usize>>> =
+        RefCell::new(HashMap::default());
+    /// Exact constructor result nodes replaced while an owned-data worker is
+    /// emitted: expression address -> owned parameter local.
+    static OWNED_DATA_RETURNS: RefCell<HashMap<usize, String>> =
+        RefCell::new(HashMap::default());
+    /// Combine applications in a recursive eliminator: expression address ->
+    /// local holding the exclusively owned input constructor node.
+    static OWNED_RECURSIVE_COMBINE_CALLS: RefCell<HashMap<usize, usize>> =
+        RefCell::new(HashMap::default());
+    static OWNED_RECURSIVE_ELIMINATORS: RefCell<HashMap<QualifiedName, OwnedRecursiveEliminator>> =
+        RefCell::new(HashMap::default());
+    /// Workers whose result contains an exclusively owned input spine without
+    /// publishing another alias to it (for example, prefixing fresh nodes).
+    static OWNED_SPINE_PRESERVING_WORKERS: RefCell<HashMap<QualifiedName, Vec<usize>>> =
+        RefCell::new(HashMap::default());
+    /// Fresh-result wrappers whose exclusive parameter can flow into a nested
+    /// owned-data consumer. Variants retain the ordinary ABI and source body.
+    static OWNED_SPINE_WORKER_VARIANTS: RefCell<HashMap<QualifiedName, Vec<usize>>> =
+        RefCell::new(HashMap::default());
+    /// When set, the first copy of a peeled tail loop jumps to its ownership-aware
+    /// steady-state loop after assigning the back-edge arguments.
+    static TAIL_BACKEDGE_LABEL: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Parameters freshly produced by every backedge of the steady-state loop.
+    /// They remain borrowed through the body and become consumable only while
+    /// compiling their final occurrence among the backedge arguments.
+    static TAIL_BACKEDGE_OWNED_LOCALS: RefCell<HashSet<usize>> =
+        RefCell::new(HashSet::default());
+    /// Path-linear loop values whose ownership is established at runtime (for
+    /// example, an accumulator preserved on one branch and freshly replaced on
+    /// another). The map value is a generated C `bool` expression.
+    static DYNAMIC_OWNED_SPINE_LOCALS: RefCell<HashMap<usize, String>> =
         RefCell::new(HashMap::default());
 }
 
@@ -662,6 +761,2239 @@ fn projection_root_and_selectors(
 static MATCH_ID: AtomicUsize = AtomicUsize::new(0);
 
 impl lambda_lift::Program {
+    fn named_application<'a>(expression: &'a Expr) -> Option<(&'a QualifiedName, Vec<&'a Expr>)> {
+        let mut head = strip_ascription(expression);
+        let mut arguments = Vec::new();
+        while let Expr::Apply(_, application) = head {
+            arguments.push(application.argument.as_ref());
+            head = strip_ascription(&application.function);
+        }
+        arguments.reverse();
+        let Expr::Variable(_, Identifier::Global(name)) = head else {
+            return None;
+        };
+        Some((name.as_ref(), arguments))
+    }
+
+    fn local_level(expression: &Expr) -> Option<usize> {
+        let Expr::Variable(_, Identifier::Local(LexicalLevel(level))) =
+            strip_ascription(expression)
+        else {
+            return None;
+        };
+        Some(*level)
+    }
+
+    fn local_use_count(expression: &Expr, wanted: usize) -> usize {
+        usize::from(Self::local_level(expression) == Some(wanted))
+            + crate::simplify::children(expression)
+                .into_iter()
+                .map(|child| Self::local_use_count(child, wanted))
+                .sum::<usize>()
+    }
+
+    fn fresh_product_fields_from_recursive_eliminator(
+        &self,
+        expression: &Expr,
+        self_name: &QualifiedName,
+        known: &HashSet<QualifiedName>,
+        owned: &HashSet<usize>,
+    ) -> Vec<usize> {
+        let Some((name, arguments)) = Self::named_application(expression) else {
+            return Vec::new();
+        };
+        let Some(variant) =
+            OWNED_RECURSIVE_ELIMINATORS.with(|variants| variants.borrow().get(name).cloned())
+        else {
+            return Vec::new();
+        };
+        let Some(Expr::MakeClosure(_, closure)) = arguments
+            .get(variant.combine_parameter)
+            .map(|argument| strip_ascription(argument))
+        else {
+            return Vec::new();
+        };
+        let Some(step) = OWNED_PRODUCT_DATA_STEP_WORKERS
+            .with(|steps| steps.borrow().get(&closure.lifted_name).cloned())
+        else {
+            return Vec::new();
+        };
+        let Some(Expr::Tuple(_, seed)) = arguments
+            .get(variant.product_parameter)
+            .map(|argument| strip_ascription(argument))
+        else {
+            return Vec::new();
+        };
+        seed.elements
+            .get(step.data_product_field)
+            .is_some_and(|field| {
+                self.expression_returns_fresh_spine_with_locals(field, self_name, known, owned)
+            })
+            .then_some(step.data_product_field)
+            .into_iter()
+            .collect()
+    }
+
+    /// Whether every result path constructs a fresh recursive constructor spine.
+    /// Recursive calls to `self_name` are accepted coinductively; calls to workers
+    /// already admitted by the fixed point are fresh too. A constructor field is
+    /// recursive when its inferred type equals the enclosing constructor value's
+    /// type, so this has no knowledge of `List`, `Cons`, or field position.
+    fn expression_returns_fresh_spine(
+        &self,
+        expression: &Expr,
+        self_name: &QualifiedName,
+        known: &HashSet<QualifiedName>,
+    ) -> bool {
+        self.expression_returns_fresh_spine_with_locals(
+            expression,
+            self_name,
+            known,
+            &HashSet::default(),
+        )
+    }
+
+    fn expression_returns_fresh_spine_with_locals(
+        &self,
+        expression: &Expr,
+        self_name: &QualifiedName,
+        known: &HashSet<QualifiedName>,
+        owned: &HashSet<usize>,
+    ) -> bool {
+        let expression = strip_ascription(expression);
+        if Self::local_level(expression).is_some_and(|level| owned.contains(&level)) {
+            return true;
+        }
+        if let Some((constructor, arguments)) = Self::constructor_application(expression) {
+            if self.newtype_constructors.contains(constructor) {
+                return arguments.len() == 1
+                    && (Self::named_application(arguments[0])
+                        .is_some_and(|(name, _)| name == self_name || known.contains(name))
+                        || self.expression_returns_fresh_spine_with_locals(
+                            arguments[0],
+                            self_name,
+                            known,
+                            owned,
+                        ));
+            }
+            if self.constructor_tags.contains_key(constructor) {
+                if arguments.is_empty() {
+                    return true;
+                }
+                let result_type = &expression.annotation().type_info.inferred_type;
+                let recursive = arguments
+                    .iter()
+                    .filter(|argument| {
+                        &argument.annotation().type_info.inferred_type == result_type
+                    })
+                    .collect::<Vec<_>>();
+                return !recursive.is_empty()
+                    && recursive.iter().all(|argument| {
+                        Self::named_application(argument)
+                            .is_some_and(|(name, _)| name == self_name || known.contains(name))
+                            || self.expression_returns_fresh_spine_with_locals(
+                                argument, self_name, known, owned,
+                            )
+                    });
+            }
+        }
+
+        if let Some((name, arguments)) = Self::named_application(expression) {
+            if name == self_name || known.contains(name) {
+                return true;
+            }
+            if let [argument] = arguments.as_slice()
+                && self.workers.iter().any(|worker| {
+                    worker.name == *name
+                        && worker.params == 1
+                        && Self::local_use_count(&worker.body, 0) == 1
+                        && !self.has_tail_self_call(SelfCall::Named(&worker.name), 1, &worker.body)
+                        && self.expression_contains_spine_rebuild(&worker.body)
+                })
+                && (Self::named_application(argument)
+                    .is_some_and(|(producer, _)| known.contains(producer))
+                    || self.expression_returns_fresh_spine_with_locals(
+                        argument, self_name, known, owned,
+                    ))
+            {
+                return true;
+            }
+        }
+
+        match expression {
+            Expr::Let(_, binding) => {
+                let mut inner = owned.clone();
+                if self.expression_returns_fresh_spine_with_locals(
+                    &binding.bound,
+                    self_name,
+                    known,
+                    owned,
+                ) && let Identifier::Local(LexicalLevel(level)) = binding.binder
+                {
+                    inner.insert(level);
+                }
+                self.expression_returns_fresh_spine_with_locals(
+                    &binding.body,
+                    self_name,
+                    known,
+                    &inner,
+                )
+            }
+            Expr::Sequence(_, sequence) => self.expression_returns_fresh_spine_with_locals(
+                &sequence.and_then,
+                self_name,
+                known,
+                owned,
+            ),
+            Expr::If(_, branch) => {
+                self.expression_returns_fresh_spine_with_locals(
+                    &branch.consequent,
+                    self_name,
+                    known,
+                    owned,
+                ) && self.expression_returns_fresh_spine_with_locals(
+                    &branch.alternate,
+                    self_name,
+                    known,
+                    owned,
+                )
+            }
+            Expr::Deconstruct(_, deconstruct) => {
+                let scrutinee_owned = self.expression_returns_fresh_spine_with_locals(
+                    &deconstruct.scrutinee,
+                    self_name,
+                    known,
+                    owned,
+                );
+                !deconstruct.match_clauses.is_empty()
+                    && deconstruct.match_clauses.iter().all(|clause| {
+                        let mut inner = owned.clone();
+                        if scrutinee_owned {
+                            self.collect_owned_spine_pattern_binders(
+                                &clause.pattern,
+                                &deconstruct.scrutinee.annotation().type_info.inferred_type,
+                                &mut inner,
+                            );
+                        }
+                        if let Pattern::Tuple(_, pattern) = &clause.pattern {
+                            for field in self.fresh_product_fields_from_recursive_eliminator(
+                                &deconstruct.scrutinee,
+                                self_name,
+                                known,
+                                owned,
+                            ) {
+                                if let Some(field_pattern) = pattern.elements.get(field) {
+                                    self.collect_owned_spine_pattern_binders(
+                                        field_pattern,
+                                        &field_pattern.annotation().type_info.inferred_type,
+                                        &mut inner,
+                                    );
+                                }
+                            }
+                        }
+                        self.expression_returns_fresh_spine_with_locals(
+                            &clause.consequent,
+                            self_name,
+                            known,
+                            &inner,
+                        )
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn fresh_spine_workers(&self) -> HashSet<QualifiedName> {
+        let mut fresh = HashSet::default();
+        loop {
+            let additions = self
+                .workers
+                .iter()
+                .filter(|worker| {
+                    !fresh.contains(&worker.name)
+                        && self.expression_returns_fresh_spine(&worker.body, &worker.name, &fresh)
+                })
+                .map(|worker| worker.name.clone())
+                .collect::<Vec<_>>();
+            if additions.is_empty() {
+                break;
+            }
+            fresh.extend(additions);
+        }
+        fresh
+    }
+
+    fn expression_is_fresh_spine(&self, expression: &Expr) -> bool {
+        FRESH_SPINE_WORKERS.with(|fresh| {
+            let fresh = fresh.borrow();
+            Self::named_application(expression).is_some_and(|(name, _)| fresh.contains(name))
+        })
+    }
+
+    /// Recognize a recursive spine transformation from semantics alone:
+    ///
+    /// * one worker deconstructs a recursive sum with one terminal constructor
+    ///   and one step constructor;
+    /// * the terminal branch returns a seed;
+    /// * the step branch invokes a callback with the accumulator and every
+    ///   non-recursive payload, then tail-recurs on the sole recursive field;
+    /// * that callback reconstructs the same step constructor, placing the old
+    ///   accumulator in its recursive field.
+    ///
+    /// No type, constructor, module, or function identity participates.
+    fn owned_spine_rebuild<'a>(
+        &'a self,
+        head: &'a Expr,
+        arguments: &[&'a Expr],
+    ) -> Option<OwnedSpineRebuild<'a>> {
+        if std::env::var_os("MARM_NO_OWNED_SPINES").is_some() || arguments.len() != 3 {
+            return None;
+        }
+        let Expr::Variable(_, Identifier::Global(worker_name)) = strip_ascription(head) else {
+            return None;
+        };
+        let worker = self
+            .workers
+            .iter()
+            .find(|worker| worker.name == **worker_name && worker.params == 3)?;
+        let Expr::Deconstruct(_, deconstruct) = strip_ascription(&worker.body) else {
+            return None;
+        };
+        if Self::local_level(&deconstruct.scrutinee) != Some(2)
+            || deconstruct.match_clauses.len() != 2
+        {
+            return None;
+        }
+
+        let mut end_constructor = None;
+        let mut step = None;
+        for clause in &deconstruct.match_clauses {
+            let Pattern::Coproduct(_, constructor) = &clause.pattern else {
+                return None;
+            };
+            let Identifier::Global(name) = &constructor.constructor else {
+                return None;
+            };
+            if constructor.arguments.is_empty() {
+                if end_constructor.is_some() || Self::local_level(&clause.consequent) != Some(1) {
+                    return None;
+                }
+                end_constructor = Some(name.as_ref());
+                continue;
+            }
+
+            let binders = constructor
+                .arguments
+                .iter()
+                .map(|pattern| match pattern {
+                    Pattern::Bind(_, Identifier::Local(LexicalLevel(level))) => Some(*level),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let (called, recursive_arguments) = Self::named_application(&clause.consequent)?;
+            if called != worker_name.as_ref()
+                || recursive_arguments.len() != 3
+                || Self::local_level(recursive_arguments[0]) != Some(0)
+            {
+                return None;
+            }
+            let tail_level = Self::local_level(recursive_arguments[2])?;
+            let next_field = binders.iter().position(|level| *level == tail_level)?;
+            let input_type = &deconstruct.scrutinee.annotation().type_info.inferred_type;
+            let recursive_fields = constructor
+                .arguments
+                .iter()
+                .enumerate()
+                .filter_map(|(index, pattern)| {
+                    (&pattern.annotation().type_info.inferred_type == input_type).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            if recursive_fields.as_slice() != [next_field] {
+                return None;
+            }
+
+            let mut combine_head = strip_ascription(recursive_arguments[1]);
+            let mut combine_arguments = Vec::new();
+            while let Expr::Apply(_, application) = combine_head {
+                combine_arguments.push(application.argument.as_ref());
+                combine_head = strip_ascription(&application.function);
+            }
+            combine_arguments.reverse();
+            if Self::local_level(combine_head) != Some(0)
+                || combine_arguments.len() != binders.len()
+                || Self::local_level(combine_arguments[0]) != Some(1)
+            {
+                return None;
+            }
+            let payload = binders
+                .iter()
+                .enumerate()
+                .filter_map(|(index, level)| (index != next_field).then_some(*level))
+                .collect::<Vec<_>>();
+            if !combine_arguments[1..]
+                .iter()
+                .zip(payload)
+                .all(|(argument, level)| Self::local_level(argument) == Some(level))
+                || step.is_some()
+            {
+                return None;
+            }
+            step = Some((name.as_ref(), next_field, binders.len()));
+        }
+
+        let end_constructor = end_constructor?;
+        let (step_constructor, next_field, fields) = step?;
+        let (seed_constructor, seed_arguments) = Self::constructor_application(arguments[1])?;
+        if seed_constructor != end_constructor || !seed_arguments.is_empty() {
+            return None;
+        }
+        let Expr::MakeClosure(_, closure) = strip_ascription(arguments[0]) else {
+            return None;
+        };
+        let Expr::Tuple(_, environment) = closure.environment.as_ref() else {
+            return None;
+        };
+        if !environment.elements.is_empty() {
+            return None;
+        }
+        let rebuild = self
+            .chain_workers
+            .iter()
+            .find(|candidate| candidate.head == closure.lifted_name && candidate.arity == fields)?;
+        let (rebuilt_constructor, rebuilt_fields) = Self::constructor_application(&rebuild.body)?;
+        if rebuilt_constructor != step_constructor || rebuilt_fields.len() != fields {
+            return None;
+        }
+        let mut payload_parameter = 1usize;
+        for (index, field) in rebuilt_fields.iter().enumerate() {
+            let expected = if index == next_field {
+                0
+            } else {
+                let parameter = payload_parameter;
+                payload_parameter += 1;
+                parameter
+            };
+            if Self::local_level(field) != Some(expected) {
+                return None;
+            }
+        }
+        Some(OwnedSpineRebuild {
+            input: arguments[2],
+            seed: arguments[1],
+            step_constructor,
+            end_constructor,
+            next_field,
+        })
+    }
+
+    fn subspine_result(
+        expression: &Expr,
+        allowed: &HashSet<usize>,
+        recursive_arity: usize,
+    ) -> bool {
+        let expression = strip_ascription(expression);
+        if Self::local_level(expression).is_some_and(|level| allowed.contains(&level)) {
+            return true;
+        }
+        if matches!(expression, Expr::Apply(..)) {
+            let mut head = expression;
+            let mut arguments = Vec::new();
+            while let Expr::Apply(_, application) = head {
+                arguments.push(application.argument.as_ref());
+                head = strip_ascription(&application.function);
+            }
+            arguments.reverse();
+            if matches!(head, Expr::Variable(_, Identifier::SelfRef))
+                && arguments.len() == recursive_arity
+            {
+                return arguments
+                    .iter()
+                    .all(|argument| Self::subspine_result(argument, allowed, recursive_arity));
+            }
+        }
+        match expression {
+            Expr::Let(_, binding) => {
+                let mut inner = allowed.clone();
+                if Self::subspine_result(&binding.bound, allowed, recursive_arity)
+                    && let Identifier::Local(LexicalLevel(level)) = binding.binder
+                {
+                    inner.insert(level);
+                }
+                Self::subspine_result(&binding.body, &inner, recursive_arity)
+            }
+            Expr::If(_, branch) => {
+                Self::subspine_result(&branch.consequent, allowed, recursive_arity)
+                    && Self::subspine_result(&branch.alternate, allowed, recursive_arity)
+            }
+            Expr::Deconstruct(_, deconstruct)
+                if Self::local_level(&deconstruct.scrutinee)
+                    .is_some_and(|level| allowed.contains(&level)) =>
+            {
+                let scrutinee_type = &deconstruct.scrutinee.annotation().type_info.inferred_type;
+                deconstruct.match_clauses.iter().all(|clause| {
+                    let mut inner = allowed.clone();
+                    Self::collect_same_type_pattern_binders(
+                        &clause.pattern,
+                        scrutinee_type,
+                        &mut inner,
+                    );
+                    Self::subspine_result(&clause.consequent, &inner, recursive_arity)
+                })
+            }
+            _ => false,
+        }
+    }
+
+    fn closure_preserves_owned_subspine(&self, closure: &ClosureInfo, arity: usize) -> bool {
+        let body = if arity == 1 {
+            let Some(function) = self
+                .functions
+                .iter()
+                .find(|function| function.name == closure.lifted_name)
+            else {
+                return false;
+            };
+            &function.code
+        } else {
+            let Some(worker) = self
+                .chain_workers
+                .iter()
+                .find(|worker| worker.head == closure.lifted_name && worker.arity == arity)
+            else {
+                return false;
+            };
+            &worker.body
+        };
+        let allowed = (0..arity).collect::<HashSet<_>>();
+        Self::subspine_result(body, &allowed, arity)
+    }
+
+    fn expression_preserves_owned_spine(
+        &self,
+        expression: &Expr,
+        owner: usize,
+        self_name: &QualifiedName,
+    ) -> bool {
+        let expression = strip_ascription(expression);
+        if Self::local_level(expression) == Some(owner) {
+            return true;
+        }
+        if let Some((name, arguments)) = Self::named_application(expression)
+            && name == self_name
+            && let Some(argument) = arguments.get(owner)
+            && arguments
+                .iter()
+                .enumerate()
+                .all(|(index, other)| index == owner || Self::local_use_count(other, owner) == 0)
+            && Self::same_type(expression, argument)
+            && self.expression_preserves_owned_spine(argument, owner, self_name)
+        {
+            return true;
+        }
+        if let Some((constructor, arguments)) = Self::constructor_application(expression)
+            && self.constructor_tags.contains_key(constructor)
+        {
+            if arguments.is_empty() {
+                return true;
+            }
+            let result_type = &expression.annotation().type_info.inferred_type;
+            let recursive = arguments
+                .iter()
+                .filter(|argument| &argument.annotation().type_info.inferred_type == result_type)
+                .collect::<Vec<_>>();
+            return !recursive.is_empty()
+                && recursive.iter().all(|argument| {
+                    self.expression_preserves_owned_spine(argument, owner, self_name)
+                })
+                && arguments
+                    .iter()
+                    .filter(|argument| {
+                        &argument.annotation().type_info.inferred_type != result_type
+                    })
+                    .all(|argument| Self::local_use_count(argument, owner) == 0);
+        }
+        match expression {
+            Expr::Let(_, binding) => {
+                Self::local_use_count(&binding.bound, owner) == 0
+                    && self.expression_preserves_owned_spine(&binding.body, owner, self_name)
+            }
+            Expr::Sequence(_, sequence) => {
+                Self::local_use_count(&sequence.this, owner) == 0
+                    && self.expression_preserves_owned_spine(&sequence.and_then, owner, self_name)
+            }
+            Expr::If(_, branch) => {
+                Self::local_use_count(&branch.predicate, owner) == 0
+                    && self.expression_preserves_owned_spine(&branch.consequent, owner, self_name)
+                    && self.expression_preserves_owned_spine(&branch.alternate, owner, self_name)
+            }
+            Expr::Deconstruct(_, deconstruct) => {
+                Self::local_use_count(&deconstruct.scrutinee, owner) == 0
+                    && !deconstruct.match_clauses.is_empty()
+                    && deconstruct.match_clauses.iter().all(|clause| {
+                        self.expression_preserves_owned_spine(&clause.consequent, owner, self_name)
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn owned_spine_preserving_workers(&self) -> HashMap<QualifiedName, Vec<usize>> {
+        self.workers
+            .iter()
+            .filter_map(|worker| {
+                let parameters = (0..worker.params)
+                    .filter(|parameter| {
+                        Self::local_use_count(&worker.body, *parameter) != 0
+                            && self.expression_preserves_owned_spine(
+                                &worker.body,
+                                *parameter,
+                                &worker.name,
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                (!parameters.is_empty()).then(|| (worker.name.clone(), parameters))
+            })
+            .collect()
+    }
+
+    fn expression_is_owned_spine(&self, expression: &Expr) -> bool {
+        let owned = OWNED_SPINE_LOCALS.with(|current| current.borrow().clone());
+        self.expression_is_owned_spine_with_locals(expression, &owned)
+    }
+
+    fn owned_product_fields_from_recursive_eliminator(
+        &self,
+        expression: &Expr,
+        owned: &HashSet<usize>,
+    ) -> Vec<usize> {
+        if std::env::var_os("MARM_NO_PRODUCT_SPINE_PROVENANCE").is_some() {
+            return Vec::new();
+        }
+        let Some((name, arguments)) = Self::named_application(expression) else {
+            return Vec::new();
+        };
+        let Some(variant) =
+            OWNED_RECURSIVE_ELIMINATORS.with(|variants| variants.borrow().get(name).cloned())
+        else {
+            return Vec::new();
+        };
+        let Some(Expr::MakeClosure(_, closure)) = arguments
+            .get(variant.combine_parameter)
+            .map(|argument| strip_ascription(argument))
+        else {
+            return Vec::new();
+        };
+        let Some(step) = OWNED_PRODUCT_DATA_STEP_WORKERS
+            .with(|steps| steps.borrow().get(&closure.lifted_name).cloned())
+        else {
+            return Vec::new();
+        };
+        let Some(Expr::Tuple(_, seed)) = arguments
+            .get(variant.product_parameter)
+            .map(|argument| strip_ascription(argument))
+        else {
+            return Vec::new();
+        };
+        seed.elements
+            .get(step.data_product_field)
+            .is_some_and(|field| self.expression_is_owned_spine_with_locals(field, owned))
+            .then_some(step.data_product_field)
+            .into_iter()
+            .collect()
+    }
+
+    /// An owned value may be mentioned more than once inside one call. Passing
+    /// one mention to a consuming specialization would then mutate storage that
+    /// another argument still aliases. Fresh expressions have no such external
+    /// alias; for values derived from an owned local, require every other
+    /// argument to be independent of that local.
+    fn owned_spine_argument_is_exclusive(&self, arguments: &[&Expr], selected: usize) -> bool {
+        let Some(argument) = arguments.get(selected) else {
+            return false;
+        };
+        // Distinct lexical binders can still denote the same owned value after
+        // two matches on an erased wrapper. Until provenance is tracked across
+        // those binds, consuming either is safe only when it is the call's sole
+        // owned argument.
+        if arguments.iter().enumerate().any(|(index, other)| {
+            index != selected
+                && self.expression_is_owned_spine(other)
+                && !Self::constructor_application(other)
+                    .is_some_and(|(_, fields)| fields.is_empty())
+        }) {
+            return false;
+        }
+        OWNED_SPINE_LOCALS.with(|current| {
+            current.borrow().iter().all(|level| {
+                Self::local_use_count(argument, *level) == 0
+                    || arguments.iter().enumerate().all(|(index, other)| {
+                        index == selected || Self::local_use_count(other, *level) == 0
+                    })
+            })
+        })
+    }
+
+    /// Follow exclusive-spine provenance through the expression's lexical
+    /// bindings. Simplification commonly inlines a fresh producer into a loop
+    /// backedge as `let x = producer ... in ... x ...`; looking only at the
+    /// final expression loses that fact and prevents the steady-state loop from
+    /// consuming its freshly produced values.
+    fn expression_is_owned_spine_with_locals(
+        &self,
+        expression: &Expr,
+        owned: &HashSet<usize>,
+    ) -> bool {
+        let expression = strip_ascription(expression);
+        if let Some(level) = Self::local_level(expression)
+            && owned.contains(&level)
+        {
+            return true;
+        }
+        if self.expression_is_fresh_spine(expression) {
+            return true;
+        }
+
+        if let Expr::Apply(..) = expression {
+            let mut head = expression;
+            let mut arguments = Vec::new();
+            while let Expr::Apply(_, application) = head {
+                arguments.push(application.argument.as_ref());
+                head = strip_ascription(&application.function);
+            }
+            arguments.reverse();
+            if self.owned_spine_rebuild(head, &arguments).is_some() {
+                return true;
+            }
+            if let Expr::Variable(_, Identifier::Global(name)) = head
+                && arguments.len() == 1
+                && OWNED_REBUILD_WORKER_VARIANTS
+                    .with(|variants| variants.borrow().contains(name.as_ref()))
+                && self.expression_is_owned_spine_with_locals(arguments[0], owned)
+            {
+                return true;
+            }
+            if let Expr::Variable(_, Identifier::Global(name)) = head
+                && let Some(parameters) = OWNED_SPINE_PRESERVING_WORKERS
+                    .with(|workers| workers.borrow().get(name.as_ref()).cloned())
+                && parameters.into_iter().any(|parameter| {
+                    arguments.get(parameter).is_some_and(|argument| {
+                        self.expression_is_owned_spine_with_locals(argument, owned)
+                    })
+                })
+            {
+                return true;
+            }
+            if let Expr::MakeClosure(_, closure) = head
+                && arguments
+                    .iter()
+                    .all(|argument| self.expression_is_owned_spine_with_locals(argument, owned))
+                && self.closure_preserves_owned_subspine(closure, arguments.len())
+            {
+                return true;
+            }
+        }
+
+        if let Some((constructor, arguments)) = Self::constructor_application(expression) {
+            if self.newtype_constructors.contains(constructor) {
+                return arguments.len() == 1
+                    && self.expression_is_owned_spine_with_locals(arguments[0], owned);
+            }
+            if !self.constructor_tags.contains_key(constructor) {
+                return false;
+            }
+            if arguments.is_empty() {
+                return true;
+            }
+            let result_type = &expression.annotation().type_info.inferred_type;
+            let recursive = arguments
+                .iter()
+                .filter(|argument| &argument.annotation().type_info.inferred_type == result_type);
+            let recursive = recursive.collect::<Vec<_>>();
+            return !recursive.is_empty()
+                && recursive
+                    .iter()
+                    .all(|argument| self.expression_is_owned_spine_with_locals(argument, owned));
+        }
+        match expression {
+            Expr::Let(_, binding) => {
+                let mut inner = owned.clone();
+                if self.expression_is_owned_spine_with_locals(&binding.bound, owned)
+                    && let Identifier::Local(LexicalLevel(level)) = binding.binder
+                {
+                    inner.insert(level);
+                }
+                self.expression_is_owned_spine_with_locals(&binding.body, &inner)
+            }
+            Expr::Sequence(_, sequence) => {
+                self.expression_is_owned_spine_with_locals(&sequence.and_then, owned)
+            }
+            Expr::If(_, branch) => {
+                self.expression_is_owned_spine_with_locals(&branch.consequent, owned)
+                    && self.expression_is_owned_spine_with_locals(&branch.alternate, owned)
+            }
+            Expr::Deconstruct(_, deconstruct) => {
+                let scrutinee_owned =
+                    self.expression_is_owned_spine_with_locals(&deconstruct.scrutinee, owned);
+                !deconstruct.match_clauses.is_empty()
+                    && deconstruct.match_clauses.iter().all(|clause| {
+                        let mut inner = owned.clone();
+                        if scrutinee_owned {
+                            self.collect_owned_spine_pattern_binders(
+                                &clause.pattern,
+                                &deconstruct.scrutinee.annotation().type_info.inferred_type,
+                                &mut inner,
+                            );
+                        }
+                        if let Pattern::Tuple(_, pattern) = &clause.pattern {
+                            for field in self.owned_product_fields_from_recursive_eliminator(
+                                &deconstruct.scrutinee,
+                                owned,
+                            ) {
+                                if let Some(field_pattern) = pattern.elements.get(field) {
+                                    self.collect_owned_spine_pattern_binders(
+                                        field_pattern,
+                                        &field_pattern.annotation().type_info.inferred_type,
+                                        &mut inner,
+                                    );
+                                }
+                            }
+                        }
+                        self.expression_is_owned_spine_with_locals(&clause.consequent, &inner)
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn collect_same_type_pattern_binders(
+        pattern: &phase::Pattern<Closed>,
+        expected: &Type,
+        out: &mut HashSet<usize>,
+    ) {
+        // Stay on direct recursive edges. A differently typed payload may hide a
+        // reference back to the spine, but copying that payload does not acquire
+        // ownership of anything inside it.
+        if &pattern.annotation().type_info.inferred_type != expected {
+            return;
+        }
+        match pattern {
+            Pattern::Bind(annotation, Identifier::Local(LexicalLevel(level))) => {
+                debug_assert_eq!(&annotation.type_info.inferred_type, expected);
+                out.insert(*level);
+            }
+            Pattern::Coproduct(_, constructor) => {
+                for argument in &constructor.arguments {
+                    Self::collect_same_type_pattern_binders(argument, expected, out);
+                }
+            }
+            Pattern::Tuple(_, tuple) => {
+                for element in &tuple.elements {
+                    Self::collect_same_type_pattern_binders(element, expected, out);
+                }
+            }
+            Pattern::Struct(_, record) => {
+                for (_, _, field) in &record.fields {
+                    Self::collect_same_type_pattern_binders(field, expected, out);
+                }
+            }
+            Pattern::Literally(..) | Pattern::Bind(..) => {}
+        }
+    }
+
+    fn collect_owned_spine_pattern_binders(
+        &self,
+        pattern: &phase::Pattern<Closed>,
+        expected: &Type,
+        out: &mut HashSet<usize>,
+    ) {
+        if &pattern.annotation().type_info.inferred_type != expected {
+            return;
+        }
+        if let Pattern::Coproduct(_, constructor) = pattern
+            && let Identifier::Global(name) = &constructor.constructor
+            && self.newtype_constructors.contains(name.as_ref())
+        {
+            for argument in &constructor.arguments {
+                self.collect_owned_spine_pattern_binders(
+                    argument,
+                    &argument.annotation().type_info.inferred_type,
+                    out,
+                );
+            }
+            return;
+        }
+        Self::collect_same_type_pattern_binders(pattern, expected, out);
+    }
+
+    fn install_owned_spine_locals<I>(levels: I) -> HashSet<usize>
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        OWNED_SPINE_LOCALS.with(|owned| {
+            let previous = owned.borrow().clone();
+            owned.borrow_mut().extend(levels);
+            previous
+        })
+    }
+
+    fn restore_owned_spine_locals(previous: HashSet<usize>) {
+        OWNED_SPINE_LOCALS.with(|owned| *owned.borrow_mut() = previous);
+    }
+
+    fn max_local_uses_per_path(expression: &Expr, wanted: usize) -> usize {
+        let expression = strip_ascription(expression);
+        match expression {
+            Expr::If(_, branch) => {
+                Self::max_local_uses_per_path(&branch.predicate, wanted)
+                    + Self::max_local_uses_per_path(&branch.consequent, wanted)
+                        .max(Self::max_local_uses_per_path(&branch.alternate, wanted))
+            }
+            Expr::Deconstruct(_, deconstruct) => {
+                Self::max_local_uses_per_path(&deconstruct.scrutinee, wanted)
+                    + deconstruct
+                        .match_clauses
+                        .iter()
+                        .map(|clause| Self::max_local_uses_per_path(&clause.consequent, wanted))
+                        .max()
+                        .unwrap_or(0)
+            }
+            Expr::Let(_, binding) => {
+                Self::max_local_uses_per_path(&binding.bound, wanted)
+                    + Self::max_local_uses_per_path(&binding.body, wanted)
+            }
+            Expr::Sequence(_, sequence) => {
+                Self::max_local_uses_per_path(&sequence.this, wanted)
+                    + Self::max_local_uses_per_path(&sequence.and_then, wanted)
+            }
+            _ => {
+                usize::from(Self::local_level(expression) == Some(wanted))
+                    + crate::simplify::children(expression)
+                        .into_iter()
+                        .map(|child| Self::max_local_uses_per_path(child, wanted))
+                        .sum::<usize>()
+            }
+        }
+    }
+
+    fn owned_local_is_linear(expression: &Expr, wanted: usize) -> bool {
+        // Branch alternatives are mutually exclusive. One use in each arm is
+        // therefore one dynamic use, and an owned recursive node can remain the
+        // destination along either path. Counting the whole syntax tree here
+        // used to drop destination ownership at exactly these joins.
+        if std::env::var_os("MARM_NO_PATH_LINEAR_OWNERSHIP").is_some() {
+            Self::local_use_count(expression, wanted) == 1
+        } else {
+            Self::max_local_uses_per_path(expression, wanted) <= 1
+        }
+    }
+
+    fn dynamic_owned_condition(&self, expression: &Expr) -> Option<String> {
+        if let Some(level) = Self::local_level(expression)
+            && let Some(condition) =
+                DYNAMIC_OWNED_SPINE_LOCALS.with(|current| current.borrow().get(&level).cloned())
+        {
+            return Some(condition);
+        }
+        self.expression_is_owned_spine(expression)
+            .then(|| "true".to_owned())
+    }
+
+    fn install_dynamic_owned_spine_locals<I>(entries: I) -> HashMap<usize, String>
+    where
+        I: IntoIterator<Item = (usize, String)>,
+    {
+        DYNAMIC_OWNED_SPINE_LOCALS.with(|current| {
+            let previous = current.borrow().clone();
+            current.borrow_mut().extend(entries);
+            previous
+        })
+    }
+
+    fn restore_dynamic_owned_spine_locals(previous: HashMap<usize, String>) {
+        DYNAMIC_OWNED_SPINE_LOCALS.with(|current| *current.borrow_mut() = previous);
+    }
+
+    fn expression_contains_spine_rebuild(&self, expression: &Expr) -> bool {
+        if let Expr::Apply(..) = strip_ascription(expression) {
+            let mut head = strip_ascription(expression);
+            let mut arguments = Vec::new();
+            while let Expr::Apply(_, application) = head {
+                arguments.push(application.argument.as_ref());
+                head = strip_ascription(&application.function);
+            }
+            arguments.reverse();
+            if self.owned_spine_rebuild(head, &arguments).is_some() {
+                return true;
+            }
+        }
+        crate::simplify::children(expression)
+            .into_iter()
+            .any(|child| self.expression_contains_spine_rebuild(child))
+    }
+
+    fn owned_rebuild_worker_variants(
+        &self,
+        fresh: &HashSet<QualifiedName>,
+    ) -> HashSet<QualifiedName> {
+        let candidates = self
+            .workers
+            .iter()
+            .filter(|worker| {
+                worker.params == 1
+                    && Self::local_use_count(&worker.body, 0) == 1
+                    && !self.has_tail_self_call(SelfCall::Named(&worker.name), 1, &worker.body)
+                    && self.expression_contains_spine_rebuild(&worker.body)
+            })
+            .map(|worker| worker.name.clone())
+            .collect::<HashSet<_>>();
+        let mut selected = HashSet::default();
+        fn visit(
+            expression: &Expr,
+            candidates: &HashSet<QualifiedName>,
+            fresh: &HashSet<QualifiedName>,
+            selected: &mut HashSet<QualifiedName>,
+        ) {
+            if let Some((name, arguments)) = lambda_lift::Program::named_application(expression)
+                && candidates.contains(name)
+                && matches!(arguments.as_slice(), [argument]
+                    if lambda_lift::Program::named_application(argument)
+                        .is_some_and(|(producer, _)| fresh.contains(producer)))
+            {
+                selected.insert(name.clone());
+            }
+            for child in crate::simplify::children(expression) {
+                visit(child, candidates, fresh, selected);
+            }
+        }
+        for function in &self.functions {
+            visit(&function.code, &candidates, fresh, &mut selected);
+        }
+        for worker in &self.workers {
+            visit(&worker.body, &candidates, fresh, &mut selected);
+        }
+        for worker in &self.chain_workers {
+            visit(&worker.body, &candidates, fresh, &mut selected);
+        }
+        for global in &self.globals {
+            visit(&global.value, &candidates, fresh, &mut selected);
+        }
+        selected
+    }
+
+    fn result_tuple_nodes(expression: &Expr, arity: usize, out: &mut Vec<usize>) -> bool {
+        let expression = strip_ascription(expression);
+        match expression {
+            Expr::Tuple(_, tuple) if tuple.elements.len() == arity => {
+                out.push(expression as *const Expr as usize);
+                true
+            }
+            Expr::Let(_, binding) => Self::result_tuple_nodes(&binding.body, arity, out),
+            Expr::Sequence(_, sequence) => Self::result_tuple_nodes(&sequence.and_then, arity, out),
+            Expr::If(_, branch) => {
+                Self::result_tuple_nodes(&branch.consequent, arity, out)
+                    && Self::result_tuple_nodes(&branch.alternate, arity, out)
+            }
+            Expr::Deconstruct(_, deconstruct) => {
+                !deconstruct.match_clauses.is_empty()
+                    && deconstruct
+                        .match_clauses
+                        .iter()
+                        .all(|clause| Self::result_tuple_nodes(&clause.consequent, arity, out))
+            }
+            _ => false,
+        }
+    }
+
+    /// Return the tuple arity and exact result nodes for a two-argument step
+    /// which consumes its accumulator only by destructuring it.  Reusing the
+    /// accumulator box is then observationally equivalent to returning a fresh
+    /// tuple, provided the caller owns that accumulator.
+    fn owned_tuple_step(&self, worker: &ChainWorker) -> Option<(usize, Vec<usize>)> {
+        if std::env::var_os("MARM_NO_OWNED_TUPLES").is_some() || worker.arity != 2 {
+            return None;
+        }
+        let Expr::Deconstruct(_, deconstruct) = strip_ascription(&worker.body) else {
+            return None;
+        };
+        if Self::local_level(&deconstruct.scrutinee) != Some(1)
+            || Self::local_use_count(&worker.body, 1) != 1
+            || deconstruct.match_clauses.len() != 1
+        {
+            return None;
+        }
+        let clause = &deconstruct.match_clauses[0];
+        let Pattern::Tuple(_, tuple) = &clause.pattern else {
+            return None;
+        };
+        let arity = tuple.elements.len();
+        if !(1..=4).contains(&arity) {
+            return None;
+        }
+        let mut returns = Vec::new();
+        Self::result_tuple_nodes(&clause.consequent, arity, &mut returns)
+            .then_some((arity, returns))
+    }
+
+    fn owned_tuple_step_workers(&self) -> HashMap<QualifiedName, usize> {
+        self.chain_workers
+            .iter()
+            .filter_map(|worker| {
+                self.owned_tuple_step(worker)
+                    .map(|(arity, _)| (worker.head.clone(), arity))
+            })
+            .collect()
+    }
+
+    fn owned_product_data_step(&self, worker: &ChainWorker) -> Option<OwnedProductDataStep> {
+        if std::env::var_os("MARM_NO_RECURSIVE_ELIMINATOR_OWNERSHIP").is_some()
+            || std::env::var_os("MARM_NO_OWNED_DATA").is_some()
+        {
+            return None;
+        }
+        let (product_arity, product_returns) = self.owned_tuple_step(worker)?;
+        let mut candidates = Vec::new();
+        fn collect(
+            program: &lambda_lift::Program,
+            expression: &Expr,
+            out: &mut Vec<(usize, usize)>,
+        ) {
+            let expression = strip_ascription(expression);
+            if let Some((constructor, arguments)) =
+                lambda_lift::Program::constructor_application(expression)
+                && program.constructor_tags.contains_key(constructor)
+                && (1..=4).contains(&arguments.len())
+            {
+                let result_type = &expression.annotation().type_info.inferred_type;
+                if arguments
+                    .iter()
+                    .any(|argument| &argument.annotation().type_info.inferred_type == result_type)
+                {
+                    out.push((expression as *const Expr as usize, arguments.len()));
+                    return;
+                }
+            }
+            for child in crate::simplify::children(expression) {
+                collect(program, child, out);
+            }
+        }
+        collect(self, &worker.body, &mut candidates);
+        let [(data_return, data_arity)] = candidates.as_slice() else {
+            return None;
+        };
+        fn contains(expression: &Expr, wanted: usize) -> bool {
+            expression as *const Expr as usize == wanted
+                || crate::simplify::children(expression)
+                    .into_iter()
+                    .any(|child| contains(child, wanted))
+        }
+        fn guaranteed_result(expression: &Expr, wanted: usize) -> bool {
+            let expression = strip_ascription(expression);
+            if expression as *const Expr as usize == wanted {
+                return true;
+            }
+            match expression {
+                Expr::Let(_, binding) => guaranteed_result(&binding.body, wanted),
+                Expr::Sequence(_, sequence) => guaranteed_result(&sequence.and_then, wanted),
+                Expr::If(_, branch) => {
+                    guaranteed_result(&branch.consequent, wanted)
+                        && guaranteed_result(&branch.alternate, wanted)
+                }
+                Expr::Deconstruct(_, deconstruct) => {
+                    !deconstruct.match_clauses.is_empty()
+                        && deconstruct
+                            .match_clauses
+                            .iter()
+                            .all(|clause| guaranteed_result(&clause.consequent, wanted))
+                }
+                _ => false,
+            }
+        }
+        fn result_fields(
+            expression: &Expr,
+            returns: &HashSet<usize>,
+            wanted: usize,
+            out: &mut Vec<Option<usize>>,
+        ) {
+            let expression = strip_ascription(expression);
+            if returns.contains(&(expression as *const Expr as usize)) {
+                let Expr::Tuple(_, tuple) = expression else {
+                    out.push(None);
+                    return;
+                };
+                let fields = tuple
+                    .elements
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, element)| contains(element, wanted).then_some(index))
+                    .collect::<Vec<_>>();
+                out.push(match fields.as_slice() {
+                    [field] if guaranteed_result(&tuple.elements[*field], wanted) => Some(*field),
+                    _ => None,
+                });
+                return;
+            }
+            for child in crate::simplify::children(expression) {
+                result_fields(child, returns, wanted, out);
+            }
+        }
+        let returns = product_returns.iter().copied().collect::<HashSet<_>>();
+        let mut fields = Vec::new();
+        result_fields(&worker.body, &returns, *data_return, &mut fields);
+        if fields.len() != product_returns.len() {
+            return None;
+        }
+        let data_product_field = fields.first().copied().flatten()?;
+        if fields
+            .iter()
+            .any(|field| *field != Some(data_product_field))
+        {
+            return None;
+        }
+        Some(OwnedProductDataStep {
+            product_arity,
+            product_returns,
+            data_return: *data_return,
+            data_arity: *data_arity,
+            data_product_field,
+        })
+    }
+
+    fn owned_product_data_step_workers(&self) -> HashMap<QualifiedName, OwnedProductDataStep> {
+        self.chain_workers
+            .iter()
+            .filter_map(|worker| {
+                self.owned_product_data_step(worker)
+                    .map(|step| (worker.head.clone(), step))
+            })
+            .collect()
+    }
+
+    /// Find recursive eliminators by their typed control/data flow. A qualifying
+    /// worker deconstructs one recursive input, returns a product seed at its
+    /// terminal constructor, and invokes a combine parameter with a recursive
+    /// self-result at a step constructor. This is the general catamorphism shape;
+    /// no declaration identity is consulted.
+    fn owned_recursive_eliminators(
+        &self,
+        product_variants: &HashMap<QualifiedName, Vec<usize>>,
+    ) -> HashMap<QualifiedName, OwnedRecursiveEliminator> {
+        let mut variants = HashMap::default();
+        for worker in &self.workers {
+            let Some(product_parameters) = product_variants.get(&worker.name) else {
+                continue;
+            };
+            let Expr::Deconstruct(_, deconstruct) = strip_ascription(&worker.body) else {
+                continue;
+            };
+            let Some(input_parameter) = Self::local_level(&deconstruct.scrutinee) else {
+                continue;
+            };
+            if deconstruct.match_clauses.len() != 2 {
+                continue;
+            }
+            for product_parameter in product_parameters {
+                let mut terminal_ok = false;
+                let mut step = None;
+                for clause in &deconstruct.match_clauses {
+                    let Pattern::Coproduct(_, constructor) = &clause.pattern else {
+                        continue;
+                    };
+                    if constructor.arguments.is_empty() {
+                        terminal_ok |=
+                            Self::local_level(&clause.consequent) == Some(*product_parameter);
+                        continue;
+                    }
+                    let input_type = &deconstruct.scrutinee.annotation().type_info.inferred_type;
+                    let tails = constructor
+                        .arguments
+                        .iter()
+                        .filter(|argument| {
+                            &argument.annotation().type_info.inferred_type == input_type
+                        })
+                        .filter_map(|argument| match argument {
+                            Pattern::Bind(_, Identifier::Local(LexicalLevel(level))) => {
+                                Some(*level)
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let [tail] = tails.as_slice() else {
+                        continue;
+                    };
+
+                    let mut combine_head = strip_ascription(&clause.consequent);
+                    let combine_call = combine_head as *const Expr as usize;
+                    let mut combine_arguments = Vec::new();
+                    while let Expr::Apply(_, application) = combine_head {
+                        combine_arguments.push(application.argument.as_ref());
+                        combine_head = strip_ascription(&application.function);
+                    }
+                    combine_arguments.reverse();
+                    let Some(combine_parameter) = Self::local_level(combine_head) else {
+                        continue;
+                    };
+                    let Some(recursive_result) = combine_arguments.last() else {
+                        continue;
+                    };
+                    let Some((called, recursive_arguments)) =
+                        Self::named_application(recursive_result)
+                    else {
+                        continue;
+                    };
+                    if called != &worker.name
+                        || recursive_arguments.len() != worker.params
+                        || Self::local_level(recursive_arguments[input_parameter]) != Some(*tail)
+                        || Self::local_level(recursive_arguments[*product_parameter])
+                            != Some(*product_parameter)
+                        || Self::local_level(recursive_arguments[combine_parameter])
+                            != Some(combine_parameter)
+                    {
+                        continue;
+                    }
+                    step = Some(OwnedRecursiveEliminator {
+                        product_parameter: *product_parameter,
+                        input_parameter,
+                        combine_parameter,
+                        combine_call,
+                    });
+                }
+                if terminal_ok && let Some(step) = step {
+                    variants.insert(worker.name.clone(), step);
+                }
+            }
+        }
+        variants
+    }
+
+    fn same_type(left: &Expr, right: &Expr) -> bool {
+        left.annotation().type_info.inferred_type == right.annotation().type_info.inferred_type
+    }
+
+    /// Prove that an owned tuple parameter can supply the expression's result.
+    /// Calls with an owned result argument use an ownership-aware ABI: a
+    /// specialized callee may update it directly, while the generic fallback
+    /// computes normally and copies the value into that owned box.
+    fn expression_preserves_owned_tuple(
+        expression: &Expr,
+        owner: usize,
+        self_name: &QualifiedName,
+    ) -> bool {
+        let expression = strip_ascription(expression);
+        if Self::local_level(expression) == Some(owner) || matches!(expression, Expr::Tuple(..)) {
+            return true;
+        }
+        if let Expr::Apply(..) = expression {
+            let mut head = expression;
+            let mut arguments = Vec::new();
+            while let Expr::Apply(_, application) = head {
+                arguments.push(application.argument.as_ref());
+                head = strip_ascription(&application.function);
+            }
+            arguments.reverse();
+            if let Expr::Variable(_, Identifier::Global(name)) = head
+                && name.as_ref() == self_name
+                && let Some(argument) = arguments.get(owner)
+                && arguments.iter().enumerate().all(|(index, other)| {
+                    index == owner || Self::local_use_count(other, owner) == 0
+                })
+                && Self::same_type(expression, argument)
+                && Self::expression_preserves_owned_tuple(argument, owner, self_name)
+            {
+                return true;
+            }
+            if let Some(last) = arguments.last()
+                && Self::local_use_count(head, owner) == 0
+                && arguments[..arguments.len() - 1]
+                    .iter()
+                    .all(|other| Self::local_use_count(other, owner) == 0)
+                && Self::same_type(expression, last)
+                && Self::expression_preserves_owned_tuple(last, owner, self_name)
+            {
+                return true;
+            }
+        }
+        match expression {
+            Expr::Let(_, binding) => {
+                Self::local_use_count(&binding.bound, owner) == 0
+                    && Self::expression_preserves_owned_tuple(&binding.body, owner, self_name)
+            }
+            Expr::Sequence(_, sequence) => {
+                Self::local_use_count(&sequence.this, owner) == 0
+                    && Self::expression_preserves_owned_tuple(&sequence.and_then, owner, self_name)
+            }
+            Expr::If(_, branch) => {
+                Self::local_use_count(&branch.predicate, owner) == 0
+                    && Self::expression_preserves_owned_tuple(&branch.consequent, owner, self_name)
+                    && Self::expression_preserves_owned_tuple(&branch.alternate, owner, self_name)
+            }
+            Expr::Deconstruct(_, deconstruct) => {
+                Self::local_use_count(&deconstruct.scrutinee, owner) == 0
+                    && !deconstruct.match_clauses.is_empty()
+                    && deconstruct.match_clauses.iter().all(|clause| {
+                        Self::expression_preserves_owned_tuple(&clause.consequent, owner, self_name)
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn selected_owned_tuple_expression(
+        expression: &Expr,
+        selected: &HashMap<QualifiedName, Vec<usize>>,
+    ) -> bool {
+        let expression = strip_ascription(expression);
+        if matches!(expression, Expr::Tuple(..)) {
+            return true;
+        }
+        let Expr::Apply(..) = expression else {
+            return false;
+        };
+        let mut head = expression;
+        let mut arguments = Vec::new();
+        while let Expr::Apply(_, application) = head {
+            arguments.push(application.argument.as_ref());
+            head = strip_ascription(&application.function);
+        }
+        arguments.reverse();
+        if let Expr::Variable(_, Identifier::Global(name)) = head
+            && selected.get(name.as_ref()).is_some_and(|parameters| {
+                parameters.iter().any(|parameter| {
+                    arguments.get(*parameter).is_some_and(|argument| {
+                        Self::same_type(expression, argument)
+                            && Self::selected_owned_tuple_expression(argument, selected)
+                    })
+                })
+            })
+        {
+            return true;
+        }
+        arguments.last().is_some_and(|last| {
+            Self::same_type(expression, last)
+                && Self::selected_owned_tuple_expression(last, selected)
+        })
+    }
+
+    fn collect_owned_tuple_worker_calls(
+        expression: &Expr,
+        candidates: &HashMap<QualifiedName, Vec<usize>>,
+        selected: &HashMap<QualifiedName, Vec<usize>>,
+        additions: &mut HashMap<QualifiedName, Vec<usize>>,
+    ) {
+        if let Some((name, arguments)) = Self::named_application(expression)
+            && let Some(parameters) = candidates.get(name)
+        {
+            for parameter in parameters {
+                if arguments.get(*parameter).is_some_and(|argument| {
+                    Self::selected_owned_tuple_expression(argument, selected)
+                }) {
+                    let entry = additions.entry(name.clone()).or_default();
+                    if !entry.contains(parameter) {
+                        entry.push(*parameter);
+                    }
+                }
+            }
+        }
+        for child in crate::simplify::children(expression) {
+            Self::collect_owned_tuple_worker_calls(child, candidates, selected, additions);
+        }
+    }
+
+    fn owned_tuple_worker_variants(&self) -> HashMap<QualifiedName, Vec<usize>> {
+        if std::env::var_os("MARM_NO_OWNED_TUPLES").is_some() {
+            return HashMap::default();
+        }
+        let candidates = self
+            .workers
+            .iter()
+            .filter_map(|worker| {
+                let parameters = (0..worker.params)
+                    .filter(|parameter| {
+                        Self::local_use_count(&worker.body, *parameter) != 0
+                            && Self::expression_preserves_owned_tuple(
+                                &worker.body,
+                                *parameter,
+                                &worker.name,
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                (!parameters.is_empty()).then(|| (worker.name.clone(), parameters))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut selected = HashMap::<QualifiedName, Vec<usize>>::default();
+        loop {
+            let mut additions = HashMap::default();
+            for expression in self
+                .functions
+                .iter()
+                .map(|function| &function.code)
+                .chain(self.workers.iter().map(|worker| &worker.body))
+                .chain(self.chain_workers.iter().map(|worker| &worker.body))
+                .chain(self.globals.iter().map(|global| &global.value))
+                .chain(std::iter::once(&self.start))
+            {
+                Self::collect_owned_tuple_worker_calls(
+                    expression,
+                    &candidates,
+                    &selected,
+                    &mut additions,
+                );
+            }
+            let mut changed = false;
+            for (name, parameters) in additions {
+                let entry = selected.entry(name).or_default();
+                for parameter in parameters {
+                    if !entry.contains(&parameter) {
+                        entry.push(parameter);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        selected
+    }
+
+    fn expression_is_owned_tuple(&self, expression: &Expr) -> bool {
+        let expression = strip_ascription(expression);
+        if matches!(expression, Expr::Tuple(..)) {
+            return true;
+        }
+        if let Some(level) = Self::local_level(expression)
+            && OWNED_TUPLE_LOCALS.with(|owned| owned.borrow().contains(&level))
+        {
+            return true;
+        }
+        let Expr::Apply(..) = expression else {
+            return false;
+        };
+        let mut head = expression;
+        let mut arguments = Vec::new();
+        while let Expr::Apply(_, application) = head {
+            arguments.push(application.argument.as_ref());
+            head = strip_ascription(&application.function);
+        }
+        arguments.reverse();
+        if let Expr::Variable(_, Identifier::Global(name)) = head
+            && let Some(parameters) = OWNED_TUPLE_WORKER_VARIANTS
+                .with(|workers| workers.borrow().get(name.as_ref()).cloned())
+            && parameters.into_iter().any(|parameter| {
+                arguments.get(parameter).is_some_and(|argument| {
+                    Self::same_type(expression, argument)
+                        && self.expression_is_owned_tuple(argument)
+                })
+            })
+        {
+            return true;
+        }
+        arguments.last().is_some_and(|last| {
+            Self::same_type(expression, last) && self.expression_is_owned_tuple(last)
+        })
+    }
+
+    /// Find the fresh tuple literal which supplies an ownership-preserving call's
+    /// result. This mirrors `expression_is_owned_tuple`, but retains the producer
+    /// node so an immediately consuming match can represent it virtually.
+    fn owned_tuple_literal<'a>(
+        &self,
+        expression: &'a Expr,
+    ) -> Option<&'a ast::Tuple<CaptureInfo, Identifier>> {
+        let expression = strip_ascription(expression);
+        if let Expr::Tuple(_, tuple) = expression {
+            return Some(tuple);
+        }
+        let Expr::Apply(..) = expression else {
+            return None;
+        };
+        let mut head = expression;
+        let mut arguments = Vec::new();
+        while let Expr::Apply(_, application) = head {
+            arguments.push(application.argument.as_ref());
+            head = strip_ascription(&application.function);
+        }
+        arguments.reverse();
+        if let Expr::Variable(_, Identifier::Global(name)) = head
+            && let Some(parameters) = OWNED_TUPLE_WORKER_VARIANTS
+                .with(|workers| workers.borrow().get(name.as_ref()).cloned())
+            && let Some(tuple) = parameters.into_iter().find_map(|parameter| {
+                arguments.get(parameter).and_then(|argument| {
+                    (Self::same_type(expression, argument))
+                        .then(|| self.owned_tuple_literal(argument))
+                        .flatten()
+                })
+            })
+        {
+            return Some(tuple);
+        }
+        arguments.last().and_then(|last| {
+            Self::same_type(expression, last)
+                .then(|| self.owned_tuple_literal(last))
+                .flatten()
+        })
+    }
+
+    fn owner_pattern<'a>(
+        deconstruct: &'a phase::Deconstruct<Closed>,
+        clause: &'a phase::MatchClause<Closed>,
+        owner: usize,
+    ) -> Option<&'a phase::Pattern<Closed>> {
+        if Self::local_level(&deconstruct.scrutinee) == Some(owner) {
+            return Some(&clause.pattern);
+        }
+        let Expr::Tuple(_, scrutinee) = strip_ascription(&deconstruct.scrutinee) else {
+            return None;
+        };
+        let Pattern::Tuple(_, pattern) = &clause.pattern else {
+            return None;
+        };
+        scrutinee
+            .elements
+            .iter()
+            .position(|element| Self::local_level(element) == Some(owner))
+            .and_then(|index| pattern.elements.get(index))
+    }
+
+    /// Find result constructors that can overwrite an exclusively owned input
+    /// node. The owner itself must have one use (the match), and the selected
+    /// clause must rebuild the same constructor. Other result paths retain their
+    /// ordinary representation, so growth and terminator cases stay correct.
+    fn owned_data_result_nodes(
+        expression: &Expr,
+        owner: usize,
+        matched: Option<&QualifiedName>,
+        out: &mut Vec<usize>,
+    ) {
+        let expression = strip_ascription(expression);
+        if let Some((constructor, arguments)) = Self::constructor_application(expression)
+            && !arguments.is_empty()
+            && matched.is_some_and(|matched| matched == constructor)
+        {
+            out.push(expression as *const Expr as usize);
+            return;
+        }
+        match expression {
+            Expr::Let(_, binding) => {
+                Self::owned_data_result_nodes(&binding.body, owner, matched, out)
+            }
+            Expr::Sequence(_, sequence) => {
+                Self::owned_data_result_nodes(&sequence.and_then, owner, matched, out)
+            }
+            Expr::If(_, branch) => {
+                Self::owned_data_result_nodes(&branch.consequent, owner, matched, out);
+                Self::owned_data_result_nodes(&branch.alternate, owner, matched, out);
+            }
+            Expr::Deconstruct(_, deconstruct) => {
+                for clause in &deconstruct.match_clauses {
+                    let constructor = Self::owner_pattern(deconstruct, clause, owner)
+                        .and_then(|pattern| match pattern {
+                            Pattern::Coproduct(_, constructor) => {
+                                let Identifier::Global(name) = &constructor.constructor else {
+                                    return None;
+                                };
+                                Some(name.as_ref())
+                            }
+                            _ => None,
+                        })
+                        .or(matched);
+                    Self::owned_data_result_nodes(&clause.consequent, owner, constructor, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn owned_data_worker_variants(&self) -> HashMap<QualifiedName, Vec<usize>> {
+        if std::env::var_os("MARM_NO_OWNED_DATA").is_some() {
+            return HashMap::default();
+        }
+        self.workers
+            .iter()
+            .filter_map(|worker| {
+                let parameters = (0..worker.params)
+                    .filter(|parameter| {
+                        if Self::local_use_count(&worker.body, *parameter) != 1 {
+                            return false;
+                        }
+                        let mut returns = Vec::new();
+                        Self::owned_data_result_nodes(&worker.body, *parameter, None, &mut returns);
+                        !returns.is_empty()
+                    })
+                    .collect::<Vec<_>>();
+                (!parameters.is_empty()).then(|| (worker.name.clone(), parameters))
+            })
+            .collect()
+    }
+
+    /// Recognize the stricter subset of owned-data rebuilding which can run as
+    /// a forward loop.  The result constructor must put a saturated self-call
+    /// in its final recursive field, and that call must advance the selected
+    /// owner to the recursive binder from the matched input constructor.
+    /// Requiring the recursive field to be last preserves field evaluation
+    /// order when the recursive call becomes the loop backedge.
+    fn owned_data_loop_result(
+        expression: &Expr,
+        worker: &Worker,
+        owner: usize,
+        constructor: &QualifiedName,
+        recursive_field: usize,
+        recursive_binder: usize,
+    ) -> bool {
+        let expression = strip_ascription(expression);
+        if let Some((result_constructor, fields)) = Self::constructor_application(expression) {
+            if result_constructor != constructor
+                || recursive_field + 1 != fields.len()
+                || fields.len() > 4
+            {
+                return false;
+            }
+            let Some((called, arguments)) = fields
+                .get(recursive_field)
+                .and_then(|field| Self::named_application(field))
+            else {
+                return false;
+            };
+            return called == &worker.name
+                && arguments.len() == worker.params
+                && arguments
+                    .get(owner)
+                    .and_then(|argument| Self::local_level(argument))
+                    == Some(recursive_binder);
+        }
+        match expression {
+            Expr::Let(_, binding) => {
+                matches!(binding.binder, Identifier::Local(_))
+                    && Self::owned_data_loop_result(
+                        &binding.body,
+                        worker,
+                        owner,
+                        constructor,
+                        recursive_field,
+                        recursive_binder,
+                    )
+            }
+            Expr::Sequence(_, sequence) => Self::owned_data_loop_result(
+                &sequence.and_then,
+                worker,
+                owner,
+                constructor,
+                recursive_field,
+                recursive_binder,
+            ),
+            Expr::If(_, branch) => {
+                Self::owned_data_loop_result(
+                    &branch.consequent,
+                    worker,
+                    owner,
+                    constructor,
+                    recursive_field,
+                    recursive_binder,
+                ) && Self::owned_data_loop_result(
+                    &branch.alternate,
+                    worker,
+                    owner,
+                    constructor,
+                    recursive_field,
+                    recursive_binder,
+                )
+            }
+            _ => false,
+        }
+    }
+
+    fn owned_data_loop_clause(
+        &self,
+        worker: &Worker,
+        owner: usize,
+        deconstruct: &phase::Deconstruct<Closed>,
+        clause: &phase::MatchClause<Closed>,
+    ) -> Option<(QualifiedName, usize, usize)> {
+        let owner_pattern = Self::owner_pattern(deconstruct, clause, owner)?;
+        let owner_type = &owner_pattern.annotation().type_info.inferred_type;
+        let Pattern::Coproduct(_, pattern) = owner_pattern else {
+            return None;
+        };
+        let Identifier::Global(constructor) = &pattern.constructor else {
+            return None;
+        };
+        if pattern.arguments.is_empty() || pattern.arguments.len() > 4 {
+            return None;
+        }
+        let recursive = pattern
+            .arguments
+            .iter()
+            .enumerate()
+            .filter(|(_, argument)| &argument.annotation().type_info.inferred_type == owner_type)
+            .map(|(index, argument)| match argument {
+                Pattern::Bind(_, Identifier::Local(LexicalLevel(level))) => Some((index, *level)),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let [(recursive_field, recursive_binder)] = recursive.as_slice() else {
+            return None;
+        };
+        if !Self::owned_local_is_linear(&clause.consequent, *recursive_binder) {
+            return None;
+        }
+        Self::owned_data_loop_result(
+            &clause.consequent,
+            worker,
+            owner,
+            constructor.as_ref(),
+            *recursive_field,
+            *recursive_binder,
+        )
+        .then(|| {
+            (
+                constructor.as_ref().clone(),
+                *recursive_field,
+                *recursive_binder,
+            )
+        })
+    }
+
+    fn compile_owned_data_loop_fallback(
+        &self,
+        worker: &Worker,
+        code: &mut CodeBuffer,
+    ) -> fmt::Result {
+        write!(code, "{{ Value _od_tail = {}_worker(", c_name(&worker.name))?;
+        for parameter in 0..worker.params {
+            if parameter != 0 {
+                write!(code, ", ")?;
+            }
+            write!(code, "l{parameter}")?;
+        }
+        write!(
+            code,
+            "); if (!_od_started) return _od_tail; \
+             set_owned_data_field_fast(_od_parent, _od_parent_field, _od_tail); \
+             return _od_root; }}"
+        )
+    }
+
+    fn compile_owned_data_loop_result(
+        &self,
+        expression: &Expr,
+        worker: &Worker,
+        owner: usize,
+        constructor: &QualifiedName,
+        recursive_field: usize,
+        recursive_binder: usize,
+        code: &mut CodeBuffer,
+    ) -> fmt::Result {
+        let expression = strip_ascription(expression);
+        if let Some((result_constructor, fields)) = Self::constructor_application(expression) {
+            debug_assert_eq!(result_constructor, constructor);
+            debug_assert_eq!(recursive_field + 1, fields.len());
+            let (_, recursive_arguments) = Self::named_application(fields[recursive_field])
+                .expect("owned-data loop analysis admitted a non-recursive result field");
+            let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+            write!(code, "{{ ")?;
+            for (index, field) in fields.iter().take(recursive_field).enumerate() {
+                write!(code, "Value _odf{id}_{index} = ")?;
+                self.compile_expr(field, code)?;
+                write!(code, "; ")?;
+            }
+            for (index, argument) in recursive_arguments.iter().enumerate() {
+                write!(code, "Value _oda{id}_{index} = ")?;
+                self.compile_expr(argument, code)?;
+                write!(code, "; ")?;
+            }
+            write!(
+                code,
+                "if (!_od_started) {{ _od_root = l{owner}; _od_started = true; }} "
+            )?;
+            write!(
+                code,
+                "reuse_owned_data{}_fast(l{owner}, {}",
+                fields.len(),
+                self.constructor_tag(constructor)
+            )?;
+            for index in 0..fields.len() {
+                if index == recursive_field {
+                    write!(code, ", _oda{id}_{owner}")?;
+                } else {
+                    write!(code, ", _odf{id}_{index}")?;
+                }
+            }
+            write!(
+                code,
+                "); _od_parent = l{owner}; _od_parent_field = {recursive_field}; "
+            )?;
+            for parameter in 0..worker.params {
+                write!(code, "l{parameter} = _oda{id}_{parameter}; ")?;
+            }
+            return write!(code, "continue; }}");
+        }
+        match expression {
+            Expr::Let(_, binding) => {
+                let Identifier::Local(LexicalLevel(level)) = binding.binder else {
+                    unreachable!("owned-data loop analysis admitted a non-local let")
+                };
+                write!(code, "{{ Value l{level} = ")?;
+                self.compile_expr(&binding.bound, code)?;
+                write!(code, "; ")?;
+                self.compile_owned_data_loop_result(
+                    &binding.body,
+                    worker,
+                    owner,
+                    constructor,
+                    recursive_field,
+                    recursive_binder,
+                    code,
+                )?;
+                write!(code, " }}")
+            }
+            Expr::Sequence(_, sequence) => {
+                write!(code, "{{ (void)(")?;
+                self.compile_expr(&sequence.this, code)?;
+                write!(code, "); ")?;
+                self.compile_owned_data_loop_result(
+                    &sequence.and_then,
+                    worker,
+                    owner,
+                    constructor,
+                    recursive_field,
+                    recursive_binder,
+                    code,
+                )?;
+                write!(code, " }}")
+            }
+            Expr::If(_, branch) => {
+                write!(code, "if (as_bool(")?;
+                self.compile_expr(&branch.predicate, code)?;
+                write!(code, ")) {{ ")?;
+                self.compile_owned_data_loop_result(
+                    &branch.consequent,
+                    worker,
+                    owner,
+                    constructor,
+                    recursive_field,
+                    recursive_binder,
+                    code,
+                )?;
+                write!(code, " }} else {{ ")?;
+                self.compile_owned_data_loop_result(
+                    &branch.alternate,
+                    worker,
+                    owner,
+                    constructor,
+                    recursive_field,
+                    recursive_binder,
+                    code,
+                )?;
+                write!(code, " }}")
+            }
+            _ => unreachable!("owned-data loop result changed after analysis"),
+        }
+    }
+
+    /// Emit an ownership-specialized reconstruction as a forward mutation loop.
+    /// Unsupported or terminal clauses delegate the remaining suffix to the
+    /// ordinary worker and attach its result to the already rewritten prefix.
+    fn compile_owned_data_loop_worker(
+        &self,
+        worker: &Worker,
+        owner: usize,
+        code: &mut CodeBuffer,
+    ) -> Result<bool, fmt::Error> {
+        if std::env::var_os("MARM_NO_OWNED_DATA_LOOPS").is_some() {
+            return Ok(false);
+        }
+        let Expr::Deconstruct(_, deconstruct) = strip_ascription(&worker.body) else {
+            return Ok(false);
+        };
+        let plans = deconstruct
+            .match_clauses
+            .iter()
+            .map(|clause| self.owned_data_loop_clause(worker, owner, deconstruct, clause))
+            .collect::<Vec<_>>();
+        if plans.iter().all(Option::is_none) {
+            return Ok(false);
+        }
+
+        let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+        let tuple_plan = if let Expr::Tuple(_, tuple) = strip_ascription(&deconstruct.scrutinee) {
+            let locals = (0..tuple.elements.len())
+                .map(|index| format!("_od_scrut{id}_{index}"))
+                .collect::<Vec<_>>();
+            let Some(match_plans) =
+                self.plan_direct_tuple_match(&deconstruct.match_clauses, &locals)
+            else {
+                return Ok(false);
+            };
+            Some((tuple, locals, match_plans))
+        } else {
+            None
+        };
+        write!(
+            code,
+            "\n  Value _od_root = VInt(0); Value _od_parent = VInt(0); \
+             size_t _od_parent_field = 0; bool _od_started = false; for (;;) {{ "
+        )?;
+
+        let (scrutinee, match_plans) = if let Some((tuple, locals, match_plans)) = tuple_plan {
+            for (local, element) in locals.iter().zip(&tuple.elements) {
+                write!(code, "Value {local} = ")?;
+                self.compile_expr(element, code)?;
+                write!(code, "; ")?;
+            }
+            (None, Some(match_plans))
+        } else {
+            let scrutinee = format!("_od_scrut{id}");
+            write!(code, "Value {scrutinee} = ")?;
+            self.compile_expr(&deconstruct.scrutinee, code)?;
+            write!(code, "; ")?;
+            (Some(scrutinee), None)
+        };
+
+        let mut exhaustive = false;
+        for (clause_index, clause) in deconstruct.match_clauses.iter().enumerate() {
+            let (tests, binds) = if let Some(match_plans) = &match_plans {
+                match_plans[clause_index].clone()
+            } else {
+                let mut tests = Vec::new();
+                let mut binds = Vec::new();
+                self.collect_pattern(
+                    &clause.pattern,
+                    scrutinee.as_deref().expect("single scrutinee"),
+                    &mut tests,
+                    &mut binds,
+                );
+                (tests, binds)
+            };
+            if clause_index != 0 {
+                write!(code, " else ")?;
+            }
+            if tests.is_empty() {
+                write!(code, "{{ ")?;
+                exhaustive = true;
+            } else {
+                write!(code, "if ({}) {{ ", tests.join(" && "))?;
+            }
+            for (level, path) in &binds {
+                write!(code, "Value l{level} = {path}; ")?;
+            }
+            if let Some((constructor, recursive_field, recursive_binder)) = &plans[clause_index] {
+                let mut owned_binders = HashSet::default();
+                if let Some(pattern) = Self::owner_pattern(deconstruct, clause, owner) {
+                    self.collect_owned_spine_pattern_binders(
+                        pattern,
+                        &pattern.annotation().type_info.inferred_type,
+                        &mut owned_binders,
+                    );
+                }
+                let previous = Self::install_owned_spine_locals(owned_binders);
+                let result = self.compile_owned_data_loop_result(
+                    &clause.consequent,
+                    worker,
+                    owner,
+                    constructor,
+                    *recursive_field,
+                    *recursive_binder,
+                    code,
+                );
+                Self::restore_owned_spine_locals(previous);
+                result?;
+            } else {
+                self.compile_owned_data_loop_fallback(worker, code)?;
+            }
+            write!(code, " }}")?;
+            if exhaustive {
+                break;
+            }
+        }
+        if !exhaustive {
+            write!(code, " else {{ match_fail(); }}")?;
+        }
+        write!(code, " }}\n}}\n\n")?;
+        Ok(true)
+    }
+
+    /// Prove that two parameters may denote the same recursive node while one
+    /// is consumed. Both parameters must be taken apart together, and on every
+    /// reachable equal-constructor branch their recursive fields must be passed
+    /// in the same positions of the recursive call. The fields are loaded before
+    /// that call, so bottom-up replacement cannot invalidate the second view.
+    fn owned_data_parameters_are_lockstep(
+        &self,
+        name: &QualifiedName,
+        left: usize,
+        right: usize,
+    ) -> bool {
+        let Some(worker) = self.workers.iter().find(|worker| worker.name == *name) else {
+            return false;
+        };
+        if Self::local_use_count(&worker.body, left) != 1
+            || Self::local_use_count(&worker.body, right) != 1
+        {
+            return false;
+        }
+        let Expr::Deconstruct(_, deconstruct) = strip_ascription(&worker.body) else {
+            return false;
+        };
+        let Expr::Tuple(_, scrutinee) = strip_ascription(&deconstruct.scrutinee) else {
+            return false;
+        };
+        let Some(left_field) = scrutinee
+            .elements
+            .iter()
+            .position(|element| Self::local_level(element) == Some(left))
+        else {
+            return false;
+        };
+        let Some(right_field) = scrutinee
+            .elements
+            .iter()
+            .position(|element| Self::local_level(element) == Some(right))
+        else {
+            return false;
+        };
+
+        deconstruct.match_clauses.iter().all(|clause| {
+            let Pattern::Tuple(_, tuple) = &clause.pattern else {
+                return false;
+            };
+            let Some(Pattern::Coproduct(_, left_pattern)) = tuple.elements.get(left_field) else {
+                return false;
+            };
+            let Some(Pattern::Coproduct(_, right_pattern)) = tuple.elements.get(right_field) else {
+                return false;
+            };
+            let (Identifier::Global(left_constructor), Identifier::Global(right_constructor)) =
+                (&left_pattern.constructor, &right_pattern.constructor)
+            else {
+                return false;
+            };
+            // Aliased values cannot select unequal-constructor clauses.
+            if left_constructor != right_constructor {
+                return true;
+            }
+            if left_pattern.arguments.is_empty() && right_pattern.arguments.is_empty() {
+                return true;
+            }
+            let recursive_type = &tuple.elements[left_field]
+                .annotation()
+                .type_info
+                .inferred_type;
+            let recursive_binder = |pattern: &phase::Pattern<Closed>| match pattern {
+                Pattern::Coproduct(_, constructor) => constructor
+                    .arguments
+                    .iter()
+                    .filter(|argument| {
+                        &argument.annotation().type_info.inferred_type == recursive_type
+                    })
+                    .map(|argument| match argument {
+                        Pattern::Bind(_, Identifier::Local(LexicalLevel(level))) => Some(*level),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>(),
+                _ => None,
+            };
+            let Some(left_recursive) = recursive_binder(&tuple.elements[left_field]) else {
+                return false;
+            };
+            let Some(right_recursive) = recursive_binder(&tuple.elements[right_field]) else {
+                return false;
+            };
+            if left_recursive.len() != 1 || right_recursive.len() != 1 {
+                return false;
+            }
+            let left_recursive = left_recursive[0];
+            let right_recursive = right_recursive[0];
+            if Self::local_use_count(&clause.consequent, left_recursive) != 1
+                || Self::local_use_count(&clause.consequent, right_recursive) != 1
+            {
+                return false;
+            }
+            fn has_lockstep_call(
+                expression: &Expr,
+                name: &QualifiedName,
+                left: usize,
+                right: usize,
+                left_recursive: usize,
+                right_recursive: usize,
+            ) -> bool {
+                if let Some((called, arguments)) =
+                    lambda_lift::Program::named_application(expression)
+                    && called == name
+                    && arguments
+                        .get(left)
+                        .and_then(|arg| lambda_lift::Program::local_level(arg))
+                        == Some(left_recursive)
+                    && arguments
+                        .get(right)
+                        .and_then(|arg| lambda_lift::Program::local_level(arg))
+                        == Some(right_recursive)
+                {
+                    return true;
+                }
+                crate::simplify::children(expression)
+                    .into_iter()
+                    .any(|child| {
+                        has_lockstep_call(child, name, left, right, left_recursive, right_recursive)
+                    })
+            }
+            has_lockstep_call(
+                &clause.consequent,
+                name,
+                left,
+                right,
+                left_recursive,
+                right_recursive,
+            )
+        })
+    }
+
+    fn owned_data_argument_is_exclusive(
+        &self,
+        name: &QualifiedName,
+        arguments: &[&Expr],
+        selected: usize,
+    ) -> bool {
+        if self.owned_spine_argument_is_exclusive(arguments, selected) {
+            return true;
+        }
+        let Some(selected_argument) = arguments.get(selected) else {
+            return false;
+        };
+        let shared_owned_local_is_lockstep = OWNED_SPINE_LOCALS.with(|current| {
+            current.borrow().iter().all(|level| {
+                Self::local_use_count(selected_argument, *level) == 0
+                    || arguments.iter().enumerate().all(|(other, argument)| {
+                        other == selected
+                            || Self::local_use_count(argument, *level) == 0
+                            || self.owned_data_parameters_are_lockstep(name, selected, other)
+                    })
+            })
+        });
+        shared_owned_local_is_lockstep
+            && arguments.iter().enumerate().all(|(other, argument)| {
+                other == selected
+                    || !self.expression_is_owned_spine(argument)
+                    || Self::constructor_application(argument)
+                        .is_some_and(|(_, fields)| fields.is_empty())
+                    || self.owned_data_parameters_are_lockstep(name, selected, other)
+            })
+    }
+
+    fn owned_spine_worker_variants(
+        &self,
+        fresh: &HashSet<QualifiedName>,
+    ) -> HashMap<QualifiedName, Vec<usize>> {
+        self.workers
+            .iter()
+            .filter(|worker| fresh.contains(&worker.name))
+            .filter_map(|worker| {
+                let parameters = (0..worker.params)
+                    .filter(|parameter| Self::local_use_count(&worker.body, *parameter) == 1)
+                    .collect::<Vec<_>>();
+                (!parameters.is_empty()).then(|| (worker.name.clone(), parameters))
+            })
+            .collect()
+    }
+
     fn intrinsic_for_name(&self, name: &QualifiedName) -> Option<IntrinsicSemantics> {
         self.term_intrinsics.get(name).copied()
     }
@@ -1489,6 +3821,42 @@ impl lambda_lift::Program {
     }
 
     pub fn generate_code_for(&self, out: &mut CodeBuffer, entry_point: CEntryPoint) -> fmt::Result {
+        let owned_tuple_steps = self.owned_tuple_step_workers();
+        let owned_product_data_steps = self.owned_product_data_step_workers();
+        let owned_tuple_variants = self.owned_tuple_worker_variants();
+        let owned_recursive_eliminators = self.owned_recursive_eliminators(&owned_tuple_variants);
+        OWNED_PRODUCT_DATA_STEP_WORKERS
+            .with(|current| *current.borrow_mut() = owned_product_data_steps.clone());
+        OWNED_RECURSIVE_ELIMINATORS
+            .with(|current| *current.borrow_mut() = owned_recursive_eliminators.clone());
+        let fresh_spines = self.fresh_spine_workers();
+        FRESH_SPINE_WORKERS.with(|current| *current.borrow_mut() = fresh_spines.clone());
+        let owned_rebuild_variants = self.owned_rebuild_worker_variants(&fresh_spines);
+        let owned_data_variants = self.owned_data_worker_variants();
+        let owned_spine_preserving = self.owned_spine_preserving_workers();
+        let owned_spine_worker_variants = self.owned_spine_worker_variants(&fresh_spines);
+        if std::env::var_os("MARM_DUMP_OWNED_SPINES").is_some() {
+            for name in &fresh_spines {
+                eprintln!("[owned-spine] fresh {name}");
+            }
+        }
+        OWNED_REBUILD_WORKER_VARIANTS
+            .with(|current| *current.borrow_mut() = owned_rebuild_variants.clone());
+        OWNED_TUPLE_STEP_WORKERS.with(|current| *current.borrow_mut() = owned_tuple_steps.clone());
+        OWNED_TUPLE_WORKER_VARIANTS
+            .with(|current| *current.borrow_mut() = owned_tuple_variants.clone());
+        OWNED_DATA_WORKER_VARIANTS
+            .with(|current| *current.borrow_mut() = owned_data_variants.clone());
+        OWNED_SPINE_PRESERVING_WORKERS
+            .with(|current| *current.borrow_mut() = owned_spine_preserving);
+        OWNED_SPINE_WORKER_VARIANTS
+            .with(|current| *current.borrow_mut() = owned_spine_worker_variants.clone());
+        OWNED_DATA_RETURNS.with(|current| current.borrow_mut().clear());
+        OWNED_RECURSIVE_COMBINE_CALLS.with(|current| current.borrow_mut().clear());
+        OWNED_TUPLE_RETURNS.with(|current| current.borrow_mut().clear());
+        OWNED_TUPLE_LOCALS.with(|current| current.borrow_mut().clear());
+        OWNED_SPINE_LOCALS.with(|current| current.borrow_mut().clear());
+        DYNAMIC_OWNED_SPINE_LOCALS.with(|current| current.borrow_mut().clear());
         let c_inline_workers = self.c_inline_workers();
         let allocating = self.allocation_summaries();
         writeln!(out, "#include \"runtime.h\"")?;
@@ -1515,6 +3883,53 @@ impl lambda_lift::Program {
                 c_name(name),
                 signature
             )?;
+            if owned_rebuild_variants.contains(name) {
+                debug_assert_eq!(*params, 1);
+                writeln!(out, "Value {}_owned_rebuild_worker(Value);", c_name(name))?;
+            }
+            if let Some(parameters) = owned_tuple_variants.get(name) {
+                for parameter in parameters {
+                    writeln!(
+                        out,
+                        "Value {}_owned_tuple_{}_worker({});",
+                        c_name(name),
+                        parameter,
+                        signature
+                    )?;
+                }
+            }
+            if let Some(variant) = owned_recursive_eliminators.get(name) {
+                writeln!(
+                    out,
+                    "Value {}_owned_tuple_{}_data_{}_worker({});",
+                    c_name(name),
+                    variant.product_parameter,
+                    variant.input_parameter,
+                    signature
+                )?;
+            }
+            if let Some(parameters) = owned_data_variants.get(name) {
+                for parameter in parameters {
+                    writeln!(
+                        out,
+                        "Value {}_owned_data_{}_worker({});",
+                        c_name(name),
+                        parameter,
+                        signature
+                    )?;
+                }
+            }
+            if let Some(parameters) = owned_spine_worker_variants.get(name) {
+                for parameter in parameters {
+                    writeln!(
+                        out,
+                        "Value {}_owned_spine_{}_worker({});",
+                        c_name(name),
+                        parameter,
+                        signature
+                    )?;
+                }
+            }
         }
         for ChainWorker { head, .. } in &self.chain_workers {
             writeln!(
@@ -1522,6 +3937,20 @@ impl lambda_lift::Program {
                 "Value {}_uworker(Value self, Value *args);",
                 c_name(head)
             )?;
+            if owned_tuple_steps.contains_key(head) {
+                writeln!(
+                    out,
+                    "Value {}_owned_tuple_uworker(Value self, Value *args);",
+                    c_name(head)
+                )?;
+            }
+            if owned_product_data_steps.contains_key(head) {
+                writeln!(
+                    out,
+                    "Value {}_owned_tuple_data_uworker(Value self, Value *args, Value owned_data);",
+                    c_name(head)
+                )?;
+            }
         }
         for TopLevelBinding { name, value, .. } in &self.globals {
             if !is_builtin(name) {
@@ -1600,7 +4029,7 @@ impl lambda_lift::Program {
                     borrows_slices || self.loop_needs_poll(SelfCall::SelfRef, 1, code, &allocating);
                 let slots = slots
                     .iter()
-                    .map(|slot| format!("Slice {slot}; "))
+                    .map(|slot| format!("_Alignas(MARM_VALUE_ALIGNMENT) Slice {slot}; "))
                     .collect::<String>();
                 let bases = immutable_bases
                     .iter()
@@ -1678,7 +4107,7 @@ impl lambda_lift::Program {
                     || self.loop_needs_poll(SelfCall::Named(name), *params, body, &allocating);
                 let slots = slots
                     .iter()
-                    .map(|slot| format!("Slice {slot}; "))
+                    .map(|slot| format!("_Alignas(MARM_VALUE_ALIGNMENT) Slice {slot}; "))
                     .collect::<String>();
                 let bases = immutable_bases
                     .iter()
@@ -1706,6 +4135,180 @@ impl lambda_lift::Program {
                     writeln!(out, ";\n}}\n")?;
                 }
             }
+        }
+
+        // Ownership-specialized entries are ordinary workers with one tuple
+        // parameter marked exclusive. Calls and returns propagate that fact;
+        // no source function or data type is named by this transformation.
+        for Worker { name, params, body } in &self.workers {
+            let Some(parameters) = owned_tuple_variants.get(name) else {
+                continue;
+            };
+            let signature = (0..*params)
+                .map(|i| format!("Value l{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            for parameter in parameters {
+                writeln!(
+                    out,
+                    "Value {}_owned_tuple_{}_worker({}) {{",
+                    c_name(name),
+                    parameter,
+                    signature
+                )?;
+                for i in 0..*params {
+                    write!(out, "  (void)l{i};")?;
+                }
+                let previous = OWNED_TUPLE_LOCALS.with(|owned| {
+                    let previous = owned.borrow().clone();
+                    owned.borrow_mut().insert(*parameter);
+                    previous
+                });
+                write!(out, "\n  return ")?;
+                let result = self.compile_expr(body, out);
+                OWNED_TUPLE_LOCALS.with(|owned| *owned.borrow_mut() = previous);
+                result?;
+                writeln!(out, ";\n}}\n")?;
+            }
+        }
+
+        // A recursive eliminator may own both its product accumulator and its
+        // recursive input. Each combine call receives the consumed input node as
+        // storage for one nested recursive-data result.
+        for Worker { name, params, body } in &self.workers {
+            let Some(variant) = owned_recursive_eliminators.get(name) else {
+                continue;
+            };
+            let signature = (0..*params)
+                .map(|i| format!("Value l{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(
+                out,
+                "Value {}_owned_tuple_{}_data_{}_worker({}) {{",
+                c_name(name),
+                variant.product_parameter,
+                variant.input_parameter,
+                signature
+            )?;
+            for i in 0..*params {
+                write!(out, "  (void)l{i};")?;
+            }
+            let previous_tuple = OWNED_TUPLE_LOCALS.with(|owned| {
+                let previous = owned.borrow().clone();
+                owned.borrow_mut().insert(variant.product_parameter);
+                previous
+            });
+            let previous_spine = Self::install_owned_spine_locals([variant.input_parameter]);
+            let previous_calls = OWNED_RECURSIVE_COMBINE_CALLS.with(|calls| {
+                let previous = calls.borrow().clone();
+                calls
+                    .borrow_mut()
+                    .insert(variant.combine_call, variant.input_parameter);
+                previous
+            });
+            write!(out, "\n  return ")?;
+            let result = self.compile_expr(body, out);
+            OWNED_RECURSIVE_COMBINE_CALLS.with(|calls| *calls.borrow_mut() = previous_calls);
+            Self::restore_owned_spine_locals(previous_spine);
+            OWNED_TUPLE_LOCALS.with(|owned| *owned.borrow_mut() = previous_tuple);
+            result?;
+            writeln!(out, ";\n}}\n")?;
+        }
+
+        // A structurally rebuilding recursive worker may consume an exclusive
+        // input spine. Each branch which returns the same constructor writes its
+        // completed fields back into that node; recursive calls receive the owned
+        // tail and do the same. Growth branches simply allocate as before.
+        for worker in &self.workers {
+            let Worker { name, params, body } = worker;
+            let Some(parameters) = owned_data_variants.get(name) else {
+                continue;
+            };
+            let signature = (0..*params)
+                .map(|i| format!("Value l{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            for parameter in parameters {
+                writeln!(
+                    out,
+                    "Value {}_owned_data_{}_worker({}) {{",
+                    c_name(name),
+                    parameter,
+                    signature
+                )?;
+                for i in 0..*params {
+                    write!(out, "  (void)l{i};")?;
+                }
+                if self.compile_owned_data_loop_worker(worker, *parameter, out)? {
+                    continue;
+                }
+                let mut returns = Vec::new();
+                Self::owned_data_result_nodes(body, *parameter, None, &mut returns);
+                let previous_returns = OWNED_DATA_RETURNS.with(|current| {
+                    let previous = current.borrow().clone();
+                    current.borrow_mut().extend(
+                        returns
+                            .into_iter()
+                            .map(|node| (node, format!("l{parameter}"))),
+                    );
+                    previous
+                });
+                let previous_owned = Self::install_owned_spine_locals([*parameter]);
+                write!(out, "\n  return ")?;
+                let result = self.compile_expr(body, out);
+                Self::restore_owned_spine_locals(previous_owned);
+                OWNED_DATA_RETURNS.with(|current| *current.borrow_mut() = previous_returns);
+                result?;
+                writeln!(out, ";\n}}\n")?;
+            }
+        }
+
+        for Worker { name, params, body } in &self.workers {
+            let Some(parameters) = owned_spine_worker_variants.get(name) else {
+                continue;
+            };
+            let signature = (0..*params)
+                .map(|i| format!("Value l{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            for parameter in parameters {
+                writeln!(
+                    out,
+                    "Value {}_owned_spine_{}_worker({}) {{",
+                    c_name(name),
+                    parameter,
+                    signature
+                )?;
+                for i in 0..*params {
+                    write!(out, "  (void)l{i};")?;
+                }
+                let previous = Self::install_owned_spine_locals([*parameter]);
+                write!(out, "\n  return ")?;
+                let result = self.compile_expr(body, out);
+                Self::restore_owned_spine_locals(previous);
+                result?;
+                writeln!(out, ";\n}}\n")?;
+            }
+        }
+
+        for Worker { name, params, body } in &self.workers {
+            if !owned_rebuild_variants.contains(name) {
+                continue;
+            }
+            debug_assert_eq!(*params, 1);
+            writeln!(
+                out,
+                "Value {}_owned_rebuild_worker(Value l0) {{",
+                c_name(name)
+            )?;
+            writeln!(out, "  (void)l0;")?;
+            let previous = Self::install_owned_spine_locals([0]);
+            write!(out, "  return ")?;
+            let result = self.compile_expr(body, out);
+            Self::restore_owned_spine_locals(previous);
+            result?;
+            writeln!(out, ";\n}}\n")?;
         }
 
         // Chain workers: the uncurried entry a chain-head closure carries, run by
@@ -1738,16 +4341,54 @@ impl lambda_lift::Program {
                 slots.sort();
                 let previous = Self::install_borrowed_slice_places(borrowed);
                 let previous_bases = Self::install_immutable_slice_bases(&immutable_bases);
+                let fresh_backedge =
+                    self.fresh_backedge_parameters(SelfCall::SelfRef, *arity, body);
+                let dynamic_parameters = if std::env::var_os("MARM_NO_DYNAMIC_OWNERSHIP").is_some()
+                {
+                    Vec::new()
+                } else {
+                    (0..*arity)
+                        .filter(|parameter| Self::max_local_uses_per_path(body, *parameter) <= 1)
+                        .collect::<Vec<_>>()
+                };
+                let previous_dynamic = Self::install_dynamic_owned_spine_locals(
+                    dynamic_parameters
+                        .iter()
+                        .map(|parameter| (*parameter, format!("_own{parameter}"))),
+                );
                 let mut emitted = CodeBuffer::default();
-                let result = self.compile_tail(SelfCall::SelfRef, *arity, body, &mut emitted);
+                let mut first = CodeBuffer::default();
+                if fresh_backedge.is_empty() {
+                    self.compile_tail(SelfCall::SelfRef, *arity, body, &mut emitted)?;
+                } else {
+                    let label = format!("_owned_loop{}", MATCH_ID.fetch_add(1, Ordering::Relaxed));
+                    let previous_label =
+                        TAIL_BACKEDGE_LABEL.with(|current| current.replace(Some(label.clone())));
+                    let first_result =
+                        self.compile_tail(SelfCall::SelfRef, *arity, body, &mut first);
+                    TAIL_BACKEDGE_LABEL.with(|current| *current.borrow_mut() = previous_label);
+                    first_result?;
+                    let previous_owned = TAIL_BACKEDGE_OWNED_LOCALS.with(|current| {
+                        std::mem::replace(
+                            &mut *current.borrow_mut(),
+                            fresh_backedge.iter().copied().collect(),
+                        )
+                    });
+                    let steady_result =
+                        self.compile_tail(SelfCall::SelfRef, *arity, body, &mut emitted);
+                    TAIL_BACKEDGE_OWNED_LOCALS
+                        .with(|current| *current.borrow_mut() = previous_owned);
+                    steady_result?;
+                    write!(first, " {label}: ;")?;
+                }
+                Self::restore_dynamic_owned_spine_locals(previous_dynamic);
                 Self::restore_immutable_slice_bases(previous_bases);
                 Self::restore_borrowed_slice_places(previous);
-                result?;
                 let needs_poll = borrows_slices
                     || self.loop_needs_poll(SelfCall::SelfRef, *arity, body, &allocating);
                 let slots = slots
                     .iter()
-                    .map(|slot| format!("Slice {slot}; "))
+                    .map(|slot| format!("_Alignas(MARM_VALUE_ALIGNMENT) Slice {slot}; "))
                     .collect::<String>();
                 let bases = immutable_bases
                     .iter()
@@ -1755,9 +4396,13 @@ impl lambda_lift::Program {
                         format!("const uint8_t *{} = slice_ptr({}); ", base.name, base.value)
                     })
                     .collect::<String>();
+                let ownership_flags = dynamic_parameters
+                    .iter()
+                    .map(|parameter| format!("bool _own{parameter} = false; "))
+                    .collect::<String>();
                 write!(
                     out,
-                    "\n  {slots}{bases}{}for (;;) {{ {}{emitted} }}\n}}\n\n",
+                    "\n  {slots}{bases}{ownership_flags}{}{{ {first} }} for (;;) {{ {}{emitted} }}\n}}\n\n",
                     poll_decl(needs_poll),
                     back_edge_poll(needs_poll)
                 )?;
@@ -1766,6 +4411,85 @@ impl lambda_lift::Program {
                 self.compile_expr(body, out)?;
                 writeln!(out, ";\n}}\n")?;
             }
+        }
+
+        // A binary closure may receive an exclusively owned tuple as its second
+        // argument. Its specialized entry has the same closure ABI, but terminal
+        // tuple results replace that box after computing every new field.
+        for worker @ ChainWorker { head, arity, body } in &self.chain_workers {
+            let Some((tuple_arity, returns)) = self.owned_tuple_step(worker) else {
+                continue;
+            };
+            debug_assert_eq!(*arity, 2);
+            CAPTURE_PLACES.with(|places| *places.borrow_mut() = self.capture_places(head));
+            writeln!(
+                out,
+                "Value {}_owned_tuple_uworker(Value self, Value *args) {{",
+                c_name(head)
+            )?;
+            write!(out, "  (void)self;")?;
+            for i in 0..*arity {
+                write!(out, " Value l{i} = args[{i}];")?;
+            }
+            let previous = OWNED_TUPLE_RETURNS.with(|current| {
+                let previous = current.borrow().clone();
+                current.borrow_mut().extend(
+                    returns
+                        .into_iter()
+                        .map(|node| (node, (1usize, tuple_arity))),
+                );
+                previous
+            });
+            write!(out, "\n  return ")?;
+            let result = self.compile_expr(body, out);
+            OWNED_TUPLE_RETURNS.with(|current| *current.borrow_mut() = previous);
+            result?;
+            writeln!(out, ";\n}}\n")?;
+        }
+
+        for ChainWorker { head, arity, body } in &self.chain_workers {
+            let Some(step) = owned_product_data_steps.get(head) else {
+                continue;
+            };
+            debug_assert_eq!(*arity, 2);
+            CAPTURE_PLACES.with(|places| *places.borrow_mut() = self.capture_places(head));
+            writeln!(
+                out,
+                "Value {}_owned_tuple_data_uworker(Value self, Value *args, Value owned_data) {{",
+                c_name(head)
+            )?;
+            writeln!(
+                out,
+                "  if (data_len(owned_data) != {}) return apply_n_owned_last(self, {}, args);",
+                step.data_arity, arity
+            )?;
+            write!(out, "  (void)self;")?;
+            for i in 0..*arity {
+                write!(out, " Value l{i} = args[{i}];")?;
+            }
+            write!(out, " Value _owned_data = owned_data;")?;
+            let previous_tuples = OWNED_TUPLE_RETURNS.with(|current| {
+                let previous = current.borrow().clone();
+                current.borrow_mut().extend(
+                    step.product_returns
+                        .iter()
+                        .map(|node| (*node, (1usize, step.product_arity))),
+                );
+                previous
+            });
+            let previous_data = OWNED_DATA_RETURNS.with(|current| {
+                let previous = current.borrow().clone();
+                current
+                    .borrow_mut()
+                    .insert(step.data_return, "_owned_data".to_owned());
+                previous
+            });
+            write!(out, "\n  return ")?;
+            let result = self.compile_expr(body, out);
+            OWNED_DATA_RETURNS.with(|current| *current.borrow_mut() = previous_data);
+            OWNED_TUPLE_RETURNS.with(|current| *current.borrow_mut() = previous_tuples);
+            result?;
+            writeln!(out, ";\n}}\n")?;
         }
 
         CAPTURE_PLACES.with(|places| places.borrow_mut().clear());
@@ -1884,12 +4608,65 @@ impl lambda_lift::Program {
             Expr::Constant(_, the) => write!(code, "{}", self.compile_constant(the)),
             Expr::RecursiveLambda(_, _the) => panic!("lambdas are lifted"),
             Expr::Lambda(_, _the) => panic!("lambdas are lifted"),
-            Expr::Apply(a, the) => self.compile_apply(a, the, code),
+            Expr::Apply(a, the) => {
+                let combine_owner = OWNED_RECURSIVE_COMBINE_CALLS
+                    .with(|calls| calls.borrow().get(&(expr as *const Expr as usize)).copied());
+                if let Some(owner) = combine_owner {
+                    return self.compile_owned_recursive_combine(expr, owner, code);
+                }
+                let owned = OWNED_DATA_RETURNS.with(|returns| {
+                    returns
+                        .borrow()
+                        .get(&(expr as *const Expr as usize))
+                        .cloned()
+                });
+                if let Some(owner) = owned {
+                    let (constructor, arguments) = Self::constructor_application(expr)
+                        .expect("owned data result is a constructor application");
+                    self.compile_owned_data_application(&owner, constructor, &arguments, code)
+                } else {
+                    self.compile_apply(a, the, code)
+                }
+            }
             Expr::Let(_, the) => self.compile_let(the, code),
-            Expr::Tuple(_, the) => self.compile_tuple(&the.elements, code),
+            Expr::Tuple(_, the) => {
+                let virtual_tuple = VIRTUAL_TUPLE_LITERALS.with(|tuples| {
+                    tuples
+                        .borrow()
+                        .get(&(the as *const ast::Tuple<CaptureInfo, Identifier> as usize))
+                        .cloned()
+                });
+                if let Some(local) = virtual_tuple {
+                    return write!(code, "VBorrowedTuple((void *){local}.elems)");
+                }
+                let owned = OWNED_TUPLE_RETURNS.with(|returns| {
+                    returns
+                        .borrow()
+                        .get(&(expr as *const Expr as usize))
+                        .copied()
+                });
+                if let Some((local, arity)) = owned {
+                    debug_assert_eq!(arity, the.elements.len());
+                    self.compile_owned_tuple_replace(local, &the.elements, code)
+                } else {
+                    self.compile_tuple(&the.elements, code)
+                }
+            }
             Expr::Record(a, the) => self.compile_record(a, the, code),
             Expr::RecordUpdate(a, the) => self.compile_record_update(a, the, code),
-            Expr::Inject(_, the) => self.compile_inject(the, code),
+            Expr::Inject(_, the) => {
+                let owned = OWNED_DATA_RETURNS.with(|returns| {
+                    returns
+                        .borrow()
+                        .get(&(expr as *const Expr as usize))
+                        .cloned()
+                });
+                if let Some(owner) = owned {
+                    self.compile_owned_data_replace(&owner, the, code)
+                } else {
+                    self.compile_inject(the, code)
+                }
+            }
             Expr::Array(a, the) => self.compile_array(a, &the.elements, code),
             Expr::Project(a, the) => self.compile_projection(a, the, code),
             Expr::Sequence(_, the) => self.compile_sequence(the, code),
@@ -1899,6 +4676,31 @@ impl lambda_lift::Program {
             Expr::Ascription(_, the) => self.compile_expr(&the.ascribed_tree, code),
             Expr::MakeClosure(_, the) => self.compile_closure(the, code),
         }
+    }
+
+    fn compile_owned_recursive_combine(
+        &self,
+        expression: &Expr,
+        owner: usize,
+        code: &mut CodeBuffer,
+    ) -> fmt::Result {
+        let mut head = strip_ascription(expression);
+        let mut arguments = Vec::new();
+        while let Expr::Apply(_, application) = head {
+            arguments.push(application.argument.as_ref());
+            head = strip_ascription(&application.function);
+        }
+        arguments.reverse();
+        write!(code, "apply_n_owned_last_data(")?;
+        self.compile_expr(head, code)?;
+        write!(code, ", {}, (Value[]){{", arguments.len())?;
+        for (index, argument) in arguments.iter().enumerate() {
+            if index != 0 {
+                write!(code, ", ")?;
+            }
+            self.compile_expr(argument, code)?;
+        }
+        write!(code, "}}, l{owner})")
     }
 
     fn compile_tuple(&self, elements: &[Rc<Expr>], code: &mut CodeBuffer) -> fmt::Result {
@@ -1919,6 +4721,26 @@ impl lambda_lift::Program {
             self.compile_expr(element, code)?;
         }
         write!(code, ")")
+    }
+
+    fn compile_owned_tuple_replace(
+        &self,
+        local: usize,
+        elements: &[Rc<Expr>],
+        code: &mut CodeBuffer,
+    ) -> fmt::Result {
+        let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+        write!(code, "({{ ")?;
+        for (index, element) in elements.iter().enumerate() {
+            write!(code, "Value _otr{id}_{index} = ")?;
+            self.compile_expr(element, code)?;
+            write!(code, "; ")?;
+        }
+        write!(code, "reuse_owned_tuple{}_fast(l{local}", elements.len())?;
+        for index in 0..elements.len() {
+            write!(code, ", _otr{id}_{index}")?;
+        }
+        write!(code, "); }})")
     }
 
     // A readonly `[...]` array literal builds a flat array: one heap object with
@@ -2546,7 +5368,7 @@ impl lambda_lift::Program {
         let words = shape.len() + 1; // leading `slen` word, then the entries
         write!(
             code,
-            "mk_tuple(1, ({{ static const struct {{ GcHeader gch; int64_t s[{words}]; }} __ml = \
+            "mk_tuple(1, ({{ _Alignas(MARM_VALUE_ALIGNMENT) static const struct {{ GcHeader gch; int64_t s[{words}]; }} __ml = \
              {{{{{}, 0, OBJ_BYTES, MARM_ETERNAL}}, {{{}",
             words * 8,
             shape.len()
@@ -2590,6 +5412,47 @@ impl lambda_lift::Program {
             self.compile_expr(argument, code)?;
         }
         write!(code, ")")
+    }
+
+    fn compile_owned_data_replace(
+        &self,
+        owner: &str,
+        the: &phase::Injection<Closed>,
+        code: &mut CodeBuffer,
+    ) -> fmt::Result {
+        let arguments = the
+            .arguments
+            .iter()
+            .map(|argument| &**argument)
+            .collect::<Vec<_>>();
+        self.compile_owned_data_application(owner, &the.constructor, &arguments, code)
+    }
+
+    fn compile_owned_data_application(
+        &self,
+        owner: &str,
+        constructor: &QualifiedName,
+        arguments: &[&Expr],
+        code: &mut CodeBuffer,
+    ) -> fmt::Result {
+        let arity = arguments.len();
+        debug_assert!((1..=4).contains(&arity));
+        let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+        write!(code, "({{ ")?;
+        for (index, argument) in arguments.iter().enumerate() {
+            write!(code, "Value _od{id}_{index} = ")?;
+            self.compile_expr(argument, code)?;
+            write!(code, "; ")?;
+        }
+        write!(
+            code,
+            "reuse_owned_data{arity}_fast({owner}, {}",
+            self.constructor_tag(constructor)
+        )?;
+        for index in 0..arity {
+            write!(code, ", _od{id}_{index}")?;
+        }
+        write!(code, "); }})")
     }
 
     // -------------------------------------------------- flat record literals
@@ -4697,6 +7560,85 @@ impl lambda_lift::Program {
     ) -> fmt::Result {
         let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
 
+        // Carry a fresh tuple through an ownership-preserving call as a virtual
+        // aggregate when its result is consumed here. The tuple-shaped stack
+        // object keeps the normal Value ABI, and its fields remain visible to the
+        // conservative root scan during allocations. Tuple-pattern arms read the
+        // fields directly; a whole-value arm materialises a heap tuple lazily.
+        if std::env::var_os("MARM_NO_VIRTUAL_TUPLES").is_none()
+            && !matches!(strip_ascription(&the.scrutinee), Expr::Tuple(..))
+            && let Some(tuple) = self.owned_tuple_literal(&the.scrutinee)
+            && (1..=4).contains(&tuple.elements.len())
+        {
+            let owned_product_fields = OWNED_SPINE_LOCALS.with(|owned| {
+                self.owned_product_fields_from_recursive_eliminator(&the.scrutinee, &owned.borrow())
+            });
+            let aggregate = format!("_vtuple{id}");
+            let locals = (0..tuple.elements.len())
+                .map(|index| format!("{aggregate}.elems[{index}]"))
+                .collect::<Vec<_>>();
+            if let Some(plans) = self.plan_direct_tuple_match(&the.match_clauses, &locals) {
+                write!(
+                    code,
+                    "({{ _Alignas(MARM_VALUE_ALIGNMENT) struct {{ GcHeader gch; Value elems[{}]; }} {aggregate} = \
+                     {{{{{}, 0, OBJ_TUPLE, MARM_ETERNAL, 0}}, {{0}}}}; ",
+                    tuple.elements.len(),
+                    tuple.elements.len() * std::mem::size_of::<u64>()
+                )?;
+                for (index, element) in tuple.elements.iter().enumerate() {
+                    write!(code, "{aggregate}.elems[{index}] = ")?;
+                    self.compile_expr(element, code)?;
+                    write!(code, "; ")?;
+                }
+                let key = tuple as *const ast::Tuple<CaptureInfo, Identifier> as usize;
+                let previous = VIRTUAL_TUPLE_LITERALS
+                    .with(|tuples| tuples.borrow_mut().insert(key, aggregate.clone()));
+                write!(code, "Value _vresult{id} = ")?;
+                let result = self.compile_expr(&the.scrutinee, code);
+                VIRTUAL_TUPLE_LITERALS.with(|tuples| {
+                    let mut tuples = tuples.borrow_mut();
+                    if let Some(previous) = previous {
+                        tuples.insert(key, previous);
+                    } else {
+                        tuples.remove(&key);
+                    }
+                });
+                result?;
+                write!(code, "; (void)_vresult{id}; ")?;
+                for (clause, (tests, binds)) in the.match_clauses.iter().zip(&plans) {
+                    if tests.is_empty() {
+                        write!(code, "true")?;
+                    } else {
+                        write!(code, "{}", tests.join(" && "))?;
+                    }
+                    write!(code, " ? ({{ ")?;
+                    for (level, path) in binds {
+                        write!(code, "Value l{level} = {path}; ")?;
+                    }
+                    let mut owned_binders = HashSet::default();
+                    if let Pattern::Tuple(_, pattern) = &clause.pattern {
+                        for field in &owned_product_fields {
+                            if let Some(field_pattern) = pattern.elements.get(*field) {
+                                self.collect_owned_spine_pattern_binders(
+                                    field_pattern,
+                                    &field_pattern.annotation().type_info.inferred_type,
+                                    &mut owned_binders,
+                                );
+                            }
+                        }
+                    }
+                    owned_binders
+                        .retain(|level| Self::owned_local_is_linear(&clause.consequent, *level));
+                    let previous = Self::install_owned_spine_locals(owned_binders);
+                    let result = self.compile_expr(&clause.consequent, code);
+                    Self::restore_owned_spine_locals(previous);
+                    result?;
+                    write!(code, "; }}) : ")?;
+                }
+                return write!(code, "match_fail(); }})");
+            }
+        }
+
         // Match a packed ARRAY element in place.  A let-bound raw get records
         // its (array,index) pair in `ARRAY_ELEMENT_PLACES`; matching that value
         // can then read the tag and scalar fields directly from the backing
@@ -4764,6 +7706,105 @@ impl lambda_lift::Program {
             }
         }
 
+        // A comma-separated scrutinee is an ordinary tuple in the AST. When every
+        // clause either takes that tuple apart or binds it as a whole, keep its
+        // elements in separate C locals instead of allocating `mk_tupleN(...)` only
+        // to project it again. A whole-value clause reconstructs the tuple inside
+        // that branch, after it has actually matched.
+        // Planning precedes emission so an unsupported clause leaves the canonical
+        // boxed-tuple path untouched.
+        if let Expr::Tuple(_, tuple) = strip_ascription(&the.scrutinee)
+            && !tuple.elements.is_empty()
+        {
+            let locals = (0..tuple.elements.len())
+                .map(|index| format!("_scrut{id}_{index}"))
+                .collect::<Vec<_>>();
+            if let Some(plans) = self.plan_direct_tuple_match(&the.match_clauses, &locals) {
+                write!(code, "({{ ")?;
+                for (local, element) in locals.iter().zip(&tuple.elements) {
+                    write!(code, "Value {local} = ")?;
+                    self.compile_expr(element, code)?;
+                    write!(code, "; ")?;
+                }
+                for (clause, (tests, binds)) in the.match_clauses.iter().zip(&plans) {
+                    if tests.is_empty() {
+                        write!(code, "true")?;
+                    } else {
+                        write!(code, "{}", tests.join(" && "))?;
+                    }
+                    write!(code, " ? ({{ ")?;
+                    for (level, path) in binds {
+                        write!(code, "Value l{level} = {path}; ")?;
+                    }
+                    let mut owned_binders = HashSet::default();
+                    if let Pattern::Tuple(_, pattern) = &clause.pattern {
+                        for (element, field_pattern) in tuple.elements.iter().zip(&pattern.elements)
+                        {
+                            if self.expression_is_owned_spine(element) {
+                                self.collect_owned_spine_pattern_binders(
+                                    field_pattern,
+                                    &element.annotation().type_info.inferred_type,
+                                    &mut owned_binders,
+                                );
+                            }
+                        }
+                    }
+                    owned_binders
+                        .retain(|level| Self::owned_local_is_linear(&clause.consequent, *level));
+                    let previous = Self::install_owned_spine_locals(owned_binders);
+                    let result = self.compile_expr(&clause.consequent, code);
+                    Self::restore_owned_spine_locals(previous);
+                    result?;
+                    write!(code, "; }}) : ")?;
+                }
+                return write!(code, "match_fail(); }})");
+            }
+        }
+
+        // Generic constructor scalar replacement. The simplifier has already
+        // cancelled the simplest `C(args)`/`C(patterns)` pairs, but deliberately
+        // leaves nested and literal subpatterns plus whole-value fallbacks alone.
+        // Keep every constructor field in a C local while those clauses inspect it;
+        // only a fallback that binds the complete value materialises the Data box.
+        // This is based solely on constructor identity and arity -- no knowledge of
+        // List, Perhaps, or any other source-level type is involved.
+        if let Some((constructor, arguments)) = Self::constructor_application(&the.scrutinee)
+            && !arguments.is_empty()
+            && self.constructor_tags.contains_key(constructor)
+            && !self.newtype_constructors.contains(constructor)
+        {
+            let locals = (0..arguments.len())
+                .map(|index| format!("_cscrut{id}_{index}"))
+                .collect::<Vec<_>>();
+            if let Some(plans) =
+                self.plan_direct_constructor_match(constructor, &the.match_clauses, &locals)
+            {
+                write!(code, "({{ ")?;
+                for (local, argument) in locals.iter().zip(&arguments) {
+                    write!(code, "Value {local} = ")?;
+                    self.compile_expr(argument, code)?;
+                    write!(code, "; ")?;
+                }
+                for (clause, plan) in the.match_clauses.iter().zip(&plans) {
+                    let Some((tests, binds)) = plan else {
+                        continue;
+                    };
+                    if tests.is_empty() {
+                        write!(code, "true")?;
+                    } else {
+                        write!(code, "{}", tests.join(" && "))?;
+                    }
+                    write!(code, " ? ({{ ")?;
+                    for (level, path) in binds {
+                        write!(code, "Value l{level} = {path}; ")?;
+                    }
+                    self.compile_expr(&clause.consequent, code)?;
+                    write!(code, "; }}) : ")?;
+                }
+                return write!(code, "match_fail(); }})");
+            }
+        }
+
         // A multiword sum projected out of a flat record is already a readable
         // region (tag followed by payload words).  If it is consumed immediately
         // by a constructor match, inspect that region directly instead of calling
@@ -4811,6 +7852,18 @@ impl lambda_lift::Program {
         }
 
         let scrutinee = format!("_scrut{id}");
+        let scrutinee_owned = self.expression_is_owned_spine(&the.scrutinee);
+        // A recursive eliminator can return a product containing a fresh spine
+        // even when its input was shared. Preserve that field-level provenance
+        // through the product match so a following structural consumer can use
+        // the fresh spine as a destination. This is derived from the producer's
+        // typed recursion and callback result, not from a library identity.
+        let owned_product_fields = OWNED_SPINE_LOCALS.with(|owned| {
+            self.owned_product_fields_from_recursive_eliminator(&the.scrutinee, &owned.borrow())
+        });
+        let scrutinee_dynamic = self
+            .dynamic_owned_condition(&the.scrutinee)
+            .filter(|condition| condition != "true");
 
         write!(code, "({{ Value {scrutinee} = ")?;
         self.compile_expr(&the.scrutinee, code)?;
@@ -4842,11 +7895,193 @@ impl lambda_lift::Program {
             for (level, path) in &binds {
                 write!(code, "Value l{level} = {path}; ")?;
             }
-            self.compile_expr(&clause.consequent, code)?;
+            let mut owned_binders = HashSet::default();
+            if scrutinee_owned {
+                self.collect_owned_spine_pattern_binders(
+                    &clause.pattern,
+                    &the.scrutinee.annotation().type_info.inferred_type,
+                    &mut owned_binders,
+                );
+                owned_binders.retain(|level| {
+                    // Destructive consumption is valid only for a linear use of
+                    // this particular subspine along each selected path.
+                    Self::owned_local_is_linear(&clause.consequent, *level)
+                });
+            }
+            if let Pattern::Tuple(_, tuple) = &clause.pattern {
+                for field in &owned_product_fields {
+                    if let Some(field_pattern) = tuple.elements.get(*field) {
+                        self.collect_owned_spine_pattern_binders(
+                            field_pattern,
+                            &field_pattern.annotation().type_info.inferred_type,
+                            &mut owned_binders,
+                        );
+                    }
+                }
+            }
+            owned_binders.retain(|level| {
+                // Uses in mutually exclusive branches do not alias at runtime.
+                // Accept one use on each path, rather than requiring one use in
+                // the whole syntax tree, so the destination survives an `if`.
+                Self::owned_local_is_linear(&clause.consequent, *level)
+            });
+            let previous = Self::install_owned_spine_locals(owned_binders);
+            let mut dynamic_binders = HashSet::default();
+            if scrutinee_dynamic.is_some() {
+                self.collect_owned_spine_pattern_binders(
+                    &clause.pattern,
+                    &the.scrutinee.annotation().type_info.inferred_type,
+                    &mut dynamic_binders,
+                );
+                dynamic_binders
+                    .retain(|level| Self::max_local_uses_per_path(&clause.consequent, *level) <= 1);
+            }
+            let previous_dynamic = Self::install_dynamic_owned_spine_locals(
+                dynamic_binders.into_iter().map(|level| {
+                    (
+                        level,
+                        scrutinee_dynamic.clone().expect("dynamic binder condition"),
+                    )
+                }),
+            );
+            let result = self.compile_expr(&clause.consequent, code);
+            Self::restore_dynamic_owned_spine_locals(previous_dynamic);
+            Self::restore_owned_spine_locals(previous);
+            result?;
             write!(code, "; }}) : ")?;
         }
 
         write!(code, "match_fail(); }})")
+    }
+
+    /// Plan a match whose scrutinee is a tuple literal represented by one C local
+    /// per element. Tuple patterns inspect those locals directly. A whole-tuple bind
+    /// reconstructs the canonical tuple only within the matching clause.
+    fn plan_direct_tuple_match(
+        &self,
+        clauses: &[phase::MatchClause<Closed>],
+        locals: &[String],
+    ) -> Option<Vec<(Vec<String>, Vec<(usize, String)>)>> {
+        clauses
+            .iter()
+            .map(|clause| {
+                let mut tests = Vec::new();
+                let mut binds = Vec::new();
+                match &clause.pattern {
+                    Pattern::Tuple(_, tuple) if tuple.elements.len() == locals.len() => {
+                        for (pattern, local) in tuple.elements.iter().zip(locals) {
+                            if self.flat_records_enabled() {
+                                self.collect_pattern_flat(
+                                    pattern, local, 0, 1, true, &mut tests, &mut binds,
+                                );
+                            } else {
+                                self.collect_pattern(pattern, local, &mut tests, &mut binds);
+                            }
+                        }
+                    }
+                    Pattern::Bind(_, Identifier::Local(LexicalLevel(level))) => binds.push((
+                        *level,
+                        if locals.len() <= 4 {
+                            format!("mk_tuple{}({})", locals.len(), locals.join(", "))
+                        } else {
+                            format!("mk_tuple({}, {})", locals.len(), locals.join(", "))
+                        },
+                    )),
+                    _ => return None,
+                }
+                // A whole-value fallback is represented as an ordinary binder,
+                // including `_`.  When that binder is dead, rebuilding the
+                // scalar-replaced tuple would be pure allocation with no
+                // observable value.  Nested tuple binders benefit from the same
+                // liveness check.  The element expressions have already been
+                // evaluated into `locals`, so dropping the bind preserves source
+                // evaluation order and effects.
+                if std::env::var_os("MARM_NO_DEAD_PATTERN_BINDS").is_none() {
+                    binds.retain(|(level, _)| {
+                        Self::local_use_count(&clause.consequent, *level) != 0
+                    });
+                }
+                Some((tests, binds))
+            })
+            .collect()
+    }
+
+    /// Plan a match against a constructor whose fields are held in separate C
+    /// locals. Clauses for other constructors and literal clauses are statically
+    /// unreachable. A binder for the whole scrutinee reconstructs the canonical
+    /// Data value only in that matching branch.
+    fn plan_direct_constructor_match(
+        &self,
+        injected_constructor: &QualifiedName,
+        clauses: &[phase::MatchClause<Closed>],
+        locals: &[String],
+    ) -> Option<Vec<Option<(Vec<String>, Vec<(usize, String)>)>>> {
+        let mut plans = Vec::with_capacity(clauses.len());
+        let mut exhaustive = false;
+        for clause in clauses {
+            if exhaustive {
+                plans.push(None);
+                continue;
+            }
+            let mut tests = Vec::new();
+            let mut binds = Vec::new();
+            match &clause.pattern {
+                Pattern::Coproduct(_, constructor) => {
+                    let Identifier::Global(name) = &constructor.constructor else {
+                        return None;
+                    };
+                    if name.as_ref() != injected_constructor {
+                        plans.push(None);
+                        continue;
+                    }
+                    if constructor.arguments.len() != locals.len() {
+                        return None;
+                    }
+                    for (pattern, local) in constructor.arguments.iter().zip(locals) {
+                        if self.flat_records_enabled() {
+                            self.collect_pattern_flat(
+                                pattern, local, 0, 1, true, &mut tests, &mut binds,
+                            );
+                        } else {
+                            self.collect_pattern(pattern, local, &mut tests, &mut binds);
+                        }
+                    }
+                }
+                Pattern::Bind(_, Identifier::Local(LexicalLevel(level))) => {
+                    binds.push((
+                        *level,
+                        self.materialize_constructor(injected_constructor, locals),
+                    ));
+                }
+                Pattern::Bind(_, other) => {
+                    panic!("pattern binder must be a local: {other:?}")
+                }
+                Pattern::Literally(..) => {
+                    plans.push(None);
+                    continue;
+                }
+                Pattern::Tuple(..) | Pattern::Struct(..) => return None,
+            }
+            // As in direct tuple matching, materialize a scalar-replaced
+            // constructor only when its pattern binding reaches the clause body.
+            // This also removes dead field binds without changing any pattern
+            // tests, which refer directly to the scalar locals.
+            if std::env::var_os("MARM_NO_DEAD_PATTERN_BINDS").is_none() {
+                binds.retain(|(level, _)| Self::local_use_count(&clause.consequent, *level) != 0);
+            }
+            exhaustive = tests.is_empty();
+            plans.push(Some((tests, binds)));
+        }
+        Some(plans)
+    }
+
+    fn materialize_constructor(&self, constructor: &QualifiedName, locals: &[String]) -> String {
+        let tag = self.constructor_tag(constructor);
+        match locals.len() {
+            0 => format!("STATIC_DATA0({tag})"),
+            n @ 1..=4 => format!("mk_data{n}({tag}, {})", locals.join(", ")),
+            n => format!("mk_data({tag}, {n}, {})", locals.join(", ")),
+        }
     }
 
     // Walk a pattern against a C expression `path` for the value it matches,
@@ -4962,6 +8197,23 @@ impl lambda_lift::Program {
             write!(code, "), (size_t)as_int(")?;
             self.compile_expr(args[length_argument], code)?;
             return write!(code, "), &{slot})");
+        }
+
+        if let Some(rebuild) = self.owned_spine_rebuild(head, &args)
+            && self.expression_is_owned_spine(rebuild.input)
+        {
+            let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+            write!(code, "({{ Value _ors{id}_seed = ")?;
+            self.compile_expr(rebuild.seed, code)?;
+            write!(code, "; Value _ors{id}_input = ")?;
+            self.compile_expr(rebuild.input, code)?;
+            return write!(
+                code,
+                "; reverse_constructor_spine_owned(_ors{id}_input, _ors{id}_seed, {}, {}, {}); }})",
+                self.constructor_tag(rebuild.step_constructor),
+                self.constructor_tag(rebuild.end_constructor),
+                rebuild.next_field
+            );
         }
 
         // `omg_wtf_bbq` deliberately keeps the ordinary surface type `Text -> a`.
@@ -5209,7 +8461,216 @@ impl lambda_lift::Program {
         // fall through to the curried `apply` path below.
         if let Expr::Variable(_, Identifier::Global(qualified_name)) = head {
             if self.arities.get(qualified_name.as_ref()) == Some(&args.len()) {
-                write!(code, "{}_worker(", c_name(qualified_name.as_ref()))?;
+                let recursive_eliminator = OWNED_RECURSIVE_ELIMINATORS
+                    .with(|variants| variants.borrow().get(qualified_name.as_ref()).cloned());
+                if let Some(variant) = recursive_eliminator
+                    && args
+                        .get(variant.product_parameter)
+                        .is_some_and(|argument| self.expression_is_owned_tuple(argument))
+                    && args.get(variant.input_parameter).is_some_and(|argument| {
+                        self.expression_is_owned_spine(argument)
+                            && !Self::constructor_application(argument)
+                                .is_some_and(|(_, fields)| fields.is_empty())
+                    })
+                    && self.owned_spine_argument_is_exclusive(&args, variant.input_parameter)
+                {
+                    write!(
+                        code,
+                        "{}_owned_tuple_{}_data_{}_worker(",
+                        c_name(qualified_name.as_ref()),
+                        variant.product_parameter,
+                        variant.input_parameter
+                    )?;
+                    for (index, argument) in args.iter().enumerate() {
+                        if index != 0 {
+                            write!(code, ", ")?;
+                        }
+                        self.compile_expr(argument, code)?;
+                    }
+                    return write!(code, ")");
+                }
+                let owned_data_parameter = OWNED_DATA_WORKER_VARIANTS.with(|variants| {
+                    variants
+                        .borrow()
+                        .get(qualified_name.as_ref())
+                        .and_then(|parameters| {
+                            parameters.iter().copied().find(|parameter| {
+                                args.get(*parameter).is_some_and(|argument| {
+                                    self.expression_is_owned_spine(argument)
+                                        && !Self::constructor_application(argument)
+                                            .is_some_and(|(_, fields)| fields.is_empty())
+                                }) && self.owned_data_argument_is_exclusive(
+                                    qualified_name.as_ref(),
+                                    &args,
+                                    *parameter,
+                                )
+                            })
+                        })
+                });
+                if let Some(parameter) = owned_data_parameter {
+                    write!(
+                        code,
+                        "{}_owned_data_{}_worker(",
+                        c_name(qualified_name.as_ref()),
+                        parameter
+                    )?;
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            write!(code, ", ")?;
+                        }
+                        self.compile_expr(arg, code)?;
+                    }
+                    return write!(code, ")");
+                }
+                let dynamic_data_parameter = OWNED_DATA_WORKER_VARIANTS.with(|variants| {
+                    variants
+                        .borrow()
+                        .get(qualified_name.as_ref())
+                        .and_then(|parameters| {
+                            parameters.iter().find_map(|parameter| {
+                                let condition = args
+                                    .get(*parameter)
+                                    .and_then(|argument| self.dynamic_owned_condition(argument))?;
+                                if condition == "true"
+                                    || args.iter().enumerate().any(|(index, argument)| {
+                                        index != *parameter
+                                            && self.dynamic_owned_condition(argument).as_deref()
+                                                == Some(condition.as_str())
+                                    })
+                                {
+                                    return None;
+                                }
+                                Some((*parameter, condition))
+                            })
+                        })
+                });
+                if let Some((parameter, condition)) = dynamic_data_parameter {
+                    write!(
+                        code,
+                        "({condition} ? {}_owned_data_{}_worker(",
+                        c_name(qualified_name.as_ref()),
+                        parameter
+                    )?;
+                    for (index, argument) in args.iter().enumerate() {
+                        if index != 0 {
+                            write!(code, ", ")?;
+                        }
+                        self.compile_expr(argument, code)?;
+                    }
+                    write!(code, ") : {}_worker(", c_name(qualified_name.as_ref()))?;
+                    for (index, argument) in args.iter().enumerate() {
+                        if index != 0 {
+                            write!(code, ", ")?;
+                        }
+                        self.compile_expr(argument, code)?;
+                    }
+                    return write!(code, "))");
+                }
+                let owned_spine_parameter = OWNED_SPINE_WORKER_VARIANTS.with(|variants| {
+                    variants
+                        .borrow()
+                        .get(qualified_name.as_ref())
+                        .and_then(|parameters| {
+                            parameters.iter().copied().find(|parameter| {
+                                args.get(*parameter).is_some_and(|argument| {
+                                    self.expression_is_owned_spine(argument)
+                                }) && self.owned_spine_argument_is_exclusive(&args, *parameter)
+                            })
+                        })
+                });
+                if let Some(parameter) = owned_spine_parameter {
+                    write!(
+                        code,
+                        "{}_owned_spine_{}_worker(",
+                        c_name(qualified_name.as_ref()),
+                        parameter
+                    )?;
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            write!(code, ", ")?;
+                        }
+                        self.compile_expr(arg, code)?;
+                    }
+                    return write!(code, ")");
+                }
+                let dynamic_spine_parameter = OWNED_SPINE_WORKER_VARIANTS.with(|variants| {
+                    variants
+                        .borrow()
+                        .get(qualified_name.as_ref())
+                        .and_then(|parameters| {
+                            parameters.iter().find_map(|parameter| {
+                                args.get(*parameter)
+                                    .and_then(|argument| self.dynamic_owned_condition(argument))
+                                    .filter(|condition| condition != "true")
+                                    .map(|condition| (*parameter, condition))
+                            })
+                        })
+                });
+                if let Some((parameter, condition)) = dynamic_spine_parameter {
+                    write!(
+                        code,
+                        "({condition} ? {}_owned_spine_{}_worker(",
+                        c_name(qualified_name.as_ref()),
+                        parameter
+                    )?;
+                    for (index, argument) in args.iter().enumerate() {
+                        if index != 0 {
+                            write!(code, ", ")?;
+                        }
+                        self.compile_expr(argument, code)?;
+                    }
+                    write!(code, ") : {}_worker(", c_name(qualified_name.as_ref()))?;
+                    for (index, argument) in args.iter().enumerate() {
+                        if index != 0 {
+                            write!(code, ", ")?;
+                        }
+                        self.compile_expr(argument, code)?;
+                    }
+                    return write!(code, "))");
+                }
+                let owned_tuple_parameter = OWNED_TUPLE_WORKER_VARIANTS.with(|variants| {
+                    variants
+                        .borrow()
+                        .get(qualified_name.as_ref())
+                        .and_then(|parameters| {
+                            parameters.iter().copied().find(|parameter| {
+                                args.get(*parameter).is_some_and(|argument| {
+                                    annotation.type_info.inferred_type
+                                        == argument.annotation().type_info.inferred_type
+                                        && self.expression_is_owned_tuple(argument)
+                                })
+                            })
+                        })
+                });
+                if let Some(parameter) = owned_tuple_parameter {
+                    write!(
+                        code,
+                        "{}_owned_tuple_{}_worker(",
+                        c_name(qualified_name.as_ref()),
+                        parameter
+                    )?;
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            write!(code, ", ")?;
+                        }
+                        self.compile_expr(arg, code)?;
+                    }
+                    return write!(code, ")");
+                }
+                let owned_rebuild = args.len() == 1
+                    && OWNED_REBUILD_WORKER_VARIANTS
+                        .with(|variants| variants.borrow().contains(qualified_name.as_ref()))
+                    && self.expression_is_owned_spine(args[0])
+                    && self.owned_spine_argument_is_exclusive(&args, 0);
+                if owned_rebuild {
+                    write!(
+                        code,
+                        "{}_owned_rebuild_worker(",
+                        c_name(qualified_name.as_ref())
+                    )?;
+                } else {
+                    write!(code, "{}_worker(", c_name(qualified_name.as_ref()))?;
+                }
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         write!(code, ", ")?;
@@ -5242,7 +8703,19 @@ impl lambda_lift::Program {
         // applying one argument at a time. A single-argument application has no
         // stage to skip, so it stays the leaner `apply`.
         if args.len() >= 2 {
-            write!(code, "apply_n(")?;
+            let owned_last = args.last().is_some_and(|last| {
+                annotation.type_info.inferred_type == last.annotation().type_info.inferred_type
+                    && self.expression_is_owned_tuple(last)
+            });
+            write!(
+                code,
+                "{}(",
+                if owned_last {
+                    "apply_n_owned_last"
+                } else {
+                    "apply_n"
+                }
+            )?;
             self.compile_expr(head, code)?;
             write!(code, ", {}, (Value[]){{", args.len())?;
             for (i, arg) in args.iter().enumerate() {
@@ -5384,7 +8857,7 @@ impl lambda_lift::Program {
                 )?;
                 write!(
                     code,
-                    "struct {{ const ClosureDesc *desc; Value caps[{captures}]; }} _sc{id} = {{&_sd{id}, {{"
+                    "_Alignas(MARM_VALUE_ALIGNMENT) struct {{ const ClosureDesc *desc; Value caps[{captures}]; }} _sc{id} = {{&_sd{id}, {{"
                 )?;
                 for (index, value) in capture_values.iter().enumerate() {
                     if index > 0 {
@@ -5542,10 +9015,36 @@ impl lambda_lift::Program {
             Some(&arity) => (format!("{name}_uworker"), arity),
             None => ("NULL".to_owned(), 1),
         };
+        let owned_worker = OWNED_TUPLE_STEP_WORKERS.with(|workers| {
+            workers
+                .borrow()
+                .contains_key(&the.lifted_name)
+                .then(|| format!("{name}_owned_tuple_uworker"))
+                .unwrap_or_else(|| "NULL".to_owned())
+        });
+        let owned_data_worker = OWNED_PRODUCT_DATA_STEP_WORKERS.with(|workers| {
+            workers
+                .borrow()
+                .contains_key(&the.lifted_name)
+                .then(|| format!("{name}_owned_tuple_data_uworker"))
+                .unwrap_or_else(|| "NULL".to_owned())
+        });
         // Capture-free: identical + immutable, so a single static instance, no heap
         // allocation at all (mirrors the borrowed-string descriptors).
         if env.elements.is_empty() {
-            return write!(code, "STATIC_CLOSURE0({name}, {worker}, {arity})");
+            if owned_worker == "NULL" && owned_data_worker == "NULL" {
+                return write!(code, "STATIC_CLOSURE0({name}, {worker}, {arity})");
+            }
+            if owned_data_worker != "NULL" {
+                return write!(
+                    code,
+                    "STATIC_CLOSURE0_OWNED_DATA({name}, {worker}, {arity}, {owned_worker}, {owned_data_worker})"
+                );
+            }
+            return write!(
+                code,
+                "STATIC_CLOSURE0_OWNED({name}, {worker}, {arity}, {owned_worker})"
+            );
         }
         // Per-site static descriptor, then a heap {desc, captures}. Statement-expression
         // scoping keeps each site's `__d` local, so `&__d` binds to this site's descriptor
@@ -5561,7 +9060,7 @@ impl lambda_lift::Program {
         let n = capture_values.len();
         write!(
             code,
-            "static const ClosureDesc __d = {{{name}, {worker}, {arity}}}; "
+            "static const ClosureDesc __d = {{{name}, {worker}, {arity}, {owned_worker}, {owned_data_worker}}}; "
         )?;
         if n <= 4 {
             write!(code, "mk_closure_d{n}(&__d")?;
@@ -5685,6 +9184,9 @@ impl lambda_lift::Program {
             // `sizeof("...")` sizes the body (escapes handled by the C compiler); the
             // slice length excludes the trailing NUL. `static` locals in a statement
             // expression have static storage duration -> they land in .rodata.
+            // On wasm32 a `Slice` is only 4-byte aligned, and a body address with
+            // bit 2 set reads as a borrowed tuple. Every emitted Value body uses
+            // the runtime's shared tagged-pointer alignment contract.
             Literal::Text(x) => {
                 // The `Text` may hold characters that are special in a C string literal
                 // (quotes, backslashes, newlines from source escapes), so re-escape it.
@@ -5692,9 +9194,9 @@ impl lambda_lift::Program {
                 // and the slice correctly.
                 let x = c_string_escape(x);
                 format!(
-                    "({{ static const struct {{ GcHeader gch; char b[sizeof(\"{x}\")]; }} \
+                    "({{ _Alignas(MARM_VALUE_ALIGNMENT) static const struct {{ GcHeader gch; char b[sizeof(\"{x}\")]; }} \
                      __marm_b = {{{{sizeof(\"{x}\"), 0, OBJ_BYTES, MARM_ETERNAL}}, \"{x}\"}}; \
-                     static const struct {{ GcHeader gch; Slice s; }} \
+                     _Alignas(MARM_VALUE_ALIGNMENT) static const struct {{ GcHeader gch; Slice s; }} \
                      __marm_s = {{{{sizeof(Slice), 0, OBJ_SLICE, MARM_ETERNAL}}, \
                      {{(void *)__marm_b.b, (const uint8_t *)__marm_b.b, \
                      sizeof(\"{x}\") - 1}}}}; \
@@ -6235,10 +9737,84 @@ impl lambda_lift::Program {
             }
         }
 
+        if Self::max_local_uses_per_path(body, *level) <= 1
+            && let Expr::If(_, branch) = strip_ascription(bound)
+        {
+            let consequent_owned = self.dynamic_owned_condition(&branch.consequent);
+            let alternate_owned = self.dynamic_owned_condition(&branch.alternate);
+            if consequent_owned.is_some() || alternate_owned.is_some() {
+                let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+                write!(code, "({{ Value l{level}; bool _own{id}; if (as_bool(")?;
+                self.compile_expr(&branch.predicate, code)?;
+                write!(code, ")) {{ l{level} = ")?;
+                self.compile_expr(&branch.consequent, code)?;
+                write!(
+                    code,
+                    "; _own{id} = {}; }} else {{ l{level} = ",
+                    consequent_owned.as_deref().unwrap_or("false")
+                )?;
+                self.compile_expr(&branch.alternate, code)?;
+                write!(
+                    code,
+                    "; _own{id} = {}; }} ",
+                    alternate_owned.as_deref().unwrap_or("false")
+                )?;
+                let previous_dynamic =
+                    Self::install_dynamic_owned_spine_locals([(*level, format!("_own{id}"))]);
+                let result = self.compile_expr(body, code);
+                Self::restore_dynamic_owned_spine_locals(previous_dynamic);
+                result?;
+                return write!(code, "; }})");
+            }
+        }
+
+        let dynamic_bound = (Self::max_local_uses_per_path(body, *level) <= 1)
+            .then(|| self.dynamic_owned_condition(bound))
+            .flatten()
+            .filter(|condition| condition != "true");
+        let bound_owned = self.expression_is_owned_spine(bound);
         write!(code, "({{ Value l{level} = ")?;
         self.compile_expr(bound, code)?;
         write!(code, "; ")?;
-        self.compile_expr(body, code)?;
+        if let Some(condition) = dynamic_bound {
+            let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+            write!(code, "bool _own{id} = {condition}; ")?;
+            let previous_dynamic =
+                Self::install_dynamic_owned_spine_locals([(*level, format!("_own{id}"))]);
+            let result = self.compile_expr(body, code);
+            Self::restore_dynamic_owned_spine_locals(previous_dynamic);
+            result?;
+            return write!(code, "; }})");
+        }
+        if bound_owned
+            && let Expr::If(_, branch) = strip_ascription(body)
+            && Self::local_use_count(&branch.consequent, *level) <= 1
+            && Self::local_use_count(&branch.alternate, *level) <= 1
+        {
+            write!(code, "(as_bool(")?;
+            self.compile_expr(&branch.predicate, code)?;
+            write!(code, ") ? ")?;
+            let previous = Self::install_owned_spine_locals([*level]);
+            let consequent = self.compile_expr(&branch.consequent, code);
+            Self::restore_owned_spine_locals(previous);
+            consequent?;
+            write!(code, " : ")?;
+            let previous = Self::install_owned_spine_locals([*level]);
+            let alternate = self.compile_expr(&branch.alternate, code);
+            Self::restore_owned_spine_locals(previous);
+            alternate?;
+            return write!(code, "); }})");
+        }
+        let previous = if bound_owned && Self::local_use_count(body, *level) == 1 {
+            Some(Self::install_owned_spine_locals([*level]))
+        } else {
+            None
+        };
+        let result = self.compile_expr(body, code);
+        if let Some(previous) = previous {
+            Self::restore_owned_spine_locals(previous);
+        }
+        result?;
         write!(code, "; }})")
     }
 
@@ -6289,6 +9865,66 @@ impl lambda_lift::Program {
                 .any(|clause| self.has_tail_self_call(target, arity, &clause.consequent)),
             _ => self.is_self_call(target, arity, expr),
         }
+    }
+
+    fn fresh_backedge_parameters(
+        &self,
+        target: SelfCall,
+        arity: usize,
+        expression: &Expr,
+    ) -> Vec<usize> {
+        fn visit(
+            program: &lambda_lift::Program,
+            target: SelfCall<'_>,
+            arity: usize,
+            expression: &Expr,
+            fresh: &mut [bool],
+            seen: &mut bool,
+        ) {
+            let expression = strip_ascription(expression);
+            if program.is_self_call(target, arity, expression) {
+                *seen = true;
+                let mut head = expression;
+                let mut arguments = Vec::new();
+                while let Expr::Apply(_, application) = head {
+                    arguments.push(application.argument.as_ref());
+                    head = strip_ascription(&application.function);
+                }
+                arguments.reverse();
+                for (index, argument) in arguments.into_iter().enumerate() {
+                    fresh[index] &= program.expression_is_owned_spine(argument);
+                }
+                return;
+            }
+            match expression {
+                Expr::If(_, branch) => {
+                    visit(program, target, arity, &branch.consequent, fresh, seen);
+                    visit(program, target, arity, &branch.alternate, fresh, seen);
+                }
+                Expr::Let(_, binding) => visit(program, target, arity, &binding.body, fresh, seen),
+                Expr::Sequence(_, sequence) => {
+                    visit(program, target, arity, &sequence.and_then, fresh, seen)
+                }
+                Expr::Deconstruct(_, deconstruct) => {
+                    for clause in &deconstruct.match_clauses {
+                        visit(program, target, arity, &clause.consequent, fresh, seen);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut fresh = vec![true; arity];
+        let mut seen = false;
+        visit(self, target, arity, expression, &mut fresh, &mut seen);
+        if !seen {
+            return Vec::new();
+        }
+        fresh
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, fresh)| fresh.then_some(index))
+            .collect()
     }
 
     // Emit `expr` in tail position as C statements. A saturated self-call becomes
@@ -6443,10 +10079,55 @@ impl lambda_lift::Program {
                         return result;
                     }
                 }
+                if Self::max_local_uses_per_path(&the.body, *level) <= 1
+                    && let Expr::If(_, branch) = strip_ascription(&the.bound)
+                {
+                    let consequent_owned = self.dynamic_owned_condition(&branch.consequent);
+                    let alternate_owned = self.dynamic_owned_condition(&branch.alternate);
+                    if consequent_owned.is_some() || alternate_owned.is_some() {
+                        let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+                        write!(code, "Value l{level}; bool _own{id}; if (as_bool(")?;
+                        self.compile_expr(&branch.predicate, code)?;
+                        write!(code, ")) {{ l{level} = ")?;
+                        self.compile_expr(&branch.consequent, code)?;
+                        write!(
+                            code,
+                            "; _own{id} = {}; }} else {{ l{level} = ",
+                            consequent_owned.as_deref().unwrap_or("false")
+                        )?;
+                        self.compile_expr(&branch.alternate, code)?;
+                        write!(
+                            code,
+                            "; _own{id} = {}; }} ",
+                            alternate_owned.as_deref().unwrap_or("false")
+                        )?;
+                        let previous_dynamic = Self::install_dynamic_owned_spine_locals([(
+                            *level,
+                            format!("_own{id}"),
+                        )]);
+                        let result = self.compile_tail(target, arity, &the.body, code);
+                        Self::restore_dynamic_owned_spine_locals(previous_dynamic);
+                        return result;
+                    }
+                }
                 write!(code, "Value l{level} = ")?;
                 self.compile_expr(&the.bound, code)?;
                 write!(code, "; ")?;
-                self.compile_tail(target, arity, &the.body, code)
+                let dynamic_bound = (Self::max_local_uses_per_path(&the.body, *level) <= 1)
+                    .then(|| self.dynamic_owned_condition(&the.bound))
+                    .flatten()
+                    .filter(|condition| condition != "true");
+                if let Some(condition) = dynamic_bound {
+                    let id = MATCH_ID.fetch_add(1, Ordering::Relaxed);
+                    write!(code, "bool _own{id} = {condition}; ")?;
+                    let previous_dynamic =
+                        Self::install_dynamic_owned_spine_locals([(*level, format!("_own{id}"))]);
+                    let result = self.compile_tail(target, arity, &the.body, code);
+                    Self::restore_dynamic_owned_spine_locals(previous_dynamic);
+                    result
+                } else {
+                    self.compile_tail(target, arity, &the.body, code)
+                }
             }
 
             Expr::Sequence(_, the) => {
@@ -6516,6 +10197,104 @@ impl lambda_lift::Program {
                     return write!(code, " }}");
                 }
 
+                // Tail-position counterpart of the tuple producer/consumer fusion
+                // in `compile_deconstruct`.
+                if let Expr::Tuple(_, tuple) = strip_ascription(&the.scrutinee)
+                    && !tuple.elements.is_empty()
+                {
+                    let locals = (0..tuple.elements.len())
+                        .map(|index| format!("_tscrut{id}_{index}"))
+                        .collect::<Vec<_>>();
+                    if let Some(plans) = self.plan_direct_tuple_match(&the.match_clauses, &locals) {
+                        write!(code, "{{ ")?;
+                        for (local, element) in locals.iter().zip(&tuple.elements) {
+                            write!(code, "Value {local} = ")?;
+                            self.compile_expr(element, code)?;
+                            write!(code, "; ")?;
+                        }
+                        let mut first = true;
+                        let mut exhaustive = false;
+                        for (clause, (tests, binds)) in the.match_clauses.iter().zip(&plans) {
+                            if !first {
+                                write!(code, " else ")?;
+                            }
+                            first = false;
+                            if tests.is_empty() {
+                                write!(code, "{{ ")?;
+                                exhaustive = true;
+                            } else {
+                                write!(code, "if ({}) {{ ", tests.join(" && "))?;
+                            }
+                            for (level, path) in binds {
+                                write!(code, "Value l{level} = {path}; ")?;
+                            }
+                            self.compile_tail(target, arity, &clause.consequent, code)?;
+                            write!(code, " }}")?;
+                            if exhaustive {
+                                break;
+                            }
+                        }
+                        if !exhaustive {
+                            write!(code, " else {{ match_fail(); }}")?;
+                        }
+                        return write!(code, " }}");
+                    }
+                }
+
+                // Tail-position counterpart of generic constructor scalar
+                // replacement in `compile_deconstruct`.
+                if let Some((constructor, arguments)) =
+                    Self::constructor_application(&the.scrutinee)
+                    && !arguments.is_empty()
+                    && self.constructor_tags.contains_key(constructor)
+                    && !self.newtype_constructors.contains(constructor)
+                {
+                    let locals = (0..arguments.len())
+                        .map(|index| format!("_tcscrut{id}_{index}"))
+                        .collect::<Vec<_>>();
+                    if let Some(plans) =
+                        self.plan_direct_constructor_match(constructor, &the.match_clauses, &locals)
+                    {
+                        write!(code, "{{ ")?;
+                        for (local, argument) in locals.iter().zip(&arguments) {
+                            write!(code, "Value {local} = ")?;
+                            self.compile_expr(argument, code)?;
+                            write!(code, "; ")?;
+                        }
+                        let mut first = true;
+                        let mut exhaustive = false;
+                        for (clause, plan) in the.match_clauses.iter().zip(&plans) {
+                            let Some((tests, binds)) = plan else {
+                                continue;
+                            };
+                            if !first {
+                                write!(code, " else ")?;
+                            }
+                            first = false;
+                            if tests.is_empty() {
+                                write!(code, "{{ ")?;
+                                exhaustive = true;
+                            } else {
+                                write!(code, "if ({}) {{ ", tests.join(" && "))?;
+                            }
+                            for (level, path) in binds {
+                                write!(code, "Value l{level} = {path}; ")?;
+                            }
+                            self.compile_tail(target, arity, &clause.consequent, code)?;
+                            write!(code, " }}")?;
+                            if exhaustive {
+                                break;
+                            }
+                        }
+                        if first {
+                            write!(code, "match_fail();")?;
+                        } else if !exhaustive {
+                            write!(code, " else {{ match_fail(); }}")?;
+                        }
+                        return write!(code, " }}");
+                    }
+                }
+
                 let scrutinee = format!("_scrut{id}");
                 write!(code, "{{ Value {scrutinee} = ")?;
                 self.compile_expr(&the.scrutinee, code)?;
@@ -6575,20 +10354,54 @@ impl lambda_lift::Program {
                 let escape = BORROWED_SLICE_PLACES.with(|places| !places.borrow().is_empty());
                 write!(code, "{{ ")?;
                 for (i, arg) in args.iter().enumerate() {
+                    let dynamic_target = DYNAMIC_OWNED_SPINE_LOCALS
+                        .with(|current| current.borrow().get(&i).cloned());
+                    let dynamic_result = dynamic_target.as_ref().map(|_| {
+                        self.dynamic_owned_condition(arg)
+                            .unwrap_or_else(|| "false".into())
+                    });
                     write!(code, "Value _a{id}_{i} = ")?;
                     if escape {
                         write!(code, "gc_escape_borrowed(")?;
                     }
-                    self.compile_expr(arg, code)?;
+                    let last_use = TAIL_BACKEDGE_OWNED_LOCALS.with(|owned| {
+                        owned
+                            .borrow()
+                            .iter()
+                            .copied()
+                            .filter(|level| {
+                                Self::local_use_count(arg, *level) != 0
+                                    && args[i + 1..]
+                                        .iter()
+                                        .all(|later| Self::local_use_count(later, *level) == 0)
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    let previous_owned = Self::install_owned_spine_locals(last_use);
+                    let result = self.compile_expr(arg, code);
+                    Self::restore_owned_spine_locals(previous_owned);
+                    result?;
                     if escape {
                         write!(code, ")")?;
                     }
                     write!(code, "; ")?;
+                    if let Some(condition) = dynamic_result {
+                        write!(code, "bool _ao{id}_{i} = {condition}; ")?;
+                    }
                 }
                 for i in 0..arity {
                     write!(code, "l{i} = _a{id}_{i}; ")?;
+                    if let Some(flag) =
+                        DYNAMIC_OWNED_SPINE_LOCALS.with(|current| current.borrow().get(&i).cloned())
+                    {
+                        write!(code, "{flag} = _ao{id}_{i}; ")?;
+                    }
                 }
-                write!(code, "continue; }}")
+                if let Some(label) = TAIL_BACKEDGE_LABEL.with(|current| current.borrow().clone()) {
+                    write!(code, "goto {label}; }}")
+                } else {
+                    write!(code, "continue; }}")
+                }
             }
 
             _ => {

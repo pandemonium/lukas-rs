@@ -48,6 +48,9 @@ typedef struct GcHeader {
   uint8_t ctag;
 } GcHeader;
 
+_Static_assert(sizeof(GcHeader) % MARM_VALUE_ALIGNMENT == 0,
+               "a header must preserve Value body-pointer alignment");
+
 #define BODY(h) ((void *)((h) + 1))
 #define HEADER(p) (((GcHeader *)(p)) - 1)
 
@@ -86,11 +89,35 @@ typedef struct {
 #define STATIC_CLOSURE0(code_fn, worker_fn, arity_n)                           \
   ({                                                                           \
     static const ClosureDesc __d = {(code_fn), (worker_fn), (arity_n)};        \
-    static const struct {                                                      \
+    _Alignas(MARM_VALUE_ALIGNMENT) static const struct {                       \
       GcHeader gch;                                                            \
       const ClosureDesc *desc;                                                 \
     } __sc = {{sizeof(Closure), 0, OBJ_CLOSURE, MARM_ETERNAL}, &__d};          \
     VObject((void *)&__sc.desc);                                               \
+  })
+
+#define STATIC_CLOSURE0_OWNED(code_fn, worker_fn, arity_n, owned_worker_fn)    \
+  ({                                                                           \
+    static const ClosureDesc __d = {                                            \
+        (code_fn), (worker_fn), (arity_n), (owned_worker_fn)};                 \
+    _Alignas(MARM_VALUE_ALIGNMENT) static const struct {                        \
+      GcHeader gch;                                                             \
+      const ClosureDesc *desc;                                                  \
+    } __sc = {{sizeof(Closure), 0, OBJ_CLOSURE, MARM_ETERNAL}, &__d};           \
+    VObject((void *)&__sc.desc);                                                \
+  })
+
+#define STATIC_CLOSURE0_OWNED_DATA(code_fn, worker_fn, arity_n,                \
+                                   owned_worker_fn, owned_data_worker_fn)       \
+  ({                                                                            \
+    static const ClosureDesc __d = {                                             \
+        (code_fn), (worker_fn), (arity_n), (owned_worker_fn),                    \
+        (owned_data_worker_fn)};                                                  \
+    _Alignas(MARM_VALUE_ALIGNMENT) static const struct {                         \
+      GcHeader gch;                                                              \
+      const ClosureDesc *desc;                                                   \
+    } __sc = {{sizeof(Closure), 0, OBJ_CLOSURE, MARM_ETERNAL}, &__d};            \
+    VObject((void *)&__sc.desc);                                                 \
   })
 
 // A nullary constructor (a sum-type tag with no fields) is identical and
@@ -105,13 +132,13 @@ typedef struct {
 // fields) -- `data_len` recovers 0 and the tracer visits nothing. The body
 // pointer is just past the 8-byte header, which is what `data_tag` reads back
 // (via `HEADER(...)->ctag`).
-// `_Alignas(16)`: this struct is only a GcHeader (4-byte alignment), but every
-// object body must be 8-aligned like the heap allocator's -- the tagged-value
-// representation reserves the low bits of a pointer, so a body must never carry
-// spare low bits. Heap bodies get this from `gc_new`; this static forces it.
+// This struct is only a GcHeader (4-byte natural alignment on wasm32), but every
+// object body must obey MARM_VALUE_ALIGNMENT like the heap allocator's: the
+// tagged-value representation reserves its low bits. Heap bodies get this from
+// `gc_new`; this static forces it.
 #define STATIC_DATA0(tagv)                                                     \
   ({                                                                           \
-    _Alignas(16) static const struct {                                         \
+    _Alignas(MARM_VALUE_ALIGNMENT) static const struct {                       \
       GcHeader gch;                                                            \
     } __sd = {{0, 0, OBJ_DATA, MARM_ETERNAL, (tagv)}};                         \
     VObject((void *)((const char *)&__sd + sizeof(GcHeader)));                 \
@@ -126,7 +153,7 @@ typedef struct {
 // pointer (past the 8-byte header).
 #define STATIC_FLOAT(x)                                                        \
   ({                                                                           \
-    static const struct {                                                      \
+    _Alignas(MARM_VALUE_ALIGNMENT) static const struct {                       \
       GcHeader gch;                                                            \
       double f;                                                                \
     } __sf = {{sizeof(double), 0, OBJ_FLOAT, MARM_ETERNAL}, (x)};              \
@@ -141,7 +168,7 @@ Value perhaps_nope();
 
 // Heap constructors (GC-managed). A lifted function is `Value code(Value self,
 // Value arg)`; a closure stores a pointer to its shared static `ClosureDesc`
-// (`code`/`worker`/`arity`, see runtime.h) plus its `nfree` captured values
+// (see runtime.h) plus its `nfree` captured values
 // inline (passed variadically, like `mk_tuple`).
 Value mk_closure_dn(const ClosureDesc *desc, size_t nfree, ...);
 // Compatibility builders (code/worker/arity instead of a static descriptor) for
@@ -152,6 +179,16 @@ Value mk_closure_n(Value (*code)(Value, Value), Value (*worker)(Value, Value *),
                    size_t arity, size_t nfree, ...);
 Value mk_tuple(size_t len, ...);
 Value mk_tuple_uninit(size_t len);
+Value reuse_owned_tuple(Value owned, size_t len, const Value *elements);
+Value reuse_owned_tuple_from(Value owned, Value result);
+Value reuse_owned_tuple1(Value owned, Value e0);
+Value reuse_owned_tuple2(Value owned, Value e0, Value e1);
+Value reuse_owned_tuple3(Value owned, Value e0, Value e1, Value e2);
+Value reuse_owned_tuple4(Value owned, Value e0, Value e1, Value e2, Value e3);
+Value reuse_owned_data1(Value owned, uint64_t tag, Value e0);
+Value reuse_owned_data2(Value owned, uint64_t tag, Value e0, Value e1);
+Value reuse_owned_data3(Value owned, uint64_t tag, Value e0, Value e1, Value e2);
+Value reuse_owned_data4(Value owned, uint64_t tag, Value e0, Value e1, Value e2, Value e3);
 
 // Flat mutable arrays: one heap object holding all `count` elements' leaves
 // inline, so an array of nested products is a single GC object (see the
@@ -232,6 +269,11 @@ Value mk_data1(uint64_t tag, Value f0);
 Value mk_data2(uint64_t tag, Value f0, Value f1);
 Value mk_data3(uint64_t tag, Value f0, Value f1, Value f2);
 Value mk_data4(uint64_t tag, Value f0, Value f1, Value f2, Value f3);
+// Rewire an exclusively owned one-recursive-field constructor spine. Codegen
+// emits this only after matching the typed recursive transformation semantics.
+Value reverse_constructor_spine_owned(Value input, Value seed,
+                                      uint64_t step_tag, uint64_t end_tag,
+                                      size_t next_field);
 Value mk_tuple0(void);
 Value mk_tuple1(Value e0);
 Value mk_tuple2(Value e0, Value e1);
@@ -320,10 +362,10 @@ Value mk_slice(void *owner, size_t offset, size_t len);
 // liveness link (see the `Slice` comment); `base` must point into whatever it
 // keeps alive.
 Value mk_slice_at(void *owner, const uint8_t *base, size_t len);
-// Compiler-side partial escape analysis uses a reusable stack `Slice` on the hot
-// path. The tagged Value remains readable by all ordinary slice primitives, but
-// must pass through `gc_escape_borrowed` before reaching the heap or outliving the
-// generated loop frame.
+// Compiler-side partial escape analysis uses reusable stack objects on hot paths
+// (currently Slice descriptors and virtual tuples). The tagged Value remains
+// readable by ordinary type-directed accessors, but must pass through
+// `gc_escape_borrowed` before reaching the heap or outliving its generated frame.
 static inline Value slice_sub_borrowed(Value parent, size_t offset, size_t len,
                                        Slice *slot) {
   const Slice *source = (const Slice *)as_ptr(parent);
@@ -337,6 +379,63 @@ static inline Value gc_escape_borrowed(Value value) {
   return __builtin_expect(!is_borrowed(value), 1)
              ? value
              : gc_materialize_borrowed(value);
+}
+
+// Generated ownership-specialized workers use this header-inline path: the
+// overwhelmingly common young-node replacement is a handful of stores with no
+// cross-translation-unit call. Only a tenured node enters the remembered-set
+// slow path. The public out-of-line helpers remain for runtime clients.
+extern bool marm_gc_alloc_stats;
+extern unsigned long long marm_owned_data_reuses;
+void gc_remember_old_mutation(void *body);
+static inline Value reuse_owned_data_fast(Value owned, uint64_t tag, size_t len,
+                                          const Value *fields) {
+  if (__builtin_expect(marm_gc_alloc_stats, 0)) marm_owned_data_reuses++;
+  Data *data = as_data(owned);
+  HEADER(data)->ctag = (uint8_t)tag;
+  for (size_t i = 0; i < len; i++) data->fields[i] = gc_escape_borrowed(fields[i]);
+  if (__builtin_expect(HEADER(data)->old == 1, 0)) gc_remember_old_mutation(data);
+  return owned;
+}
+static inline Value reuse_owned_data1_fast(Value owned, uint64_t tag, Value e0) {
+  return reuse_owned_data_fast(owned, tag, 1, (Value[]){e0});
+}
+static inline Value reuse_owned_data2_fast(Value owned, uint64_t tag, Value e0, Value e1) {
+  return reuse_owned_data_fast(owned, tag, 2, (Value[]){e0, e1});
+}
+static inline Value reuse_owned_data3_fast(Value owned, uint64_t tag, Value e0, Value e1,
+                                           Value e2) {
+  return reuse_owned_data_fast(owned, tag, 3, (Value[]){e0, e1, e2});
+}
+static inline Value reuse_owned_data4_fast(Value owned, uint64_t tag, Value e0, Value e1,
+                                           Value e2, Value e3) {
+  return reuse_owned_data_fast(owned, tag, 4, (Value[]){e0, e1, e2, e3});
+}
+static inline void set_owned_data_field_fast(Value owned, size_t index, Value field) {
+  Data *data = as_data(owned);
+  field = gc_escape_borrowed(field);
+  if (data->fields[index].w == field.w) return;
+  data->fields[index] = field;
+  if (__builtin_expect(HEADER(data)->old == 1, 0)) gc_remember_old_mutation(data);
+}
+static inline Value reuse_owned_tuple_fast(Value owned, size_t len, const Value *elements) {
+  Tuple *tuple = as_tuple(owned);
+  for (size_t i = 0; i < len; i++) tuple->elems[i] = gc_escape_borrowed(elements[i]);
+  if (__builtin_expect(HEADER(tuple)->old == 1, 0)) gc_remember_old_mutation(tuple);
+  return owned;
+}
+static inline Value reuse_owned_tuple1_fast(Value owned, Value e0) {
+  return reuse_owned_tuple_fast(owned, 1, (Value[]){e0});
+}
+static inline Value reuse_owned_tuple2_fast(Value owned, Value e0, Value e1) {
+  return reuse_owned_tuple_fast(owned, 2, (Value[]){e0, e1});
+}
+static inline Value reuse_owned_tuple3_fast(Value owned, Value e0, Value e1, Value e2) {
+  return reuse_owned_tuple_fast(owned, 3, (Value[]){e0, e1, e2});
+}
+static inline Value reuse_owned_tuple4_fast(Value owned, Value e0, Value e1, Value e2,
+                                            Value e3) {
+  return reuse_owned_tuple_fast(owned, 4, (Value[]){e0, e1, e2, e3});
 }
 
 // The hot accessors. Each is a single load because the base pointer was resolved

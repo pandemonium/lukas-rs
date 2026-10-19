@@ -17,14 +17,21 @@ static Value captured(Value self, Value ignored) {
     return env_get(self, 0);
 }
 
+static void assert_ordinary_pointer(Value value) {
+    assert((value.w & (MARM_VALUE_ALIGNMENT - 1)) == 0);
+    assert(!is_borrowed(value));
+}
+
 int main(void) {
     int stack_bottom;
     gc_init(&stack_bottom);
     runtime_init();
 
     Value owner = mk_text("abcdef");
-    Slice slot;
+    _Alignas(MARM_VALUE_ALIGNMENT) Slice slot;
     Value borrowed = slice_sub_borrowed(owner, 1, 3, &slot);
+    assert(((uintptr_t)&slot & (MARM_VALUE_ALIGNMENT - 1)) == 0);
+    assert(as_ptr(borrowed) == &slot);
     assert(is_borrowed(borrowed));
     assert(slice_len(borrowed) == 3);
     assert(memcmp(slice_ptr(borrowed), "bcd", 3) == 0);
@@ -49,6 +56,24 @@ int main(void) {
     assert(!is_borrowed(capture));
     assert(as_bool(prim_text_eq(capture, ordinary)));
 
+    Value static_closure = STATIC_CLOSURE0(captured, NULL, 1);
+    Value static_data = STATIC_DATA0(0);
+    Value static_float = STATIC_FLOAT(1.0);
+    assert_ordinary_pointer(static_closure);
+    assert_ordinary_pointer(static_data);
+    assert_ordinary_pointer(static_float);
+
+    _Alignas(MARM_VALUE_ALIGNMENT) struct {
+        GcHeader gch;
+        Value elems[1];
+    } tuple_slot = {{sizeof(Value), 0, OBJ_TUPLE, MARM_ETERNAL, 0}, {VInt(7)}};
+    Value borrowed_tuple = VBorrowedTuple(tuple_slot.elems);
+    assert(as_tuple(borrowed_tuple) == (Tuple *)tuple_slot.elems);
+    assert(is_borrowed_tuple(borrowed_tuple));
+    Value escaped_tuple = gc_escape_borrowed(borrowed_tuple);
+    assert(!is_borrowed(escaped_tuple));
+    assert(as_int(proj(escaped_tuple, 0)) == 7);
+
     Value elements[] = {borrowed};
     Value array = mk_flat_array_from(1, elements);
     Value array_child = flat_array_get_word(array, 0, 0);
@@ -62,7 +87,7 @@ int main(void) {
 
     // The backing object is reachable only through the stack descriptor when
     // the escape barrier triggers its stress collection.
-    Slice temporary_slot;
+    _Alignas(MARM_VALUE_ALIGNMENT) Slice temporary_slot;
     Value temporary = slice_sub_borrowed(mk_text("xyz"), 1, 2, &temporary_slot);
     Value escaped = mk_tuple1(temporary);
     assert(memcmp(slice_ptr(proj(escaped, 0)), "yz", 2) == 0);

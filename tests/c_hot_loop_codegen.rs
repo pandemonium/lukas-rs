@@ -112,7 +112,10 @@ start := λ_. hot 2 0
     assert!(!allocating.contains("_poll"), "{allocating}");
 
     let borrowed = generated_function(&generated, "Root_borrow_hot_worker");
-    assert!(borrowed.contains("Slice _bs"), "{borrowed}");
+    assert!(
+        borrowed.contains("_Alignas(MARM_VALUE_ALIGNMENT) Slice _bs"),
+        "a borrowed Slice slot did not enforce the tagged-pointer alignment: {borrowed}"
+    );
     assert!(borrowed.contains("slice_sub_borrowed"), "{borrowed}");
     assert!(borrowed.contains("gc_escape_borrowed"), "{borrowed}");
     assert!(

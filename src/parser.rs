@@ -1183,7 +1183,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse the optional capability set in
-    /// `foreign [ Browser; Dom ] document_title :: Unit -> Text`.
+    /// `foreign [ Socket; Timer ] wait_for_socket :: Unit -> Unit`.
     ///
     /// This syntax is deliberately confined to foreign *values*. The caller
     /// diagnoses a following foreign type after it has seen whether `::` exists.
@@ -3628,7 +3628,7 @@ mod tests {
     #[test]
     fn parses_requirements_on_foreign_values() {
         let source = concat!(
-            "foreign [ Browser; Platform.Dom ] document_title :: Unit -> Text\n",
+            "foreign [ Socket; Platform.Timer ] wait_for_socket :: Unit -> Unit\n",
             "foreign parse_int :: Text -> Int\n",
         );
         let characters = source.chars().collect::<Vec<_>>();
@@ -3638,20 +3638,20 @@ mod tests {
             .parse_declaration_list()
             .expect("foreign values parse");
 
-        let Declaration::Foreign(_, document_title) = &declarations[0] else {
+        let Declaration::Foreign(_, wait_for_socket) = &declarations[0] else {
             panic!("expected a foreign value");
         };
         assert_eq!(
-            document_title
+            wait_for_socket
                 .requirements
                 .iter()
                 .map(|requirement| requirement.name.to_string())
                 .collect::<Vec<_>>(),
-            ["Browser", "Platform.Dom"]
+            ["Socket", "Platform.Timer"]
         );
         assert_eq!(
             declarations[0].to_string(),
-            "foreign [ Browser; Platform.Dom ] document_title :: (Unit -> Text)"
+            "foreign [ Socket; Platform.Timer ] wait_for_socket :: (Unit -> Unit)"
         );
 
         let Declaration::Foreign(_, parse_int) = &declarations[1] else {

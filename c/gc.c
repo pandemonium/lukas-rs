@@ -601,6 +601,8 @@ static void gc_remember_object(void *body) {
     ctx->rem[ctx->rem_len++] = (uintptr_t)body;
 }
 
+void gc_remember_old_mutation(void *body) { gc_remember_object(body); }
+
 // Fold every thread's buffer into the collector's set. Called with all mutators
 // parked. Duplicates across threads are harmless -- an entry is only ever used as
 // an extra tracing root.
@@ -697,7 +699,7 @@ static double gc_started = 0.0; // wall clock at gc_init
 // closures (bind continuations), and small data (Results), i.e. what struct-return
 // State + stack closures would remove. Gated: a single predictable branch off the hot
 // path, no effect unless MARM_ALLOC_STATS is set.
-static bool gc_alloc_stats = false;
+bool marm_gc_alloc_stats = false;
 // Is anyone going to READ the timing counters? Taking them is not free: two
 // `clock_gettime`s and an `atomic_fetch_add` on one shared cache line, on EVERY
 // allocation slow-path call -- roughly once per 32 KiB, from every thread at once.
@@ -706,6 +708,7 @@ static bool gc_alloc_stats = false;
 #define ALLOC_MAX_ARITY 16
 static unsigned long long alloc_hist_n[OBJ_KIND_COUNT][ALLOC_MAX_ARITY + 1];
 static unsigned long long alloc_hist_b[OBJ_KIND_COUNT][ALLOC_MAX_ARITY + 1];
+unsigned long long marm_owned_data_reuses = 0;
 static void alloc_record(ObjKind kind, size_t total) {
     size_t body = total - sizeof(GcHeader), arity = 0;
     switch (kind) {
@@ -1360,7 +1363,7 @@ void *gc_alloc_slow(size_t total, ObjKind kind) {
     h->mark = 0;
     h->kind = (uint8_t)kind;
     h->old = 0;
-    if (gc_alloc_stats) alloc_record(kind, total);
+    if (marm_gc_alloc_stats) alloc_record(kind, total);
     if (__builtin_expect(gc_timing, 0)) {
         unsigned long long slow_ns = (unsigned long long)((now() - slow_t0) * 1e9);
         unsigned long long collected_ns =
@@ -1496,7 +1499,7 @@ static inline MARM_GC_NONNULL MARM_GC_ALIGNED void *gc_new(size_t body, ObjKind 
         // One store initialises the whole 8-byte header (little-endian): body in
         // bytes 0-3, kind in byte 5, mark/old/pad zero. See the static_assert above.
         *(uint64_t *)h = (uint64_t)(total - sizeof(GcHeader)) | ((uint64_t)(uint8_t)kind << 40);
-        if (gc_alloc_stats) alloc_record(kind, total);
+        if (marm_gc_alloc_stats) alloc_record(kind, total);
         return BODY(h);
     }
     return gc_alloc_slow(total, kind);
@@ -1561,6 +1564,7 @@ static void alloc_report(void) {
             100.0 * (double)tup2 / (double)grand, 100.0 * (double)clos / (double)grand,
             100.0 * (double)dat / (double)grand,
             100.0 * (double)(tup2 + clos + dat) / (double)grand);
+    fprintf(stderr, "[alloc] owned data reuses: %llu\n", marm_owned_data_reuses);
 }
 
 // A thread makes itself known to the collector. Called by the thread itself at the
@@ -1668,7 +1672,7 @@ void gc_init(void *stack_bottom) {
     // fire every time instead.
     gc_stress = getenv("MARM_GC_STRESS") != NULL;
     gc_verify = getenv("MARM_GC_VERIFY") != NULL;
-    if (getenv("MARM_ALLOC_STATS")) { gc_alloc_stats = true; gc_timing = true; atexit(alloc_report); }
+    if (getenv("MARM_ALLOC_STATS")) { marm_gc_alloc_stats = true; gc_timing = true; atexit(alloc_report); }
     gc_on = true;
 }
 
@@ -1699,8 +1703,9 @@ Value mk_closure_dn(const ClosureDesc *desc, size_t nfree, ...) {
 // Compatibility path for callers that pass code/worker/arity directly rather than a
 // static descriptor: the runtime builtins and the `FOREIGN_DECL` companions. These
 // are few and mostly built once, so a tiny intern cache hands out ONE shared descriptor
-// per distinct (code, worker, arity) -- no per-call allocation, no leak. The
-// codegen-emitted hot path uses `mk_closure_d*` with its own static descriptors.
+// per distinct (code, worker, arity) -- no per-call allocation, no leak. These
+// compatibility descriptors have no owned-argument entry. The codegen-emitted
+// hot path uses `mk_closure_d*` with its own static descriptors.
 static ClosureDesc *intern_desc(Value (*code)(Value, Value),
                                 Value (*worker)(Value, Value *), size_t arity) {
     static ClosureDesc *cache[256];
@@ -1710,6 +1715,8 @@ static ClosureDesc *intern_desc(Value (*code)(Value, Value),
             return cache[i];
     ClosureDesc *d = malloc(sizeof *d); // one per distinct function; never freed
     d->code = code, d->worker = worker, d->arity = arity;
+    d->owned_last_worker = NULL;
+    d->owned_last_data_worker = NULL;
     if (ncache < sizeof cache / sizeof *cache) cache[ncache++] = d;
     return d;
 }
@@ -1768,6 +1775,88 @@ Value mk_tuple_uninit(size_t len) {
     size_t body = sizeof(Tuple) + len * sizeof(Value);
     Tuple *t = gc_new(body, OBJ_TUPLE);
     return VObject(t);
+}
+
+Value reuse_owned_tuple(Value owned, size_t len, const Value *elements) {
+    Tuple *tuple = as_tuple(owned);
+    assert(tuple_len(owned) == len);
+    for (size_t i = 0; i < len; i++) {
+        tuple->elems[i] = gc_escape_borrowed(elements[i]);
+    }
+    // A virtual tuple seed may live in a generated caller's stack frame. Its
+    // header is eternal so the collector never treats it as a heap allocation;
+    // its Value words are roots through the conservative stack scan.
+    if (len != 0 && HEADER(tuple)->old == 1) gc_remember_object(tuple);
+    return owned;
+}
+
+Value reuse_owned_tuple_from(Value owned, Value result) {
+    if (owned.w == result.w) return owned;
+    size_t len = tuple_len(owned);
+    assert(tuple_len(result) == len);
+    return reuse_owned_tuple(owned, len, as_tuple(result)->elems);
+}
+
+Value reuse_owned_tuple1(Value owned, Value e0) {
+    Tuple *tuple = as_tuple(owned);
+    tuple->elems[0] = gc_escape_borrowed(e0);
+    if (HEADER(tuple)->old == 1) gc_remember_object(tuple);
+    return owned;
+}
+
+Value reuse_owned_tuple2(Value owned, Value e0, Value e1) {
+    Tuple *tuple = as_tuple(owned);
+    e0 = gc_escape_borrowed(e0), e1 = gc_escape_borrowed(e1);
+    tuple->elems[0] = e0, tuple->elems[1] = e1;
+    if (HEADER(tuple)->old == 1) gc_remember_object(tuple);
+    return owned;
+}
+
+Value reuse_owned_tuple3(Value owned, Value e0, Value e1, Value e2) {
+    Tuple *tuple = as_tuple(owned);
+    e0 = gc_escape_borrowed(e0), e1 = gc_escape_borrowed(e1);
+    e2 = gc_escape_borrowed(e2);
+    tuple->elems[0] = e0, tuple->elems[1] = e1, tuple->elems[2] = e2;
+    if (HEADER(tuple)->old == 1) gc_remember_object(tuple);
+    return owned;
+}
+
+Value reuse_owned_tuple4(Value owned, Value e0, Value e1, Value e2, Value e3) {
+    Tuple *tuple = as_tuple(owned);
+    e0 = gc_escape_borrowed(e0), e1 = gc_escape_borrowed(e1);
+    e2 = gc_escape_borrowed(e2), e3 = gc_escape_borrowed(e3);
+    tuple->elems[0] = e0, tuple->elems[1] = e1;
+    tuple->elems[2] = e2, tuple->elems[3] = e3;
+    if (HEADER(tuple)->old == 1) gc_remember_object(tuple);
+    return owned;
+}
+
+static Value reuse_owned_data(Value owned, uint64_t tag, size_t len,
+                              const Value *fields) {
+    if (marm_gc_alloc_stats) marm_owned_data_reuses++;
+    Data *data = as_data(owned);
+    assert(data_len(owned) == len);
+    HEADER(data)->ctag = (uint8_t)tag;
+    for (size_t i = 0; i < len; i++)
+        data->fields[i] = gc_escape_borrowed(fields[i]);
+    if (HEADER(data)->old == 1) gc_remember_object(data);
+    return owned;
+}
+
+Value reuse_owned_data1(Value owned, uint64_t tag, Value e0) {
+    return reuse_owned_data(owned, tag, 1, (Value[]){e0});
+}
+
+Value reuse_owned_data2(Value owned, uint64_t tag, Value e0, Value e1) {
+    return reuse_owned_data(owned, tag, 2, (Value[]){e0, e1});
+}
+
+Value reuse_owned_data3(Value owned, uint64_t tag, Value e0, Value e1, Value e2) {
+    return reuse_owned_data(owned, tag, 3, (Value[]){e0, e1, e2});
+}
+
+Value reuse_owned_data4(Value owned, uint64_t tag, Value e0, Value e1, Value e2, Value e3) {
+    return reuse_owned_data(owned, tag, 4, (Value[]){e0, e1, e2, e3});
 }
 
 // ------------------------------------------------------------- flat arrays
@@ -2481,6 +2570,29 @@ Value mk_data4(uint64_t tag, Value f0, Value f1, Value f2, Value f3) {
     return VObject(d);
 }
 
+Value reverse_constructor_spine_owned(Value input, Value seed,
+                                      uint64_t step_tag, uint64_t end_tag,
+                                      size_t next_field) {
+    Value current = input;
+    Value reversed = seed;
+    unsigned poll = 4096;
+    while (data_tag(current) == step_tag) {
+        Data *node = as_data(current);
+        assert(next_field < data_len(current));
+        Value next = node->fields[next_field];
+        gc_remember_object(node);
+        node->fields[next_field] = reversed;
+        reversed = current;
+        current = next;
+        if (__builtin_expect(--poll == 0, 0)) {
+            poll = 4096;
+            gc_poll();
+        }
+    }
+    if (data_tag(current) != end_tag) return match_fail();
+    return reversed;
+}
+
 Value mk_tuple0(void) {
     Tuple *t = alloc_body(sizeof(Tuple), OBJ_TUPLE);
     return VObject(t);
@@ -2637,7 +2749,16 @@ Value mk_slice_at(void *owner, const uint8_t *base, size_t len) {
 
 Value gc_materialize_borrowed(Value value) {
     assert(is_borrowed(value));
-    // Copy the descriptor before allocating. Its owner remains an exact body
+    if (is_borrowed_tuple(value)) {
+        Tuple *source = as_tuple(value);
+        size_t len = tuple_len(value);
+        Tuple *copy = gc_new(sizeof(Tuple) + len * sizeof(Value), OBJ_TUPLE);
+        memset(copy->elems, 0, len * sizeof(Value));
+        for (size_t i = 0; i < len; i++)
+            copy->elems[i] = gc_escape_borrowed(source->elems[i]);
+        return VObject(copy);
+    }
+    // Copy the Slice descriptor before allocating. Its owner remains an exact body
     // pointer in this stack frame, so the conservative collector keeps it live
     // if materialisation itself triggers a collection.
     volatile Slice source = *(const Slice *)as_ptr(value);

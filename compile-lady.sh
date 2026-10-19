@@ -226,6 +226,13 @@ case "$BACKEND" in
           fi
         fi
         set -- "$@" "$foreign_c"
+        # A Wasm companion may keep its JavaScript beside it as `M.js`, an
+        # Emscripten library (`addToLibrary({...})`) defining the functions `M.c`
+        # declares extern. It rides along exactly when `M.c` is selected.
+        if { [ "$PROFILE" = wasm-browser ] || [ "$PROFILE" = wasm-node ]; } \
+          && [ -f "${foreign_c%.c}.js" ]; then
+          set -- "$@" --js-library "${foreign_c%.c}.js"
+        fi
       fi
     done < "$C_SOURCE_LIST"
     set -- "$@" "$ROOT_C"
@@ -244,6 +251,13 @@ case "$BACKEND" in
       WASM_CFLAGS=${WASM_CFLAGS:--O2 -flto}
       MODULE_JS="$WASM_DIR/marmelade.mjs"
       MODULE_WASM="$WASM_DIR/marmelade.wasm"
+
+      if [ "$PROFILE" = wasm-browser ] && [ -d "$SOURCE_PATH/browser" ]; then
+        for reserved_asset in marmelade.mjs marmelade.wasm root.generated.c; do
+          [ ! -e "$SOURCE_PATH/browser/$reserved_asset" ] \
+            || die "browser asset uses compiler-owned name: $reserved_asset"
+        done
+      fi
 
       command -v "$EMCC" >/dev/null 2>&1 \
         || die "Emscripten compiler not found: $EMCC"
@@ -265,8 +279,12 @@ case "$BACKEND" in
       fi
 
       if [ "$PROFILE" = wasm-browser ]; then
+        if [ -d "$SOURCE_PATH/browser" ]; then
+          cp -R "$SOURCE_PATH/browser/." "$WASM_DIR/"
+        fi
         INDEX_HTML="$WASM_DIR/index.html"
-        cat > "$INDEX_HTML" <<'EOF_HTML'
+        if [ ! -f "$SOURCE_PATH/browser/index.html" ]; then
+          cat > "$INDEX_HTML" <<'EOF_HTML'
 <!doctype html>
 <html lang="en">
 <meta charset="utf-8">
@@ -284,6 +302,8 @@ case "$BACKEND" in
 </script>
 </html>
 EOF_HTML
+        fi
+        [ -s "$INDEX_HTML" ] || die "browser entry page is empty: $INDEX_HTML"
       else
         NODE_RUNNER="$WASM_DIR/run.mjs"
         cat > "$NODE_RUNNER" <<'EOF_NODE'
