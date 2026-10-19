@@ -25,7 +25,11 @@ foreign [ Terminal ] raw_window_size     :: Unit -> Perhaps (Int, Int)
 
 (* ------------------------------------------------- wire bytes, as the protocols spell them *)
 escape_byte    :: Int := 0x1B
+bell_byte      :: Int := 0x07
+osc_byte       :: Int := 0x5D   (* the ] of `ESC ]` *)
+st_final_byte  :: Int := 0x5C   (* the \\ of `ESC \\` *)
 semicolon_byte :: Int := 0x3B   (* separates CSI parameters *)
+slash_byte     :: Int := 0x2F
 digit_low      :: Int := 0x30
 digit_high     :: Int := 0x39
 c0_limit       :: Int := 0x20   (* below this a byte is a C0 control *)
@@ -166,6 +170,11 @@ wait_ms :: Wait -> Int := λwait.
 (* Long enough for a real sequence to arrive, short enough not to be noticed. *)
 escape_timeout :: Wait := Milliseconds 25
 
+(* A terminal reply normally arrives as one write. This is deliberately longer than the
+   timeout used to distinguish a bare Escape key, while still bounding an unsupported
+   OSC colour query. *)
+colour_query_timeout :: Wait := Milliseconds 100
+
 
 (* The CONSOLE_* defines in Console.c. Above the byte range, so a byte can never be
    mistaken for a status.
@@ -188,6 +197,104 @@ read_byte_within :: Wait -> IO (Result Fault (Perhaps Int)) := λwait.
   IO.suspend (λ_. classify (raw_read_byte (wait_ms wait)))
 
 read_byte :: IO (Result Fault (Perhaps Int)) := read_byte_within Forever
+
+(* Colour queries are optional. Their read failures therefore mean "no answer", rather
+   than ending the Console program as a requested key or line would. *)
+read_colour_query_byte :: IO (Perhaps Int) :=
+  let* answer = read_byte_within colour_query_timeout in
+  deconstruct answer into
+    Return byte -> pure byte
+  | Fault _ -> pure Nope
+
+read_expected :: List Int -> IO Bool := λexpected.
+  deconstruct expected into
+    Nil -> pure true
+  | Cons wanted rest ->
+      let* actual = read_colour_query_byte in
+      deconstruct actual into
+        This byte -> if byte = wanted then read_expected rest else pure false
+      | Nope -> pure false
+
+hex_digit :: Int -> Perhaps Int := λbyte.
+  if byte >= digit_low and byte <= digit_high
+    then This (byte - digit_low)
+    else if byte >= 0x61 and byte <= 0x66
+      then This (byte - 0x61 + 10)
+      else if byte >= 0x41 and byte <= 0x46
+        then This (byte - 0x41 + 10)
+        else Nope
+
+(* XParseColor permits one to four hex digits per component. Scale whatever precision
+   the terminal returned to the eight-bit components carried by `Rgb`. *)
+scale_colour_component :: Int -> Int -> Perhaps Int := λvalue maximum.
+  if maximum = 0
+    then Nope
+    else This ((value * 255 + maximum / 2) / maximum)
+
+read_colour_component :: Int -> Int -> Int -> IO (Perhaps Int) := λterminator value maximum.
+  let* next = read_colour_query_byte in
+  deconstruct next into
+    Nope -> pure Nope
+  | This byte ->
+      if byte = terminator
+        then pure (scale_colour_component value maximum)
+        else
+          deconstruct hex_digit byte into
+            This digit ->
+              if maximum >= 0xFFFF
+                then pure Nope
+                else read_colour_component terminator (value * 16 + digit) (maximum * 16 + 15)
+          | Nope -> pure Nope
+
+(* The last component is followed by BEL or ST (`ESC \\`). *)
+read_last_colour_component :: Int -> Int -> IO (Perhaps Int) := λvalue maximum.
+  let* next = read_colour_query_byte in
+  deconstruct next into
+    Nope -> pure Nope
+  | This byte ->
+      if byte = bell_byte
+        then pure (scale_colour_component value maximum)
+        else if byte = escape_byte
+          then
+            let* final = read_colour_query_byte in
+            deconstruct final into
+              This ending ->
+                if ending = st_final_byte
+                  then pure (scale_colour_component value maximum)
+                  else pure Nope
+            | Nope -> pure Nope
+          else
+            deconstruct hex_digit byte into
+              This digit ->
+                if maximum >= 0xFFFF
+                  then pure Nope
+                  else read_last_colour_component (value * 16 + digit) (maximum * 16 + 15)
+            | Nope -> pure Nope
+
+(* A reply has the form `OSC 10;rgb:rrrr/gggg/bbbb ST` (11 for background). *)
+read_default_colour_reply :: Int -> IO (Perhaps Colour) := λcode.
+  let prefix =
+    from
+      [ escape_byte; osc_byte; digit_low + 1; digit_low + code - 10; semicolon_byte;
+        0x72; 0x67; 0x62; 0x3A
+      ]
+  in
+  let* matched = read_expected prefix in
+  if not matched
+    then pure Nope
+    else
+      let* red = read_colour_component slash_byte 0 0 in
+      deconstruct red into
+        Nope -> pure Nope
+      | This r ->
+          let* green = read_colour_component slash_byte 0 0 in
+          deconstruct green into
+            Nope -> pure Nope
+          | This g ->
+              let* blue = read_last_colour_component 0 0 in
+              deconstruct blue into
+                Nope -> pure Nope
+              | This b -> pure (This (Rgb r g b))
 
 
 (* A terminal can deliver bytes that are not UTF-8: a Latin-1 paste, an odd locale. *)
@@ -481,6 +588,9 @@ Echo ::= Show_Typing | Hide_Typing
 (* `before` is the text left of the cursor, most recent first. *)
 alias Line_State ::= (List Text, List Text)
 
+line_state :: Text -> Line_State := λtext.
+  (List.reverse (List.map (λcharacter. "`character`") (Text.to_list text)), Nil)
+
 edit :: Key -> Line_State -> Line_State := λkey (before, after).
   let unchanged = (before, after) in
   deconstruct key into
@@ -499,14 +609,16 @@ edit :: Key -> Line_State -> Line_State := λkey (before, after).
 (* A line editor for raw mode, where the driver supplies none. Every key redraws the whole
    line, so the prompt's width is never measured. Assumes one screen row and one column
    per Unicode scalar -- wrong for combining marks and for CJK or emoji. *)
-edit_line :: Echo -> Text -> IO (Result Fault (Perhaps Text)) := λecho prompt_text.
+edit_line :: Echo -> List Text -> Text -> IO (Result Fault (Perhaps Text)) := λecho history prompt_text.
   let whole = λ(before, after). List.append (List.reverse before) after in
   let shown = λ(before, after) content.
     deconstruct echo into
       Show_Typing -> "`List.concat_texts content``erase_to_end``cursor_left (List.length after)`"
     | Hide_Typing -> erase_to_end
   in
-  let step = λ(before, after).
+  (* `older` starts newest-first. `newer` holds the lines crossed while moving up,
+     including the unfinished draft, so Down restores it exactly. *)
+  let step = λ(before, after) older newer.
     let state = (before, after) in
     let content = whole state in
     let* _ = put "\r`prompt_text``shown state content`" in
@@ -524,9 +636,25 @@ edit_line :: Echo -> Text -> IO (Result Fault (Perhaps Text)) := λecho prompt_t
     | Return (This (Ctrl 'D')) ->
         deconstruct content into
           Nil -> pure (Return Nope)
-        | otherwise -> step state
-    | Return (This key) -> step (edit key state)
-  in step (Nil, Nil)
+        | otherwise -> step state older newer
+    | Return (This Up) ->
+        deconstruct older into
+          Nil -> step state older newer
+        | Cons previous rest -> step (line_state previous) rest (Cons (List.concat_texts content) newer)
+    | Return (This (Ctrl 'P')) ->
+        deconstruct older into
+          Nil -> step state older newer
+        | Cons previous rest -> step (line_state previous) rest (Cons (List.concat_texts content) newer)
+    | Return (This Down) ->
+        deconstruct newer into
+          Nil -> step state older newer
+        | Cons following rest -> step (line_state following) (Cons (List.concat_texts content) older) rest
+    | Return (This (Ctrl 'N')) ->
+        deconstruct newer into
+          Nil -> step state older newer
+        | Cons following rest -> step (line_state following) (Cons (List.concat_texts content) older) rest
+    | Return (This key) -> step (edit key state) older newer
+  in step (Nil, Nil) history Nil
 
 (* Negative `timeout_ms` blocks. *)
 next_key_within :: Wait -> IO (Result Fault (Perhaps Key)) := λwait.
@@ -575,11 +703,11 @@ write_control :: Screen_Control -> IO Unit := λcontrol.
 
 (* In COOKED mode the driver does the editing and the prompt is drawn once; in RAW mode
    `edit_line` supplies its own and redraws per key. *)
-prompt_line :: Markup -> IO (Result Fault (Perhaps Text)) := λquestion.
+prompt_line :: List Text -> Markup -> IO (Result Fault (Perhaps Text)) := λhistory question.
   let* drawn = rendered question in
   let* mode = IO.suspend (λ_. raw_mode_current ()) in
   if mode >= 0
-    then edit_line Show_Typing drawn
+    then edit_line Show_Typing history drawn
     else
       let* _ = put drawn in
       let* raw = IO.suspend (λ_. raw_read_line ()) in
@@ -599,7 +727,7 @@ prompt_line :: Markup -> IO (Result Fault (Perhaps Text)) := λquestion.
 masked_line :: Markup -> IO (Result Fault (Perhaps Text)) := λquestion.
   let* drawn = rendered question in
   let* entered = change_mode (Enter_Mode Cbreak) in
-  let* typed = edit_line Hide_Typing drawn in
+  let* typed = edit_line Hide_Typing Nil drawn in
   let* _ = if entered then change_mode Leave_Mode else pure false in
   pure typed
 
@@ -628,6 +756,30 @@ restore :: IO Unit :=
   flush
 
 colour_support :: IO Bool := IO.suspend (λ_. raw_supports_colour ())
+
+(* OSC 10 and 11 query the dynamic colours to which SGR 39 and 49 reset. Both input
+   and output must be the same usable terminal: the request is written to stdout and
+   its reply arrives on stdin. Cbreak makes the reply available byte by byte even when
+   the caller was in cooked mode. *)
+default_colour :: Int -> IO (Perhaps Colour) := λcode.
+  let* coloured = colour_support in
+  let* input_terminal = input_is_terminal in
+  if not coloured or not input_terminal
+    then pure Nope
+    else
+      let* entered = change_mode (Enter_Mode Cbreak) in
+      if not entered
+        then pure Nope
+        else
+          let terminator = "`Char.of_byte bell_byte`" in
+          let* _ = put "`escape`]`code`;?`terminator`" in
+          let* answer = read_default_colour_reply code in
+          let* _ = change_mode Leave_Mode in
+          pure answer
+
+default_text_colour :: IO (Perhaps Colour) := default_colour 10
+
+default_background_colour :: IO (Perhaps Colour) := default_colour 11
 
 input_is_terminal :: IO Bool := IO.suspend (λ_. raw_is_tty ())
 

@@ -46,6 +46,8 @@ Console_F ::= ∀β.
   | Read_Line Markup (Perhaps Text -> β)
   | Read_Line_Masked Markup (Perhaps Text -> β)
   | Query_Colour (Bool -> β)
+  | Query_Default_Text_Colour (Perhaps Colour -> β)
+  | Query_Default_Background_Colour (Perhaps Colour -> β)
   | Query_Terminal (Bool -> β)
   | Query_Size (Perhaps (Int, Int) -> β)
   | Lift (IO β)
@@ -60,6 +62,8 @@ witness Functor Console_F :=
       | Read_Line question receive -> Read_Line question (compose g receive)
       | Read_Line_Masked question receive -> Read_Line_Masked question (compose g receive)
       | Query_Colour receive -> Query_Colour (compose g receive)
+      | Query_Default_Text_Colour receive -> Query_Default_Text_Colour (compose g receive)
+      | Query_Default_Background_Colour receive -> Query_Default_Background_Colour (compose g receive)
       | Query_Terminal receive -> Query_Terminal (compose g receive)
       | Query_Size receive -> Query_Size (compose g receive)
       | Lift action -> Lift (fmap g action)
@@ -301,6 +305,15 @@ clear :: Console Unit :=
 (* Is standard OUTPUT a terminal that wants escapes: a tty, NO_COLOR unset, TERM not dumb. *)
 supports_colour :: Console Bool := lift_free (Query_Colour id)
 
+(* The terminal's default text/background colours, where it supports the xterm dynamic-
+   colour queries. A successful query is an `Rgb`; `Nope` covers redirected input or
+   output, disabled colour output, an unsupported query, a timeout, and a malformed reply. *)
+default_text_colour :: Console (Perhaps Colour) :=
+  lift_free (Query_Default_Text_Colour id)
+
+default_background_colour :: Console (Perhaps Colour) :=
+  lift_free (Query_Default_Background_Colour id)
+
 (* Is standard INPUT a terminal. *)
 is_tty :: Console Bool := lift_free (Query_Terminal id)
 
@@ -435,7 +448,14 @@ execute :: ∀α. Console α -> IO (Result Fault α) := λprogram.
    breaking, and there has never been anything for a caller to do about either. The
    ordinary outcomes -- no more input, the wait ran out -- are a `Nope` handed to the
    continuation like any other answer. *)
-interpret :: ∀α. Console α -> IO (Result Fault α) := λprogram.
+remember_line :: Text -> List Text -> List Text := λline history.
+  if Text.length line = 0 then history
+  else
+    deconstruct history into
+      Cons previous _ -> if line = previous then history else Cons line history
+    | Nil -> Cons line Nil
+
+interpret_with_history :: ∀α. List Text -> Console α -> IO (Result Fault α) := λhistory program.
   deconstruct program into
     (* Reached once per program, however deeply bound. *)
     Pure value ->
@@ -445,41 +465,51 @@ interpret :: ∀α. Console α -> IO (Result Fault α) := λprogram.
       deconstruct instruction into
         Write markup next ->
           let* _ = Terminal.write_markup markup in
-          interpret (next ())
+          interpret_with_history history (next ())
       | Screen control next ->
           let* _ = Terminal.write_control control in
-          interpret (next ())
+          interpret_with_history history (next ())
       | Mode change receive ->
           let* entered = Terminal.change_mode change in
-          interpret (receive entered)
+          interpret_with_history history (receive entered)
       (* Output is stdio-buffered; a read is the moment it must be on screen. *)
       | Read_Key wait receive ->
           let* _ = Terminal.flush in
           let* pressed = Terminal.next_key_within wait in
           deconstruct pressed into
             Fault reason -> pure (Fault reason)
-          | Return answer -> interpret (receive answer)
+          | Return answer -> interpret_with_history history (receive answer)
       | Read_Line question receive ->
           let* _ = Terminal.flush in
-          let* typed = Terminal.prompt_line question in
+          let* typed = Terminal.prompt_line history question in
           deconstruct typed into
             Fault reason -> pure (Fault reason)
-          | Return answer -> interpret (receive answer)
+          | Return (This line) ->
+              interpret_with_history (remember_line line history) (receive (This line))
+          | Return Nope -> interpret_with_history history (receive Nope)
       | Read_Line_Masked question receive ->
           let* _ = Terminal.flush in
           let* typed = Terminal.masked_line question in
           deconstruct typed into
             Fault reason -> pure (Fault reason)
-          | Return answer -> interpret (receive answer)
+          | Return answer -> interpret_with_history history (receive answer)
       | Query_Colour receive ->
           let* coloured = Terminal.colour_support in
-          interpret (receive coloured)
+          interpret_with_history history (receive coloured)
+      | Query_Default_Text_Colour receive ->
+          let* colour = Terminal.default_text_colour in
+          interpret_with_history history (receive colour)
+      | Query_Default_Background_Colour receive ->
+          let* colour = Terminal.default_background_colour in
+          interpret_with_history history (receive colour)
       | Query_Terminal receive ->
           let* terminal = Terminal.input_is_terminal in
-          interpret (receive terminal)
+          interpret_with_history history (receive terminal)
       | Query_Size receive ->
           let* measured = Terminal.window_size in
-          interpret (receive measured)
+          interpret_with_history history (receive measured)
       | Lift action ->
           let* next = action in
-          interpret next
+          interpret_with_history history next
+
+interpret :: ∀α. Console α -> IO (Result Fault α) := interpret_with_history Nil
