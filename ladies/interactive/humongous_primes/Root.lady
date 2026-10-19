@@ -1,0 +1,335 @@
+(* Interactive arbitrary-precision prime finder, implemented in Marmelade.
+   Big naturals are little-endian lists of base-1,000,000 limbs. *)
+use Stdlib.
+use Stdlib.Console.
+
+Base :: Int := 1000000
+Big ::= Big (List Int)
+
+module Big:
+  zero :: Big := Big (Cons 0 Nil)
+  one  :: Big := Big (Cons 1 Nil)
+
+  make :: List Int -> Big := λdigits.
+    let trim = λxs. deconstruct xs into Cons 0 rest -> trim rest | other -> other in
+    deconstruct trim (List.reverse digits) into
+      Nil -> zero
+    | kept -> Big (List.reverse kept)
+
+  from_int :: Int -> Big := λnumber.
+    let loop = λn. if n < Base then Cons n Nil else Cons (n % Base) (loop (n / Base)) in
+    Big (loop number)
+
+  is_zero :: Big -> Bool := λ(Big ds). deconstruct ds into Cons 0 Nil -> true | _ -> false
+  is_even :: Big -> Bool := λ(Big ds). deconstruct ds into Cons low _ -> low % 2 = 0 | Nil -> true
+
+  compare :: Big -> Big -> Ordering := λ(Big left) (Big right).
+    let ll = List.length left in let rl = List.length right in
+    if ll < rl then Less else if ll > rl then Greater else
+      let loop = λxs ys answer.
+        deconstruct xs, ys into
+          Cons x xt, Cons y yt -> loop xt yt (if x < y then Less else if x > y then Greater else answer)
+        | _ -> answer
+      in loop left right Equal
+
+  equal :: Big -> Big -> Bool := λa b. deconstruct compare a b into Equal -> true | _ -> false
+  less :: Big -> Big -> Bool := λa b. deconstruct compare a b into Less -> true | _ -> false
+  lte :: Big -> Big -> Bool := λa b. deconstruct compare a b into Greater -> false | _ -> true
+
+  add_digits :: List Int -> List Int -> Int -> List Int := λleft right carry.
+    deconstruct left, right into
+      Nil, Nil -> if carry = 0 then Nil else Cons carry Nil
+    | Cons x xs, Nil -> let t = x + carry in Cons (t % Base) (add_digits xs Nil (t / Base))
+    | Nil, Cons y ys -> let t = y + carry in Cons (t % Base) (add_digits Nil ys (t / Base))
+    | Cons x xs, Cons y ys -> let t = x + y + carry in Cons (t % Base) (add_digits xs ys (t / Base))
+
+  add :: Big -> Big -> Big := λ(Big a) (Big b). make (add_digits a b 0)
+  add_int :: Big -> Int -> Big := λa b. add a (from_int b)
+
+  sub_digits :: List Int -> List Int -> Int -> List Int := λleft right borrow.
+    deconstruct left, right into
+      Nil, _ -> Nil
+    | Cons x xs, Nil ->
+        let t = x - borrow in
+        if t < 0 then Cons (t + Base) (sub_digits xs Nil 1) else Cons t (sub_digits xs Nil 0)
+    | Cons x xs, Cons y ys ->
+        let t = x - y - borrow in
+        if t < 0 then Cons (t + Base) (sub_digits xs ys 1) else Cons t (sub_digits xs ys 0)
+
+  subtract :: Big -> Big -> Big := λ(Big a) (Big b). make (sub_digits a b 0)
+
+  mul_digit :: List Int -> Int -> Int -> List Int := λdigits by carry.
+    deconstruct digits into
+      Nil -> if carry = 0 then Nil else Cons (carry % Base) (mul_digit Nil 0 (carry / Base))
+    | Cons d rest -> let p = d * by + carry in Cons (p % Base) (mul_digit rest by (p / Base))
+
+  shift :: Int -> List Int -> List Int := λplaces digits. if places = 0 then digits else Cons 0 (shift (places - 1) digits)
+
+  multiply :: Big -> Big -> Big := λ(Big a) (Big b).
+    let loop = λdigits place total.
+      deconstruct digits into
+        Nil -> total
+      | Cons d rest -> loop rest (place + 1) (add total (make (shift place (mul_digit a d 0))))
+    in loop b 0 zero
+
+  halve :: Big -> Big := λ(Big digits).
+    let _, out =
+      List.fold_right
+        (λdigit (carry, quotient).
+          let n = carry * Base + digit in
+          n % 2, Cons (n / 2) quotient)
+        (0, Nil)
+        digits
+    in make out
+
+  mod_int :: Big -> Int -> Int := λ(Big digits) divisor.
+    List.fold_left (λremainder digit. (remainder * Base + digit) % divisor) 0 (List.reverse digits)
+
+  pow :: Big -> Int -> Big := λbase exponent.
+    let loop = λfactor power answer.
+      if power = 0 then answer else
+        let answer' = if power % 2 = 1 then multiply answer factor else answer in
+        loop (if power > 1 then multiply factor factor else factor) (power / 2) answer'
+    in loop base exponent one
+
+  pad :: Int -> Text := λn.
+    if n < 10 then "00000`n`" else if n < 100 then "0000`n`"
+    else if n < 1000 then "000`n`" else if n < 10000 then "00`n`"
+    else if n < 100000 then "0`n`" else "`n`"
+
+  text :: Big -> Text := λ(Big digits).
+    deconstruct List.reverse digits into
+      Nil -> "0"
+    | Cons first rest -> "`first``List.concat_texts (List.map pad rest)`"
+
+  small_int :: Big -> Perhaps Int := λ(Big digits).
+    deconstruct digits into Cons n Nil -> This n | _ -> Nope
+
+  add_mod :: Big -> Big -> Big -> Big := λa b modulus.
+    let sum = add a b in if less sum modulus then sum else subtract sum modulus
+
+  mul_mod :: Big -> Big -> Big -> Big := λa b modulus.
+    let loop = λfactor multiplier answer.
+      if is_zero multiplier then answer else
+        let answer' = if is_even multiplier then answer else add_mod answer factor modulus in
+        loop (add_mod factor factor modulus) (halve multiplier) answer'
+    in loop a b zero
+
+  pow_mod :: Big -> Big -> Big -> Big := λbase exponent modulus.
+    let loop = λfactor power answer.
+      if is_zero power then answer else
+        let answer' = if is_even power then answer else mul_mod answer factor modulus in
+        loop (mul_mod factor factor modulus) (halve power) answer'
+    in loop base exponent one
+
+Input ::= { Source :: Text; Position :: Int }
+
+module Input:
+  make :: Text -> Input := λsource. { Source := source; Position := 0 }
+  ended :: Input -> Bool := λinput. input.Position >= Text.length input.Source
+  peek :: Input -> Int := λinput. if ended input then -1 else Text.get input.Source input.Position
+  advance :: Input -> Input := λinput. { input: Position := input.Position + 1 }
+  spaces :: Input -> Input := λinput.
+    let b = peek input in
+    if b = 32 or b = 9 or b = 10 or b = 13 then spaces (advance input) else input
+  matches :: Text -> Input -> Int -> Bool := λword input offset.
+    if offset = Text.length word then true
+    else if input.Position + offset >= Text.length input.Source then false
+    else if Text.get word offset = Text.get input.Source (input.Position + offset)
+      then matches word input (offset + 1) else false
+  word :: Text -> Input -> Perhaps Input := λexpected input.
+    let start = spaces input in let width = Text.length expected in
+    if matches expected start 0 then
+      let finish = { start: Position := start.Position + width } in
+      let next = peek finish in
+      if (next >= 48 and next <= 57) or (next >= 65 and next <= 90) or (next >= 97 and next <= 122)
+      then Nope else This finish
+    else Nope
+
+Parsed ::= Parsed Input Big | Parse_Error Text
+
+precedence :: Int -> Int := λbyte.
+  if byte = 43 or byte = 45 then 10 else if byte = 42 then 20 else if byte = 94 then 30 else -1
+
+parse_expression :: Input -> Int -> Parsed := λinput minimum.
+  let start = Input.spaces input in
+  let primary =
+    if Input.peek start = 40 then
+      deconstruct parse_expression (Input.advance start) 0 into
+        Parse_Error message -> Parse_Error message
+      | Parsed remains value ->
+          let closing = Input.spaces remains in
+          if Input.peek closing = 41 then Parsed (Input.advance closing) value else Parse_Error "expected ')'"
+    else if Input.peek start = 77 then
+      let opening = Input.spaces (Input.advance start) in
+      if Input.peek opening = 40 then
+        deconstruct parse_expression (Input.advance opening) 0 into
+          Parse_Error message -> Parse_Error message
+        | Parsed remains exponent ->
+            let closing = Input.spaces remains in
+            if Input.peek closing = 41 then
+              deconstruct Big.small_int exponent into
+                Nope -> Parse_Error "the Mersenne exponent is too large"
+              | This power -> Parsed (Input.advance closing) (Big.subtract (Big.pow (Big.from_int 2) power) Big.one)
+            else Parse_Error "expected ')' after the Mersenne exponent"
+      else Parse_Error "expected '(' after M"
+    else
+      let digits = λstate value seen.
+        let byte = Input.peek state in
+        if byte >= 48 and byte <= 57 then
+          digits (Input.advance state) (Big.add_int (Big.multiply value (Big.from_int 10)) (byte - 48)) true
+        else if seen then Parsed state value else Parse_Error "expected a non-negative decimal integer"
+      in digits start Big.zero false
+  in
+  deconstruct primary into
+    Parse_Error message -> Parse_Error message
+  | Parsed remains first ->
+      let continue = λstate left.
+        let op_input = Input.spaces state in let op = Input.peek op_input in let p = precedence op in
+        if p < minimum then Parsed state left else
+          deconstruct parse_expression (Input.advance op_input) (if op = 94 then p else p + 1) into
+            Parse_Error message -> Parse_Error message
+          | Parsed after_right right ->
+              if op = 43 then continue after_right (Big.add left right)
+              else if op = 42 then continue after_right (Big.multiply left right)
+              else if op = 45 then
+                if Big.less left right then Parse_Error "negative integers are not supported"
+                else continue after_right (Big.subtract left right)
+              else deconstruct Big.small_int right into
+                Nope -> Parse_Error "an exponent is too large"
+              | This exponent -> continue after_right (Big.pow left exponent)
+      in continue remains first
+
+parse_all := λinput.
+  deconstruct parse_expression input 0 into
+    Parse_Error message -> Parse_Error message
+  | Parsed remains value ->
+      if Input.ended (Input.spaces remains) then Parsed remains value else Parse_Error "unexpected text after the expression"
+
+small_primes :: List Int := from [2;3;5;7;11;13;17;19;23;29;31;37;41;43;47;53;59;61;67;71;73;79;83;89;97]
+bases :: List Int := from [2;3;5;7;11;13;17;19;23]
+Small_Check ::= Known_Prime | Known_Composite | Needs_Rounds
+
+check_small :: Big -> List Int -> Small_Check := λnumber primes.
+  deconstruct primes into
+    Nil -> Needs_Rounds
+  | Cons prime rest ->
+      if Big.equal number (Big.from_int prime) then Known_Prime
+      else if Big.mod_int number prime = 0 then Known_Composite
+      else check_small number rest
+
+factor_twos :: Big -> (Int, Big) := λnumber.
+  let loop = λcount odd. if Big.is_even odd then loop (count + 1) (Big.halve odd) else count, odd in
+  loop 0 (Big.subtract number Big.one)
+
+square_to_minus_one :: Big -> Big -> Int -> Big -> Bool := λnumber minus_one remaining value.
+  if remaining = 0 then false else
+    let squared = Big.mul_mod value value number in
+    if Big.equal squared minus_one then true else if Big.equal squared Big.one then false
+    else square_to_minus_one number minus_one (remaining - 1) squared
+
+passes :: Big -> Int -> Big -> Int -> Bool := λnumber twos odd base.
+  let minus_one = Big.subtract number Big.one in
+  let value = Big.pow_mod (Big.from_int base) odd number in
+  if Big.equal value Big.one or Big.equal value minus_one then true
+  else square_to_minus_one number minus_one (twos - 1) value
+
+passes_all :: Big -> Int -> Big -> List Int -> Bool := λnumber twos odd witnesses.
+  deconstruct witnesses into
+    Nil -> true
+  | Cons base rest ->
+      if passes number twos odd base then passes_all number twos odd rest else false
+
+is_probable_prime :: Big -> Bool := λnumber.
+  if Big.less number (Big.from_int 2) then false else
+    deconstruct check_small number small_primes into
+      Known_Prime -> true
+    | Known_Composite -> false
+    | Needs_Rounds -> let twos, odd = factor_twos number in passes_all number twos odd bases
+
+find_prime :: Big -> Perhaps Big -> Perhaps Big := λlower upper.
+  if Big.lte lower (Big.from_int 2) then
+    deconstruct upper into This top -> if Big.less top (Big.from_int 2) then Nope else This (Big.from_int 2) | Nope -> This (Big.from_int 2)
+  else
+    let first = if Big.is_even lower then Big.add_int lower 1 else lower in
+    let search = λcandidate.
+      deconstruct upper into
+        This top -> if Big.less top candidate then Nope else if is_probable_prime candidate then This candidate else search (Big.add_int candidate 2)
+      | Nope -> if is_probable_prime candidate then This candidate else search (Big.add_int candidate 2)
+    in search first
+
+render :: Perhaps Big -> Text := λanswer. deconstruct answer into Nope -> "no probable prime in that range" | This p -> "probable prime: `Big.text p`"
+
+run_check :: Input -> Text := λrest.
+  deconstruct parse_all rest into
+    Parse_Error e -> "error: `e`"
+  | Parsed _ n -> if is_probable_prime n then "probable prime: `Big.text n`" else "composite: `Big.text n`"
+
+run_next :: Input -> Text := λrest.
+  deconstruct parse_all rest into
+    Parse_Error e -> "error: `e`"
+  | Parsed _ n -> render (find_prime n Nope)
+
+run_range :: Input -> Text := λrest.
+  deconstruct parse_expression rest 0 into
+    Parse_Error e -> "error: `e`"
+  | Parsed after_lower lower ->
+      deconstruct Input.word "and" after_lower into
+        Nope -> "error: expected 'and' between the range bounds"
+      | This after_and ->
+          deconstruct parse_all after_and into
+            Parse_Error e -> "error: `e`"
+          | Parsed _ upper ->
+              if Big.less upper lower then "error: the lower bound is greater than the upper bound"
+              else render (find_prime lower (This upper))
+
+run_digits :: Input -> Text := λrest.
+  deconstruct parse_expression rest 0 into
+    Parse_Error e -> "error: `e`"
+  | Parsed after_count count ->
+      deconstruct Input.word "digits" after_count, Big.small_int count into
+        This after_digits, This digits ->
+          if not (Input.ended (Input.spaces after_digits)) then "error: unexpected text after digits"
+          else if digits < 1 then "error: the digit count must be positive"
+          else
+            let lower = Big.pow (Big.from_int 10) (digits - 1) in
+            let upper = Big.subtract (Big.pow (Big.from_int 10) digits) Big.one in
+            render (find_prime lower (This upper))
+      | _ -> "error: expected a practical digit count followed by 'digits'"
+
+run_find :: Input -> Text := λrest.
+  deconstruct Input.word "between" rest into
+    This after_between -> run_range after_between
+  | Nope -> run_digits rest
+
+run_command :: Text -> Text := λcommand.
+  let input = Input.make command in
+  deconstruct Input.word "help" input into
+    This rest -> if Input.ended (Input.spaces rest) then "Commands:\n  check EXPR\n  next EXPR\n  find N digits\n  find between EXPR and EXPR\n  quit\nExpressions: decimal integers, (), +, -, *, ^, and M(n) = 2^n - 1." else "error: unexpected text after help"
+  | Nope ->
+      deconstruct Input.word "check" input into
+        This rest -> run_check rest
+      | Nope ->
+          deconstruct Input.word "next" input into
+            This rest -> run_next rest
+          | Nope ->
+              deconstruct Input.word "find" input into
+                This rest -> run_find rest
+              | Nope -> "error: unknown command; type help"
+
+wants_to_quit :: Text -> Bool := λcommand.
+  let input = Input.make command in
+  let complete = λword. deconstruct Input.word word input into This rest -> Input.ended (Input.spaces rest) | Nope -> false in
+  complete "quit" or complete "exit"
+
+repl :: Console Unit :=
+  let* entered = Console.prompt (Markup.text "prime> ") in
+  deconstruct entered into
+    Nope -> repl
+  | This command -> if wants_to_quit command then Console.write_plain_line "bye" else let* _ = Console.write_plain_line (run_command command) in repl
+
+welcome :: Console Unit :=
+  let* _ = Console.write_plain_line "Humongous prime finder (native backend, written in Marmelade)" in
+  let* _ = Console.write_plain_line "Type help for commands and expression syntax." in repl
+
+start :: Int -> Unit := λ_. IO.unsafe_run_IO (Console.run (Console.in_raw_mode welcome))
