@@ -85,6 +85,10 @@ module Char:
   of_byte :: Int -> Char := char_of_byte
 
 
+module Byte:
+  of_char :: Char -> Int := Int.of_char
+
+
 (* ---------------------------------------------------------------- core ADTs *)
 (* Types + eliminators only. Every typeclass WITNESS (Functor/Monad/Foldable/...) and    *)
 (* SIGNATURE lives in Stdlib -- these are dumb until you `use Stdlib`.                    *)
@@ -215,8 +219,15 @@ module Bytes:
   skip :: Bytes -> Int -> Bytes := λ(Bytes s) n.
     Bytes (raw_sub s n (raw_slice_len s - n))
 
-  take_while :: Bytes -> (Int -> Bool) -> Bytes := λbytes.
-    take_while' bytes 0
+  drop_while :: Bytes -> (Int -> Bool) -> Bytes := λbytes p.
+    let loop = λi.
+      if p (get_u8 bytes i)
+      then loop (1 + i)
+      else Bytes.slice bytes 0 i
+    in loop 0
+
+  take_while :: Bytes -> (Int -> Bool) -> Bytes :=
+    λbytes. take_while' bytes 0
 
   take_while' :: Bytes -> Int -> (Int -> Bool) -> Bytes := λbytes offset p.
     let loop = λi.

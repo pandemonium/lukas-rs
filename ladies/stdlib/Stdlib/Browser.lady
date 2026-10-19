@@ -1,0 +1,644 @@
+use Stdlib.Data.List.
+use Stdlib.Data.Array.
+use Stdlib.Data.Perhaps.
+use Stdlib.Control.
+
+(* A browser program is interpreted by this module.  Action and Hyper_Text are opaque:
+   applications can compose them through the public modules, but cannot inspect or
+   interpret either language themselves. *)
+
+Action_Runtime ::= ∀model.
+  { Dirty  :: Int
+    State  :: Int
+    Render :: model -> Unit
+  }
+
+opaque Action ::= ∀model α.
+  Make_Action (Action_Runtime model -> (α -> Unit) -> Unit)
+
+run_action :: ∀model α. Action_Runtime model -> Action model α -> (α -> Unit) -> Unit :=
+  λruntime (Make_Action action) continue. action runtime continue
+
+lift_action :: ∀model α. (Unit -> α) -> Action model α :=
+  λaction. Make_Action (λ_ continue. continue (action ()))
+
+witness ∀model. Functor (Action model) :=
+  { fmap := λf (Make_Action action).
+      Make_Action (λruntime continue.
+        action runtime (compose continue f))
+  }
+
+witness ∀model. Applicative (Action model) :=
+  { pure := λvalue. Make_Action (λ_ continue. continue value)
+    apply := λ(Make_Action functions) (Make_Action arguments).
+      Make_Action (λruntime continue.
+        functions runtime (λf.
+          arguments runtime (λargument.
+            continue (f argument))))
+  }
+
+witness ∀model. Monad (Action model) :=
+  { bind := λnext (Make_Action action).
+      Make_Action (λruntime continue.
+        action runtime (λvalue.
+          run_action runtime (next value) continue))
+  }
+
+foreign [ Browser ] raw_state_new :: ∀model. model -> Int
+foreign [ Browser ] raw_state_get :: ∀model. Int -> model
+foreign [ Browser ] raw_state_set :: ∀model. Int -> model -> Unit
+
+flush_action :: ∀model. Action_Runtime model -> Unit := λruntime.
+  if raw_state_get runtime.Dirty
+  then
+    let _ = raw_state_set runtime.Dirty false in
+    runtime.Render (raw_state_get runtime.State)
+  else ()
+
+suspend_action :: ∀model α. ((α -> Unit) -> Unit) -> Action model α := λstart.
+  Make_Action (λruntime continue.
+    let _ = flush_action runtime in
+    start continue)
+
+module Model:
+  read :: ∀model α. (model -> α) -> Action model α := λproject.
+    Make_Action (λ({ Dirty: _; State: state; Render: _ }) continue.
+      continue (project (raw_state_get state)))
+
+  get :: ∀model. Action model model :=
+    read id
+
+  modify :: ∀model. (model -> model) -> Action model Unit := λrevise.
+    Make_Action (λ({ Dirty: dirty; State: state; Render: _ }) continue.
+      let model = revise (raw_state_get state) in
+      let _ = raw_state_set state model in
+      let _ = raw_state_set dirty true in
+      continue ())
+
+  put :: ∀model. model -> Action model Unit := λmodel.
+    modify (λ_. model)
+
+
+(* -------------------------------------------------------------------- HTML *)
+
+(* Where a pointer event happened. X and Y are relative to the element carrying the
+   handler: CSS pixels from its top-left corner, or user units (its viewBox) when that
+   element is SVG -- so a scaled board answers in board coordinates. Button follows
+   the DOM: 0 left, 1 middle, 2 right, -1 none (a move with nothing pressed). *)
+Pointer ::=
+  { Button :: Int
+    Shift  :: Bool
+    X      :: Int
+    Y      :: Int
+  }
+
+(* A keyboard event. Key is the DOM's event.key ("a", "Escape", " "), Code the
+   layout-independent event.code ("KeyA"). *)
+Key ::=
+  { Code   :: Text
+    Ctrl   :: Bool
+    Key    :: Text
+    Repeat :: Bool
+    Shift  :: Bool
+  }
+
+Attribute ::= ∀message.
+  Plain_Attribute Text Text
+| Click_Attribute message
+| Input_Attribute (Text -> message)
+| Pointer_Attribute Text (Pointer -> message)
+| Signal_Attribute Text message
+
+Namespace ::= Html_Namespace | Svg_Namespace
+
+(* What `Lazy` compares: any value, reduced to its identity. Never inspected, only
+   handed to `raw_same`. *)
+Lazy_Key ::= Lazy_Key_Of Int
+
+opaque Hyper_Text ::= ∀message.
+  Text_Node Text
+| Element_Node Namespace Text (Array (Attribute message)) (Array (Hyper_Text message))
+| Keyed_Node Namespace Text (Array (Attribute message)) (Array (Text, Hyper_Text message))
+| Lazy_Node (Array Lazy_Key) (Unit -> Hyper_Text message)
+
+foreign [ Browser ] raw_erase :: ∀α. α -> Lazy_Key
+foreign [ Browser ] raw_same :: Lazy_Key -> Lazy_Key -> Bool
+
+style_text :: Array (Text, Text) -> Int -> Text -> Text := λdeclarations index sofar.
+  if index >= Array.length declarations
+  then sofar
+  else
+    deconstruct Array.get declarations index into
+      Nope -> sofar
+    | This (property, value) ->
+        style_text declarations (1 + index) "`sofar` `property`: `value`;"
+
+module Attribute:
+  named :: ∀message. Text -> Text -> Attribute message := Plain_Attribute
+  class_name :: ∀message. Text -> Attribute message := Plain_Attribute "class"
+  value :: ∀message. Text -> Attribute message := Plain_Attribute "value"
+  placeholder :: ∀message. Text -> Attribute message := Plain_Attribute "placeholder"
+  style :: ∀message. Array (Text, Text) -> Attribute message := λdeclarations.
+    Plain_Attribute "style" (style_text declarations 0 "")
+  on_click :: ∀message. message -> Attribute message := Click_Attribute
+  on_input :: ∀message. (Text -> message) -> Attribute message := Input_Attribute
+  on_pointer_down :: ∀message. (Pointer -> message) -> Attribute message := Pointer_Attribute "pointerdown"
+  on_pointer_up :: ∀message. (Pointer -> message) -> Attribute message := Pointer_Attribute "pointerup"
+  (* Coalesced: at most one per animation frame, carrying the latest position. *)
+  on_pointer_move :: ∀message. (Pointer -> message) -> Attribute message := Pointer_Attribute "pointermove"
+  on_pointer_leave :: ∀message. message -> Attribute message := Signal_Attribute "pointerleave"
+  (* Also suppresses the browser's own context menu on this element. *)
+  on_context_menu :: ∀message. message -> Attribute message := Signal_Attribute "contextmenu"
+
+module Html:
+  text :: ∀message. Text -> Hyper_Text message := Text_Node
+
+  element :: ∀message. Text -> Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Html_Namespace
+
+  div :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Html_Namespace "div"
+
+  section :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Html_Namespace "section"
+
+  h1 :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Html_Namespace "h1"
+
+  p :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Html_Namespace "p"
+
+  span :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Html_Namespace "span"
+
+  button :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Html_Namespace "button"
+
+  input :: ∀message. Array (Attribute message) -> Hyper_Text message := λattributes.
+    Element_Node Html_Namespace "input" attributes []
+
+  ul :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Html_Namespace "ul"
+
+  li :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Html_Namespace "li"
+
+(* SVG elements, created in the SVG namespace. Attributes go through
+   `Attribute.named` ("cx", "viewBox", "fill", ...); text content through `Html.text`. *)
+module Svg:
+  element :: ∀message. Text -> Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Svg_Namespace
+
+  svg :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Svg_Namespace "svg"
+
+  g :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Svg_Namespace "g"
+
+  rect :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Svg_Namespace "rect"
+
+  circle :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Svg_Namespace "circle"
+
+  ellipse :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Svg_Namespace "ellipse"
+
+  line :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Svg_Namespace "line"
+
+  polyline :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Svg_Namespace "polyline"
+
+  polygon :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Svg_Namespace "polygon"
+
+  path :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Svg_Namespace "path"
+
+  text :: ∀message. Array (Attribute message) -> Array (Hyper_Text message) -> Hyper_Text message :=
+    Element_Node Svg_Namespace "text"
+
+(* Children with identities. The DOM node for a key is kept, moved and patched
+   rather than the child list being matched by position -- so removing one item from
+   the middle touches one node, not every node after it. Keys are unique per parent. *)
+module Keyed:
+  node :: ∀message. Text -> Array (Attribute message) -> Array (Text, Hyper_Text message) -> Hyper_Text message :=
+    Keyed_Node Html_Namespace
+
+  ul :: ∀message. Array (Attribute message) -> Array (Text, Hyper_Text message) -> Hyper_Text message :=
+    Keyed_Node Html_Namespace "ul"
+
+  ol :: ∀message. Array (Attribute message) -> Array (Text, Hyper_Text message) -> Hyper_Text message :=
+    Keyed_Node Html_Namespace "ol"
+
+  svg_node :: ∀message. Text -> Array (Attribute message) -> Array (Text, Hyper_Text message) -> Hyper_Text message :=
+    Keyed_Node Svg_Namespace
+
+(* A subtree that is not rebuilt while its inputs are unchanged. "Unchanged" is
+   identity, not equality: the same function and the very same argument values as
+   some lazy node of the previous render. A model field that was not touched keeps
+   its identity, so `Lazy.lazy towers_view model.Towers` costs nothing until a tower
+   changes. A partial application or a freshly built argument is never the same, so
+   pass a top-level function and values taken straight from the model. *)
+module Lazy:
+  lazy :: ∀α message. (α -> Hyper_Text message) -> α -> Hyper_Text message := λview a.
+    Lazy_Node [ raw_erase view; raw_erase a ] (λ_. view a)
+
+  lazy2 :: ∀α β message. (α -> β -> Hyper_Text message) -> α -> β -> Hyper_Text message := λview a b.
+    Lazy_Node [ raw_erase view; raw_erase a; raw_erase b ] (λ_. view a b)
+
+  lazy3 :: ∀α β γ message. (α -> β -> γ -> Hyper_Text message) -> α -> β -> γ -> Hyper_Text message := λview a b c.
+    Lazy_Node [ raw_erase view; raw_erase a; raw_erase b; raw_erase c ] (λ_. view a b c)
+
+(* Things that happen without being attached to an element. `program` re-reads the
+   list after every render and switches the browser listeners to match, so a game
+   pauses by leaving `On_Frame` out. The frame's Int is performance.now() in
+   milliseconds; a frame that arrives while an action is still running is dropped
+   rather than queued. *)
+Subscription ::= ∀message.
+  On_Frame (Int -> message)
+| On_Key_Down (Key -> message)
+| On_Key_Up (Key -> message)
+
+Program ::= ∀model message.
+  { Initial       :: model
+    Init          :: Action model Unit
+    Update        :: message -> Action model Unit
+    View          :: model -> Hyper_Text message
+    Subscriptions :: model -> Array (Subscription message)
+  }
+
+foreign [ Browser ] raw_time_now :: Unit -> Int
+
+module Time:
+  (* performance.now(), in whole milliseconds. *)
+  now :: ∀model. Action model Int :=
+    lift_action (λ_. raw_time_now ())
+
+
+(* The DOM builder collects a lightweight tree between begin/finish and reconciles
+   it with the live DOM. Events are delegated by the browser side and return an
+   integer into the typed handler table.
+
+   Handler indices and lazy ids come from one counter that is never reset, so a
+   lazy subtree reused from an earlier render keeps the indices already written into
+   its DOM without colliding with anything drawn since. *)
+foreign [ Dom ] raw_dom_begin :: Text -> Unit
+foreign [ Dom ] raw_dom_open :: Int -> Bool -> Text -> Unit
+foreign [ Dom ] raw_dom_close :: Unit -> Unit
+foreign [ Dom ] raw_dom_text :: Text -> Unit
+foreign [ Dom ] raw_dom_key :: Text -> Unit
+foreign [ Dom ] raw_dom_attribute :: Text -> Text -> Unit
+foreign [ Dom ] raw_dom_event :: Text -> Int -> Unit
+foreign [ Dom ] raw_dom_lazy_store :: Int -> Unit
+foreign [ Dom ] raw_dom_lazy_reuse :: Int -> Unit
+foreign [ Dom ] raw_dom_lazy_keep :: Int -> Unit
+foreign [ Dom ] raw_dom_finish :: (Int -> Text -> Unit) -> Unit
+foreign [ Browser ] raw_set_dispatchers :: (Int -> Pointer -> Unit) -> (Int -> Key -> Unit) -> (Int -> Unit) -> Unit
+foreign [ Browser ] raw_subscribe :: Bool -> Bool -> Bool -> Unit
+foreign [ Browser ] raw_yield :: (Unit -> Unit) -> Unit
+
+yield :: ∀model. Action model Unit :=
+  suspend_action raw_yield
+
+Event_Handler ::= ∀message.
+  Signal_Handler message
+| Input_Handler (Text -> message)
+| Pointer_Handler (Pointer -> message)
+
+(* A lazy node drawn in some render: its identity, the id the browser side filed its
+   subtree under, the handlers inside that subtree, and every lazy node nested in it
+   -- reusing the subtree reuses those too, so they must stay findable. *)
+Lazy_Entry ::= ∀message.
+  Make_Lazy_Entry (Array Lazy_Key) Int (List (Int, Event_Handler message)) (List (Lazy_Entry message))
+
+Drawn ::= ∀message.
+  { Next     :: Int
+    Handlers :: List (Int, Event_Handler message)
+    Lazies   :: List (Lazy_Entry message)
+  }
+
+namespace_code :: Namespace -> Int := λspace.
+  deconstruct space into
+    Html_Namespace -> 0
+  | Svg_Namespace -> 1
+
+same_keys_from :: Array Lazy_Key -> Array Lazy_Key -> Int -> Bool := λwanted known index.
+  if index >= Array.length wanted
+  then true
+  else
+    deconstruct Array.get wanted index into
+      Nope -> false
+    | This left ->
+        deconstruct Array.get known index into
+          Nope -> false
+        | This right ->
+            if raw_same left right
+            then same_keys_from wanted known (1 + index)
+            else false
+
+same_keys :: Array Lazy_Key -> Array Lazy_Key -> Bool := λwanted known.
+  if Array.length wanted = Array.length known
+  then same_keys_from wanted known 0
+  else false
+
+find_lazy :: ∀message. Array Lazy_Key -> List (Lazy_Entry message) -> Perhaps (Lazy_Entry message) :=
+  λwanted entries.
+    deconstruct entries into
+      Nil -> Nope
+    | Cons entry rest ->
+        deconstruct entry into
+          Make_Lazy_Entry known _ _ _ ->
+            if same_keys wanted known then This entry else find_lazy wanted rest
+
+keep_lazies :: ∀message. List (Lazy_Entry message) -> Unit := λentries.
+  deconstruct entries into
+    Nil -> ()
+  | Cons (Make_Lazy_Entry _ id _ _) rest ->
+      let _ = raw_dom_lazy_keep id in
+      keep_lazies rest
+
+with_handler :: ∀message. Text -> Event_Handler message -> Drawn message -> Drawn message :=
+  λkind handler drawn.
+    let index = drawn.Next in
+    let _ = raw_dom_event kind index in
+    { drawn: Next := 1 + index
+             Handlers := Cons (index, handler) drawn.Handlers
+    }
+
+draw_attributes :: ∀message. Array (Attribute message) -> Int -> Drawn message -> Drawn message :=
+  λattributes index drawn.
+    if index >= Array.length attributes
+    then drawn
+    else
+      deconstruct Array.get attributes index into
+        Nope -> drawn
+      | This attribute ->
+        deconstruct attribute into
+          Plain_Attribute name value ->
+            let _ = raw_dom_attribute name value in
+            draw_attributes attributes (1 + index) drawn
+        | Click_Attribute message ->
+            draw_attributes attributes (1 + index) (with_handler "click" (Signal_Handler message) drawn)
+        | Input_Attribute make_message ->
+            draw_attributes attributes (1 + index) (with_handler "input" (Input_Handler make_message) drawn)
+        | Pointer_Attribute kind make_message ->
+            draw_attributes attributes (1 + index) (with_handler kind (Pointer_Handler make_message) drawn)
+        | Signal_Attribute kind message ->
+            draw_attributes attributes (1 + index) (with_handler kind (Signal_Handler message) drawn)
+
+draw_html :: ∀message. List (Lazy_Entry message) -> Hyper_Text message -> Drawn message -> Drawn message :=
+  λprevious html drawn.
+    deconstruct html into
+      Text_Node body ->
+        let _ = raw_dom_text body in
+        drawn
+    | Element_Node space name attributes children ->
+        let _ = raw_dom_open (namespace_code space) false name in
+        let attributed = draw_attributes attributes 0 drawn in
+        let loop = λindex sofar.
+          if index >= Array.length children
+          then sofar
+          else
+            deconstruct Array.get children index into
+              Nope -> sofar
+            | This child -> loop (1 + index) (draw_html previous child sofar)
+        in
+        let finished = loop 0 attributed in
+        let _ = raw_dom_close () in
+        finished
+    | Keyed_Node space name attributes children ->
+        let _ = raw_dom_open (namespace_code space) true name in
+        let attributed = draw_attributes attributes 0 drawn in
+        let loop = λindex sofar.
+          if index >= Array.length children
+          then sofar
+          else
+            deconstruct Array.get children index into
+              Nope -> sofar
+            | This (key, child) ->
+                let _ = raw_dom_key key in
+                loop (1 + index) (draw_html previous child sofar)
+        in
+        let finished = loop 0 attributed in
+        let _ = raw_dom_close () in
+        finished
+    | Lazy_Node keys build ->
+        deconstruct find_lazy keys previous into
+          This entry ->
+            deconstruct entry into
+              Make_Lazy_Entry _ id handlers nested ->
+                let _ = raw_dom_lazy_reuse id in
+                let _ = keep_lazies nested in
+                { drawn: Handlers := append handlers drawn.Handlers
+                         Lazies := Cons entry (append nested drawn.Lazies)
+                }
+        | Nope ->
+            let id = drawn.Next in
+            let inner = draw_html previous (build ()) { Next := 1 + id; Handlers := Nil; Lazies := Nil } in
+            let _ = raw_dom_lazy_store id in
+            let entry = Make_Lazy_Entry keys id inner.Handlers inner.Lazies in
+            { Next := inner.Next
+              Handlers := append inner.Handlers drawn.Handlers
+              Lazies := Cons entry (append inner.Lazies drawn.Lazies)
+            }
+
+handler_at :: ∀message. Int -> List (Int, Event_Handler message) -> Perhaps (Event_Handler message) :=
+  λwanted handlers.
+    deconstruct handlers into
+      Nil -> Nope
+    | Cons (index, handler) rest ->
+        if index = wanted then This handler else handler_at wanted rest
+
+subscribed_frame :: ∀message. Array (Subscription message) -> Int -> Perhaps (Int -> message) :=
+  λwanted index.
+    if index >= Array.length wanted
+    then Nope
+    else
+      deconstruct Array.get wanted index into
+        This (On_Frame make_message) -> This make_message
+      | otherwise -> subscribed_frame wanted (1 + index)
+
+(* `up` false for key-down, true for key-up. *)
+subscribed_key :: ∀message. Bool -> Array (Subscription message) -> Int -> Perhaps (Key -> message) :=
+  λup wanted index.
+    if index >= Array.length wanted
+    then Nope
+    else
+      deconstruct Array.get wanted index into
+        This (On_Key_Down make_message) ->
+          if up then subscribed_key up wanted (1 + index) else This make_message
+      | This (On_Key_Up make_message) ->
+          if up then This make_message else subscribed_key up wanted (1 + index)
+      | otherwise -> subscribed_key up wanted (1 + index)
+
+is_present :: ∀α. Perhaps α -> Bool := λfound.
+  deconstruct found into
+    Nope -> false
+  | This _ -> true
+
+Render_Command ::= ∀model message.
+  Render_Model model
+| Dispatch_Event Int Text
+| Dispatch_Pointer Int Pointer
+| Dispatch_Key Int Key
+| Dispatch_Frame Int
+| Run_Message message
+| Action_Finished
+
+
+(* --------------------------------------------------------------- application *)
+
+mount_program :: ∀model message. Text -> Program model message -> Unit :=
+    λroot program.
+      let state = raw_state_new program.Initial in
+      let handlers_state = raw_state_new Nil in
+      let lazies_state = raw_state_new Nil in
+      let next_state = raw_state_new 0 in
+      let subscriptions_state = raw_state_new [] in
+      let pending_messages = raw_state_new Nil in
+      let action_running = raw_state_new false in
+      let dirty = raw_state_new false in
+      let loop = λcommand.
+        deconstruct command into
+          Render_Model model ->
+            let _ = raw_dom_begin root in
+            let fresh = { Next := raw_state_get next_state; Handlers := Nil; Lazies := Nil } in
+            let drawn = draw_html (raw_state_get lazies_state) (program.View model) fresh in
+            let _ = raw_state_set handlers_state drawn.Handlers in
+            let _ = raw_state_set lazies_state drawn.Lazies in
+            let _ = raw_state_set next_state drawn.Next in
+            let wanted = program.Subscriptions model in
+            let _ = raw_state_set subscriptions_state wanted in
+            let frame = is_present (subscribed_frame wanted 0) in
+            let key_down = is_present (subscribed_key false wanted 0) in
+            let key_up = is_present (subscribed_key true wanted 0) in
+            let _ = raw_subscribe frame key_down key_up in
+            raw_dom_finish (λindex payload. loop (Dispatch_Event index payload))
+        | Dispatch_Event index payload ->
+            deconstruct handler_at index (raw_state_get handlers_state) into
+              This (Signal_Handler message) -> loop (Run_Message message)
+            | This (Input_Handler make_message) -> loop (Run_Message (make_message payload))
+            | otherwise -> ()
+        | Dispatch_Pointer index pointer ->
+            deconstruct handler_at index (raw_state_get handlers_state) into
+              This (Pointer_Handler make_message) -> loop (Run_Message (make_message pointer))
+            | otherwise -> ()
+        | Dispatch_Key kind key ->
+            deconstruct subscribed_key (kind = 1) (raw_state_get subscriptions_state) 0 into
+              Nope -> ()
+            | This make_message -> loop (Run_Message (make_message key))
+        | Dispatch_Frame time ->
+            if raw_state_get action_running
+            then ()
+            else
+              deconstruct subscribed_frame (raw_state_get subscriptions_state) 0 into
+                Nope -> ()
+              | This make_message -> loop (Run_Message (make_message time))
+        | Run_Message message ->
+            if raw_state_get action_running
+            then
+              raw_state_set pending_messages
+                (append (raw_state_get pending_messages) (Cons message Nil))
+            else
+              let _ = raw_state_set action_running true in
+              run_action
+                { Dirty := dirty; State := state; Render := λmodel. loop (Render_Model model) }
+                (program.Update message)
+                (λ_. loop Action_Finished)
+        | Action_Finished ->
+            let _ = flush_action { Dirty := dirty; State := state; Render := λmodel. loop (Render_Model model) } in
+            deconstruct raw_state_get pending_messages into
+              Nil -> raw_state_set action_running false
+            | Cons message rest ->
+                let _ = raw_state_set pending_messages rest in
+                run_action
+                  { Dirty := dirty; State := state; Render := λmodel. loop (Render_Model model) }
+                  (program.Update message)
+                  (λ_. loop Action_Finished)
+      in
+      let on_pointer = λindex pointer. loop (Dispatch_Pointer index pointer) in
+      let on_key = λkind key. loop (Dispatch_Key kind key) in
+      let on_frame = λtime. loop (Dispatch_Frame time) in
+      let _ = raw_set_dispatchers on_pointer on_key on_frame in
+      let runtime = { Dirty := dirty; State := state; Render := λmodel. loop (Render_Model model) } in
+      let _ = loop (Render_Model program.Initial) in
+      let _ = raw_state_set action_running true in
+      run_action runtime program.Init (λ_. loop Action_Finished)
+
+mount :: ∀model message. Text -> model -> Action model Unit -> (message -> Action model Unit) -> (model -> Hyper_Text message) -> Unit :=
+    λroot initial init update view.
+      mount_program root
+        { Initial := initial
+          Init := init
+          Update := update
+          View := view
+          Subscriptions := λ_. []
+        }
+
+run :: ∀model message. model -> Action model Unit -> (message -> Action model Unit) -> (model -> Hyper_Text message) -> Unit :=
+    mount "app"
+
+program :: ∀model message. Program model message -> Unit :=
+    mount_program "app"
+
+
+(* -------------------------------------------------------------- local storage *)
+
+foreign [ Local_Storage ] raw_local_storage_get :: Text -> Perhaps Text
+foreign [ Local_Storage ] raw_local_storage_set :: Text -> Text -> Unit
+foreign [ Local_Storage ] raw_local_storage_remove :: Text -> Unit
+foreign [ Local_Storage ] raw_local_storage_clear :: Unit -> Unit
+
+module Local_Storage:
+  get :: ∀model. Text -> Action model (Perhaps Text) := λkey.
+    lift_action (λ_. raw_local_storage_get key)
+
+  set :: ∀model. Text -> Text -> Action model Unit := λkey value.
+    lift_action (λ_. raw_local_storage_set key value)
+
+  remove :: ∀model. Text -> Action model Unit := λkey.
+    lift_action (λ_. raw_local_storage_remove key)
+
+  clear :: ∀model. Action model Unit :=
+    lift_action (λ_. raw_local_storage_clear ())
+
+
+(* --------------------------------------------------------------------- fetch *)
+
+Response ::=
+  { Status :: Int
+    Body   :: Text
+  }
+
+foreign [ Fetch ] raw_fetch_get :: Text -> (Response -> Unit) -> Unit
+
+module Fetch:
+  get :: ∀model. Text -> Action model Response := λurl.
+    suspend_action (λcontinue. raw_fetch_get url continue)
+
+
+(* ---------------------------------------------------------------- web socket *)
+
+opaque Socket ::= Make_Socket Int
+
+foreign [ Web_Socket ] raw_web_socket_connect :: Text -> (Int -> Unit) -> Unit
+foreign [ Web_Socket ] raw_web_socket_send :: Int -> Text -> Bool
+foreign [ Web_Socket ] raw_web_socket_receive :: Int -> (Perhaps Text -> Unit) -> Unit
+foreign [ Web_Socket ] raw_web_socket_close :: Int -> Unit
+
+module Web_Socket:
+  connect :: ∀model. Text -> Action model (Perhaps Socket) := λurl.
+    suspend_action (λcontinue.
+      raw_web_socket_connect url (λhandle.
+        continue (if handle < 0 then Nope else This (Make_Socket handle))))
+
+  send :: ∀model. Socket -> Text -> Action model Bool := λ(Make_Socket handle) body.
+    lift_action (λ_. raw_web_socket_send handle body)
+
+  receive :: ∀model. Socket -> Action model (Perhaps Text) := λ(Make_Socket handle).
+    suspend_action (λcontinue. raw_web_socket_receive handle continue)
+
+  close :: ∀model. Socket -> Action model Unit := λ(Make_Socket handle).
+    lift_action (λ_. raw_web_socket_close handle)
