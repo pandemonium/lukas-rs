@@ -1,0 +1,100 @@
+use Stdlib.
+use Stdlib.Browser.
+
+Todo ::=
+  { ID    :: Int
+    Title :: Text
+    Done  :: Bool
+  }
+
+Model ::=
+  { Next_ID :: Int
+    Draft   :: Text
+    Todos   :: List Todo
+  }
+
+Message ::=
+  Changed Text
+| Add
+| Toggle Int
+| Delete Int
+
+initial :: Model :=
+  { Next_ID := 1
+    Draft := ""
+    Todos := Nil
+  }
+
+init :: Action Model Unit :=
+  let* saved = Local_Storage.get "marmelade.todo.last" in
+  deconstruct saved into
+    Nope -> pure ()
+  | This title ->
+      Model.put
+        { Next_ID := 2
+          Draft := ""
+          Todos := Cons { ID := 1; Title := title; Done := false } Nil
+        }
+
+toggle :: Int -> Todo -> Todo := λwanted todo.
+  if todo.ID = wanted
+  then { todo: Done := not todo.Done }
+  else todo
+
+change_draft :: Text -> Model -> Model := λdraft model.
+  { model: Draft := draft }
+
+toggle_todo :: Int -> Model -> Model := λwanted model.
+  { model: Todos := fmap (toggle wanted) model.Todos }
+
+delete_todo :: Int -> Model -> Model := λwanted model.
+  { model: Todos := List.filter (λtodo. not (todo.ID = wanted)) model.Todos }
+
+add_todo :: Text -> Model -> Model := λtitle model.
+  let todo = { ID := model.Next_ID; Title := title; Done := false } in
+  { model: Next_ID := 1 + model.Next_ID; Draft := ""; Todos := append model.Todos (Cons todo Nil) }
+
+update :: Message -> Action Model Unit := λmessage.
+  deconstruct message into
+    Changed draft -> Model.modify (change_draft draft)
+  | Add ->
+      let* title = Model.read (λmodel. model.Draft) in
+      if title = ""
+      then pure ()
+      else
+        let* _ = Model.modify (add_todo title) in
+        Local_Storage.set "marmelade.todo.last" title
+  | Toggle wanted ->
+      Model.modify (toggle_todo wanted)
+  | Delete wanted ->
+      Model.modify (delete_todo wanted)
+
+todo_view :: Todo -> Hyper_Text Message := λtodo.
+  Html.li
+    [ Attribute.class_name (if todo.Done then "todo done" else "todo") ]
+    [ Html.button [ Attribute.on_click (Toggle todo.ID) ]
+        [ Html.text (if todo.Done then "Undo" else "Done") ]
+      Html.span [] [ Html.text todo.Title ]
+      Html.button [ Attribute.on_click (Delete todo.ID) ] [ Html.text "Delete" ]
+    ]
+
+todo_views :: List Todo -> Array (Hyper_Text Message) := λtodos.
+  let views = fmap todo_view todos in
+  Array.from_enumerator (indexed_sized (length views) views)
+
+view :: Model -> Hyper_Text Message := λmodel.
+  Html.section [ Attribute.class_name "todo-app" ]
+    [ Html.h1 [] [ Html.text "Marmelade Todo" ]
+      Html.div [ Attribute.class_name "new-todo" ]
+        [ Html.input
+            [ Attribute.placeholder "What needs doing?"
+              Attribute.value model.Draft
+              Attribute.on_input Changed
+            ]
+          Html.button [ Attribute.on_click Add ] [ Html.text "Add" ]
+        ]
+      Html.ul [] (todo_views model.Todos)
+    ]
+
+start :: Int -> Unit := λ_.
+  Browser.run initial init update view
